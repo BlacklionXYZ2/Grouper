@@ -1,0 +1,4 @@
+module grouper_ffiFFI {
+    header "grouper_ffiFFI.h"
+    export *
+}

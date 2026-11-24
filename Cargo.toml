@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/core-protocol", "crates/providers", "crates/core-agent", "crates/core-client", "crates/hub", "crates/ffi", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+core-protocol = { path = "crates/core-protocol" }
+core-client = { path = "crates/core-client" }
+providers = { path = "crates/providers" }
+core-agent = { path = "crates/core-agent" }
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+getrandom = "0.4"
+hex = "0.4"
+rusqlite = { version = "0.43", features = ["bundled"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "fs", "process", "io-util"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uniffi = "0.32"
+
+[profile.release]
+lto = "thin"
+# Homebrew rustup's rust-objcopy is broken on this Mac; skip stripping.
+strip = false

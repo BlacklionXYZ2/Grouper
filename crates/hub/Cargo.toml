@@ -1,0 +1,29 @@
+[package]
+name = "hub"
+description = "Grouper hub: device registry, presence and tool routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "grouper-hub"
+path = "src/main.rs"
+
+[dependencies]
+core-protocol.workspace = true
+core-agent.workspace = true
+providers.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

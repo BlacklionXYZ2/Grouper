@@ -1,0 +1,261 @@
+{
+ "delay_ms": 300,
+ "rules": [
+  {
+   "system": "helpful personal assistant",
+   "reply": [
+    {
+     "type": "text",
+     "text": "Hello from standard chat (one model, no threads)."
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "stepped into",
+   "reply": [
+    {
+     "type": "text",
+     "text": "Noted: you stepped into that thread, so I'll leave it to you."
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "Write two haiku",
+   "reply": [
+    {
+     "type": "text",
+     "text": "I'll split this into two threads: one on your Mac, one on the hub."
+    },
+    {
+     "type": "tool_use",
+     "name": "start_thread",
+     "input": {
+      "title": "Mac haiku",
+      "device": "Mac CLI",
+      "goal": "Write a haiku about autumn to haiku.txt and count its lines.",
+      "expected_output": "The file path and line count."
+     }
+    },
+    {
+     "type": "tool_use",
+     "name": "start_thread",
+     "input": {
+      "title": "Hub haiku",
+      "device": "hub",
+      "goal": "Write a haiku about servers to hub.txt.",
+      "hub_reason": "No device needed; preparing it in the cloud."
+     }
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "Try the PC",
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "start_thread",
+     "input": {
+      "title": "PC job",
+      "device": "PC",
+      "goal": "Anything."
+     }
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "Swift check",
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "start_thread",
+     "input": {
+      "title": "Swift info",
+      "device": "Swift Mac",
+      "goal": "Report Mac info."
+     }
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "Long job",
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "start_thread",
+     "input": {
+      "title": "Long job",
+      "device": "Mac CLI",
+      "goal": "Run a long command."
+     }
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "is offline",
+   "reply": [
+    {
+     "type": "text",
+     "text": "Your PC is offline. Want me to prepare the work on the hub so it's ready when the PC is back?"
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "asks]",
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "message_thread",
+     "input": {
+      "thread_id": "$THREAD_ID",
+      "text": "Use the number 42."
+     }
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "\"thread_id\"",
+   "reply": [
+    {
+     "type": "text",
+     "text": "Both threads are running; I'll report back when they finish."
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "sent",
+   "reply": [
+    {
+     "type": "text",
+     "text": "Answered the hub thread's question."
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": " done]",
+   "reply": [
+    {
+     "type": "text",
+     "text": "A thread finished; results are in its summary."
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": " failed]",
+   "reply": [
+    {
+     "type": "text",
+     "text": "A thread failed; see its summary."
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "# Brief: Mac haiku",
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "write_file",
+     "input": {
+      "path": "haiku.txt",
+      "content": "Leaves let go of light\nthe maple counts its losses\nin red, then in brown\n"
+     }
+    },
+    {
+     "type": "tool_use",
+     "name": "run_shell",
+     "input": {
+      "command": "wc -l haiku.txt"
+     }
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "# Brief: Swift info",
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "mac_info",
+     "input": {}
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "implemented_in",
+   "reply": [
+    {
+     "type": "text",
+     "text": "The Swift mac_info tool answered."
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "# Brief: Long job",
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "run_shell",
+     "input": {
+      "command": "sleep 30"
+     }
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "# Brief: Hub haiku",
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "ask_orchestrator",
+     "input": {
+      "question": "Which number should the haiku mention?"
+     }
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "42",
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "write_file",
+     "input": {
+      "path": "hub.txt",
+      "content": "Forty-two fans hum\nracks of patient blinking lights\nthe cloud never sleeps\n"
+     }
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "wrote",
+   "reply": [
+    {
+     "type": "text",
+     "text": "Done. Wrote the haiku file in my workspace."
+    }
+   ]
+  }
+ ],
+ "default": [
+  {
+   "type": "text",
+   "text": "(scripted default)"
+  }
+ ]
+}

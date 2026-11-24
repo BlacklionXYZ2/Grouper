@@ -1,0 +1,20 @@
+[package]
+name = "grouper-ffi"
+description = "UniFFI bindings exposing the Grouper core to Swift (and later Kotlin)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "grouper_ffi"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+core-client.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uniffi = { workspace = true, features = ["cli"] }

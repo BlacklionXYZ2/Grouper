@@ -1,0 +1,34 @@
+// swift-tools-version:5.10
+// GrouperKit: the Rust core (via UniFFI) packaged for Swift.
+// Run scripts/build-apple.sh first to build lib/libgrouper_ffi.a and the bindings.
+//
+// This links a static library with -L/-l flags so it builds with the Command Line
+// Tools alone. Once Xcode is installed, swap this for an XCFramework binaryTarget
+// (needed for iOS device + simulator slices).
+import PackageDescription
+import Foundation
+
+let libDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("lib").path
+
+let package = Package(
+    name: "GrouperKit",
+    platforms: [.macOS(.v14)],
+    products: [
+        .library(name: "GrouperKit", targets: ["GrouperKit"]),
+        .executable(name: "grouper-mac", targets: ["grouper-mac"]),
+    ],
+    targets: [
+        .target(
+            name: "grouper_ffiFFI",
+            path: "Sources/grouper_ffiFFI",
+            linkerSettings: [
+                .unsafeFlags(["-L\(libDir)", "-lgrouper_ffi"]),
+                .linkedFramework("Security"),
+                .linkedFramework("SystemConfiguration"),
+                .linkedFramework("CoreFoundation"),
+            ]
+        ),
+        .target(name: "GrouperKit", dependencies: ["grouper_ffiFFI"]),
+        .executableTarget(name: "grouper-mac", dependencies: ["GrouperKit"]),
+    ]
+)

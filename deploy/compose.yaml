@@ -1,0 +1,22 @@
+# Run from the repo root:
+#   docker compose -f deploy/compose.yaml up -d --build
+#   docker compose -f deploy/compose.yaml exec hub grouper-hub device add "MacBook" --platform macos
+#
+# The hub listens on 8080 inside the VM. Expose it through your domain with a
+# tunnel (e.g. cloudflared) or a TLS reverse proxy; don't port-forward 8080 directly.
+services:
+  hub:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: grouper-hub:dev
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - grouper-data:/data
+    environment:
+      RUST_LOG: info
+
+volumes:
+  grouper-data:
