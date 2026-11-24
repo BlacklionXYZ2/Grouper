@@ -133,7 +133,14 @@ impl Tool for ListFiles {
                 let Ok(rd) = std::fs::read_dir(&d) else { continue };
                 for e in rd.flatten() {
                     let p = e.path();
-                    let shown = p.strip_prefix(&root).unwrap_or(&p).display().to_string();
+                    // Always `/`, so models see the same paths on every OS.
+                    let shown = p
+                        .strip_prefix(&root)
+                        .unwrap_or(&p)
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
                     if p.is_dir() {
                         out.push(format!("{shown}/"));
                         stack.push(p);

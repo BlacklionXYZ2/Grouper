@@ -191,8 +191,8 @@ pub(crate) async fn post_json(
         .await
         .map_err(|e| ProviderError::Network { provider: provider.into(), message: e.to_string() })?;
     if !(200..300).contains(&status) {
-        let mut body = text;
-        body.truncate(2000);
+        // Cut on a character boundary: `String::truncate` panics inside a UTF-8 sequence.
+        let body: String = text.chars().take(2000).collect();
         return Err(ProviderError::Http { provider: provider.into(), status, body });
     }
     serde_json::from_str(&text)
