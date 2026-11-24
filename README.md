@@ -41,11 +41,16 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 cargo build --workspace
 H="target/debug/grouper-hub --data ./data"
 $H device add "Mac CLI" --platform macos      # token for the device that runs threads
-$H device add "Phone" --platform ios          # token for you, the chat client
+$H device add "Phone" --platform ios --admin  # admin token for you, the chat client
 $H provider scripted --kind scripted --options "{\"script\": \"$PWD/examples/scripted-demo.json\"}"
 $H model fake --provider scripted --model fake-1 --roles orchestrator,standard,thread
 $H serve
 ```
+
+Device tokens can connect and read. Changing tool permissions, answering approvals,
+managing keys and models, chatting and steering threads need an admin token
+(`--admin`, or `grouper-hub device admin <id>` later). Keep admin tokens off devices
+that run threads with a shell. Thread shells never see `GROUPER_*` variables.
 
 In a second terminal, connect a device that runs threads:
 
@@ -65,7 +70,7 @@ The Mac thread's shell command waits for approval: run the `grouper approve …`
 ## Use a real model
 
 ```bash
-export GROUPER_TOKEN=<your token>
+export GROUPER_TOKEN=<your admin token>
 GROUPER_PROVIDER_KEY=<key> target/debug/grouper keys set openrouter --kind openai
 target/debug/grouper models add orchestrator --provider openrouter --model <model> --roles orchestrator,thread
 target/debug/grouper models add free --provider openrouter --model <free model> --free --roles standard

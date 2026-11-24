@@ -1,0 +1,37 @@
+#cloud-config
+# First-boot setup for the Grouper hub VM. new-hub-vm.ps1 replaces __SSH_KEY__.
+hostname: grouper-hub
+fqdn: grouper-hub
+users:
+  - name: grouper
+    groups: [sudo, docker]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __SSH_KEY__
+ssh_pwauth: false
+growpart:
+  mode: auto
+  devices: ["/"]
+package_update: true
+package_upgrade: true
+packages:
+  - hyperv-daemons      # lets Windows see the VM's IP address
+  - docker.io
+  - docker-compose
+  - docker-buildx
+  - git
+  - curl
+  - ca-certificates
+  - unattended-upgrades
+runcmd:
+  # cloudflared from Cloudflare's own apt repository
+  - mkdir -p --mode=0755 /usr/share/keyrings
+  - curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg
+  - echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" > /etc/apt/sources.list.d/cloudflared.list
+  - apt-get update && apt-get install -y cloudflared
+  - usermod -aG docker grouper
+  - systemctl enable --now docker
+  - mkdir -p /opt/grouper && chown grouper:grouper /opt/grouper
+final_message: "grouper-hub ready after $UPTIME seconds"

@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
-use crate::db::Db;
+use crate::db::{Auth, Db};
 use crate::orchestrator::Wake;
 
 const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -129,7 +129,7 @@ impl Hub {
         self.broadcast(HubMessage::Providers { providers: self.db.providers() }).await;
     }
 
-    fn auth(&self, headers: &HeaderMap) -> Option<String> {
+    fn auth(&self, headers: &HeaderMap) -> Option<Auth> {
         let token = headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")?;
         self.db.authenticate(token)
     }
@@ -237,13 +237,27 @@ fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, Json(json!({ "error": msg.to_string() }))).into_response()
 }
 
+/// Any valid token: a device or the user's client. Enough to connect and to read.
 macro_rules! authed {
     ($hub:expr, $headers:expr) => {
         match $hub.auth(&$headers) {
-            Some(id) => id,
+            Some(a) => a,
             None => return err(StatusCode::UNAUTHORIZED, "invalid or missing device token"),
         }
     };
+}
+
+/// An admin token (`grouper-hub device add --admin`). Required for anything that
+/// changes access, answers approvals, touches provider keys, or acts on the user's
+/// behalf, so a thread that reads its own device's token can't raise its access.
+macro_rules! admin {
+    ($hub:expr, $headers:expr) => {{
+        let a = authed!($hub, $headers);
+        if !a.admin {
+            return err(StatusCode::FORBIDDEN, "this needs an admin token (grouper-hub device add --admin)");
+        }
+        a
+    }};
 }
 
 async fn list_devices(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
@@ -257,7 +271,7 @@ async fn call_device(
     Path(id): Path<String>,
     Json(req): Json<ToolCallRequest>,
 ) -> Response {
-    let caller = authed!(hub, headers);
+    let caller = admin!(hub, headers).device_id;
     tracing::info!(%caller, device = %id, tool = %req.tool, "tool call");
     match hub.call_tool(&id, &req.tool, req.args.to_string()).await {
         Ok(r) => Json(r).into_response(),
@@ -282,14 +296,14 @@ struct PermissionBody {
     permission: String,
 }
 
-/// Only reachable with a device token (that is, by the user); no model has a tool for this.
+/// Only reachable with an admin token (that is, by the user); no model has a tool for this.
 async fn set_permission(
     State(hub): State<Arc<Hub>>,
     headers: HeaderMap,
     Path((device, tool)): Path<(String, String)>,
     Json(body): Json<PermissionBody>,
 ) -> Response {
-    authed!(hub, headers);
+    admin!(hub, headers);
     let Some(p) = Permission::parse(&body.permission) else {
         return err(StatusCode::BAD_REQUEST, "permission must be manual, auto or bypass");
     };
@@ -300,7 +314,7 @@ async fn set_permission(
 }
 
 async fn list_providers(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
-    authed!(hub, headers);
+    admin!(hub, headers);
     let list: Vec<ProviderInfo> = hub
         .db
         .providers()
@@ -316,7 +330,7 @@ async fn put_provider(
     Path(id): Path<String>,
     Json(mut p): Json<ProviderConfig>,
 ) -> Response {
-    authed!(hub, headers);
+    admin!(hub, headers);
     p.id = id;
     if let Err(e) = hub.db.upsert_provider(&p) {
         return err(StatusCode::BAD_REQUEST, e);
@@ -336,7 +350,7 @@ async fn put_model(
     Path(id): Path<String>,
     Json(mut m): Json<ModelEntry>,
 ) -> Response {
-    authed!(hub, headers);
+    admin!(hub, headers);
     m.id = id;
     match hub.db.upsert_model(&m) {
         Ok(()) => Json(m).into_response(),
@@ -345,7 +359,7 @@ async fn put_model(
 }
 
 async fn delete_model(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
-    authed!(hub, headers);
+    admin!(hub, headers);
     match hub.db.delete_model(&id) {
         Ok(()) => Json(json!({"deleted": id})).into_response(),
         Err(e) => err(StatusCode::NOT_FOUND, e),
@@ -353,7 +367,7 @@ async fn delete_model(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id):
 }
 
 async fn chat(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(req): Json<ChatRequest>) -> Response {
-    authed!(hub, headers);
+    admin!(hub, headers);
     match hub.chat(req).await {
         Ok(conversation_id) => Json(ChatResponse { conversation_id }).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, e),
@@ -415,7 +429,7 @@ async fn thread_message(
     Path(id): Path<String>,
     Json(body): Json<TextBody>,
 ) -> Response {
-    authed!(hub, headers);
+    admin!(hub, headers);
     match hub.user_thread_message(&id, &body.text).await {
         Ok(()) => Json(json!({"sent": true})).into_response(),
         Err(e) => err(StatusCode::CONFLICT, e),
@@ -423,7 +437,7 @@ async fn thread_message(
 }
 
 async fn thread_stop(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
-    authed!(hub, headers);
+    admin!(hub, headers);
     match hub.stop_thread(&id, "user").await {
         Ok(()) => Json(json!({"stopped": true})).into_response(),
         Err(e) => err(StatusCode::CONFLICT, e),
@@ -441,7 +455,7 @@ async fn approval(
     Path(id): Path<String>,
     Json(body): Json<ApprovalBody>,
 ) -> Response {
-    authed!(hub, headers);
+    admin!(hub, headers);
     if hub.resolve_approval(&id, body.approve).await {
         Json(json!({"approval_id": id, "approved": body.approve})).into_response()
     } else {
@@ -486,7 +500,7 @@ async fn events_ws(
 }
 
 async fn connect(State(hub): State<Arc<Hub>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    let device_id = authed!(hub, headers);
+    let device_id = authed!(hub, headers).device_id;
     ws.on_upgrade(move |socket| async move {
         if let Err(e) = session(hub, device_id.clone(), socket).await {
             tracing::info!(device = %device_id, "session ended: {e}");

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -111,20 +111,52 @@ pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn 
 }
 
 /// Per-connection state for threads running on this device.
+///
+/// Running threads hold an `Arc` to this (as their [`ThreadHost`]), so it can't rely
+/// on `Drop` to stop them: [`StopOnDisconnect`] calls [`Threads::shutdown`] when the
+/// connection ends.
 struct Threads {
     out: mpsc::UnboundedSender<NodeMessage>,
     controls: Mutex<HashMap<String, ThreadControl>>,
     approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     providers: Mutex<Vec<ProviderConfig>>,
     next: AtomicU64,
+    /// Set once the connection is gone: no new threads or approvals.
+    closed: AtomicBool,
 }
 
-impl Drop for Threads {
-    fn drop(&mut self) {
-        // Connection gone: the hub has already marked these threads failed.
-        for c in self.controls.lock().unwrap().values() {
+impl Threads {
+    fn new(out: mpsc::UnboundedSender<NodeMessage>) -> Self {
+        Self {
+            out,
+            controls: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
+            providers: Mutex::new(Vec::new()),
+            next: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// The connection is gone and the hub has already marked these threads failed:
+    /// stop every thread and deny every pending approval.
+    fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let controls: Vec<ThreadControl> = self.controls.lock().unwrap().drain().map(|(_, c)| c).collect();
+        for c in controls {
             c.stop();
         }
+        // Dropping the senders resolves each waiting `approve` as a denial.
+        self.approvals.lock().unwrap().clear();
+    }
+}
+
+/// Stops this connection's threads when dropped, whether `connect_once` returned or
+/// was cancelled by shutdown.
+struct StopOnDisconnect(Arc<Threads>);
+
+impl Drop for StopOnDisconnect {
+    fn drop(&mut self) {
+        self.0.shutdown();
     }
 }
 
@@ -136,7 +168,13 @@ impl ThreadHost for Threads {
     async fn approve(&self, thread_id: &str, tool: &str, input: &Value, reason: &str) -> bool {
         let approval_id = format!("{thread_id}-a{}", self.next.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
-        self.approvals.lock().unwrap().insert(approval_id.clone(), tx);
+        {
+            let mut approvals = self.approvals.lock().unwrap();
+            if self.closed.load(Ordering::SeqCst) {
+                return false;
+            }
+            approvals.insert(approval_id.clone(), tx);
+        }
         let _ = self.out.send(NodeMessage::ApprovalRequest {
             approval_id,
             thread_id: thread_id.into(),
@@ -226,7 +264,14 @@ fn start_thread(
     events.thread(&id, &title, "running");
     let host: Arc<dyn ThreadHost> = threads.clone();
     let (control, handle) = spawn_thread(spec, provider, tools, host);
-    threads.controls.lock().unwrap().insert(id.clone(), control);
+    {
+        let mut controls = threads.controls.lock().unwrap();
+        if threads.closed.load(Ordering::SeqCst) {
+            control.stop();
+        } else {
+            controls.insert(id.clone(), control);
+        }
+    }
     let (threads, events) = (Arc::downgrade(threads), events.clone());
     tokio::spawn(async move {
         let result = handle.await.unwrap_or_else(|e| core_agent::thread::ThreadResult {
@@ -277,13 +322,8 @@ async fn connect_once(url: &str, config: &Config, handler: &Arc<dyn ToolHandler>
     }
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NodeMessage>();
-    let threads = Arc::new(Threads {
-        out: out_tx.clone(),
-        controls: Mutex::new(HashMap::new()),
-        approvals: Mutex::new(HashMap::new()),
-        providers: Mutex::new(Vec::new()),
-        next: AtomicU64::new(1),
-    });
+    let threads = Arc::new(Threads::new(out_tx.clone()));
+    let _stop_threads = StopOnDisconnect(threads.clone());
     let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.tick().await;
 
@@ -354,5 +394,66 @@ async fn connect_once(url: &str, config: &Config, handler: &Arc<dyn ToolHandler>
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_protocol::Permission;
+
+    /// A thread waiting for approval must end, and release its host, when the
+    /// connection drops (it used to wait forever and keep `Threads` alive).
+    #[tokio::test]
+    async fn disconnect_stops_threads_and_denies_approvals() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let threads = Arc::new(Threads::new(out_tx));
+        let guard = StopOnDisconnect(threads.clone());
+
+        let provider = providers::build(&ProviderConfig {
+            id: "fake".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"inline": {"default": [{"type": "tool_use", "name": "list_files", "input": {}}]}}),
+        })
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("grouper-client-{}", std::process::id()));
+        let ws = Workspace::create(dir.clone()).unwrap();
+        let spec = ThreadSpec {
+            thread_id: "t1".into(),
+            conversation_id: "c1".into(),
+            title: "test".into(),
+            provider_id: "fake".into(),
+            model: "fake".into(),
+            system: String::new(),
+            brief: "go".into(),
+            permissions: HashMap::from([("list_files".to_string(), Permission::Manual)]),
+            max_turns: 5,
+        };
+        let host: Arc<dyn ThreadHost> = threads.clone();
+        let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host);
+        threads.controls.lock().unwrap().insert("t1".into(), control);
+
+        // Wait until the thread is blocked on an approval.
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), out_rx.recv()).await.unwrap().unwrap();
+            if matches!(msg, NodeMessage::ApprovalRequest { .. }) {
+                break;
+            }
+        }
+        assert_eq!(threads.approvals.lock().unwrap().len(), 1);
+
+        drop(guard); // the connection ends
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await.expect("thread kept running").unwrap();
+        assert!(!result.ok);
+        assert!(threads.controls.lock().unwrap().is_empty());
+        assert!(threads.approvals.lock().unwrap().is_empty());
+        // Nothing else holds the connection state once the thread is gone.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(Arc::strong_count(&threads), 1);
+        // A late approval request is denied at once.
+        assert!(!threads.approve("t1", "list_files", &json!({}), "late").await);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

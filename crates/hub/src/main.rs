@@ -66,9 +66,20 @@ enum DeviceCmd {
         name: String,
         #[arg(long, default_value = "unknown")]
         platform: String,
+        /// Make this an admin token, for your own client: it can change tool
+        /// permissions, answer approvals, manage keys and models, and chat. Don't
+        /// give an admin token to a device that runs threads with a shell.
+        #[arg(long)]
+        admin: bool,
     },
     /// List registered devices.
     List,
+    /// Grant admin rights to a device's existing token (or remove them with --off).
+    Admin {
+        id: String,
+        #[arg(long)]
+        off: bool,
+    },
     /// Revoke a device's token.
     Revoke { id: String },
 }
@@ -96,15 +107,25 @@ async fn main() -> Result<()> {
                 })
                 .await?;
         }
-        Cmd::Device(DeviceCmd::Add { name, platform }) => {
-            let (d, token) = db.add_device(&name, &platform)?;
-            println!("Registered {} ({}) as {}", d.name, d.platform, d.id);
+        Cmd::Device(DeviceCmd::Add { name, platform, admin }) => {
+            let (d, token) = db.add_device(&name, &platform, admin)?;
+            let kind = if admin { "admin" } else { "device" };
+            println!("Registered {} ({}) as {} with a {kind} token", d.name, d.platform, d.id);
             println!("Token (shown once, keep it secret):\n{token}");
         }
         Cmd::Device(DeviceCmd::List) => {
             for d in db.devices() {
                 let state = if d.revoked { "revoked" } else { "active" };
-                println!("{}  {:<20} {:<8} {}", d.id, d.name, d.platform, state);
+                let kind = if d.admin { "admin" } else { "device" };
+                println!("{}  {:<20} {:<8} {:<7} {}", d.id, d.name, d.platform, state, kind);
+            }
+        }
+        Cmd::Device(DeviceCmd::Admin { id, off }) => {
+            db.set_admin(&id, !off)?;
+            if off {
+                println!("{id} now has a plain device token.");
+            } else {
+                println!("{id} now has an admin token. Don't use it on a device that runs threads with a shell.");
             }
         }
         Cmd::Device(DeviceCmd::Revoke { id }) => {

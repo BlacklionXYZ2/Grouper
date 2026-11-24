@@ -47,6 +47,17 @@ pub struct Device {
     pub platform: String,
     pub revoked: bool,
     pub last_seen: Option<u64>,
+    /// Admin tokens belong to the user's own clients. Only they may change tool
+    /// permissions, answer approvals, manage providers and models, chat or steer
+    /// threads. Plain device tokens can connect and read.
+    pub admin: bool,
+}
+
+/// Who a valid token belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Auth {
+    pub device_id: String,
+    pub admin: bool,
 }
 
 pub struct Db(Mutex<Connection>);
@@ -54,7 +65,8 @@ pub struct Db(Mutex<Connection>);
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL, secret_hash TEXT NOT NULL,
-  created INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, last_seen INTEGER);
+  created INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, last_seen INTEGER,
+  admin INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS tools (
   device_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, permission TEXT NOT NULL,
   PRIMARY KEY (device_id, name));
@@ -121,6 +133,14 @@ impl Db {
         let conn = Connection::open(data_dir.join("grouper.db"))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        // Databases made before admin tokens: every existing token becomes a plain
+        // device token; grant admin with `grouper-hub device admin <id>`.
+        let has_admin: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('devices') WHERE name = 'admin'")?
+            .exists([])?;
+        if !has_admin {
+            conn.execute_batch("ALTER TABLE devices ADD COLUMN admin INTEGER NOT NULL DEFAULT 0;")?;
+        }
         let db = Self(Mutex::new(conn));
         db.import_devices_json(data_dir)?;
         Ok(db)
@@ -158,7 +178,7 @@ impl Db {
 
     // ---- devices
 
-    pub fn add_device(&self, name: &str, platform: &str) -> Result<(Device, String)> {
+    pub fn add_device(&self, name: &str, platform: &str, admin: bool) -> Result<(Device, String)> {
         let name = name.trim();
         if name.is_empty() {
             bail!("device name is empty");
@@ -170,10 +190,21 @@ impl Db {
         let secret = random_hex(32);
         let platform = platform.trim().to_lowercase();
         self.c().execute(
-            "INSERT INTO devices (id, name, platform, secret_hash, created) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, name, platform, hash(&secret), ts()],
+            "INSERT INTO devices (id, name, platform, secret_hash, created, admin) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, name, platform, hash(&secret), ts(), admin],
         )?;
-        Ok((Device { id: id.clone(), name: name.into(), platform, revoked: false, last_seen: None }, format!("{id}.{secret}")))
+        Ok((
+            Device { id: id.clone(), name: name.into(), platform, revoked: false, last_seen: None, admin },
+            format!("{id}.{secret}"),
+        ))
+    }
+
+    /// Grant or remove admin rights for a device's token.
+    pub fn set_admin(&self, id: &str, admin: bool) -> Result<()> {
+        if self.c().execute("UPDATE devices SET admin = ?1 WHERE id = ?2", params![admin, id])? == 0 {
+            bail!("no such device");
+        }
+        Ok(())
     }
 
     pub fn revoke_device(&self, id: &str) -> Result<()> {
@@ -185,7 +216,7 @@ impl Db {
 
     pub fn devices(&self) -> Vec<Device> {
         let c = self.c();
-        let mut st = c.prepare("SELECT id, name, platform, revoked, last_seen FROM devices ORDER BY created").unwrap();
+        let mut st = c.prepare("SELECT id, name, platform, revoked, last_seen, admin FROM devices ORDER BY created").unwrap();
         st.query_map([], |r| {
             Ok(Device {
                 id: r.get(0)?,
@@ -193,6 +224,7 @@ impl Db {
                 platform: r.get(2)?,
                 revoked: r.get::<_, i64>(3)? != 0,
                 last_seen: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                admin: r.get::<_, i64>(5)? != 0,
             })
         })
         .unwrap()
@@ -201,13 +233,15 @@ impl Db {
     }
 
     /// The device a token belongs to, if valid and not revoked.
-    pub fn authenticate(&self, token: &str) -> Option<String> {
+    pub fn authenticate(&self, token: &str) -> Option<Auth> {
         let (id, secret) = core_protocol::split_token(token)?;
-        let stored: String = self
+        let (stored, admin): (String, i64) = self
             .c()
-            .query_row("SELECT secret_hash FROM devices WHERE id = ?1 AND revoked = 0", [id], |r| r.get(0))
+            .query_row("SELECT secret_hash, admin FROM devices WHERE id = ?1 AND revoked = 0", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .ok()?;
-        ct_eq(&stored, &hash(secret)).then(|| id.to_string())
+        ct_eq(&stored, &hash(secret)).then(|| Auth { device_id: id.to_string(), admin: admin != 0 })
     }
 
     pub fn touch(&self, id: &str) {
@@ -562,12 +596,42 @@ mod tests {
     fn devices_and_tokens() {
         let dir = tmp();
         let db = Db::open(&dir).unwrap();
-        let (d, token) = db.add_device("MacBook", "macOS").unwrap();
-        assert_eq!(db.authenticate(&token).as_deref(), Some(d.id.as_str()));
+        let (d, token) = db.add_device("MacBook", "macOS", false).unwrap();
+        assert_eq!(db.authenticate(&token), Some(Auth { device_id: d.id.clone(), admin: false }));
         assert!(db.authenticate(&format!("{}.wrong", d.id)).is_none());
-        assert!(db.add_device("hub", "linux").is_err());
+        assert!(db.add_device("hub", "linux", false).is_err());
+        let (phone, phone_token) = db.add_device("Phone", "ios", true).unwrap();
+        assert!(db.authenticate(&phone_token).unwrap().admin);
+        db.set_admin(&phone.id, false).unwrap();
+        assert!(!db.authenticate(&phone_token).unwrap().admin);
+        db.set_admin(&d.id, true).unwrap();
+        assert!(db.authenticate(&token).unwrap().admin);
         db.revoke_device(&d.id).unwrap();
         assert!(db.authenticate(&token).is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn old_databases_get_the_admin_column() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("grouper.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL,
+               secret_hash TEXT NOT NULL, created INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
+               last_seen INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO devices (id, name, platform, secret_hash, created) VALUES ('old', 'Old', 'macos', ?1, 0)",
+            [hash("s")],
+        )
+        .unwrap();
+        drop(conn);
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.authenticate("old.s"), Some(Auth { device_id: "old".into(), admin: false }));
+        drop(db);
+        Db::open(&dir).unwrap(); // reopening doesn't try to add the column again
         std::fs::remove_dir_all(dir).ok();
     }
 

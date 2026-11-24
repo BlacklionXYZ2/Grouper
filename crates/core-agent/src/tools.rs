@@ -182,6 +182,9 @@ impl Tool for RunShell {
             c
         };
         c.current_dir(self.0.root()).kill_on_drop(true).stdin(std::process::Stdio::null());
+        for key in secret_env_keys() {
+            c.env_remove(key);
+        }
         match tokio::time::timeout(Duration::from_secs(secs), c.output()).await {
             Err(_) => ToolOutput::err(format!("timed out after {secs}s")),
             Ok(Err(e)) => ToolOutput::err(e.to_string()),
@@ -196,6 +199,17 @@ impl Tool for RunShell {
             }
         }
     }
+}
+
+/// Environment variables a thread's shell must not inherit: everything named
+/// `GROUPER_*` (the device token, provider keys passed to the CLI, hub settings).
+/// A prompt-injected thread could otherwise read the token with `printenv` and use
+/// it against the hub.
+pub fn secret_env_keys() -> Vec<std::ffi::OsString> {
+    std::env::vars_os()
+        .map(|(k, _)| k)
+        .filter(|k| k.to_string_lossy().to_ascii_uppercase().starts_with("GROUPER_"))
+        .collect()
 }
 
 pub fn file_tools(ws: &Arc<Workspace>) -> Vec<Arc<dyn Tool>> {
@@ -238,6 +252,24 @@ mod tests {
         assert!(tools[2].call(json!({})).await.content.contains("a/b.txt"));
         let sh = shell_tool(&ws).call(json!({"command": "cat a/b.txt"})).await;
         assert!(sh.content.contains("hi"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_hides_grouper_secrets() {
+        let dir = std::env::temp_dir().join(format!("grouper-env-{}", std::process::id()));
+        let ws = Workspace::create(dir.clone()).unwrap();
+        // SAFETY: no other test reads or writes these variables.
+        unsafe {
+            std::env::set_var("GROUPER_TOKEN", "dev.supersecret");
+            std::env::set_var("GROUPER_TEST_VISIBLE_CHECK", "x");
+            std::env::set_var("NOT_GROUPER_CHECK", "visible");
+        }
+        let cmd = if cfg!(windows) { "set" } else { "env" };
+        let out = shell_tool(&ws).call(json!({"command": cmd})).await;
+        assert!(!out.content.contains("supersecret"), "{}", out.content);
+        assert!(!out.content.contains("GROUPER_TEST_VISIBLE_CHECK"));
+        assert!(out.content.contains("NOT_GROUPER_CHECK=visible"));
         std::fs::remove_dir_all(dir).ok();
     }
 }
