@@ -64,21 +64,17 @@ child-process and io transports).
   the arguments that actually ran. Threads pass their `Workspace` to the gate.
 - **Clamping** (agents never ask, so Grouper sets their safety arguments):
 
-  | Agent | Manual / Auto: edits in its folder, no unchecked commands | Bypass |
+  | Agent | Auto | Bypass |
   |---|---|---|
-  | codex | `sandbox: workspace-write` | `sandbox: danger-full-access` |
-  | claude-code | `permission_mode: acceptEdits` (headless, so other tools are denied) | `permission_mode: bypassPermissions` |
-  | antigravity | `mode: accept-edits`, `allow_all_tools: false` | `allow_all_tools: true`, no `mode` |
-  | cursor | `sandbox` on (its own sandbox flag) | sandbox off |
-  | pi | as the model asked, but never more than `tools: all` | `tools: all` |
-  | opencode | `auto_approve: true` stays (it can't ask) | same |
-  | hermes, grok | no safety option exists: always run unconfined | same |
+  | codex | `sandbox: workspace-write` (or `read-only` if asked) | `danger-full-access` |
+  | claude-code | `permission_mode: acceptEdits` (or `plan`/`default` if asked) | `bypassPermissions` |
+  | antigravity | `mode: accept-edits`, `allow_all_tools: false` | `allow_all_tools: true` |
+  | cursor | `sandbox: enabled` | `sandbox: disabled` |
+  | pi | runs without asking with `tools: read-only`/`none`; asks with `all` (or none given) | `tools: all` |
+  | hermes, grok, opencode | no way to confine them: every chat call asks first | run |
 
-  Agents with no safety option are weaker on Auto; the risk rules below still apply to the
-  call itself, and the docs say so.
+  A model's request for *less* access is always kept. Manual asks for every call.
 
-  `working_directory` defaults to the thread's workspace; one outside it needs approval
-  on Manual/Auto and is allowed on Bypass.
 - **Auto risk rules** for agent calls: `list_*` tools never ask; `*_chat` asks when the
   working directory leaves the workspace, the model asked for a bypass mode itself, or the
   message contains clearly destructive or outward-facing instructions (`git push`,
