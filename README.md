@@ -14,9 +14,20 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 - **Tools and permissions**: threads get workspace files, the shell, and the device's own
   tools. Each device's tools are in a registry with Manual / Auto / Bypass levels that only
   you can change; approvals reach every client.
+- **Streaming**: replies and thread text reach every client token by token; only full
+  messages are stored.
+- **Memory and skills**: long-term memory shared by every conversation, recalled
+  automatically when relevant; skills (saved procedures) offered on similar tasks.
 - **Models**: Anthropic and any OpenAI-compatible API (OpenRouter, OpenAI, DeepSeek, Qwen,
-  Grok, local servers), plus a scripted fake model for tests. Keys belong to the account and
-  sync to every device. Token usage and estimated cost are recorded.
+  Grok, local servers), plus a scripted fake model for tests. Keys belong to the account,
+  are encrypted at rest on the hub, and sync to every device.
+- **Registry that learns**: thread outcomes, grades and your ratings build per-model and
+  per-device stats; priority rules (e.g. sensitive → local only) and stats choose each
+  thread's model; the hub proposes use-case changes for you to accept.
+- **Accounting**: tokens and estimated cost per call, conversation, model and day
+  (`grouper usage`), and OpenRouter/DeepSeek balances.
+- **Windows**: thread shells run PowerShell, with Windows-aware Auto risk rules; the device
+  token is stored with DPAPI (`grouper login`).
 - **Swift ⇄ Rust**: the Mac demo app runs threads inside the Rust core and offers a
   Swift-implemented tool to them.
 
@@ -82,6 +93,7 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 
 | Command | Does |
 |---|---|
+| `grouper login --hub <url>`, `grouper logout` | Store this device's token (DPAPI / Keychain), so `GROUPER_TOKEN` isn't needed |
 | `grouper connect` | Be a device: stay online, run threads here (`--workspace`, `--no-shell`) |
 | `grouper chat "…"` (`-c <id>`, `--standard`) | Talk to Grouper; prints replies and thread activity |
 | `grouper watch` | Live events from every conversation |
@@ -91,6 +103,12 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 | `grouper tools list`, `grouper tools set <device> <tool> manual\|auto\|bypass` | Tool registry |
 | `grouper keys list`, `grouper keys set <provider>` | Account provider keys |
 | `grouper models list`, `grouper models add …` | Model registry |
+| `grouper models stats`, `models proposals`, `models accept\|reject <id>` | What the registry learned, and its proposals |
+| `grouper rules list\|add\|remove` | Priority rules for choosing models |
+| `grouper rate <thread> up\|down` | Rate a thread's result |
+| `grouper memory list\|add\|edit\|forget` | Long-term memory |
+| `grouper skills list\|show\|forget` | Saved skills |
+| `grouper usage [--by day\|provider\|model\|conversation]`, `grouper usage balances` | Tokens, cost and provider balances |
 | `grouper devices`, `grouper call <device> <tool>` | Presence and direct device tools |
 
 ## Swift demo node
@@ -102,18 +120,14 @@ cd apple/GrouperKit && GROUPER_TOKEN=<token> swift run grouper-mac
 
 ## Run the hub in the VM on the PC
 
-```bash
-docker compose -f deploy/compose.yaml up -d --build
-docker compose -f deploy/compose.yaml exec hub grouper-hub device add "MacBook" --platform macos
-```
-
-Point clients at `https://<your hub domain>` once the tunnel or reverse proxy is set up.
+See [deploy/README.md](deploy/README.md): a Hyper-V VM made by script, the hub in
+Docker, and a Cloudflare Tunnel to `https://grouper.clockmillbarn.uk`.
 
 ## Notes
 
 - Tokens are `<device-id>.<secret>`; the hub stores only a SHA-256 of the secret.
-- Provider keys are stored unencrypted in the hub's database and held in memory on
-  devices for now (encryption at rest and the OS keychain are on the list).
+- Provider keys are encrypted in the hub's database (XChaCha20-Poly1305) under a master
+  key kept outside the data volume (`GROUPER_MASTER_KEY_FILE`); devices hold them in memory.
 - Hub threads get file tools only, until they run in sandbox containers.
 - `apple/GrouperKit` links a static library so it builds with the Command Line Tools.
   With Xcode installed, switch to an XCFramework for iOS.
