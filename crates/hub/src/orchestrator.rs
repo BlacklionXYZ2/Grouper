@@ -295,7 +295,10 @@ impl Hooks for ConversationHooks {
     fn event(&self, event: AgentEvent) {
         match event {
             AgentEvent::Text { text } => {
-                self.hub.emit(&self.conversation_id, None, EventBody::AssistantMessage { text });
+                let text = without_imitated_notes(&text);
+                if !text.is_empty() {
+                    self.hub.emit(&self.conversation_id, None, EventBody::AssistantMessage { text });
+                }
             }
             AgentEvent::TextDelta { text } => {
                 self.hub.emit_live(&self.conversation_id, None, EventBody::AssistantDelta { text });
@@ -559,5 +562,40 @@ impl Tool for ListUsage {
             out["limits"] = limits;
         }
         to_json(out)
+    }
+}
+
+/// Small models sometimes copy the bracketed notes Grouper adds to the conversation
+/// (`[Thread t1a2b "x" done]`, `[Status] ...`, `[Memory]`, `[Skills]`) into their own
+/// replies. Drop those lines from what the user sees; the model's history is untouched.
+fn without_imitated_notes(text: &str) -> String {
+    let imitated = |line: &str| {
+        let l = line.trim_start();
+        ["[Status]", "[Memory]", "[Skills]", "[Thread t", "[The user stepped into thread"]
+            .iter()
+            .any(|p| l.starts_with(p))
+    };
+    if !text.lines().any(imitated) {
+        return text.to_string();
+    }
+    text.lines().filter(|l| !imitated(l)).collect::<Vec<_>>().join("
+").trim().to_string()
+}
+
+#[cfg(test)]
+mod imitated_notes_tests {
+    use super::without_imitated_notes;
+
+    #[test]
+    fn drops_copied_grouper_notes_only() {
+        let text = "I've started it.
+[Thread t2ebaabc2 (Gaming PC) is running: \"Sea Poem\"]";
+        assert_eq!(without_imitated_notes(text), "I've started it.");
+        assert_eq!(without_imitated_notes("[Memory]
+* likes tea"), "* likes tea");
+        let normal = "Use [brackets] freely.
+- [x] done";
+        assert_eq!(without_imitated_notes(normal), normal);
+        assert_eq!(without_imitated_notes("[Status] Devices: none."), "");
     }
 }
