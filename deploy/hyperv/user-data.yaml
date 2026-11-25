@@ -26,6 +26,10 @@ packages:
   - ca-certificates
   - unattended-upgrades
 runcmd:
+  # 4 GB of swap: Hyper-V dynamic memory can leave ~3 GB, and building Rust (or running CI
+  # with act) gets killed by the OOM killer without it.
+  - fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+  - echo "/swapfile none swap sw 0 0" >> /etc/fstab
   # cloudflared from Cloudflare's own apt repository
   - mkdir -p --mode=0755 /usr/share/keyrings
   - curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg
