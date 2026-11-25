@@ -69,7 +69,7 @@ pub const SUITE: &[ProbeTask] = &[
         task_type: "code",
         label: "code",
         prompt: "What does this Python snippet print? Reply with ONLY the output.\n\nnums = [1, 2, 3, 4]\nprint(sum(x * x for x in nums if x % 2 == 0))",
-        max_tokens: 64,
+        max_tokens: 2048,
         tools: no_tools,
         grade: grade_code,
     },
@@ -78,7 +78,7 @@ pub const SUITE: &[ProbeTask] = &[
         task_type: "writing",
         label: "writing",
         prompt: "Write exactly two short sentences explaining why software backups matter. Do not use the word 'data'. Use at most 40 words.",
-        max_tokens: 160,
+        max_tokens: 2048,
         tools: no_tools,
         grade: grade_writing,
     },
@@ -87,7 +87,7 @@ pub const SUITE: &[ProbeTask] = &[
         task_type: "research",
         label: "research",
         prompt: "Alice is taller than Bob. Carol is shorter than Bob. Dave is taller than Alice. Who is the second tallest? Reply with ONLY the name.",
-        max_tokens: 64,
+        max_tokens: 2048,
         tools: no_tools,
         grade: grade_research,
     },
@@ -96,7 +96,7 @@ pub const SUITE: &[ProbeTask] = &[
         task_type: "data",
         label: "data",
         prompt: "Summarize these sales as a JSON object with keys \"total\" (number) and \"top\" (string, highest item). Reply with ONLY valid JSON.\n\napple: 4\nbanana: 9\ncherry: 2",
-        max_tokens: 128,
+        max_tokens: 2048,
         tools: no_tools,
         grade: grade_data,
     },
@@ -105,7 +105,7 @@ pub const SUITE: &[ProbeTask] = &[
         task_type: "tool_use",
         label: "tool-use",
         prompt: "Check the status of the payments service in prod using the available tool.",
-        max_tokens: 128,
+        max_tokens: 2048,
         tools: lookup_service_tools,
         grade: grade_tool_use,
     },
@@ -442,7 +442,10 @@ pub async fn run_probes(hub: &Arc<Hub>, model_key: &str) -> Result<ProbeReport, 
                     resp.usage.cache_write_tokens,
                 );
                 crate::limits::after_daily_usage(hub, cost);
-                let (passed, detail) = (probe.grade)(&resp);
+                let (passed, mut detail) = (probe.grade)(&resp);
+                if !passed && matches!(resp.stop, providers::StopReason::MaxTokens) {
+                    detail.push_str(" (stopped at the token limit)");
+                }
                 let tokens = resp.usage.input_tokens
                     + resp.usage.output_tokens
                     + resp.usage.cache_read_tokens
