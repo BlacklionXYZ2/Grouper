@@ -6,6 +6,10 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 
 ## What works now
 
+- **Web app**: open the hub's address in a browser (`https://grouper.clockmillbarn.uk/`) and
+  sign in with an admin token: chat with live streaming and thread cards, approvals, the
+  thread inspector, devices and permissions, models, usage and limits, memory and skills.
+  Served by the hub itself; a session cookie, never the token, stays in the browser.
 - **Hub**: devices, tokens and live presence; SQLite storage; HTTP API and a live event stream.
 - **Harness**: project chat (an orchestrator that starts subagent **threads** on your
   devices or on the hub and is woken when they finish or ask something) and standard
@@ -44,6 +48,7 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 | `crates/core-protocol` | Wire protocol and shared types (frames, events, registry rows) |
 | `crates/providers` | Model adapters: Anthropic, OpenAI-compatible, scripted |
 | `crates/core-agent` | The loop engine, workspace and shell tools, permission rules, thread runner |
+| `crates/hub/web` | The web app (plain ES modules, embedded in `grouper-hub`) |
 | `crates/core-sync` | Local SQLite cache of conversations, threads and events, kept in sync with the hub; offline reads |
 | `crates/core-client` | Device side: connection, presence, running threads, approvals |
 | `crates/hub` | `grouper-hub`: storage, orchestrator, threads, HTTP and WebSocket API |
