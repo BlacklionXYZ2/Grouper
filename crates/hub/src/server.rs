@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -110,6 +110,7 @@ pub struct Hub {
     pub(crate) hub_threads: Mutex<HashMap<String, ThreadControl>>,
     pub(crate) orchestrators: Mutex<HashMap<String, mpsc::UnboundedSender<Wake>>>,
     events: broadcast::Sender<Event>,
+    session_invalidations: broadcast::Sender<String>,
     /// Held while an event is stored and broadcast, so subscribers receive stored
     /// events in `seq` order (they drop a seq lower than one they've already seen).
     emit_order: std::sync::Mutex<()>,
@@ -130,6 +131,7 @@ impl Hub {
             orchestrators: Mutex::new(HashMap::new()),
             // Roomy: streamed text sends many small events.
             events: broadcast::channel(8192).0,
+            session_invalidations: broadcast::channel(128).0,
             emit_order: std::sync::Mutex::new(()),
             next_id: AtomicU64::new(1),
             limits: Default::default(),
@@ -302,7 +304,11 @@ impl Hub {
         if headers.contains_key(header::AUTHORIZATION) {
             return self.auth_bearer(headers);
         }
-        self.db.session_auth(crate::session::cookie_session(headers)?)
+        crate::session::cookie_sessions(headers).into_iter().find_map(|id| self.db.session_auth(id))
+    }
+
+    pub(crate) fn invalidate_session(&self, id: &str) {
+        let _ = self.session_invalidations.send(id.to_string());
     }
 
     /// Only a Bearer token: for the device connection, which a browser session never opens.
@@ -417,6 +423,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::web::routes())
         .with_state(hub)
         .layer(axum::middleware::from_fn(crate::session::guard))
+        .layer(axum::middleware::from_fn(crate::session::response_security))
 }
 
 pub(crate) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
@@ -738,14 +745,37 @@ async fn events_ws(
     Query(q): Query<ConversationFilter>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    authed!(hub, headers);
+    let Some(credential) = EventCredential::from_headers(&hub, &headers) else {
+        return err(StatusCode::UNAUTHORIZED, "invalid or missing device token");
+    };
     let mut last_seq = hub.db.last_event_seq();
     let mut rx = hub.events.subscribe();
+    let mut invalidations = hub.session_invalidations.subscribe();
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |mut socket| async move {
+        let mut revalidate = tokio::time::interval(Duration::from_secs(30));
+        revalidate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        revalidate.tick().await;
         loop {
             tokio::select! {
+                _ = revalidate.tick() => {
+                    if !credential.valid(&hub) {
+                        close_policy(&mut socket).await;
+                        break;
+                    }
+                }
+                invalidated = invalidations.recv() => {
+                    let must_check = match invalidated {
+                        Ok(id) => credential.session_id().is_some_and(|mine| mine == id),
+                        Err(broadcast::error::RecvError::Lagged(_)) => credential.session_id().is_some(),
+                        Err(broadcast::error::RecvError::Closed) => false,
+                    };
+                    if must_check && !credential.valid(&hub) {
+                        close_policy(&mut socket).await;
+                        break;
+                    }
+                }
                 e = rx.recv() => match e {
                     Ok(e) => {
                         if q.conversation.as_ref().is_some_and(|c| *c != e.conversation_id) {
@@ -753,6 +783,10 @@ async fn events_ws(
                         }
                         if e.seq > 0 && e.seq <= last_seq {
                             continue;
+                        }
+                        if !credential.valid(&hub) {
+                            close_policy(&mut socket).await;
+                            break;
                         }
                         let text = serde_json::to_string(&e).unwrap();
                         if socket.send(Message::Text(text.into())).await.is_err() {
@@ -766,6 +800,11 @@ async fn events_ws(
                         tracing::warn!("event subscriber lagged by {n}");
                         let mut failed = false;
                         for e in hub.db.events_since(last_seq, q.conversation.as_deref()) {
+                            if !credential.valid(&hub) {
+                                close_policy(&mut socket).await;
+                                failed = true;
+                                break;
+                            }
                             let text = serde_json::to_string(&e).unwrap();
                             if socket.send(Message::Text(text.into())).await.is_err() {
                                 failed = true;
@@ -788,6 +827,49 @@ async fn events_ws(
             }
         }
     })
+}
+
+#[derive(Clone)]
+enum EventCredential {
+    Bearer(String),
+    Session(String),
+}
+
+impl EventCredential {
+    fn from_headers(hub: &Hub, headers: &HeaderMap) -> Option<Self> {
+        if headers.contains_key(header::AUTHORIZATION) {
+            let token = headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")?;
+            hub.db.authenticate(token)?;
+            return Some(Self::Bearer(token.to_string()));
+        }
+        crate::session::cookie_sessions(headers)
+            .into_iter()
+            .find(|id| hub.db.session_auth(id).is_some())
+            .map(|id| Self::Session(id.to_string()))
+    }
+
+    fn valid(&self, hub: &Hub) -> bool {
+        match self {
+            Self::Bearer(token) => hub.db.authenticate(token).is_some(),
+            Self::Session(id) => hub.db.session_auth(id).is_some(),
+        }
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Bearer(_) => None,
+            Self::Session(id) => Some(id),
+        }
+    }
+}
+
+async fn close_policy(socket: &mut WebSocket) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: close_code::POLICY,
+            reason: "authentication expired or was revoked".into(),
+        })))
+        .await;
 }
 
 async fn connect(State(hub): State<Arc<Hub>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {

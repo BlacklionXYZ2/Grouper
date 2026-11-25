@@ -14,10 +14,10 @@
 //!   inherits the device's current admin flag, and dies with the device's token.
 //! - [`guard`] stops cross-site use of the cookie: a cookie-authenticated POST, PUT,
 //!   PATCH or DELETE needs `X-Grouper: 1` (a header other sites can't send without a
-//!   CORS preflight the hub never grants) and any `Origin`/`Referer` must be this host;
+//!   CORS preflight the hub never grants) and an `Origin`/`Referer` from this host;
 //!   a cookie-authenticated WebSocket upgrade needs an `Origin` that is this host.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -35,12 +35,15 @@ use crate::server::{Hub, err};
 
 /// The session cookie's name.
 pub const COOKIE: &str = "grouper_session";
+/// The session cookie used when the browser reached the hub over HTTPS.
+pub const SECURE_COOKIE: &str = "__Host-grouper_session";
 /// How long a session lasts.
 pub const SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
 /// The header the web client sends on every state-changing request.
 pub const CSRF_HEADER: &str = "x-grouper";
 /// `last_used` is written at most this often per session.
 const TOUCH_EVERY_SECS: u64 = 60;
+static PLAIN_HTTP_WARNING: Once = Once::new();
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -109,16 +112,19 @@ impl Db {
     }
 }
 
-/// The session id in the request's `Cookie` headers, if any.
-pub(crate) fn cookie_session(headers: &HeaderMap) -> Option<&str> {
+/// Every possible session id in the request's `Cookie` headers. Browsers can send
+/// duplicate cookies (for example after a name migration), so callers must try all
+/// of them rather than trusting the first one.
+pub(crate) fn cookie_sessions(headers: &HeaderMap) -> Vec<&str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, _)| *name == COOKIE)
+        .filter(|(name, _)| *name == COOKIE || *name == SECURE_COOKIE)
         .map(|(_, value)| value.trim().trim_matches('"'))
+        .collect()
 }
 
 /// Whether the request reached the hub over HTTPS (directly or via a proxy that says so).
@@ -131,9 +137,13 @@ fn is_https(headers: &HeaderMap) -> bool {
 }
 
 fn set_cookie(value: &str, max_age: u64, secure: bool) -> HeaderValue {
-    let secure = if secure { "; Secure" } else { "" };
-    HeaderValue::from_str(&format!("{COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}"))
+    let (name, secure) = if secure { (SECURE_COOKIE, "; Secure") } else { (COOKIE, "") };
+    HeaderValue::from_str(&format!("{name}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}"))
         .expect("cookie header is ASCII")
+}
+
+fn clear_legacy_cookie() -> HeaderValue {
+    HeaderValue::from_static("grouper_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure")
 }
 
 /// The `host[:port]` of an `Origin` or `Referer` value.
@@ -143,21 +153,26 @@ fn authority(url: &str) -> Option<&str> {
     Some(&rest[..end]).filter(|a| !a.is_empty())
 }
 
-/// Whether `url` (an `Origin` or `Referer`) names this hub: the request's `Host`, or
-/// the `X-Forwarded-Host` a proxy in front of it set.
+/// Whether `url` (an `Origin` or `Referer`) names this hub's `Host`. In particular,
+/// do not trust `X-Forwarded-Host`: Cloudflare passes client-supplied values through.
 fn same_host(headers: &HeaderMap, url: &str) -> bool {
     let Some(origin) = authority(url) else { return false };
-    ["host", "x-forwarded-host"]
+    headers.get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(|host| host.trim().eq_ignore_ascii_case(origin))
+}
+
+fn header_has_token(headers: &HeaderMap, name: header::HeaderName, token: &str) -> bool {
+    headers
+        .get_all(name)
         .iter()
-        .filter_map(|h| headers.get(*h)?.to_str().ok())
-        .filter_map(|v| v.split(',').next())
-        .any(|host| host.trim().eq_ignore_ascii_case(origin))
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|v| v.trim().eq_ignore_ascii_case(token))
 }
 
 /// `None` when the request may go on; otherwise why not.
 fn csrf_refusal(method: &Method, path: &str, headers: &HeaderMap) -> Option<&'static str> {
     let bearer = headers.contains_key(header::AUTHORIZATION);
-    let cookie = cookie_session(headers).is_some();
+    let cookie = !cookie_sessions(headers).is_empty();
     let session_route = path == "/v1/session";
     if bearer || !(cookie || session_route) {
         return None;
@@ -166,10 +181,7 @@ fn csrf_refusal(method: &Method, path: &str, headers: &HeaderMap) -> Option<&'st
         return Some("cross-site request refused");
     }
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-    let upgrade = headers
-        .get(header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let upgrade = header_has_token(headers, header::UPGRADE, "websocket");
     if upgrade {
         return match origin {
             Some(o) if same_host(headers, o) => None,
@@ -182,14 +194,11 @@ fn csrf_refusal(method: &Method, path: &str, headers: &HeaderMap) -> Option<&'st
     if headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok()) != Some("1") {
         return Some("cookie-authenticated changes need the X-Grouper: 1 header");
     }
-    if let Some(o) = origin {
-        if !same_host(headers, o) {
-            return Some("request came from another site");
-        }
-    } else if let Some(r) = headers.get(header::REFERER).and_then(|v| v.to_str().ok())
-        && !same_host(headers, r)
-    {
-        return Some("request came from another site");
+    match (origin, headers.get(header::REFERER).and_then(|v| v.to_str().ok())) {
+        (Some(o), _) if same_host(headers, o) => {}
+        (None, Some(r)) if same_host(headers, r) => {}
+        (None, None) => return Some("cookie-authenticated changes need an Origin or Referer from this hub"),
+        _ => return Some("request came from another site"),
     }
     None
 }
@@ -201,6 +210,23 @@ pub(crate) async fn guard(req: Request, next: Next) -> Response {
         return err(StatusCode::FORBIDDEN, why);
     }
     next.run(req).await
+}
+
+/// Add response headers that are part of the HTTP security boundary. This layer is
+/// outside [`guard`], so it also decorates authentication, routing and CSRF errors.
+pub(crate) async fn response_security(req: Request, next: Next) -> Response {
+    let v1 = req.uri().path().starts_with("/v1/");
+    let https = is_https(req.headers());
+    let mut response = next.run(req).await;
+    if v1 {
+        response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+    }
+    if https {
+        response
+            .headers_mut()
+            .insert(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=31536000"));
+    }
+    response
 }
 
 #[derive(Deserialize)]
@@ -226,8 +252,17 @@ async fn login(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Json
     let mut body = who(&hub, &auth);
     body["expires"] = json!(expires);
     let mut response = Json(body).into_response();
-    response.headers_mut().insert(header::SET_COOKIE, set_cookie(&id, SESSION_TTL_SECS, is_https(&headers)));
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let secure = is_https(&headers);
+    if !secure {
+        PLAIN_HTTP_WARNING.call_once(|| {
+            tracing::warn!("web sessions over plain HTTP can be sniffed; use HTTPS outside a trusted LAN")
+        });
+    }
+    response.headers_mut().insert(header::SET_COOKIE, set_cookie(&id, SESSION_TTL_SECS, secure));
+    if secure {
+        // Remove the old LAN-cookie name as the browser migrates to the __Host- cookie.
+        response.headers_mut().append(header::SET_COOKIE, clear_legacy_cookie());
+    }
     response
 }
 
@@ -238,16 +273,25 @@ async fn whoami(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
         Some(auth) => who(&hub, &auth),
         None => json!({"signed_in": false}),
     };
-    let mut response = Json(body).into_response();
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
+    Json(body).into_response()
 }
 
 /// `DELETE /v1/session`: forget this browser's session and clear its cookie.
 async fn logout(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
-    let ended = cookie_session(&headers).is_some_and(|id| hub.db.delete_session(id));
+    let mut ended = false;
+    for id in cookie_sessions(&headers) {
+        let deleted = hub.db.delete_session(id);
+        if deleted {
+            hub.invalidate_session(id);
+            ended = true;
+        }
+    }
     let mut response = Json(json!({"signed_out": ended})).into_response();
-    response.headers_mut().insert(header::SET_COOKIE, set_cookie("", 0, is_https(&headers)));
+    let secure = is_https(&headers);
+    response.headers_mut().insert(header::SET_COOKIE, set_cookie("", 0, secure));
+    if secure {
+        response.headers_mut().append(header::SET_COOKIE, clear_legacy_cookie());
+    }
     response
 }
 
@@ -350,6 +394,9 @@ mod tests {
         assert_eq!(r.json::<serde_json::Value>().await.unwrap()["signed_in"], false);
         let r = f.http.get(format!("{}/v1/devices", f.base)).header("cookie", &cookie).send().await.unwrap();
         assert_eq!(r.status(), S::OK);
+        let prefixed = format!("{COOKIE}={}; {cookie}", "0".repeat(64));
+        let r = f.http.get(format!("{}/v1/devices", f.base)).header("cookie", prefixed).send().await.unwrap();
+        assert_eq!(r.status(), S::OK, "a bad first session cookie must not hide a later valid one");
         let r = f.http.get(format!("{}/v1/limits", f.base)).header("cookie", &cookie).send().await.unwrap();
         assert_eq!(r.status(), S::OK, "cookie inherits the admin flag on an admin route");
         let r = f
@@ -365,11 +412,13 @@ mod tests {
         assert_eq!(r.status(), S::OK);
         assert_eq!(f.hub.db.limits().thread_budget_usd, Some(0.5));
 
-        // Logout ends it: the row is gone, the cookie is cleared, the old cookie no longer works.
+        // Logout ends every valid session cookie presented, not only the first one.
+        let (extra, _) = f.hub.db.create_session(body["device_id"].as_str().unwrap()).unwrap();
+        let logout_cookies = format!("{cookie}; {COOKIE}={extra}");
         let r = f
             .http
             .delete(format!("{}/v1/session", f.base))
-            .header("cookie", &cookie)
+            .header("cookie", logout_cookies)
             .header("x-grouper", "1")
             .header("origin", &f.base)
             .send()
@@ -427,13 +476,20 @@ mod tests {
             .http
             .post(format!("{}/v1/session", f.base))
             .header("x-grouper", "1")
+            .header("origin", &f.base)
             .header("x-forwarded-proto", "https")
             .json(&json!({"token": f.admin_token}))
             .send()
             .await
             .unwrap();
         assert_eq!(r.status(), S::OK);
-        assert!(r.headers()["set-cookie"].to_str().unwrap().contains("; Secure"));
+        let sets: Vec<_> = r.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap()).collect();
+        let set = sets.iter().find(|v| v.starts_with("__Host-grouper_session=")).unwrap();
+        assert!(set.starts_with("__Host-grouper_session="), "{set}");
+        assert!(set.contains("; Secure") && set.contains("Path=/") && !set.contains("Domain="), "{set}");
+        assert!(sets.iter().any(|v| v.starts_with("grouper_session=") && v.contains("Max-Age=0")));
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store, private");
+        assert_eq!(r.headers()[header::STRICT_TRANSPORT_SECURITY], "max-age=31536000");
     }
 
     #[tokio::test]
@@ -464,8 +520,10 @@ mod tests {
         assert_eq!(r.status(), S::FORBIDDEN);
         let r = put(vec![("x-grouper", "1".into()), ("sec-fetch-site", "cross-site".into())]).await.unwrap();
         assert_eq!(r.status(), S::FORBIDDEN);
+        let r = put(vec![("x-grouper", "1".into())]).await.unwrap();
+        assert_eq!(r.status(), S::FORBIDDEN, "a custom header alone is not enough");
         assert_eq!(f.hub.db.limits().daily_budget_usd, None, "nothing changed");
-        // Behind a proxy, the forwarded host counts as this hub.
+        // A client-controlled forwarded host must not count as this hub.
         let r = put(vec![
             ("x-grouper", "1".into()),
             ("origin", "https://grouper.example.org".into()),
@@ -473,7 +531,9 @@ mod tests {
         ])
         .await
         .unwrap();
-        assert_eq!(r.status(), S::OK);
+        assert_eq!(r.status(), S::FORBIDDEN);
+        let r = put(vec![("x-grouper", "1".into()), ("referer", format!("{}/settings", f.base))]).await.unwrap();
+        assert_eq!(r.status(), S::OK, "a same-host Referer is accepted when Origin is absent");
         // Reads need neither.
         let r = f.http.get(format!("{}/v1/limits", f.base)).header("cookie", &cookie).send().await.unwrap();
         assert_eq!(r.status(), S::OK);
@@ -526,15 +586,116 @@ mod tests {
         f.hub.emit(&conv, None, core_protocol::EventBody::Error { message: "hello".into() });
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
         assert!(msg.to_text().unwrap().contains("hello"));
+        // Logging out invalidates this exact session and promptly closes its stream.
+        let r = f
+            .http
+            .delete(format!("{}/v1/session", f.base))
+            .header("cookie", &cookie)
+            .header("x-grouper", "1")
+            .header("origin", &f.base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy)
+            }
+            other => panic!("expected policy close, got {other:?}"),
+        }
         // The device connection never takes a cookie, even from this origin.
         assert_eq!(refused(open(Some(f.base.clone()), core_protocol::CONNECT_PATH).await), 401);
+    }
+
+    #[tokio::test]
+    async fn event_stream_revalidates_cookie_and_bearer_before_sending() {
+        let f = fixture().await;
+        let (_, cookie, _) = f.login(&f.admin_token).await;
+        let cookie = pair(&cookie.unwrap());
+        let mut cookie_req = format!("ws://{}/v1/events", f.addr).into_client_request().unwrap();
+        cookie_req.headers_mut().insert("cookie", cookie.parse().unwrap());
+        cookie_req.headers_mut().insert("origin", f.base.parse().unwrap());
+        let (mut cookie_ws, _) = tokio_tungstenite::connect_async(cookie_req).await.unwrap();
+        f.hub.db.c().execute("UPDATE sessions SET expires = ?1", [now() as i64 - 1]).unwrap();
+        let conv = f.hub.db.create_conversation("project", "expired").unwrap();
+        f.hub.emit(&conv, None, core_protocol::EventBody::Error { message: "must not leak".into() });
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), cookie_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            msg,
+            tokio_tungstenite::tungstenite::Message::Close(Some(frame))
+                if frame.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+        ));
+
+        let auth = f.hub.db.authenticate(&f.device_token).unwrap();
+        let mut bearer_req = format!("ws://{}/v1/events", f.addr).into_client_request().unwrap();
+        bearer_req
+            .headers_mut()
+            .insert(header::AUTHORIZATION, format!("Bearer {}", f.device_token).parse().unwrap());
+        let (mut bearer_ws, _) = tokio_tungstenite::connect_async(bearer_req).await.unwrap();
+        f.hub.db.revoke_device(&auth.device_id).unwrap();
+        f.hub.emit(&conv, None, core_protocol::EventBody::Error { message: "must not leak either".into() });
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), bearer_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            msg,
+            tokio_tungstenite::tungstenite::Message::Close(Some(frame))
+                if frame.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+        ));
+    }
+
+    #[tokio::test]
+    async fn v1_responses_are_private_and_https_responses_get_hsts() {
+        let f = fixture().await;
+        for path in ["/v1/devices", "/v1/not-a-route"] {
+            let r = f
+                .http
+                .get(format!("{}{path}", f.base))
+                .header("x-forwarded-proto", "https")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store, private", "{path}");
+            assert_eq!(r.headers()[header::STRICT_TRANSPORT_SECURITY], "max-age=31536000", "{path}");
+        }
+        let r = f
+            .http
+            .put(format!("{}/v1/limits", f.base))
+            .header("cookie", format!("{COOKIE}={}", "0".repeat(64)))
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::FORBIDDEN);
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store, private");
+        assert_eq!(r.headers()[header::STRICT_TRANSPORT_SECURITY], "max-age=31536000");
+
+        let r = f
+            .http
+            .get(format!("{}/healthz", f.base))
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert!(r.headers().get(header::CACHE_CONTROL).is_none());
+        assert_eq!(r.headers()[header::STRICT_TRANSPORT_SECURITY], "max-age=31536000");
     }
 
     #[test]
     fn cookie_and_origin_parsing() {
         let mut h = HeaderMap::new();
-        h.append(header::COOKIE, "a=1; grouper_session=abc ; b=2".parse().unwrap());
-        assert_eq!(cookie_session(&h), Some("abc"));
+        h.append(
+            header::COOKIE,
+            "a=1; grouper_session=abc ; __Host-grouper_session=def; b=2".parse().unwrap(),
+        );
+        assert_eq!(cookie_sessions(&h), vec!["abc", "def"]);
         h.insert("host", "hub.local:8080".parse().unwrap());
         assert!(same_host(&h, "http://hub.local:8080"));
         assert!(same_host(&h, "http://HUB.local:8080/app/#x"));
@@ -542,5 +703,11 @@ mod tests {
         assert!(!same_host(&h, "http://hub.local:8080.evil.example"));
         assert!(!same_host(&h, "null"));
         assert_eq!(authority("https://a.b/c?d"), Some("a.b"));
+
+        h.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        h.insert(header::UPGRADE, "h2c, WebSocket, x".parse().unwrap());
+        assert!(csrf_refusal(&Method::GET, "/v1/events", &h).is_some());
+        h.insert(header::ORIGIN, "http://hub.local:8080".parse().unwrap());
+        assert_eq!(csrf_refusal(&Method::GET, "/v1/events", &h), None);
     }
 }
