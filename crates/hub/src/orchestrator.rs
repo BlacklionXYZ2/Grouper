@@ -173,7 +173,11 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         hub.emit(conversation_id, None, EventBody::TurnFinished { running_threads: 0 });
         return;
     };
-    let provider = match hub.db.provider(&model.provider_id).ok_or_else(|| format!("no provider {}", model.provider_id))
+    let provider = match hub
+        .db
+        .provider(&model.provider_id)
+        .map_err(|e| e.to_string())
+        .and_then(|p| p.ok_or_else(|| format!("no provider {}", model.provider_id)))
         .and_then(|p| providers::build(&p).map_err(|e| e.to_string()))
     {
         Ok(p) => p,

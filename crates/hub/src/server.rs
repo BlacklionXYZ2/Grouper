@@ -126,7 +126,10 @@ impl Hub {
     }
 
     pub async fn broadcast_providers(&self) {
-        self.broadcast(HubMessage::Providers { providers: self.db.providers() }).await;
+        match self.db.providers() {
+            Ok(providers) => self.broadcast(HubMessage::Providers { providers }).await,
+            Err(error) => tracing::error!("could not decrypt provider configuration: {error:#}"),
+        }
     }
 
     fn auth(&self, headers: &HeaderMap) -> Option<Auth> {
@@ -317,9 +320,11 @@ async fn set_permission(
 
 async fn list_providers(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     admin!(hub, headers);
-    let list: Vec<ProviderInfo> = hub
-        .db
-        .providers()
+    let providers = match hub.db.providers() {
+        Ok(providers) => providers,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let list: Vec<ProviderInfo> = providers
         .into_iter()
         .map(|p| ProviderInfo { id: p.id, kind: p.kind, base_url: p.base_url, has_key: p.api_key.is_some() })
         .collect();
@@ -536,6 +541,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
         _ => return Err("first frame was not text".into()),
     };
 
+    let providers = hub.db.providers().map_err(|error| error.to_string())?;
     hub.db.upsert_tools(&device_id, &thread_tools);
     let conn_id = hub.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded_channel::<HubMessage>();
@@ -546,7 +552,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
         hub_version: HUB_VERSION.into(),
         protocol_version: PROTOCOL_VERSION,
     });
-    let _ = tx.send(HubMessage::Providers { providers: hub.db.providers() });
+    let _ = tx.send(HubMessage::Providers { providers });
     hub.broadcast_presence().await;
 
     let writer = tokio::spawn(async move {

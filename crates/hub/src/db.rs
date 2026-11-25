@@ -14,6 +14,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::secrets::Secrets;
+
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -60,7 +62,10 @@ pub struct Auth {
     pub admin: bool,
 }
 
-pub struct Db(Mutex<Connection>);
+pub struct Db {
+    connection: Mutex<Connection>,
+    secrets: Secrets,
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS devices (
@@ -127,10 +132,35 @@ fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
 }
 const MODEL_COLS: &str = "id, provider_id, model, input_price, output_price, context_window, use_cases, free, roles";
 
+fn migrate_provider_secrets(conn: &mut Connection, secrets: &Secrets) -> Result<()> {
+    let tx = conn.transaction()?;
+    let rows = {
+        let mut statement = tx.prepare("SELECT id, api_key FROM providers WHERE api_key IS NOT NULL")?;
+        statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, api_key) in rows {
+        if Secrets::is_sealed(&api_key) {
+            secrets.open(&api_key).with_context(|| format!("decrypting provider secret for {id}"))?;
+        } else {
+            let sealed = secrets.seal(&api_key).with_context(|| format!("encrypting provider secret for {id}"))?;
+            tx.execute("UPDATE providers SET api_key = ?1 WHERE id = ?2", params![sealed, id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 impl Db {
     pub fn open(data_dir: &Path) -> Result<Self> {
+        let secrets = Secrets::load(data_dir)?;
+        Self::open_with_secrets(data_dir, secrets)
+    }
+
+    fn open_with_secrets(data_dir: &Path, secrets: Secrets) -> Result<Self> {
         std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
-        let conn = Connection::open(data_dir.join("grouper.db"))?;
+        let mut conn = Connection::open(data_dir.join("grouper.db"))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(crate::memory::SCHEMA)?;
@@ -142,13 +172,14 @@ impl Db {
         if !has_admin {
             conn.execute_batch("ALTER TABLE devices ADD COLUMN admin INTEGER NOT NULL DEFAULT 0;")?;
         }
-        let db = Self(Mutex::new(conn));
+        migrate_provider_secrets(&mut conn, &secrets)?;
+        let db = Self { connection: Mutex::new(conn), secrets };
         db.import_devices_json(data_dir)?;
         Ok(db)
     }
 
     pub(crate) fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.connection.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Milestone 1 kept devices in devices.json; bring them over once.
@@ -308,39 +339,49 @@ impl Db {
             bail!("kind must be anthropic, openai or scripted");
         }
         let options = if p.options.is_null() { "{}".to_string() } else { p.options.to_string() };
+        let api_key = p.api_key.as_deref().map(|key| self.secrets.seal(key)).transpose()?;
         self.c().execute(
             "INSERT INTO providers (id, kind, base_url, api_key, options) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, base_url = excluded.base_url,
                api_key = COALESCE(excluded.api_key, providers.api_key), options = excluded.options",
-            params![p.id, p.kind, p.base_url, p.api_key, options],
+            params![p.id, p.kind, p.base_url, api_key, options],
         )?;
         Ok(())
     }
 
-    pub fn providers(&self) -> Vec<ProviderConfig> {
+    pub fn providers(&self) -> Result<Vec<ProviderConfig>> {
         let c = self.c();
-        let mut st = c.prepare("SELECT id, kind, base_url, api_key, options FROM providers ORDER BY id").unwrap();
-        st.query_map([], |r| {
-            let opts: String = r.get(4)?;
-            Ok(ProviderConfig {
-                id: r.get(0)?,
-                kind: r.get(1)?,
-                base_url: r.get(2)?,
-                api_key: r.get(3)?,
-                options: serde_json::from_str(&opts).unwrap_or(Value::Null),
+        let mut st = c.prepare("SELECT id, kind, base_url, api_key, options FROM providers ORDER BY id")?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(id, kind, base_url, api_key, options)| {
+                Ok(ProviderConfig {
+                    id,
+                    kind,
+                    base_url,
+                    api_key: api_key.map(|key| self.secrets.open(&key)).transpose()?,
+                    options: serde_json::from_str(&options).unwrap_or(Value::Null),
+                })
             })
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect()
+            .collect()
     }
 
-    pub fn provider(&self, id: &str) -> Option<ProviderConfig> {
-        self.providers().into_iter().find(|p| p.id == id)
+    pub fn provider(&self, id: &str) -> Result<Option<ProviderConfig>> {
+        Ok(self.providers()?.into_iter().find(|p| p.id == id))
     }
 
     pub fn upsert_model(&self, m: &ModelEntry) -> Result<()> {
-        if self.provider(&m.provider_id).is_none() {
+        if self.provider(&m.provider_id)?.is_none() {
             bail!("no provider {}; add it first", m.provider_id);
         }
         self.c().execute(
@@ -688,7 +729,52 @@ mod tests {
             options: Value::Null,
         })
         .unwrap();
-        assert_eq!(db.provider("or").unwrap().api_key.as_deref(), Some("k"));
+        assert_eq!(db.provider("or").unwrap().unwrap().api_key.as_deref(), Some("k"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn plaintext_provider_keys_are_migrated() {
+        let dir = tmp();
+        let db = Db::open_with_secrets(&dir, Secrets::from_key([3; 32])).unwrap();
+        db.c()
+            .execute(
+                "INSERT INTO providers (id, kind, api_key) VALUES (?1, ?2, ?3)",
+                params!["legacy", "openai", "plaintext-key"],
+            )
+            .unwrap();
+        drop(db);
+
+        let db = Db::open_with_secrets(&dir, Secrets::from_key([3; 32])).unwrap();
+        let stored: String = db
+            .c()
+            .query_row("SELECT api_key FROM providers WHERE id = 'legacy'", [], |row| row.get(0))
+            .unwrap();
+        assert!(Secrets::is_sealed(&stored));
+        assert!(!stored.contains("plaintext-key"));
+        assert_eq!(db.provider("legacy").unwrap().unwrap().api_key.as_deref(), Some("plaintext-key"));
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn opening_with_the_wrong_master_key_fails_clearly() {
+        let dir = tmp();
+        let db = Db::open_with_secrets(&dir, Secrets::from_key([4; 32])).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "secured".into(),
+            kind: "openai".into(),
+            base_url: None,
+            api_key: Some("secret".into()),
+            options: Value::Null,
+        })
+        .unwrap();
+        drop(db);
+
+        let error = Db::open_with_secrets(&dir, Secrets::from_key([5; 32])).err().unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("decrypting provider secret for secured"));
+        assert!(message.contains("master key is wrong"));
         std::fs::remove_dir_all(dir).ok();
     }
 }

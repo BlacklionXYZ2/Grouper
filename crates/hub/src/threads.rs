@@ -135,8 +135,10 @@ impl Hub {
             let id = thread_id.clone();
             async move { hub.thread_finished(&id, false, &msg).await }
         };
-        let Some(pcfg) = self.db.provider(&spec.provider_id) else {
-            return fail(format!("no provider {}", spec.provider_id)).await;
+        let pcfg = match self.db.provider(&spec.provider_id) {
+            Ok(Some(provider)) => provider,
+            Ok(None) => return fail(format!("no provider {}", spec.provider_id)).await,
+            Err(error) => return fail(error.to_string()).await,
         };
         let provider = match providers::build(&pcfg) {
             Ok(p) => p,

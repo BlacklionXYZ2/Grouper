@@ -1,3 +1,5 @@
+mod credentials;
+
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,13 +15,15 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
+const DEFAULT_HUB: &str = "http://127.0.0.1:8080";
+
 /// Grouper command-line client.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
     /// Hub base URL, e.g. https://hub.example.com
-    #[arg(long, env = "GROUPER_HUB", default_value = "http://127.0.0.1:8080", global = true)]
-    hub: String,
+    #[arg(long, env = "GROUPER_HUB", global = true)]
+    hub: Option<String>,
     /// This device's token from `grouper-hub device add`.
     #[arg(long, env = "GROUPER_TOKEN", global = true, hide_env_values = true)]
     token: Option<String>,
@@ -29,6 +33,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Save this device's hub URL and token securely for future commands.
+    Login,
+    /// Remove this device's saved hub URL and token.
+    Logout,
     /// Connect this machine as a device: stay online and run threads the orchestrator starts here.
     Connect {
         /// Where thread workspaces go.
@@ -353,16 +361,60 @@ fn read_key() -> Result<String> {
     Ok(k.trim().to_string())
 }
 
+fn read_device_token() -> Result<String> {
+    let token = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("Device token: ")?
+    } else {
+        let mut token = String::new();
+        std::io::stdin().read_line(&mut token)?;
+        token
+    };
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        bail!("device token is empty");
+    }
+    Ok(token)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .init();
     let cli = Cli::parse();
-    let token = cli.token.context("no token: pass --token or set GROUPER_TOKEN")?;
-    let api = Api { base: cli.hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
+    match &cli.cmd {
+        Cmd::Login => {
+            let hub = cli.hub.as_deref().context("login requires --hub <url>")?.trim_end_matches('/');
+            let token = read_device_token()?;
+            credentials::save(hub, &token)?;
+            println!("saved credentials for {hub}");
+            return Ok(());
+        }
+        Cmd::Logout => {
+            credentials::remove()?;
+            println!("removed saved credentials");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let saved = if cli.hub.is_none() || cli.token.is_none() {
+        credentials::load(cli.token.is_none())?
+    } else {
+        None
+    };
+    let hub = cli
+        .hub
+        .or_else(|| saved.as_ref().map(|credentials| credentials.hub.clone()))
+        .unwrap_or_else(|| DEFAULT_HUB.to_string());
+    let token = cli
+        .token
+        .or_else(|| saved.and_then(|credentials| credentials.token))
+        .context("no token: pass --token, set GROUPER_TOKEN, or run `grouper login --hub <url>`")?;
+    let api = Api { base: hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
 
     match cli.cmd {
+        Cmd::Login | Cmd::Logout => unreachable!(),
         Cmd::Connect { workspace, no_shell } => {
             let workspace = workspace.unwrap_or_else(|| {
                 PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("Grouper").join("workspaces")
