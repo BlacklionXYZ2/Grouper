@@ -3,6 +3,9 @@
 use core_protocol::{FILE_TOOLS, Permission};
 use serde_json::Value;
 
+use crate::agents;
+use crate::tools::Workspace;
+
 /// Tools that are never gated (they only talk to Grouper itself).
 pub const UNGATED: &[&str] = &["ask_orchestrator"];
 
@@ -25,6 +28,23 @@ pub fn needs_approval(level: Permission, tool: &str, input: &Value) -> Option<St
             }
         }
     }
+}
+
+/// The gate for one call in a thread: set a CLI agent's safety arguments for `level`
+/// (see [`crate::agents`]), then decide. `Some(reason)` if the call needs the user's
+/// approval; the reason mentions what Grouper changed.
+pub fn check_call(level: Permission, tool: &str, input: &mut Value, workspace: &Workspace) -> Option<String> {
+    let clamped = agents::clamp(level, tool, input, workspace);
+    let reason = if level == Permission::Auto && agents::agent_tool(tool).is_some() {
+        agents::auto_risk(tool, input, Some(workspace), &clamped)
+    } else {
+        needs_approval(level, tool, input)
+    }?;
+    Some(if clamped.changes.is_empty() {
+        reason
+    } else {
+        format!("{reason} (Grouper set {})", clamped.changes.join(", "))
+    })
 }
 
 /// Whole command tokens, compared case-insensitively. Unix and Windows names share one
@@ -230,6 +250,43 @@ mod tests {
         assert!(needs_approval(Permission::Auto, "write_file", &json!({})).is_none());
         assert!(needs_approval(Permission::Auto, "run_shell", &ls).is_none());
         assert!(needs_approval(Permission::Manual, "ask_orchestrator", &json!({})).is_none());
+    }
+
+    #[test]
+    fn agent_calls_through_the_gate() {
+        let dir = std::env::temp_dir().join(format!("grouper-gate-{}", std::process::id()));
+        let ws = Workspace::create(dir.clone()).unwrap();
+        let root = agents::display_root(&ws);
+        let t = "codex__codex_chat";
+
+        // Auto: clamped, runs without asking.
+        let mut input = json!({"message": "Write tests"});
+        assert_eq!(check_call(Permission::Auto, t, &mut input, &ws), None);
+        assert_eq!((&input["sandbox"], &input["working_directory"]), (&json!("workspace-write"), &json!(root)));
+        // Auto: a bypass request is clamped and asks, saying what was set.
+        let mut input = json!({"message": "Write tests", "sandbox": "danger-full-access"});
+        let reason = check_call(Permission::Auto, t, &mut input, &ws).unwrap();
+        assert!(reason.contains("danger-full-access") && reason.contains("workspace-write"), "{reason}");
+        assert_eq!(input["sandbox"], "workspace-write");
+        // Auto: outside the workspace asks; Bypass allows it.
+        let away = std::env::temp_dir().to_string_lossy().to_string();
+        let mut input = json!({"message": "hi", "working_directory": away});
+        assert!(check_call(Permission::Auto, t, &mut input, &ws).unwrap().contains("outside"));
+        let mut input = json!({"message": "hi", "working_directory": away});
+        assert_eq!(check_call(Permission::Bypass, t, &mut input, &ws), None);
+        assert_eq!(input["sandbox"], "danger-full-access");
+        // Manual always asks, with the clamped arguments.
+        let mut input = json!({"message": "hi"});
+        assert!(check_call(Permission::Manual, t, &mut input, &ws).unwrap().contains("Manual"));
+        assert_eq!(input["sandbox"], "workspace-write");
+        // list tools never ask on Auto.
+        let mut input = json!({});
+        assert_eq!(check_call(Permission::Auto, "catalog__list_available_agents", &mut input, &ws), None);
+        // Other tools behave as before.
+        let mut input = json!({"command": "rm -rf x"});
+        assert!(check_call(Permission::Auto, "run_shell", &mut input, &ws).is_some());
+        assert_eq!(input, json!({"command": "rm -rf x"}));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

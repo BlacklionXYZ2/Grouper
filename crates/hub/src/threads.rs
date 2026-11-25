@@ -154,7 +154,7 @@ impl Hub {
         };
         // No shell on the hub until hub threads run in sandbox containers.
         let host = Arc::new(HubHost { hub: Arc::downgrade(self) });
-        let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host);
+        let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());
         self.hub_threads.lock().await.insert(thread_id.clone(), control);
         let hub = self.clone();
         tokio::spawn(async move {

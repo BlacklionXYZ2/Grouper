@@ -10,7 +10,8 @@ use providers::{Message, Provider};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::permission::needs_approval;
+use crate::permission::check_call;
+use crate::tools::Workspace;
 use crate::{Ending, Gate, Hooks, LoopConfig, Tool, ToolOutput, run_loop};
 
 /// How long `ask_orchestrator` waits for an answer.
@@ -59,6 +60,7 @@ struct ThreadHooks {
     permissions: std::collections::HashMap<String, Permission>,
     host: Arc<dyn ThreadHost>,
     state: Arc<State>,
+    workspace: Arc<Workspace>,
 }
 
 #[async_trait]
@@ -66,9 +68,11 @@ impl Hooks for ThreadHooks {
     fn event(&self, event: AgentEvent) {
         self.host.emit(&self.thread_id, event);
     }
-    async fn gate(&self, tool: &str, input: &Value) -> Gate {
+    async fn gate(&self, tool: &str, input: &mut Value) -> Gate {
         let level = self.permissions.get(tool).copied().unwrap_or_else(|| Permission::default_for(tool));
-        match needs_approval(level, tool, input) {
+        // CLI agents never ask, so their safety arguments are set here, before anything
+        // (the log, an approval request, the call) sees them.
+        match check_call(level, tool, input, &self.workspace) {
             None => Gate::Allow,
             Some(reason) => {
                 if self.host.approve(&self.thread_id, tool, input, &reason).await {
@@ -121,11 +125,13 @@ impl Tool for AskOrchestrator {
 }
 
 /// Start a thread. `tools` are the device's tools; `ask_orchestrator` is added here.
+/// `workspace` is the thread's folder: the permission gate uses it to keep CLI agents in it.
 pub fn spawn_thread(
     spec: ThreadSpec,
     provider: Arc<dyn Provider>,
     mut tools: Vec<Arc<dyn Tool>>,
     host: Arc<dyn ThreadHost>,
+    workspace: Arc<Workspace>,
 ) -> (ThreadControl, tokio::task::JoinHandle<ThreadResult>) {
     let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<(String, String)>();
     let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -152,6 +158,7 @@ pub fn spawn_thread(
         permissions: spec.permissions.clone(),
         host: host.clone(),
         state,
+        workspace,
     };
     let cfg = LoopConfig {
         provider_id: spec.provider_id.clone(),

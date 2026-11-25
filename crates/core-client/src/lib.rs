@@ -274,7 +274,7 @@ fn start_thread(
     let title = spec.title.clone();
     events.thread(&id, &title, "running");
     let host: Arc<dyn ThreadHost> = threads.clone();
-    let (control, handle) = spawn_thread(spec, provider, tools, host);
+    let (control, handle) = spawn_thread(spec, provider, tools, host, ws);
     {
         let mut controls = threads.controls.lock().unwrap();
         if threads.closed.load(Ordering::SeqCst) {
@@ -439,7 +439,7 @@ mod tests {
             max_turns: 5,
         };
         let host: Arc<dyn ThreadHost> = threads.clone();
-        let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host);
+        let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());
         threads.controls.lock().unwrap().insert("t1".into(), control);
 
         // Wait until the thread is blocked on an approval.

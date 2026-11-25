@@ -14,6 +14,7 @@ use core_protocol::AgentEvent;
 use providers::{Block, Delta, Message, Provider, Request, Role, StopReason, ToolDef, Usage};
 use serde_json::Value;
 
+pub mod agents;
 pub mod permission;
 pub mod thread;
 pub mod tools;
@@ -53,8 +54,10 @@ pub enum Gate {
 #[async_trait]
 pub trait Hooks: Send + Sync {
     fn event(&self, event: AgentEvent);
-    /// Decide whether a tool call may run (approvals live here).
-    async fn gate(&self, _tool: &str, _input: &Value) -> Gate {
+    /// Decide whether a tool call may run (approvals live here). It may rewrite the
+    /// arguments first (clamping a CLI agent's safety options); the `ToolCall` event,
+    /// the approval request and the call itself all see the rewritten arguments.
+    async fn gate(&self, _tool: &str, _input: &mut Value) -> Gate {
         Gate::Allow
     }
     /// Messages to add before the next model call (user stepping in, etc.).
@@ -176,13 +179,21 @@ pub async fn run_loop(
 
         // Run every requested tool concurrently; results go back in one message, in order.
         let runs = calls.iter().map(|(id, name, input)| async move {
-            hooks.event(AgentEvent::ToolCall { call_id: id.clone(), name: name.clone(), input: input.clone() });
+            let mut input = input.clone();
             let out = match tools.iter().find(|t| t.def().name == *name) {
-                None => ToolOutput::err(format!("unknown tool {name}")),
-                Some(tool) => match hooks.gate(name, input).await {
-                    Gate::Deny(reason) => ToolOutput::err(format!("Not run: {reason}")),
-                    Gate::Allow => tool.call(input.clone()).await,
-                },
+                None => {
+                    hooks.event(AgentEvent::ToolCall { call_id: id.clone(), name: name.clone(), input });
+                    ToolOutput::err(format!("unknown tool {name}"))
+                }
+                Some(tool) => {
+                    // The gate runs first, so the log shows the arguments that actually run.
+                    let gate = hooks.gate(name, &mut input).await;
+                    hooks.event(AgentEvent::ToolCall { call_id: id.clone(), name: name.clone(), input: input.clone() });
+                    match gate {
+                        Gate::Deny(reason) => ToolOutput::err(format!("Not run: {reason}")),
+                        Gate::Allow => tool.call(input).await,
+                    }
+                }
             };
             let content = truncate(out.content);
             hooks.event(AgentEvent::ToolResult {
