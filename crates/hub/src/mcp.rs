@@ -5,12 +5,17 @@
 //! tool registry and the device's live entry, and lists them again whenever the
 //! device sends `notifications/tools/list_changed`. Direct tool calls
 //! ([`Hub::call_tool`], `POST /v1/devices/{id}/call`) are MCP `tools/call` requests.
+//! The device's scoped folders arrive in its `initialize` result
+//! (`_meta["grouper/folders"]`) and are stored with the device.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use core_protocol::tunnel::{Tunnel, result_text, tool_from_mcp};
-use core_protocol::{HubMessage, MCP_GRACE_SECS, ToolCallResponse, ToolDef, mcp_call_timeout, mcp_server_of};
+use core_protocol::{
+    FOLDERS_META_KEY, FolderInfo, HubMessage, MCP_GRACE_SECS, ToolCallResponse, ToolDef, mcp_call_timeout,
+    mcp_server_of, valid_folder_name,
+};
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, JsonObject};
 use rmcp::service::{NotificationContext, RoleClient};
 use rmcp::{ClientHandler, Peer, ServiceError, ServiceExt};
@@ -94,11 +99,15 @@ impl McpSession {
                 Err(_) => return tracing::warn!(device = %device_id, "MCP initialize timed out"),
             };
             let peer = client.peer().clone();
+            let folders = reported_folders(peer.peer_info().and_then(|i| i.meta.as_ref().map(|m| m.0.clone())));
             {
                 let Some(h) = hub.upgrade() else { return };
                 let mut live = h.live.lock().await;
                 match live.get_mut(&device_id).filter(|l| l.conn_id == conn_id) {
-                    Some(l) => l.mcp = Some(peer.clone()),
+                    Some(l) => {
+                        l.mcp = Some(peer.clone());
+                        h.db.set_device_folders(&device_id, &folders);
+                    }
                     None => return,
                 }
             }
@@ -114,6 +123,13 @@ impl McpSession {
         });
         Self { incoming, task }
     }
+}
+
+/// The scoped folders in a device's `initialize` `_meta` (valid names only).
+pub(crate) fn reported_folders(meta: Option<serde_json::Map<String, Value>>) -> Vec<FolderInfo> {
+    let Some(v) = meta.and_then(|mut m| m.remove(FOLDERS_META_KEY)) else { return Vec::new() };
+    let folders: Vec<FolderInfo> = serde_json::from_value(v).unwrap_or_default();
+    folders.into_iter().filter(|f| valid_folder_name(&f.name)).collect()
 }
 
 /// Apply a listed tool set only if `conn_id` is still the live connection for `device_id`.
@@ -191,6 +207,18 @@ impl Hub {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn folders_from_meta() {
+        let meta = |v: Value| v.as_object().cloned();
+        assert!(reported_folders(None).is_empty());
+        assert!(reported_folders(meta(json!({"other": 1}))).is_empty());
+        let got = reported_folders(meta(json!({FOLDERS_META_KEY: [
+            {"name": "projects", "mode": "read_write"}, {"name": "bad name", "mode": "read"}, {"name": "docs", "mode": "read"}
+        ]})));
+        let names: Vec<(&str, &str)> = got.iter().map(|f| (f.name.as_str(), f.mode.as_str())).collect();
+        assert_eq!(names, vec![("projects", "read_write"), ("docs", "read")]);
+    }
 
     #[test]
     fn call_timeouts() {

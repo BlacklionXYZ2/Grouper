@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use async_trait::async_trait;
 use core_agent::thread::{ThreadHost, spawn_thread};
 use core_agent::tools::{Workspace, file_tools};
-use core_protocol::{AgentEvent, EventBody, HubMessage, ThreadInfo, ThreadSpec};
+use core_protocol::{AgentEvent, EventBody, FolderInfo, FolderMode, HubMessage, ThreadInfo, ThreadSpec};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -35,13 +35,14 @@ pub struct ThreadRequest {
 
 pub const MAX_THREAD_TURNS: u32 = 40;
 
-pub(crate) fn thread_system(device_name: &str, on_hub: bool) -> String {
+/// The thread's system prompt. `folders` are the device's scoped folders (none on the hub).
+pub(crate) fn thread_system(device_name: &str, on_hub: bool, folders: &[FolderInfo]) -> String {
     let place = if on_hub {
         "on the Grouper hub (a cloud machine). You have file tools in a private workspace there, no shell".to_string()
     } else {
         format!("on the device \"{device_name}\". You have tools on that device, rooted in a private workspace folder")
     };
-    format!(
+    let mut text = format!(
         "You are a subagent in Grouper, a personal multi-device assistant. The orchestrator gave you one task, \
 described in a brief. You are running {place}.\n\n\
 - Work only on your brief. You can't see the user's conversation; the brief has what you need.\n\
@@ -50,7 +51,23 @@ described in a brief. You are running {place}.\n\n\
 - Messages from the user or orchestrator may arrive mid-task; follow them.\n\
 - When you're done, reply with a short report for the orchestrator: what you did, the result, \
 files you wrote (workspace paths), and anything unresolved. That reply ends the thread."
-    )
+    );
+    if !on_hub && !folders.is_empty() {
+        let list: Vec<String> = folders
+            .iter()
+            .map(|f| {
+                let mode = if f.mode == FolderMode::ReadWrite { "read and write" } else { "read only" };
+                format!("@{} ({mode})", f.name)
+            })
+            .collect();
+        text.push_str(&format!(
+            "\n\nScoped folders on this device, outside your workspace: {}. Reach them with file tools as \
+             `@<folder>/<path>` (list_files `@<folder>`), or run_shell with `cwd` `@<folder>/<path>`. Writes there and \
+             shells there may wait for the user's approval; keep your own outputs in the workspace.",
+            list.join(", ")
+        ));
+    }
+    text
 }
 
 fn render_brief(r: &ThreadRequest) -> String {
@@ -125,10 +142,15 @@ impl Hub {
             title: info.title.clone(),
             provider_id: model.provider_id.clone(),
             model: model.model.clone(),
-            system: thread_system(&device_name, on_hub),
+            system: thread_system(
+                &device_name,
+                on_hub,
+                &if on_hub { Vec::new() } else { self.db.device_folders(&device_id) },
+            ),
             brief,
             permissions: self.db.permissions(&device_id),
             max_turns: MAX_THREAD_TURNS,
+            device_name: device_name.clone(),
         };
 
         if on_hub {
@@ -399,5 +421,23 @@ impl ThreadHost for HubHost {
             let (id, q) = (thread_id.to_string(), question.to_string());
             tokio::spawn(async move { hub.thread_ask(&id, &q).await });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_prompt_lists_scoped_folders() {
+        let folders = [
+            FolderInfo { name: "projects".into(), mode: FolderMode::ReadWrite },
+            FolderInfo { name: "docs".into(), mode: FolderMode::Read },
+        ];
+        let text = thread_system("Laptop", false, &folders);
+        assert!(text.contains("@projects (read and write), @docs (read only)"), "{text}");
+        assert!(text.contains("`@<folder>/<path>`"), "{text}");
+        assert!(!thread_system("Laptop", false, &[]).contains("Scoped folders"));
+        assert!(!thread_system("Hub", true, &folders).contains("Scoped folders"));
     }
 }

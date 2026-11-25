@@ -1,50 +1,58 @@
-//! Tools a thread gets on a device: files in its workspace, and the shell.
+//! Tools a thread gets on a device: files in its workspace (and in the device's
+//! scoped folders, as `@<folder>/<path>`; see [`crate::folders`]), and the shell.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use core_protocol::ToolDef;
+use core_protocol::{FolderMode, ToolDef};
 use serde_json::{Value, json};
 
+use crate::folders::{Folders, confine};
 use crate::{Tool, ToolOutput};
 
-/// A thread's own folder. File tools can't reach outside it.
+/// A thread's own folder. File tools can't reach outside it, except into the
+/// device's scoped folders.
 pub struct Workspace {
     root: PathBuf,
+    folders: Arc<Folders>,
+    /// The device's name, for approval reasons.
+    device: String,
 }
 
 impl Workspace {
     pub fn create(root: PathBuf) -> std::io::Result<Arc<Self>> {
+        Self::create_scoped(root, Arc::default(), "")
+    }
+
+    /// A workspace whose tools also reach `folders` (`@<name>/<path>`) on device `device`.
+    pub fn create_scoped(root: PathBuf, folders: Arc<Folders>, device: &str) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&root)?;
-        Ok(Arc::new(Self { root: root.canonicalize()? }))
+        Ok(Arc::new(Self { root: root.canonicalize()?, folders, device: device.into() }))
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    pub fn folders(&self) -> &Folders {
+        &self.folders
+    }
+
+    /// The device's name, or "this device".
+    pub fn device_label(&self) -> &str {
+        if self.device.is_empty() { "this device" } else { &self.device }
+    }
+
     /// Resolve a workspace-relative path, refusing anything that escapes it.
     pub fn resolve(&self, rel: &str) -> Result<PathBuf, String> {
-        let rel = rel.trim();
-        let p = Path::new(if rel.is_empty() { "." } else { rel });
-        if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))) {
-            return Err(format!("{rel:?} is outside the workspace; use a relative path without `..`"));
-        }
-        let full = self.root.join(p);
-        // Follow symlinks for whatever part already exists.
-        let mut existing = full.as_path();
-        while !existing.exists() {
-            existing = existing.parent().unwrap_or(&self.root);
-        }
-        let real = existing.canonicalize().map_err(|e| e.to_string())?;
-        if !real.starts_with(&self.root) {
-            return Err(format!("{rel:?} leads outside the workspace"));
-        }
-        Ok(full)
+        confine(&self.root, rel, "the workspace")
     }
 }
+
+const PATH_DESCRIPTION: &str =
+    "Path relative to the workspace, or `@<folder>/<path>` in one of this device's scoped folders";
 
 fn s(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(String::from)
@@ -56,17 +64,19 @@ impl Tool for ReadFile {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "read_file".into(),
-            description: "Read a text file from your workspace.".into(),
+            description: "Read a text file from your workspace, or from one of this device's scoped folders as \
+                          `@<folder>/<path>` (e.g. `@projects/app/README.md`)."
+                .into(),
             input_schema: json!({"type": "object", "properties": {
-                "path": {"type": "string", "description": "Path relative to the workspace"}
+                "path": {"type": "string", "description": PATH_DESCRIPTION}
             }, "required": ["path"]}),
         }
     }
     async fn call(&self, input: Value) -> ToolOutput {
         let Some(rel) = s(&input, "path") else { return ToolOutput::err("missing path") };
-        match self.0.resolve(&rel) {
+        match self.0.locate(&rel) {
             Err(e) => ToolOutput::err(e),
-            Ok(p) => match tokio::fs::read_to_string(&p).await {
+            Ok(l) => match tokio::fs::read_to_string(&l.full).await {
                 Ok(t) => ToolOutput::ok(t),
                 Err(e) => ToolOutput::err(format!("{rel}: {e}")),
             },
@@ -80,9 +90,11 @@ impl Tool for WriteFile {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "write_file".into(),
-            description: "Create or overwrite a text file in your workspace (folders are created).".into(),
+            description: "Create or overwrite a text file in your workspace (folders are created), or in a \
+                          read_write scoped folder of this device as `@<folder>/<path>`."
+                .into(),
             input_schema: json!({"type": "object", "properties": {
-                "path": {"type": "string", "description": "Path relative to the workspace"},
+                "path": {"type": "string", "description": PATH_DESCRIPTION},
                 "content": {"type": "string"}
             }, "required": ["path", "content"]}),
         }
@@ -91,8 +103,17 @@ impl Tool for WriteFile {
         let (Some(rel), Some(content)) = (s(&input, "path"), s(&input, "content")) else {
             return ToolOutput::err("missing path or content");
         };
-        let p = match self.0.resolve(&rel) {
-            Ok(p) => p,
+        let p = match self.0.locate(&rel) {
+            Ok(l) => match l.folder {
+                Some(f) if f.mode == FolderMode::Read => {
+                    return ToolOutput::err(format!(
+                        "@{} is read-only on {}; write to your workspace instead",
+                        f.name,
+                        self.0.device_label()
+                    ));
+                }
+                _ => l.full,
+            },
             Err(e) => return ToolOutput::err(e),
         };
         if let Some(parent) = p.parent()
@@ -126,56 +147,79 @@ fn is_link_entry(entry: &std::fs::DirEntry, ft: &std::fs::FileType) -> bool {
     false
 }
 
+/// What [`walk`] found at one path.
+pub(crate) enum Entry {
+    File(u64),
+    Dir,
+    /// A symlink, junction or other reparse point: reported, never followed.
+    Link,
+}
+
+/// Walk `dir` recursively without following links, stopping after `max` entries.
+/// Paths are relative to `root` and always use `/`. The bool is true when it stopped early.
+pub(crate) fn walk(dir: PathBuf, root: &Path, max: usize) -> (Vec<(String, Entry)>, bool) {
+    let mut out = Vec::new();
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            let p = e.path();
+            // Always `/`, so models see the same paths on every OS.
+            let shown = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if out.len() >= max {
+                return (out, true);
+            }
+            if is_link_entry(&e, &ft) {
+                out.push((shown, Entry::Link));
+            } else if ft.is_dir() {
+                out.push((shown, Entry::Dir));
+                stack.push(p);
+            } else {
+                out.push((shown, Entry::File(e.metadata().map(|m| m.len()).unwrap_or(0))));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    (out, false)
+}
+
 struct ListFiles(Arc<Workspace>);
 #[async_trait]
 impl Tool for ListFiles {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "list_files".into(),
-            description: "List files in your workspace (recursive, up to 500 entries).".into(),
+            description: "List files in your workspace, or in one of this device's scoped folders as \
+                          `@<folder>` or `@<folder>/<path>` (recursive, up to 500 entries)."
+                .into(),
             input_schema: json!({"type": "object", "properties": {
-                "path": {"type": "string", "description": "Folder relative to the workspace (default: root)"}
+                "path": {"type": "string", "description": "Folder relative to the workspace (default: root), or `@<folder>/<path>`"}
             }}),
         }
     }
     async fn call(&self, input: Value) -> ToolOutput {
         let rel = s(&input, "path").unwrap_or_default();
-        let dir = match self.0.resolve(&rel) {
-            Ok(p) => p,
+        let (dir, root, prefix) = match self.0.locate(&rel) {
+            Ok(l) => (l.full, l.root.to_path_buf(), l.folder.map(|f| format!("@{}/", f.name)).unwrap_or_default()),
             Err(e) => return ToolOutput::err(e),
         };
-        let root = self.0.root().to_path_buf();
         let listing = tokio::task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            let mut stack = vec![dir];
-            while let Some(d) = stack.pop() {
-                let Ok(rd) = std::fs::read_dir(&d) else { continue };
-                for e in rd.flatten() {
-                    let Ok(ft) = e.file_type() else { continue };
-                    let p = e.path();
-                    // Always `/`, so models see the same paths on every OS.
-                    let shown = p
-                        .strip_prefix(&root)
-                        .unwrap_or(&p)
-                        .components()
-                        .map(|c| c.as_os_str().to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    if is_link_entry(&e, &ft) {
-                        out.push(format!("{shown}@"));
-                    } else if ft.is_dir() {
-                        out.push(format!("{shown}/"));
-                        stack.push(p);
-                    } else {
-                        out.push(shown);
-                    }
-                    if out.len() >= 500 {
-                        return out;
-                    }
-                }
-            }
-            out.sort();
-            out
+            let (entries, _) = walk(dir, &root, 500);
+            entries
+                .into_iter()
+                .map(|(shown, entry)| match entry {
+                    Entry::Link => format!("{prefix}{shown}@"),
+                    Entry::Dir => format!("{prefix}{shown}/"),
+                    Entry::File(_) => format!("{prefix}{shown}"),
+                })
+                .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
@@ -186,12 +230,14 @@ impl Tool for ListFiles {
 fn shell_description() -> &'static str {
     #[cfg(windows)]
     {
-        "Run a shell command in PowerShell on Windows, with your workspace as the working directory. \
+        "Run a shell command in PowerShell on Windows, with your workspace as the working directory \
+         (or `cwd`, which may be a scoped folder: `@<folder>/<path>`). \
          Use PowerShell syntax. Returns exit code, stdout and stderr."
     }
     #[cfg(not(windows))]
     {
-        "Run a shell command with sh -c and your workspace as the working directory. \
+        "Run a shell command with sh -c and your workspace as the working directory \
+         (or `cwd`, which may be a scoped folder: `@<folder>/<path>`). \
          Returns exit code, stdout and stderr."
     }
 }
@@ -250,15 +296,25 @@ impl Tool for RunShell {
             description: shell_description().into(),
             input_schema: json!({"type": "object", "properties": {
                 "command": {"type": "string"},
-                "timeout_secs": {"type": "integer", "description": "Default 120, max 600"}
+                "timeout_secs": {"type": "integer", "description": "Default 120, max 600"},
+                "cwd": {"type": "string", "description": "Working directory: a folder in your workspace (default: its root), \
+                        or `@<folder>/<path>` in one of this device's scoped folders (asks the user first)"}
             }, "required": ["command"]}),
         }
     }
     async fn call(&self, input: Value) -> ToolOutput {
         let Some(cmd) = s(&input, "command") else { return ToolOutput::err("missing command") };
         let secs = input.get("timeout_secs").and_then(Value::as_u64).unwrap_or(120).min(600);
+        let dir = match s(&input, "cwd").filter(|c| !c.trim().is_empty()) {
+            None => self.0.root().to_path_buf(),
+            Some(cwd) => match self.0.locate(&cwd) {
+                Ok(l) if l.full.is_dir() => l.full,
+                Ok(_) => return ToolOutput::err(format!("cwd {cwd:?} is not a folder")),
+                Err(e) => return ToolOutput::err(e),
+            },
+        };
         let mut c = shell_program(&cmd);
-        c.current_dir(self.0.root()).kill_on_drop(true).stdin(std::process::Stdio::null());
+        c.current_dir(&dir).kill_on_drop(true).stdin(std::process::Stdio::null());
         for key in secret_env_keys() {
             c.env_remove(key);
         }
@@ -300,7 +356,7 @@ pub fn shell_tool(ws: &Arc<Workspace>) -> Arc<dyn Tool> {
 
 /// Definitions of the built-in thread tools, for a device to advertise.
 pub fn builtin_defs(with_shell: bool) -> Vec<ToolDef> {
-    let ws = Arc::new(Workspace { root: PathBuf::from(".") });
+    let ws = Arc::new(Workspace { root: PathBuf::from("."), folders: Arc::default(), device: String::new() });
     let mut defs: Vec<ToolDef> = file_tools(&ws).iter().map(|t| t.def()).collect();
     if with_shell {
         defs.push(shell_tool(&ws).def());

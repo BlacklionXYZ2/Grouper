@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod db;
+pub mod files;
 pub mod limits;
 pub mod mcp;
 pub mod memory;

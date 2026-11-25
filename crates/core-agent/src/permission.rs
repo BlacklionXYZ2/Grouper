@@ -36,6 +36,10 @@ pub fn needs_approval(level: Permission, tool: &str, input: &Value) -> Option<St
 /// (see [`crate::agents`]), then decide. `Some(reason)` if the call needs the user's
 /// approval; the reason mentions what Grouper changed.
 pub fn check_call(level: Permission, tool: &str, input: &mut Value, workspace: &Workspace) -> Option<String> {
+    // File and shell calls into the device's scoped folders are gated apart from the workspace.
+    if let Some(decision) = crate::folders::gate(level, tool, input, workspace) {
+        return decision;
+    }
     let clamped = agents::clamp(level, tool, input, workspace);
     let reason = if level == Permission::Auto && agents::agent_tool(tool).is_some() {
         agents::auto_risk(tool, input, Some(workspace), &clamped)

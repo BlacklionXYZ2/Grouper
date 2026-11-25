@@ -15,6 +15,8 @@ use providers::{Block, Delta, Message, Provider, Request, Role, StopReason, Tool
 use serde_json::Value;
 
 pub mod agents;
+pub mod files;
+pub mod folders;
 pub mod permission;
 pub mod thread;
 pub mod tools;

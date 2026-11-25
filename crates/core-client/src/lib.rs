@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use core_agent::folders::{FolderSpec, Folders};
 use core_agent::thread::{ThreadControl, ThreadHost, spawn_thread};
 use core_agent::tools::{Workspace, file_tools, shell_tool};
 use core_agent::{Tool, ToolOutput};
@@ -27,9 +28,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 
+pub mod folders;
 mod handover;
 pub mod mcp_host;
 mod mcp_server;
+mod workspace_files;
 
 use mcp_host::{HostTool, McpHost};
 use mcp_server::{DeviceServer, ServerSession};
@@ -78,6 +81,9 @@ pub struct Config {
     /// The MCP host's config file. `None`: `GROUPER_MCP_CONFIG`, else
     /// `<OS config dir>/grouper/mcp.json` (see [`mcp_host`]).
     pub mcp_config: Option<PathBuf>,
+    /// Scoped folders threads here may reach as `@<name>/<path>` (see
+    /// [`core_agent::folders`]). The caller loads them ([`folders::load`]).
+    pub folders: Vec<FolderSpec>,
 }
 
 enum Outcome {
@@ -99,6 +105,11 @@ pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn 
     let mcp_config = config.mcp_config.clone();
     let specs = tokio::task::spawn_blocking(move || mcp_host::load(mcp_config.as_deref())).await.unwrap_or_default();
     let host = McpHost::start(specs);
+    let (folders, warnings) = Folders::open(&config.folders);
+    for w in warnings {
+        tracing::warn!("scoped folders: {w}");
+    }
+    let folders = Arc::new(folders);
     let mut backoff = Duration::from_secs(1);
     loop {
         if *shutdown.borrow() {
@@ -107,7 +118,7 @@ pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn 
         events.status(Status::Connecting);
         let started = tokio::time::Instant::now();
         let outcome = tokio::select! {
-            o = connect_once(&url, &config, &handler, &events, &host) => o,
+            o = connect_once(&url, &config, &handler, &events, &host, &folders) => o,
             _ = shutdown.changed() => Outcome::Stop,
         };
         match outcome {
@@ -253,6 +264,7 @@ fn start_thread(
     events: &Arc<dyn Events>,
     threads: &Arc<Threads>,
     host: &Arc<McpHost>,
+    folders: &Arc<Folders>,
 ) {
     let id = spec.thread_id.clone();
     let fail = |msg: String| {
@@ -268,7 +280,7 @@ fn start_thread(
         Ok(p) => p,
         Err(e) => return fail(e.to_string()),
     };
-    let ws = match Workspace::create(root.join(&id)) {
+    let ws = match Workspace::create_scoped(root.join(&id), folders.clone(), &spec.device_name) {
         Ok(w) => w,
         Err(e) => return fail(format!("workspace: {e}")),
     };
@@ -315,6 +327,7 @@ async fn connect_once(
     handler: &Arc<dyn ToolHandler>,
     events: &Arc<dyn Events>,
     host: &Arc<McpHost>,
+    folders: &Arc<Folders>,
 ) -> Outcome {
     let mut request = match url.into_client_request() {
         Ok(r) => r,
@@ -359,7 +372,11 @@ async fn connect_once(
     let threads = Arc::new(Threads::new(out_tx.clone(), on_overflow.clone()));
     let _stop_threads = StopOnDisconnect(threads.clone());
     // This device's MCP server; the hub is its client.
-    let mcp = ServerSession::start(DeviceServer::new(config, handler.clone(), host.clone()), out_tx.clone(), on_overflow);
+    let mcp = ServerSession::start(
+        DeviceServer::new(config, handler.clone(), host.clone(), folders.clone()),
+        out_tx.clone(),
+        on_overflow,
+    );
     let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.tick().await;
 
@@ -397,7 +414,9 @@ async fn connect_once(
                     Ok(HubMessage::Providers { providers }) => {
                         *threads.providers.lock().unwrap() = providers;
                     }
-                    Ok(HubMessage::StartThread { spec }) => start_thread(spec, config, handler, events, &threads, host),
+                    Ok(HubMessage::StartThread { spec }) => {
+                        start_thread(spec, config, handler, events, &threads, host, folders)
+                    }
                     Ok(HubMessage::ThreadInput { thread_id, from, text }) => {
                         if let Some(c) = threads.controls.lock().unwrap().get(&thread_id) {
                             c.send(&from, &text);
@@ -481,6 +500,7 @@ mod tests {
             brief: "go".into(),
             permissions: HashMap::from([("list_files".to_string(), Permission::Manual)]),
             max_turns: 5,
+            device_name: "Laptop".into(),
         };
         let host: Arc<dyn ThreadHost> = threads.clone();
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());

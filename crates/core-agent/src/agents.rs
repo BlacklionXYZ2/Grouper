@@ -16,12 +16,21 @@
 //! Every `*_chat` call also gets `working_directory` (the thread's workspace when the
 //! model gave none) and `timeout_seconds` (Grouper's default when the model gave none,
 //! so the agent and Grouper agree on when the call ends).
+//!
+//! `working_directory` may name one of the device's scoped folders (`@projects/app`):
+//! Grouper puts the folder's real path there. On Auto such a call asks once ("works in
+//! @projects on Laptop"); on Bypass it runs. In a `read` folder the agents that have a
+//! read-only mode get it at every level (codex `read-only`, claude-code `plan`,
+//! antigravity `plan`, pi `read-only`, cursor's sandbox stays on).
 
 use std::path::{Component, Path, PathBuf};
 
-use core_protocol::{AGENT_MCP_SERVERS, MCP_DEFAULT_TIMEOUT_SECS, MCP_MAX_TIMEOUT_SECS, Permission, mcp_server_of};
+use core_protocol::{
+    AGENT_MCP_SERVERS, FolderMode, MCP_DEFAULT_TIMEOUT_SECS, MCP_MAX_TIMEOUT_SECS, Permission, mcp_server_of,
+};
 use serde_json::{Value, json};
 
+use crate::folders::{display_path, split_scoped};
 use crate::tools::Workspace;
 
 /// `(server, tool)` when `name` is a tool of one of the CLI-agent servers.
@@ -37,6 +46,8 @@ pub struct Clamped {
     pub changes: Vec<String>,
     /// The model asked for a mode with no safety limits itself (on Manual/Auto).
     pub asked_for_bypass: Option<String>,
+    /// The scoped folder the agent works in (`@projects on Laptop`), when it named one.
+    pub folder: Option<String>,
 }
 
 fn s<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
@@ -78,6 +89,30 @@ pub fn clamp(level: Permission, tool: &str, input: &mut Value, workspace: &Works
     // Shared: where it runs, and how long it may take.
     if s(input, "working_directory").is_none_or(|d| d.trim().is_empty()) {
         set(input, "working_directory", json!(display_root(workspace)), &mut out);
+    }
+    // `@folder/path`: one of the device's scoped folders. An unknown one stays as given
+    // (and counts as outside the workspace).
+    let mut read_only = false;
+    if let Some(dir) = s(input, "working_directory").filter(|d| split_scoped(d).is_some()).map(String::from)
+        && let Ok(located) = workspace.locate(&dir)
+        && let Some(folder) = located.folder
+    {
+        read_only = folder.mode == FolderMode::Read;
+        out.folder = Some(format!("@{} on {}", folder.name, workspace.device_label()));
+        set(input, "working_directory", json!(display_path(&located.full)), &mut out);
+    }
+    if read_only {
+        // Asking for less is always kept below, so these hold at every level.
+        match server {
+            "codex" => set(input, "sandbox", json!("read-only"), &mut out),
+            "claude-code" if s(input, "permission_mode") != Some("default") => {
+                set(input, "permission_mode", json!("plan"), &mut out)
+            }
+            "antigravity" => set(input, "mode", json!("plan"), &mut out),
+            "pi" if s(input, "tools") != Some("none") => set(input, "tools", json!("read-only"), &mut out),
+            "cursor" => set(input, "sandbox", json!("enabled"), &mut out),
+            _ => {}
+        }
     }
     match input.get("timeout_seconds").and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64))) {
         None => set(input, "timeout_seconds", json!(MCP_DEFAULT_TIMEOUT_SECS), &mut out),
@@ -179,6 +214,10 @@ pub fn auto_risk(tool: &str, input: &Value, workspace: Option<&Workspace>, clamp
     if own.starts_with("list_") || !own.ends_with("_chat") {
         return None;
     }
+    // A scoped folder is allowed space, but the user is asked once per call.
+    if let Some(folder) = &clamped.folder {
+        return Some(format!("{tool} works in {folder}"));
+    }
     if let (Some(dir), Some(ws)) = (s(input, "working_directory"), workspace)
         && !inside(ws, dir)
     {
@@ -227,13 +266,16 @@ pub fn message_risk(message: &str) -> Option<String> {
 
 /// The workspace folder as an agent should see it (no `\\?\` prefix on Windows).
 pub fn display_root(workspace: &Workspace) -> String {
-    let root = workspace.root().to_string_lossy();
-    root.strip_prefix(r"\\?\").unwrap_or(&root).to_string()
+    display_path(workspace.root())
 }
 
 /// Whether `dir` (relative to the workspace, or absolute) stays inside it.
 pub fn inside(workspace: &Workspace, dir: &str) -> bool {
     let dir = dir.trim();
+    // `@folder` names a scoped folder, never the workspace.
+    if dir.starts_with('@') {
+        return false;
+    }
     let path = Path::new(dir);
     if !path.is_absolute() && !dir.starts_with('/') && !dir.starts_with('\\') {
         return workspace.resolve(dir).is_ok();
@@ -418,7 +460,70 @@ mod tests {
         assert!(!inside(&w, &format!("{root}/../elsewhere")));
         assert!(!inside(&w, &std::env::temp_dir().to_string_lossy()));
         assert!(!inside(&w, if cfg!(windows) { r"C:\Windows" } else { "/etc" }));
+        // `@name` is a scoped folder, never the workspace (even with a folder called `@name` in it).
+        assert!(!inside(&w, "@projects"));
+        assert!(!inside(&w, "@projects/app"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn scoped_folder_working_directory() {
+        use crate::folders::{FolderSpec, Folders};
+        use crate::permission::check_call;
+        let base = std::env::temp_dir().join(format!("grouper-agents-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (rw, ro) = (base.join("projects"), base.join("docs"));
+        std::fs::create_dir_all(rw.join("app")).unwrap();
+        std::fs::create_dir_all(&ro).unwrap();
+        let specs = [
+            FolderSpec { name: "projects".into(), path: rw.clone(), mode: FolderMode::ReadWrite },
+            FolderSpec { name: "docs".into(), path: ro.clone(), mode: FolderMode::Read },
+        ];
+        let (folders, warnings) = Folders::open(&specs);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let w = Workspace::create_scoped(base.join("ws"), std::sync::Arc::new(folders), "Laptop").unwrap();
+        let app = display_path(&rw.canonicalize().unwrap().join("app"));
+        let t = "codex__codex_chat";
+
+        // Auto: the folder's real path is set, and the call asks once.
+        let mut input = json!({"message": "Fix the bug", "working_directory": "@projects/app"});
+        let reason = check_call(Permission::Auto, t, &mut input, &w).unwrap();
+        assert!(reason.contains("works in @projects on Laptop"), "{reason}");
+        assert_eq!((&input["working_directory"], &input["sandbox"]), (&json!(app), &json!("workspace-write")));
+        // Bypass runs it with the agent's own bypass mode; Manual asks.
+        let mut input = json!({"message": "Fix the bug", "working_directory": "@projects/app"});
+        assert_eq!(check_call(Permission::Bypass, t, &mut input, &w), None);
+        assert_eq!((&input["working_directory"], &input["sandbox"]), (&json!(app), &json!("danger-full-access")));
+        let mut input = json!({"message": "Fix the bug", "working_directory": "@projects"});
+        assert!(check_call(Permission::Manual, t, &mut input, &w).unwrap().contains("Manual"));
+
+        // A read folder gets each agent's read-only mode at every level.
+        for level in [Permission::Manual, Permission::Auto, Permission::Bypass] {
+            let (i, c) = run(level, t, json!({"message": "m", "working_directory": "@docs"}), &w);
+            assert_eq!(i["sandbox"], "read-only", "{level:?}");
+            assert_eq!(c.folder.as_deref(), Some("@docs on Laptop"));
+            let (i, _) = run(level, "claude-code__claude_code_chat", json!({"message": "m", "working_directory": "@docs"}), &w);
+            assert_eq!(i["permission_mode"], "plan", "{level:?}");
+            let (i, _) = run(level, "pi__pi_chat", json!({"message": "m", "working_directory": "@docs"}), &w);
+            assert_eq!(i["tools"], "read-only", "{level:?}");
+            let (i, _) = run(level, "cursor__cursor_chat", json!({"message": "m", "working_directory": "@docs"}), &w);
+            assert_eq!(i["sandbox"], "enabled", "{level:?}");
+            let (i, _) =
+                run(level, "antigravity__antigravity_chat", json!({"message": "m", "working_directory": "@docs"}), &w);
+            assert_eq!(i["mode"], "plan", "{level:?}");
+        }
+        // pi in a read folder on Auto runs read-only, still asking because of the folder.
+        let mut input = json!({"message": "m", "working_directory": "@docs"});
+        assert!(check_call(Permission::Auto, "pi__pi_chat", &mut input, &w).unwrap().contains("works in @docs"));
+
+        // Escapes and unknown folders aren't resolved: they count as outside the workspace.
+        for dir in ["@projects/../docs", "@nope", "@projects/../../etc"] {
+            let mut input = json!({"message": "m", "working_directory": dir});
+            let reason = check_call(Permission::Auto, t, &mut input, &w).unwrap();
+            assert!(reason.contains("outside"), "{dir}: {reason}");
+            assert_eq!(input["working_directory"], dir);
+        }
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

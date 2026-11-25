@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use core_client::core_protocol::{
     AgentEvent, Capability, ChatRequest, ChatResponse, ConversationInfo, DeviceInfo, Event, EventBody, ModelEntry,
     ModelImportRequest, ModelImportResult, ProviderConfig, ProviderInfo, ThreadInfo, ToolCallRequest, ToolCallResponse,
-    ToolInfo, default_input_schema,
+    ToolInfo, WorkspaceListing, default_input_schema,
 };
 use core_client::{Events, Status, ToolHandler};
 use futures_util::StreamExt;
@@ -51,6 +51,21 @@ enum Cmd {
         /// MCP servers to run here (Claude-style mcp.json). Default: <config dir>/grouper/mcp.json.
         #[arg(long, env = "GROUPER_MCP_CONFIG")]
         mcp_config: Option<PathBuf>,
+        /// A scoped folder threads may reach as `@name/…`: name=path[:ro|rw] (read-only unless :rw).
+        /// Repeatable; adds to (or replaces by name) the folders file.
+        #[arg(long = "folder", value_name = "NAME=PATH[:ro|rw]")]
+        folders: Vec<String>,
+        /// Scoped folders file. Default: <config dir>/grouper/folders.json.
+        #[arg(long, env = "GROUPER_FOLDERS_CONFIG")]
+        folders_config: Option<PathBuf>,
+    },
+    /// List a thread's workspace files, or download one: grouper files <thread> [<path> [-o <out>]]
+    Files {
+        thread: String,
+        path: Option<String>,
+        /// Where to save the file (default: its name in the current folder; `-` for stdout).
+        #[arg(long, short)]
+        output: Option<PathBuf>,
     },
     /// Talk to Grouper. Prints replies and thread activity until the turn and its threads finish.
     Chat {
@@ -370,7 +385,21 @@ fn print_devices(devices: &[DeviceInfo]) {
             if d.online { "online" } else { "offline" },
             tools.join(", ")
         );
+        if !d.folders.is_empty() {
+            let folders: Vec<String> = d.folders.iter().map(|f| format!("@{} ({})", f.name, f.mode.as_str())).collect();
+            println!("  {:<12} scoped folders: {}", "", folders.join(", "));
+        }
     }
+}
+
+/// Percent-encode one URL path segment.
+fn url_segment(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 pub(crate) struct Api {
@@ -398,6 +427,23 @@ impl Api {
     }
     async fn put(&self, path: &str, body: &impl serde::Serialize) -> Result<Value> {
         self.send(self.http.put(format!("{}{path}", self.base)).json(body)).await
+    }
+    /// A raw (non-JSON) body, such as a downloaded file.
+    async fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("can't reach the hub")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            let msg = body.get("error").and_then(Value::as_str).map(String::from).unwrap_or_else(|| body.to_string());
+            bail!("{status}: {msg}");
+        }
+        Ok(resp.bytes().await?.to_vec())
     }
     async fn delete(&self, path: &str) -> Result<Value> {
         self.send(self.http.delete(format!("{}{path}", self.base))).await
@@ -666,11 +712,15 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Login | Cmd::Logout => unreachable!(),
-        Cmd::Connect { workspace, no_shell, mcp_config } => {
+        Cmd::Connect { workspace, no_shell, mcp_config, folders, folders_config } => {
             let workspace = workspace.unwrap_or_else(|| {
                 dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Grouper").join("workspaces")
             });
             println!("thread workspaces: {}", workspace.display());
+            let folders = core_client::folders::load(folders_config.as_deref(), &folders).map_err(anyhow::Error::msg)?;
+            for f in &folders {
+                println!("scoped folder @{} ({}): {}", f.name, f.mode.as_str(), f.path.display());
+            }
             let config = core_client::Config {
                 hub_url: api.base.clone(),
                 token: api.token.clone(),
@@ -689,6 +739,7 @@ async fn main() -> Result<()> {
                 workspace_root: Some(workspace),
                 allow_shell: !no_shell,
                 mcp_config,
+                folders,
             };
             let (tx, rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
@@ -784,6 +835,38 @@ async fn main() -> Result<()> {
             println!("denied {approval}");
         }
         Cmd::Devices => print_devices(&api.get::<Vec<DeviceInfo>>("/v1/devices").await?),
+        Cmd::Files { thread, path: None, .. } => {
+            let l: WorkspaceListing = api.get(&format!("/v1/threads/{}/files", url_segment(&thread))).await?;
+            println!("thread {} files on {}:", l.thread_id, l.device_id);
+            if l.files.is_empty() {
+                println!("  (none)");
+            }
+            for f in &l.files {
+                println!("  {:>10}  {}", f.size, f.path);
+            }
+            if l.truncated {
+                println!("  … more files not listed");
+            }
+        }
+        Cmd::Files { thread, path: Some(path), output } => {
+            let path = path.replace('\\', "/");
+            if path.split('/').any(|s| s == ".." || s == ".") {
+                bail!("{path}: use a path inside the thread's workspace, without `.` or `..`");
+            }
+            let encoded: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(url_segment).collect();
+            let bytes =
+                api.get_bytes(&format!("/v1/threads/{}/files/{}", url_segment(&thread), encoded.join("/"))).await?;
+            match output {
+                Some(out) if out.as_os_str() == "-" => std::io::stdout().write_all(&bytes)?,
+                _ => {
+                    let out = output.unwrap_or_else(|| {
+                        PathBuf::from(path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("download"))
+                    });
+                    std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+                    println!("saved {} ({} bytes)", out.display(), bytes.len());
+                }
+            }
+        }
         Cmd::Call { device, tool, args } => {
             let args: Value = serde_json::from_str(&args).context("args must be JSON")?;
             let r: ToolCallResponse = serde_json::from_value(

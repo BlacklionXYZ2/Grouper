@@ -156,9 +156,11 @@ impl Hub {
             online: true,
             capabilities: vec![],
             last_seen: Some(crate::db::now()),
+            folders: vec![],
         }];
         out.extend(self.db.devices().into_iter().filter(|d| !d.revoked).map(|d| {
             let l = live.get(&d.id);
+            let folders = self.db.device_folders(&d.id);
             DeviceInfo {
                 id: d.id,
                 name: d.name,
@@ -176,6 +178,7 @@ impl Hub {
                     })
                     .unwrap_or_default(),
                 last_seen: d.last_seen,
+                folders,
             }
         }));
         out
@@ -373,6 +376,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::catalog::routes())
         .merge(crate::skills::routes())
         .merge(crate::limits::routes())
+        .merge(crate::files::routes())
         .with_state(hub)
 }
 

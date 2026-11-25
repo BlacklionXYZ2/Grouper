@@ -436,11 +436,12 @@ impl Hub {
             title: t.title.clone(),
             provider_id: model.provider_id.clone(),
             model: model.model.clone(),
-            system: thread_system(&device, true),
+            system: thread_system(&device, true, &[]),
             brief,
             // The hub's own (file) tools, not the device's.
             permissions: self.db.permissions(HUB_DEVICE),
             max_turns: MAX_THREAD_TURNS,
+            device_name: "Hub".into(),
         };
         let host = Arc::new(HubHost { hub: Arc::downgrade(self) });
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());
@@ -650,10 +651,11 @@ impl Hub {
             title: t.title.clone(),
             provider_id: model.provider_id.clone(),
             model: model.model.clone(),
-            system: thread_system(&device, false),
+            system: thread_system(&device, false, &self.db.device_folders(&t.device_id)),
             brief,
             permissions: self.db.permissions(&t.device_id),
             max_turns: MAX_THREAD_TURNS,
+            device_name: device.clone(),
         };
         if !self.send_to_conn(&t.device_id, conn_id, HubMessage::StartThread { spec }).await {
             self.wait_for_device(thread_id, "the device went offline during the hand-over", true).await;

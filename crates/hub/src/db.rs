@@ -225,6 +225,7 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "conversations", "model", "ALTER TABLE conversations ADD COLUMN model TEXT")?;
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
+    ensure_column(&conn, "devices", "folders", "ALTER TABLE devices ADD COLUMN folders TEXT NOT NULL DEFAULT '[]'")?;
     Ok(conn)
 }
 
@@ -372,6 +373,20 @@ impl Db {
 
     pub fn touch(&self, id: &str) {
         let _ = self.c().execute("UPDATE devices SET last_seen = ?1 WHERE id = ?2", params![ts(), id]);
+    }
+
+    /// The scoped folders a device reported on its latest connection (names and modes).
+    pub fn set_device_folders(&self, id: &str, folders: &[core_protocol::FolderInfo]) {
+        let json = serde_json::to_string(folders).unwrap_or_else(|_| "[]".into());
+        let _ = self.c().execute("UPDATE devices SET folders = ?1 WHERE id = ?2", params![json, id]);
+    }
+
+    pub fn device_folders(&self, id: &str) -> Vec<core_protocol::FolderInfo> {
+        self.c()
+            .query_row("SELECT folders FROM devices WHERE id = ?1", [id], |r| r.get::<_, String>(0))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
     // ---- tool registry

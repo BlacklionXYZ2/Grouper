@@ -3,15 +3,19 @@
 //! It lists the thread tools (when this device runs threads), the platform's tools
 //! (Swift via UniFFI, the CLI's) and every `<server>__<tool>` of the [`McpHost`], and
 //! tells the hub when that list changes. Workspace tools only run inside a thread, so
-//! direct calls to them are refused.
+//! direct calls to them are refused. Its `initialize` result carries the device's
+//! scoped folders (names and modes) in `_meta["grouper/folders"]`, and it answers the
+//! hub's unlisted workspace tools ([`crate::workspace_files`]).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use core_agent::folders::Folders;
 use core_agent::tools::builtin_defs;
 use core_protocol::tunnel::{Tunnel, result_from_text, tool_to_mcp};
-use core_protocol::{Capability, NodeMessage, ToolDef};
+use core_protocol::{Capability, FOLDERS_META_KEY, NodeMessage, ToolDef};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult, PaginatedRequestParams,
+    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult, MetaObject, PaginatedRequestParams,
     ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
@@ -29,12 +33,27 @@ pub(crate) struct DeviceServer {
     capabilities: Vec<Capability>,
     handler: Arc<dyn ToolHandler>,
     host: Arc<McpHost>,
+    folders: Arc<Folders>,
+    /// Where thread workspaces live, for the hub's workspace tools.
+    workspace_root: Option<PathBuf>,
 }
 
 impl DeviceServer {
-    pub(crate) fn new(config: &Config, handler: Arc<dyn ToolHandler>, host: Arc<McpHost>) -> Self {
+    pub(crate) fn new(
+        config: &Config,
+        handler: Arc<dyn ToolHandler>,
+        host: Arc<McpHost>,
+        folders: Arc<Folders>,
+    ) -> Self {
         let workspace = if config.workspace_root.is_some() { builtin_defs(config.allow_shell) } else { Vec::new() };
-        Self { workspace, capabilities: config.capabilities.clone(), handler, host }
+        Self {
+            workspace,
+            capabilities: config.capabilities.clone(),
+            handler,
+            host,
+            folders,
+            workspace_root: config.workspace_root.clone(),
+        }
     }
 
     pub(crate) fn tool_defs(&self) -> Vec<ToolDef> {
@@ -45,6 +64,13 @@ impl DeviceServer {
     }
 
     async fn run(&self, name: &str, args: Value) -> (bool, String) {
+        // The hub fetching a thread's files: checked first, so no other tool can shadow them.
+        if crate::workspace_files::is_internal(name) {
+            let (root, name) = (self.workspace_root.clone(), name.to_string());
+            return tokio::task::spawn_blocking(move || crate::workspace_files::call(root.as_deref(), &name, &args))
+                .await
+                .unwrap_or_else(|e| (false, e.to_string()));
+        }
         if self.workspace.iter().any(|d| d.name == name) {
             return (false, format!("{name} only runs inside a thread on this device"));
         }
@@ -65,8 +91,14 @@ impl DeviceServer {
 
 impl ServerHandler for DeviceServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build())
-            .with_server_info(Implementation::new("grouper-device", CLIENT_VERSION))
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build())
+            .with_server_info(Implementation::new("grouper-device", CLIENT_VERSION));
+        if self.workspace_root.is_some() && !self.folders.is_empty() {
+            let mut meta = serde_json::Map::new();
+            meta.insert(FOLDERS_META_KEY.into(), serde_json::to_value(self.folders.infos()).unwrap_or_default());
+            info.meta = Some(MetaObject(meta));
+        }
+        info
     }
 
     async fn list_tools(

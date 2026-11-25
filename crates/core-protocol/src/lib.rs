@@ -79,6 +79,77 @@ pub struct DeviceInfo {
     pub capabilities: Vec<ToolSummary>,
     /// Unix seconds when the device was last heard from, if ever.
     pub last_seen: Option<u64>,
+    /// Scoped folders the device last reported (names and modes, never paths).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<FolderInfo>,
+}
+
+/// What threads may do in a device's scoped folder.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderMode {
+    Read,
+    ReadWrite,
+}
+
+impl FolderMode {
+    /// `read`/`ro`/`r` or `read_write`/`rw`/`read-write`, any case.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "read" | "ro" | "r" | "read_only" | "read-only" => Some(Self::Read),
+            "read_write" | "rw" | "read-write" | "readwrite" => Some(Self::ReadWrite),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::ReadWrite => "read_write",
+        }
+    }
+}
+
+/// A scoped folder as a device reports it to the hub: a named root the user allowed
+/// on that device, reached by threads as `@<name>/<path>`. The real path stays on the device.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FolderInfo {
+    pub name: String,
+    pub mode: FolderMode,
+}
+
+/// Folder names: `^[A-Za-z0-9_-]{1,32}$`, matched case-insensitively.
+pub fn valid_folder_name(name: &str) -> bool {
+    (1..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Key in the device MCP server's `initialize` result `_meta` carrying its
+/// [`FolderInfo`] list.
+pub const FOLDERS_META_KEY: &str = "grouper/folders";
+
+/// Device MCP tools only the hub calls (never listed, never offered to threads):
+/// list a thread's workspace (`{thread_id}`) and read one file from it (`{thread_id, path}`).
+pub const WORKSPACE_LIST_TOOL: &str = "grouper_workspace_list";
+pub const WORKSPACE_READ_TOOL: &str = "grouper_workspace_read";
+/// Largest workspace file the hub fetches from a device.
+pub const MAX_WORKSPACE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// One file in a thread's workspace (`path` uses `/`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceFile {
+    pub path: String,
+    pub size: u64,
+}
+
+/// `GET /v1/threads/{id}/files`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceListing {
+    pub thread_id: String,
+    /// Where the files are: the thread's device, or `hub`.
+    pub device_id: String,
+    pub files: Vec<WorkspaceFile>,
+    /// More files exist than were listed.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Device → hub.
@@ -244,6 +315,9 @@ pub struct ThreadSpec {
     pub brief: String,
     pub permissions: HashMap<String, Permission>,
     pub max_turns: u32,
+    /// The device's name as the hub knows it, for approval reasons (`writes to @docs on Laptop`).
+    #[serde(default)]
+    pub device_name: String,
 }
 
 /// What an agent loop did, reported as it happens.
@@ -817,6 +891,23 @@ mod tests {
     }
 
     #[test]
+    fn folders_on_the_wire() {
+        assert_eq!(FolderMode::parse("RW"), Some(FolderMode::ReadWrite));
+        assert_eq!(FolderMode::parse("ro"), Some(FolderMode::Read));
+        assert_eq!(FolderMode::parse("all"), None);
+        let f = FolderInfo { name: "projects".into(), mode: FolderMode::ReadWrite };
+        assert_eq!(serde_json::to_value(&f).unwrap(), serde_json::json!({"name": "projects", "mode": "read_write"}));
+        assert!(valid_folder_name("my-docs_2") && !valid_folder_name("a/b") && !valid_folder_name(""));
+        // Older hubs and devices: no folders, no device name.
+        let d: DeviceInfo = serde_json::from_str(
+            r#"{"id":"d","name":"n","platform":"p","online":true,"capabilities":[],"last_seen":null}"#,
+        )
+        .unwrap();
+        assert!(d.folders.is_empty());
+        assert!(!serde_json::to_string(&d).unwrap().contains("folders"));
+    }
+
+    #[test]
     fn urls() {
         assert_eq!(connect_url("https://hub.example.com/").unwrap(), "wss://hub.example.com/v1/connect");
         assert_eq!(connect_url("http://127.0.0.1:8080").unwrap(), "ws://127.0.0.1:8080/v1/connect");
@@ -868,6 +959,7 @@ mod tests {
                     description: "Chat with Codex".into(),
                 }],
                 last_seen: Some(123),
+                folders: vec![],
             }],
         };
         let value = serde_json::to_value(&msg).unwrap();

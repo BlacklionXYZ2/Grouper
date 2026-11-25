@@ -185,6 +185,11 @@ impl GrouperClient {
                 allow_shell,
                 // GROUPER_MCP_CONFIG, else <config dir>/grouper/mcp.json.
                 mcp_config: None,
+                // GROUPER_FOLDERS_CONFIG, else <config dir>/grouper/folders.json.
+                folders: core_client::folders::load(None, &[]).unwrap_or_else(|e| {
+                    eprintln!("grouper: scoped folders: {e}");
+                    Vec::new()
+                }),
             },
             handler,
             listener,

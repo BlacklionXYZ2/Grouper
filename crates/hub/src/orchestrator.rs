@@ -74,7 +74,11 @@ You'll be woken when a thread finishes, asks you something, or the user steps in
 while the hub does what it can up to a checkpoint, then continues on the device when it reconnects. Tell the user, \
 and ask whether to wait, use another device, or cancel (stop_thread) when it matters.
 - When a thread asks you something, answer it with message_thread (or start another thread to find out first).
-- When results come in, give the user a clear, short summary. Mention files by device and path.
+- When results come in, give the user a clear, short summary. Mention files by device and path. To quote or check \
+a thread's output file, use read_thread_file instead of starting a thread; the user can download files with \
+`grouper files <thread>`.
+- Devices may have scoped folders (list_devices): user-allowed folders outside a thread's workspace, read-only or \
+read-write. Threads reach them as `@<folder>/<path>`; mention the folder in the brief when the work is there.
 - Use list_devices, list_models and list_usage when you need to choose where and with what model to run something.
 - Give start_thread a task_type (code, research, writing, data, ops) and tags such as \"sensitive\" (private data) \
 or \"draft\". Leave model out and the registry chooses by the user's priority rules and past results; if a rule \
@@ -309,6 +313,7 @@ fn orchestrator_tools(hub: &Arc<Hub>, conversation_id: &str) -> Vec<Arc<dyn Tool
         Arc::new(ListDevices(ctx())),
         Arc::new(ListModels(ctx())),
         Arc::new(ListUsage(ctx())),
+        Arc::new(crate::files::ReadThreadFile { hub: hub.clone(), conversation_id: conversation_id.to_string() }),
     ];
     tools.extend(crate::memory::memory_tools(hub, conversation_id));
     tools.extend(crate::registry::registry_tools(hub, conversation_id));
@@ -456,8 +461,9 @@ impl Tool for ListDevices {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "list_devices".into(),
-            description: "List devices (including \"hub\"), whether they're online, and the tools threads can \
-                          use on each with their permission level."
+            description: "List devices (including \"hub\"), whether they're online, the tools threads can \
+                          use on each with their permission level, and each device's scoped folders \
+                          (`@<name>`, read or read_write)."
                 .into(),
             input_schema: json!({"type": "object", "properties": {}}),
         }
@@ -477,7 +483,14 @@ impl Tool for ListDevices {
                 } else {
                     hub.db.tools(Some(&d.id)).into_iter().map(|t| json!({"name": t.name, "permission": t.permission})).collect()
                 };
-                json!({"id": d.id, "name": d.name, "platform": d.platform, "online": d.online, "thread_tools": tools})
+                let mut row =
+                    json!({"id": d.id, "name": d.name, "platform": d.platform, "online": d.online, "thread_tools": tools});
+                if !d.folders.is_empty() {
+                    let folders: Vec<Value> =
+                        d.folders.iter().map(|f| json!({"name": format!("@{}", f.name), "mode": f.mode})).collect();
+                    row["scoped_folders"] = json!(folders);
+                }
+                row
             })
             .collect();
         to_json(list)
