@@ -413,7 +413,7 @@ impl Hub {
             .provider(&model.provider_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("no provider {}", model.provider_id))?;
-        let provider = self.build_provider(&pcfg).map_err(|e| e.to_string())?;
+        let provider = self.build_model_provider(&pcfg, &model.model).map_err(|e| e.to_string())?;
         let ws = Workspace::create(hub_workspace(&self.data_dir, &t.id)).map_err(|e| format!("workspace: {e}"))?;
         let spec = ThreadSpec {
             thread_id: t.id.clone(),
@@ -428,6 +428,7 @@ impl Hub {
             max_turns: MAX_THREAD_TURNS,
             device_name: "Hub".into(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
+            fallback_models: self.free_alternates(&model.provider_id, &model.model),
         };
         let host = Arc::new(HubHost { hub: Arc::downgrade(self) });
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());
@@ -643,8 +644,9 @@ impl Hub {
             max_turns: MAX_THREAD_TURNS,
             device_name: device.clone(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
+            fallback_models: self.free_alternates(&model.provider_id, &model.model),
         };
-        if !self.send_to_conn(&t.device_id, conn_id, HubMessage::StartThread { spec }).await {
+        if !self.send_to_conn(&t.device_id, conn_id, HubMessage::StartThread { spec: Box::new(spec) }).await {
             self.wait_for_device(thread_id, "the device went offline during the hand-over", true).await;
             return Ok(());
         }

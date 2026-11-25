@@ -165,27 +165,34 @@ impl Provider for ViaHub {
 }
 
 /// Build directly on the hosting device; use the hub relay on every other device.
+/// `alternates` are the thread's fallback free models (see [`providers::Fallback`]).
 pub(crate) fn build(
     config: &ProviderConfig,
+    alternates: &[String],
     threads: &Arc<Threads>,
     thread_id: &str,
 ) -> Result<Arc<dyn Provider>, ProviderError> {
     let Some(host) = config.via_device() else {
-        return providers::build(config);
+        return providers::build_with_fallbacks(config, alternates.to_vec());
     };
     let identity = threads.identity.lock().unwrap().clone();
     let local = identity
         .as_ref()
         .is_some_and(|(id, name)| host == id || host.eq_ignore_ascii_case(name));
     if local {
-        providers::build(&config.without_via_device())
+        providers::build_with_fallbacks(&config.without_via_device(), alternates.to_vec())
     } else {
-        Ok(Arc::new(ViaHub {
+        let relay: Arc<dyn Provider> = Arc::new(ViaHub {
             threads: Arc::downgrade(threads),
             provider_id: config.id.clone(),
             host_name: host.to_string(),
             thread_id: thread_id.to_string(),
-        }))
+        });
+        if alternates.is_empty() {
+            Ok(relay)
+        } else {
+            Ok(Arc::new(providers::Fallback::new(relay, config.id.clone(), alternates.to_vec())))
+        }
     }
 }
 

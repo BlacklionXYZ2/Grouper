@@ -249,7 +249,7 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         .provider(&model.provider_id)
         .map_err(|e| e.to_string())
         .and_then(|p| p.ok_or_else(|| format!("no provider {}", model.provider_id)))
-        .and_then(|p| hub.build_provider(&p).map_err(|e| e.to_string()))
+        .and_then(|p| hub.build_model_provider(&p, &model.model).map_err(|e| e.to_string()))
     {
         Ok(p) => p,
         Err(e) => {

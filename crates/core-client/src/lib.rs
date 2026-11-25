@@ -303,7 +303,7 @@ fn start_thread(
     let Some(pcfg) = threads.providers.lock().unwrap().iter().find(|p| p.id == spec.provider_id).cloned() else {
         return fail(format!("This device has no provider {:?}.", spec.provider_id));
     };
-    let provider = match device_provider::build(&pcfg, threads, &id) {
+    let provider = match device_provider::build(&pcfg, &spec.fallback_models, threads, &id) {
         Ok(p) => p,
         Err(e) => return fail(e.to_string()),
     };
@@ -457,7 +457,7 @@ async fn connect_once(
                         *threads.providers.lock().unwrap() = providers;
                     }
                     Ok(HubMessage::StartThread { spec }) => {
-                        start_thread(spec, config, handler, events, &threads, host, folders)
+                        start_thread(*spec, config, handler, events, &threads, host, folders)
                     }
                     Ok(HubMessage::ThreadInput { thread_id, from, text }) => {
                         if let Some(c) = threads.controls.lock().unwrap().get(&thread_id) {
@@ -560,6 +560,7 @@ mod tests {
             max_turns: 5,
             device_name: "Laptop".into(),
             ask_timeout_secs: Some(core_protocol::DEFAULT_ASK_TIMEOUT_SECS),
+            fallback_models: Vec::new(),
         };
         let host: Arc<dyn ThreadHost> = threads.clone();
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());

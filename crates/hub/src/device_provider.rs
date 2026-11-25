@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use core_protocol::{HubMessage, ProviderConfig};
-use providers::{Delta, OnDelta, Provider, ProviderError, Request, Response};
+use providers::{Delta, Fallback, OnDelta, Provider, ProviderError, Request, Response};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -103,6 +103,40 @@ impl Provider for ViaDevice {
 }
 
 impl Hub {
+    /// When `model` is a free model, the other free models on the same provider (same key),
+    /// to swap in when it is rate limited. Empty for paid models: those never change silently.
+    pub(crate) fn free_alternates(&self, provider_id: &str, model: &str) -> Vec<String> {
+        let models = self.db.models();
+        if !models.iter().any(|m| m.provider_id == provider_id && m.model == model && m.free) {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for m in models {
+            if m.provider_id == provider_id && m.free && m.model != model && !out.contains(&m.model) {
+                out.push(m.model);
+            }
+        }
+        out
+    }
+
+    /// [`build_provider`](Self::build_provider) for calls to `model`, swapping in another
+    /// free model on the same provider when a free one is rate limited.
+    pub(crate) fn build_model_provider(
+        self: &Arc<Self>,
+        config: &ProviderConfig,
+        model: &str,
+    ) -> Result<Arc<dyn Provider>, ProviderError> {
+        let alternates = self.free_alternates(&config.id, model);
+        if config.via_device().is_none() {
+            return providers::build_with_fallbacks(config, alternates);
+        }
+        let base = self.build_provider(config)?;
+        if alternates.is_empty() {
+            return Ok(base);
+        }
+        Ok(Arc::new(Fallback::new(base, config.id.clone(), alternates)))
+    }
+
     /// Build a provider for work running on the hub. Device-hosted providers use
     /// [`ViaDevice`]; ordinary providers keep their existing direct path.
     pub(crate) fn build_provider(

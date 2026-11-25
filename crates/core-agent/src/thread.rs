@@ -297,6 +297,7 @@ mod tests {
             max_turns: 4,
             device_name: "Laptop".into(),
             ask_timeout_secs: ask,
+            fallback_models: Vec::new(),
         }
     }
 

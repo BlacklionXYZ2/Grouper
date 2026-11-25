@@ -236,7 +236,7 @@ pub enum HubMessage {
     /// The account's providers and keys, sent on connect and whenever they change.
     Providers { providers: Vec<ProviderConfig> },
     /// Run a subagent thread on this device.
-    StartThread { spec: ThreadSpec },
+    StartThread { spec: Box<ThreadSpec> },
     /// A message for a running thread, from the orchestrator or the user.
     ThreadInput { thread_id: String, from: String, text: String },
     StopThread { thread_id: String },
@@ -386,6 +386,10 @@ pub struct ThreadSpec {
     /// `null` waits forever.
     #[serde(default = "default_ask_timeout_secs")]
     pub ask_timeout_secs: Option<u64>,
+    /// Other free models on the same provider, tried in order when `model` is rate limited
+    /// or unavailable. Empty for paid models. Older hubs don't send it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_models: Vec<String>,
 }
 
 /// How long `ask_orchestrator` waits when the account hasn't changed it.

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod anthropic;
+mod fallback;
 mod openai;
 mod scripted;
 mod sse;
@@ -65,6 +66,7 @@ impl Message {
 }
 
 pub use core_protocol::{ProviderConfig, ToolDef};
+pub use fallback::Fallback;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Request {
@@ -166,14 +168,30 @@ pub trait Provider: Send + Sync {
     }
 }
 
-pub fn build(cfg: &ProviderConfig) -> Result<Arc<dyn Provider>, ProviderError> {
-    let inner: Arc<dyn Provider> = match cfg.kind.as_str() {
+/// The provider itself, without retries.
+fn build_raw(cfg: &ProviderConfig) -> Result<Arc<dyn Provider>, ProviderError> {
+    Ok(match cfg.kind.as_str() {
         "anthropic" => Arc::new(anthropic::Anthropic::new(cfg)?),
         "openai" => Arc::new(openai::OpenAi::new(cfg)?),
         "scripted" => Arc::new(scripted::Scripted::new(cfg)?),
         other => return Err(ProviderError::Config(format!("unknown provider kind {other:?}"))),
-    };
+    })
+}
+
+pub fn build(cfg: &ProviderConfig) -> Result<Arc<dyn Provider>, ProviderError> {
+    let inner = build_raw(cfg)?;
     Ok(Arc::new(Retrying(inner)))
+}
+
+/// Like [`build`], but a model that is rate limited or unavailable is swapped for the
+/// next of `alternates` (same provider, same key) before backing off; see [`Fallback`].
+/// The backoff then retries the whole list.
+pub fn build_with_fallbacks(cfg: &ProviderConfig, alternates: Vec<String>) -> Result<Arc<dyn Provider>, ProviderError> {
+    if alternates.is_empty() {
+        return build(cfg);
+    }
+    let inner = build_raw(cfg)?;
+    Ok(Arc::new(Retrying(Arc::new(Fallback::new(inner, cfg.id.clone(), alternates)))))
 }
 
 /// Retries rate limits, server errors and network failures with backoff.

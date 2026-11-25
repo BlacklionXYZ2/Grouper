@@ -64,17 +64,18 @@ Docker socket, or a separate runner). Yes or no, and if yes, which approach.
 
 ## Housekeeping (no decision needed, just actions)
 
-- **Hub model:** the online hub uses local Gemma through the PC (`deploy/README.md`
-  section 4). It answers only while LM Studio runs on port 45123 and `grouper connect` is
-  running. To add a hosted model, set a key yourself with `grouper keys set` (don't paste
-  keys into chats).
+- **Hub model:** the online hub now uses free OpenRouter models, swapping to another free
+  model when one is rate limited (`deploy/README.md` section 4). LM Studio is stopped and
+  `gemma-local` is removed.
 - **Port 1234:** with Hyper-V on, Windows reserves ports 1228–1327, so LM Studio's default
   port 1234 fails, which likely breaks pi's `lmstudio` provider. Use another port (45123
   works).
 - **Test registrations** on the VM hub ("Oscar CLI", "Hub VM Linux") can be revoked:
   `docker compose -f deploy/compose.yaml exec hub grouper-hub device revoke <id>`.
-  "Gaming PC" is this PC's device token; "Browser" is the web sign-in token.
-- **The sign-in token file** on your desktop (`grouper-sign-in-token.txt`) can be deleted
-  once you've signed in.
+  "Gaming PC" is this PC's device token; "Browser" is the web sign-in token; "Claude admin
+  (PC)" is the admin login Claude uses from this PC's CLI (saved with DPAPI).
+- **The sign-in token file** on your desktop (`grouper-sign-in-token.txt`) also holds the
+  OpenRouter key on its last line. The key is now in the hub's encrypted store, so the
+  file can be deleted once you've signed in.
 - **Back up the master key** (`/secrets/master.key` in the `grouper-secrets` volume)
   somewhere safe; backups don't include it (`deploy/README.md` section 5).

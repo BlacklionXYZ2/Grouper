@@ -159,13 +159,14 @@ impl Hub {
             max_turns: MAX_THREAD_TURNS,
             device_name: device_name.clone(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
+            fallback_models: self.free_alternates(&model.provider_id, &model.model),
         };
 
         if on_hub {
             self.run_on_hub(spec).await;
         } else if !online {
             self.wait_for_device(&info.id, &format!("{device_name} was offline when the thread started"), false).await;
-        } else if !self.send_to(&device_id, HubMessage::StartThread { spec }).await {
+        } else if !self.send_to(&device_id, HubMessage::StartThread { spec: Box::new(spec) }).await {
             self.wait_for_device(&info.id, &format!("{device_name} went offline before the thread started"), false)
                 .await;
         }
@@ -184,7 +185,7 @@ impl Hub {
             Ok(None) => return fail(format!("no provider {}", spec.provider_id)).await,
             Err(error) => return fail(error.to_string()).await,
         };
-        let provider = match self.build_provider(&pcfg) {
+        let provider = match self.build_model_provider(&pcfg, &spec.model) {
             Ok(p) => p,
             Err(e) => return fail(e.to_string()).await,
         };
