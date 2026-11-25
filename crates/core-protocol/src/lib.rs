@@ -320,6 +320,11 @@ pub struct ModelEntry {
     /// Roles this model is the default for: `orchestrator`, `standard`, `thread`.
     #[serde(default)]
     pub roles: Vec<String>,
+    /// Runs on your own hardware, for privacy routing (`require: local` rules). A model
+    /// whose provider's base_url is localhost, 127.0.0.1, ::1 or `*.local` counts as
+    /// local even without this flag.
+    #[serde(default)]
+    pub local: bool,
 }
 
 /// Aggregated metered usage returned by `GET /v1/usage`.
@@ -435,6 +440,139 @@ pub struct MemoryInput {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+}
+
+// ---- model registry learning: outcomes, stats, proposals, priority rules
+
+/// How threads did, for one model or device and one task type (`GET /v1/registry/stats`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct OutcomeStats {
+    /// Model id or device id.
+    pub subject: String,
+    /// `code`, `research`, …; empty for every task type together.
+    pub task_type: String,
+    pub done: u64,
+    pub failed: u64,
+    pub stopped: u64,
+    /// Done, not graded 1–2 by the orchestrator and not rated down by you.
+    pub successes: u64,
+    /// successes / (done + failed); stopped threads don't count. `None` before any.
+    pub success_rate: Option<f64>,
+    pub median_duration_s: Option<f64>,
+    /// USD per thread.
+    pub mean_cost: Option<f64>,
+    /// The orchestrator's 1–5 grades.
+    pub mean_grade: Option<f64>,
+    /// Your thumbs up minus thumbs down.
+    pub net_rating: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct RegistryStats {
+    pub models: Vec<OutcomeStats>,
+    pub devices: Vec<OutcomeStats>,
+}
+
+/// A change to a model's registry row that waits for your approval, so the table
+/// doesn't drift (`GET /v1/registry/proposals`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RegistryProposal {
+    pub id: i64,
+    pub model_id: String,
+    /// Only `use_cases` for now.
+    pub field: String,
+    /// The proposed new value.
+    pub text: String,
+    pub reason: String,
+    /// `pending`, `accepted` or `rejected`.
+    pub status: String,
+    /// `stats` (the hub's automatic check) or `orchestrator`.
+    pub source: String,
+    pub created: u64,
+    pub decided: Option<u64>,
+}
+
+/// What a priority rule does. `when_*` say when it applies (all given must match;
+/// none means always). `require` / `forbid` filter models by `local`, `remote`,
+/// `free` or `paid`; `prefer` (`cheapest`, `local` or `free`) orders what's left.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RuleSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_task_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forbid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<String>,
+}
+
+/// A rule you set for choosing models, e.g. "Sensitive data: local only"
+/// (`GET /v1/registry/rules`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PriorityRule {
+    pub id: i64,
+    pub text: String,
+    pub rule: RuleSpec,
+    pub enabled: bool,
+    pub created: u64,
+}
+
+/// Body of `POST /v1/registry/rules`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RuleInput {
+    pub text: String,
+    pub rule: RuleSpec,
+}
+
+// ---- skills
+
+/// A procedure that worked, saved so similar tasks reuse it instead of re-planning
+/// (`GET /v1/skills`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Skill {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    /// Keywords that should bring it up.
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    /// Markdown: the steps, with which device and model handled each.
+    pub steps: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Models and devices it has worked with.
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub devices: Vec<String>,
+    pub success_count: u64,
+    #[serde(default)]
+    pub last_used: Option<u64>,
+    pub created: u64,
+    pub updated: u64,
+}
+
+/// Body of `PUT /v1/skills/{id}`: fields left out stay as they are; lists replace.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct SkillInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<String>>,
 }
 
 #[cfg(test)]

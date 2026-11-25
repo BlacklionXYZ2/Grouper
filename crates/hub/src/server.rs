@@ -145,7 +145,7 @@ impl Hub {
         }
     }
 
-    fn auth(&self, headers: &HeaderMap) -> Option<Auth> {
+    pub(crate) fn auth(&self, headers: &HeaderMap) -> Option<Auth> {
         let token = headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")?;
         self.db.authenticate(token)
     }
@@ -251,10 +251,12 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/approvals/{id}", post(approval))
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/{id}", put(update_memory).delete(delete_memory))
+        .merge(crate::registry::routes())
+        .merge(crate::skills::routes())
         .with_state(hub)
 }
 
-fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
+pub(crate) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, Json(json!({ "error": msg.to_string() }))).into_response()
 }
 
@@ -813,6 +815,7 @@ mod tests {
             use_cases: String::new(),
             free: true,
             roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
+            local: false,
         })
         .unwrap();
         let hub = Hub::new(db, dir.clone());

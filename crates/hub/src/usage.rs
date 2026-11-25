@@ -412,6 +412,7 @@ mod tests {
             use_cases: String::new(),
             free: false,
             roles: vec![],
+            local: false,
         })
         .unwrap();
         let conversation = db.create_conversation("project", "test").unwrap();

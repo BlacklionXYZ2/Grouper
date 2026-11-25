@@ -68,6 +68,12 @@ when the device is back.
 - When a thread asks you something, answer it with message_thread (or start another thread to find out first).
 - When results come in, give the user a clear, short summary. Mention files by device and path.
 - Use list_devices, list_models and list_usage when you need to choose where and with what model to run something.
+- Give start_thread a task_type (code, research, writing, data, ops) and tags such as \"sensitive\" (private data) \
+or \"draft\". Leave model out and the registry chooses by the user's priority rules and past results; if a rule \
+refuses, tell the user.
+- When a thread's result arrives, grade it with grade_thread (1-5, short note). That's how the registry learns.
+- When list_models stats clearly contradict a model's use cases, suggest new text with propose_use_cases; the user \
+decides.
 - You can't change tool permissions; only the user can.
 
 Memory:
@@ -79,8 +85,13 @@ in this conversation. One self-contained fact per memory. Never store secrets su
 - When a memory turns out wrong or outdated, fix it with update_memory. Remove it with forget, and always when the \
 user asks you to forget something.
 
-Messages in [brackets] are from Grouper (threads finishing, questions, the user stepping in, status, memories), not \
-typed by the user.";
+Skills:
+- After a multi-step task succeeds, save the procedure with save_skill: steps, tools, and the models and devices \
+that handled each step. Matching skills arrive in a [Skills] block; reuse one instead of re-planning when it fits, \
+then update_skill (worked: true, plus what changed).
+
+Messages in [brackets] are from Grouper (threads finishing, questions, the user stepping in, status, memories, \
+skills), not typed by the user.";
 
 const STANDARD_SYSTEM: &str = "You are Grouper, a helpful personal assistant. Answer directly and concisely. \
 A [Memory] block at the end of a message holds notes saved earlier about the user and their projects, added by \
@@ -148,6 +159,12 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     let from = if merged { history.len() - 1 } else { history.len() };
     let recall_query = wakes.iter().map(Wake::recall_text).collect::<Vec<_>>().join("\n");
     if let Some(block) = crate::memory::recall_block(&hub.db, &recall_query, &crate::memory::seen_text(&history)) {
+        text.push_str("\n\n");
+        text.push_str(&block);
+    }
+    if project
+        && let Some(block) = crate::skills::skills_block(&hub.db, &recall_query, &crate::skills::seen_text(&history))
+    {
         text.push_str("\n\n");
         text.push_str(&block);
     }
@@ -263,6 +280,8 @@ fn orchestrator_tools(hub: &Arc<Hub>, conversation_id: &str) -> Vec<Arc<dyn Tool
         Arc::new(ListUsage(ctx())),
     ];
     tools.extend(crate::memory::memory_tools(hub, conversation_id));
+    tools.extend(crate::registry::registry_tools(hub, conversation_id));
+    tools.extend(crate::skills::skill_tools(hub, conversation_id));
     tools
 }
 
@@ -295,7 +314,9 @@ impl Tool for StartThread {
                 "context": {"type": "string", "description": "Everything the thread needs to know; it can't see this chat"},
                 "constraints": {"type": "string"},
                 "expected_output": {"type": "string"},
-                "model": {"type": "string", "description": "Model id from list_models (optional)"},
+                "model": {"type": "string", "description": "Model id from list_models (optional; the registry chooses otherwise)"},
+                "task_type": {"type": "string", "description": "code, research, writing, data or ops"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "e.g. [\"sensitive\"] for private data, [\"draft\"]"},
                 "hub_reason": {"type": "string", "description": "When device is hub: why it runs there (e.g. the target device is offline)"}
             }, "required": ["title", "device", "goal"]}),
         }
@@ -310,6 +331,12 @@ impl Tool for StartThread {
             expected_output: str_arg(&input, "expected_output"),
             model: input.get("model").and_then(Value::as_str).map(String::from),
             hub_reason: input.get("hub_reason").and_then(Value::as_str).map(String::from),
+            task_type: input.get("task_type").and_then(Value::as_str).map(String::from),
+            tags: input
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                .unwrap_or_default(),
         };
         match self.0.hub.start_thread(&self.0.conversation_id, req).await {
             Ok(t) => to_json(json!({"thread_id": t.id, "device": t.device_id, "model": t.model, "status": t.status})),
@@ -419,12 +446,14 @@ impl Tool for ListModels {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "list_models".into(),
-            description: "List registered models with prices (USD per million tokens), use cases and default roles.".into(),
+            description: "List registered models with prices (USD per million tokens), use cases, default roles, \
+                          whether they're local, their stats by task type, and the user's priority rules."
+                .into(),
             input_schema: json!({"type": "object", "properties": {}}),
         }
     }
     async fn call(&self, _input: Value) -> ToolOutput {
-        to_json(self.0.hub.db.models())
+        to_json(crate::registry::models_overview(&self.0.hub.db))
     }
 }
 

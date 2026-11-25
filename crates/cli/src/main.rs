@@ -107,6 +107,56 @@ enum Cmd {
     /// Long-term memory about you and your projects, shared by every conversation.
     #[command(subcommand)]
     Memory(MemoryCmd),
+    /// Rate a finished thread's result: grouper rate <thread> up|down|clear
+    Rate { thread: String, rating: String },
+    /// Priority rules for choosing models, e.g. "Sensitive data: local only".
+    #[command(subcommand)]
+    Rules(RulesCmd),
+    /// Saved skills: procedures that worked, reused for similar tasks.
+    #[command(subcommand)]
+    Skills(SkillsCmd),
+}
+
+#[derive(Subcommand)]
+enum RulesCmd {
+    List,
+    /// grouper rules add "Sensitive data: local only" --when-tag sensitive --require local
+    Add {
+        text: String,
+        /// Applies when a thread has this tag
+        #[arg(long)]
+        when_tag: Option<String>,
+        /// Applies to this task type (code, research, writing, data, ops)
+        #[arg(long)]
+        when_task_type: Option<String>,
+        /// Only models that are: local, remote, free or paid
+        #[arg(long)]
+        require: Option<String>,
+        /// No models that are: local, remote, free or paid
+        #[arg(long)]
+        forbid: Option<String>,
+        /// Order models: cheapest, local or free
+        #[arg(long)]
+        prefer: Option<String>,
+    },
+    Remove { id: i64 },
+    Enable { id: i64 },
+    Disable { id: i64 },
+}
+
+#[derive(Subcommand)]
+enum SkillsCmd {
+    /// List skills, most recently changed first, or search them.
+    List {
+        #[arg(long, short)]
+        search: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Print a skill's steps and where it worked.
+    Show { id: i64 },
+    /// Delete a skill.
+    Forget { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -199,8 +249,22 @@ enum ModelsCmd {
         context_window: u64,
         #[arg(long, default_value = "")]
         use_cases: String,
+        /// Runs on your own hardware (for "sensitive → local" priority rules)
+        #[arg(long)]
+        local: bool,
     },
     Remove { id: String },
+    /// How threads went per model and device, by task type.
+    Stats,
+    /// Use-case changes the hub or orchestrator proposed, waiting for you.
+    Proposals {
+        /// Include accepted and rejected ones.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Accept a proposal: the model's use cases become the proposed text.
+    Accept { id: i64 },
+    Reject { id: i64 },
 }
 
 struct CliTools;
@@ -663,15 +727,19 @@ async fn main() -> Result<()> {
         Cmd::Models(ModelsCmd::List) => {
             for m in api.get::<Vec<ModelEntry>>("/v1/models").await? {
                 println!(
-                    "{:<16} {:<12} {:<28} ${}/${} {}{}",
+                    "{:<16} {:<12} {:<28} ${}/${} {}{}{}",
                     m.id,
                     m.provider_id,
                     m.model,
                     m.input_price,
                     m.output_price,
                     if m.free { "free " } else { "" },
+                    if m.local { "local " } else { "" },
                     m.roles.join(",")
                 );
+                if !m.use_cases.is_empty() {
+                    println!("{:<16} use cases: {}", "", m.use_cases);
+                }
             }
         }
         Cmd::Models(ModelsCmd::Add {
@@ -686,6 +754,7 @@ async fn main() -> Result<()> {
             cache_write_price,
             context_window,
             use_cases,
+            local,
         }) => {
             let entry = ModelEntry {
                 id: id.clone(),
@@ -699,6 +768,7 @@ async fn main() -> Result<()> {
                 use_cases,
                 free,
                 roles: roles.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
+                local,
             };
             api.put(&format!("/v1/models/{id}"), &entry).await?;
             println!("saved model {id}");
@@ -709,6 +779,145 @@ async fn main() -> Result<()> {
         }
         Cmd::Usage(args) => usage::run(&api, args).await?,
         Cmd::Memory(cmd) => memory_cmd(&api, cmd).await?,
+        Cmd::Models(cmd @ (ModelsCmd::Stats | ModelsCmd::Proposals { .. } | ModelsCmd::Accept { .. } | ModelsCmd::Reject { .. })) => {
+            registry_cmd(&api, cmd).await?
+        }
+        Cmd::Rate { thread, rating } => {
+            api.post(&format!("/v1/threads/{thread}/rating"), &json!({"rating": rating})).await?;
+            println!("rated {thread}: {rating}");
+        }
+        Cmd::Rules(cmd) => rules_cmd(&api, cmd).await?,
+        Cmd::Skills(cmd) => skills_cmd(&api, cmd).await?,
+    }
+    Ok(())
+}
+
+async fn registry_cmd(api: &Api, cmd: ModelsCmd) -> Result<()> {
+    use core_client::core_protocol::{OutcomeStats, RegistryProposal, RegistryStats};
+    let print_proposal = |p: &RegistryProposal| {
+        println!("#{:<4} {:<9} {:<16} ({}) {}", p.id, p.status, p.model_id, p.source, p.text);
+        println!("      why: {}", p.reason);
+    };
+    match cmd {
+        ModelsCmd::Stats => {
+            let s: RegistryStats = api.get("/v1/registry/stats").await?;
+            let print = |title: &str, rows: &[OutcomeStats]| {
+                println!("{title}:");
+                if rows.is_empty() {
+                    println!("  no finished threads yet");
+                }
+                for r in rows {
+                    let what = if r.task_type.is_empty() { "(all)" } else { r.task_type.as_str() };
+                    let rate = r.success_rate.map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "-".into());
+                    let grade = r.mean_grade.map(|g| format!("{g:.1}")).unwrap_or_else(|| "-".into());
+                    let cost = r.mean_cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "-".into());
+                    let time = r.median_duration_s.map(|d| format!("{d:.0}s")).unwrap_or_else(|| "-".into());
+                    println!(
+                        "  {:<16} {:<10} {:>3}/{:<3} ok {:>5}  stopped {:<2} grade {:<4} {:<9} median {:<6} rating {:+}",
+                        r.subject,
+                        what,
+                        r.successes,
+                        r.done + r.failed,
+                        rate,
+                        r.stopped,
+                        grade,
+                        cost,
+                        time,
+                        r.net_rating
+                    );
+                }
+            };
+            print("models", &s.models);
+            print("devices", &s.devices);
+        }
+        ModelsCmd::Proposals { all } => {
+            let q = if all { "?status=all" } else { "" };
+            let list: Vec<RegistryProposal> = api.get(&format!("/v1/registry/proposals{q}")).await?;
+            if list.is_empty() {
+                println!("no {}proposals", if all { "" } else { "pending " });
+            }
+            for p in &list {
+                print_proposal(p);
+            }
+        }
+        ModelsCmd::Accept { id } | ModelsCmd::Reject { id } => {
+            let accept = matches!(cmd, ModelsCmd::Accept { .. });
+            let p: RegistryProposal =
+                serde_json::from_value(api.post(&format!("/v1/registry/proposals/{id}"), &json!({"accept": accept})).await?)?;
+            print_proposal(&p);
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+async fn rules_cmd(api: &Api, cmd: RulesCmd) -> Result<()> {
+    use core_client::core_protocol::{PriorityRule, RuleInput, RuleSpec};
+    let print = |r: &PriorityRule| {
+        let spec = serde_json::to_string(&r.rule).unwrap_or_default();
+        println!("#{:<4} {:<8} {}  {spec}", r.id, if r.enabled { "on" } else { "off" }, r.text);
+    };
+    match cmd {
+        RulesCmd::List => {
+            let list: Vec<PriorityRule> = api.get("/v1/registry/rules").await?;
+            if list.is_empty() {
+                println!("no rules");
+            }
+            for r in &list {
+                print(r);
+            }
+        }
+        RulesCmd::Add { text, when_tag, when_task_type, require, forbid, prefer } => {
+            let rule = RuleSpec { when_tag, when_task_type, require, forbid, prefer };
+            let r: PriorityRule = serde_json::from_value(api.post("/v1/registry/rules", &RuleInput { text, rule }).await?)?;
+            print!("added ");
+            print(&r);
+        }
+        RulesCmd::Remove { id } => {
+            api.delete(&format!("/v1/registry/rules/{id}")).await?;
+            println!("removed rule #{id}");
+        }
+        RulesCmd::Enable { id } | RulesCmd::Disable { id } => {
+            let enabled = matches!(cmd, RulesCmd::Enable { .. });
+            api.post(&format!("/v1/registry/rules/{id}"), &json!({"enabled": enabled})).await?;
+            println!("rule #{id} {}", if enabled { "on" } else { "off" });
+        }
+    }
+    Ok(())
+}
+
+async fn skills_cmd(api: &Api, cmd: SkillsCmd) -> Result<()> {
+    use core_client::core_protocol::Skill;
+    match cmd {
+        SkillsCmd::List { search, limit } => {
+            let mut params = vec![("limit", limit.to_string())];
+            if let Some(q) = search {
+                params.push(("q", q));
+            }
+            let url = reqwest::Url::parse_with_params("http://hub/v1/skills", &params)?;
+            let list: Vec<Skill> = api.get(&format!("/v1/skills?{}", url.query().unwrap_or(""))).await?;
+            if list.is_empty() {
+                println!("no skills");
+            }
+            for s in &list {
+                println!("#{:<5} {:<32} worked {:<3} {}", s.id, s.name, s.success_count, s.description.replace('\n', " "));
+            }
+        }
+        SkillsCmd::Show { id } => {
+            let s: Skill = api.get(&format!("/v1/skills/{id}")).await?;
+            println!("#{} {}\n{}\n", s.id, s.name, s.description);
+            println!("{}\n", s.steps);
+            for (what, list) in [("triggers", &s.triggers), ("tools", &s.tools), ("models", &s.models), ("devices", &s.devices)] {
+                if !list.is_empty() {
+                    println!("{what}: {}", list.join(", "));
+                }
+            }
+            println!("worked {} time(s)", s.success_count);
+        }
+        SkillsCmd::Forget { id } => {
+            api.delete(&format!("/v1/skills/{id}")).await?;
+            println!("forgot skill #{id}");
+        }
     }
     Ok(())
 }

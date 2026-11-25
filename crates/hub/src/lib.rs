@@ -1,7 +1,9 @@
 pub mod db;
 pub mod memory;
 pub mod orchestrator;
+pub mod registry;
 pub mod secrets;
 pub mod server;
+pub mod skills;
 pub mod threads;
 pub mod usage;

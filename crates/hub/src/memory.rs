@@ -605,6 +605,7 @@ mod tests {
             use_cases: String::new(),
             free: true,
             roles: vec!["orchestrator".into(), "standard".into()],
+            local: false,
         })
         .unwrap();
         let cat = db.add_memory("Oscar's cat is called Miso.", &[], None).unwrap();

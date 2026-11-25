@@ -24,6 +24,10 @@ pub struct ThreadRequest {
     pub expected_output: String,
     pub model: Option<String>,
     pub hub_reason: Option<String>,
+    /// Kind of work (`code`, `research`, `writing`, `data`, `ops`), for model choice and stats.
+    pub task_type: Option<String>,
+    /// e.g. `sensitive`, `draft`: priority rules match on these.
+    pub tags: Vec<String>,
 }
 
 pub const MAX_THREAD_TURNS: u32 = 40;
@@ -87,16 +91,16 @@ impl Hub {
                  so the work is ready when {device_name} is back."
             ));
         }
-        let model = match &req.model {
-            Some(m) => self.db.find_model(m).ok_or_else(|| format!("no model {m:?} in the registry"))?,
-            None => self.db.default_model("thread").ok_or("no models registered")?,
-        };
-        let reason = req.hub_reason.clone().filter(|_| on_hub);
+        let route = self.db.route_model(req.model.as_deref(), req.task_type.as_deref(), &req.tags)?;
+        let model = route.model;
+        let reason = [req.hub_reason.clone().filter(|_| on_hub), route.reason].into_iter().flatten().collect::<Vec<_>>();
+        let reason = (!reason.is_empty()).then(|| reason.join("; "));
         let brief = render_brief(&req);
         let info = self
             .db
             .create_thread(conversation_id, req.title.trim(), &device_id, &model.id, reason.as_deref(), &brief)
             .map_err(|e| e.to_string())?;
+        self.db.set_thread_meta(&info.id, req.task_type.as_deref().unwrap_or_default(), &req.tags);
         self.emit(
             conversation_id,
             Some(&info.id),
@@ -193,6 +197,7 @@ impl Hub {
         if !self.db.finish_thread(thread_id, status, summary) {
             return;
         }
+        self.db.record_outcome(thread_id);
         self.clear_approvals(thread_id).await;
         let Some(t) = self.db.thread(thread_id) else { return };
         self.emit(
@@ -298,6 +303,7 @@ impl Hub {
         if !self.db.finish_thread(thread_id, "stopped", &summary) {
             return Err(format!("thread {} is already {}", t.id, t.status));
         }
+        self.db.record_outcome(thread_id);
         self.clear_approvals(thread_id).await;
         if t.device_id == HUB_DEVICE {
             if let Some(c) = self.hub_threads.lock().await.get(&t.id) {

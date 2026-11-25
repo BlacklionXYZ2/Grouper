@@ -60,6 +60,9 @@ enum Cmd {
         cache_read_price: Option<f64>,
         #[arg(long)]
         cache_write_price: Option<f64>,
+        /// Runs on your own hardware (for "sensitive → local" priority rules).
+        #[arg(long)]
+        local: bool,
     },
 }
 
@@ -155,6 +158,7 @@ async fn main() -> Result<()> {
             output_price,
             cache_read_price,
             cache_write_price,
+            local,
         } => {
             db.upsert_model(&ModelEntry {
                 id: id.clone(),
@@ -168,6 +172,7 @@ async fn main() -> Result<()> {
                 use_cases: String::new(),
                 free,
                 roles: roles.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
+                local,
             })?;
             println!("Saved model {id}.");
         }

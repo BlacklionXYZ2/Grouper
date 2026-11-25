@@ -137,10 +137,10 @@ fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
         use_cases: r.get(8)?,
         free: r.get::<_, i64>(9)? != 0,
         roles: roles.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
+        local: r.get::<_, i64>(11)? != 0,
     })
 }
-const MODEL_COLS: &str = "id, provider_id, model, input_price, output_price, cache_read_price, cache_write_price, \
-                          context_window, use_cases, free, roles";
+const MODEL_COLS: &str = "id, provider_id, model, input_price, output_price, cache_read_price, cache_write_price,                           context_window, use_cases, free, roles, local";
 
 fn migrate_provider_secrets(conn: &mut Connection, secrets: &Secrets) -> Result<()> {
     let tx = conn.transaction()?;
@@ -174,6 +174,8 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(crate::memory::SCHEMA)?;
+    crate::registry::migrate(&conn)?;
+    conn.execute_batch(crate::skills::SCHEMA)?;
     // Databases made before admin tokens: every existing token becomes a plain
     // device token; grant admin with `grouper-hub device admin <id>`.
     let has_admin: bool = conn
@@ -427,8 +429,8 @@ impl Db {
         }
         self.c().execute(
             "INSERT OR REPLACE INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
-               cache_write_price, context_window, use_cases, free, roles)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+               cache_write_price, context_window, use_cases, free, roles, local)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 m.id,
                 m.provider_id,
@@ -440,7 +442,8 @@ impl Db {
                 m.context_window as i64,
                 m.use_cases,
                 m.free,
-                m.roles.join(",")
+                m.roles.join(","),
+                m.local
             ],
         )?;
         Ok(())
@@ -823,6 +826,7 @@ mod tests {
             use_cases: String::new(),
             free,
             roles: roles.iter().map(|s| s.to_string()).collect(),
+            local: false,
         };
         db.upsert_model(&m("big", false, &["orchestrator"])).unwrap();
         db.upsert_model(&m("free", true, &[])).unwrap();
@@ -876,6 +880,7 @@ mod tests {
                 use_cases: String::new(),
                 free: false,
                 roles: vec![],
+                local: false,
             })
             .unwrap();
         }
