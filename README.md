@@ -138,8 +138,8 @@ Grouper sets each agent's own safety option (Codex `workspace-write`, Claude Cod
 `acceptEdits`, Antigravity accept-edits without all tools, Cursor sandbox on) and runs it in
 the thread's workspace. A call asks you first when it would leave the workspace, asks for
 a bypass mode, or contains clearly destructive instructions. Set the tool to **Bypass** and
-the agent runs in its own bypass mode too. Hermes, Grok and opencode have no safety option,
-so they run unconfined even on Auto.
+the agent runs in its own bypass mode too. Hermes, Grok, opencode (and pi with all its
+tools) can't be confined to a folder, so on Auto each of their chat calls asks you first.
 
 ## Notes
 
