@@ -13,7 +13,8 @@ threads. The overall project is in `Grouper — Proposal v3.docx`.
 | Model | Registry default for `orchestrator` | Registry default for `standard`: a free model or key if one is registered |
 | Good for | Real work across devices and models | Short questions and one-off chats, without spending your paid usage |
 
-Both modes share the account's memory and history (memory itself comes later).
+Both modes share the account's long-term memory: relevant memories are added to each turn
+automatically (see "Memory and skills" below).
 
 Project chat works like Claude's projects: one conversation with the orchestrator,
 and every delegated task becomes a **thread** you can watch in a side panel.
@@ -111,28 +112,56 @@ replies, thread started / text / tool call / tool result / finished, approvals,
 usage. Clients receive events live over their WebSocket and can fetch history over
 HTTP, so every device shows the same chat and thread panel.
 
-## First version (built)
+## Memory and skills
 
-In: providers (Anthropic, OpenAI-compatible, plus a scripted fake model for tests);
-the loop engine; project chat with asynchronous threads; standard chat; threads on
-devices and on the hub; file and shell tools; the tool registry with
-Manual/Auto/Bypass and approvals; account keys synced to devices; model registry;
-SQLite event log; `grouper chat`, `threads`, `approve`, `keys`, `tools` in the CLI.
+- **Memory** lives in the hub (SQLite with full-text search). The orchestrator has
+  `remember`, `recall`, `update_memory` and `forget`; each turn's text is searched and up
+  to six matching memories are appended to that turn as a `[Memory]` block (old messages are
+  never rewritten, so caching still works). Standard chat gets the recall only. You manage
+  memories with `grouper memory`.
+- **Skills** are procedures the orchestrator saves after a successful task (`save_skill`):
+  steps, tools, and the models and devices that did them. The two best matches for a turn
+  are offered as a `[Skills]` block.
 
-Out (later): external harness threads, memory and skills, learning, the
-offline-device question/timeout flow, streaming text token by token, sandboxing
-hub threads in containers (hub threads get file tools only until then), keys in
-the OS keychain on devices, encrypted keys at rest on the hub, the Swift chat UI,
-and a web client.
+## Model registry learning
 
-## Known gaps in the first version
+- Every finished thread records an outcome: model, device, task type, status, duration,
+  cost, the orchestrator's grade (`grade_thread`) and your rating (`grouper rate`).
+- Stats per model, device and task type feed model choice: when the orchestrator doesn't
+  name a model, priority rules filter first (e.g. "sensitive → local only", which can
+  refuse), then proven models for the task type win. The reason is recorded on the thread.
+- When stats clearly disagree with a model's use cases, the hub (or the orchestrator)
+  proposes new text; you accept or reject it (`grouper models proposals`), so the table
+  doesn't drift.
 
-- Text arrives per model turn, not token by token.
+## Accounting
+
+Every model call records tokens and an estimated cost (cache-aware, per provider kind or
+the model's own cache prices). `grouper usage` totals them by day, provider, model or
+conversation; OpenRouter and DeepSeek balances are polled hourly. The orchestrator can read
+recent totals with `list_usage`.
+
+## Built so far
+
+Providers (Anthropic, OpenAI-compatible, scripted) with token streaming; the loop engine;
+project chat with asynchronous threads; standard chat; threads on devices and the hub; file
+and shell tools (PowerShell on Windows); the tool registry with Manual/Auto/Bypass and
+approvals; account keys encrypted at rest and synced to devices; device tokens stored with
+the OS (`grouper login`); memory, skills, registry learning and priority rules; usage and
+cost reporting.
+
+Next: MCP everywhere ([mcp.md](mcp.md)), with the subagent-chat CLI agents as default
+device tools. Later: the offline-device checkpoint flow, limits on threads and spending,
+sandboxing hub threads (file tools only until then), the Swift apps, and a web client.
+
+## Known gaps
+
 - A thread on a device that disconnects is marked failed; it isn't resumed.
 - Approvals have no timeout; a thread waits until you answer or stop it.
 - No limit yet on how many threads run at once, or on spending.
-- Thread usage is shown in `grouper chat`; the orchestrator's own usage is recorded on the
-  hub but there's no command to show totals yet.
+- Auto's shell rules are a blocklist: they ask more than needed for ordinary words, and
+  obfuscated commands can get past them. Use Manual for shells you don't trust.
+- Model routing judges "local" from the hub's view of a provider URL, not the device's.
 
 ## Open questions
 
