@@ -1,3 +1,5 @@
+mod backup;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -39,6 +41,23 @@ enum Cmd {
         /// JSON options, e.g. '{"script": "/path/script.json"}'
         #[arg(long)]
         options: Option<String>,
+    },
+    /// Write a consistent snapshot of the database and thread workspaces (works while the hub
+    /// runs). The master key is not included: keep it, or GROUPER_MASTER_KEY, separately.
+    Backup {
+        /// Directory to create, or a path ending in `.tar.gz` / `.tgz`.
+        output: PathBuf,
+        /// Copy `<data>/workspaces` (pass `--include-workspaces=false` to skip it).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        include_workspaces: bool,
+    },
+    /// Restore a snapshot made by `backup` into the data directory.
+    Restore {
+        /// Directory or `.tar.gz` file produced by `backup`.
+        backup: PathBuf,
+        /// If the data directory already has hub files, move them aside (never deleted) and restore.
+        #[arg(long)]
+        force: bool,
     },
     /// Add or update a model in the registry.
     Model {
@@ -97,9 +116,18 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
+    // Backup and restore must not open the database through `Db::open`: that migrates, seals keys
+    // and can create a master key. A snapshot has to work while `serve` is running, and a restore
+    // must not create an empty database before it decides the directory is empty.
+    match &cli.cmd {
+        Cmd::Backup { output, include_workspaces } => return backup::backup(&cli.data, output, *include_workspaces),
+        Cmd::Restore { backup, force } => return backup::restore(&cli.data, backup, *force),
+        _ => {}
+    }
     let db = Db::open(&cli.data)?;
 
     match cli.cmd {
+        Cmd::Backup { .. } | Cmd::Restore { .. } => unreachable!("handled before opening the database"),
         Cmd::Serve { bind } => {
             let hub = server::Hub::new(db, cli.data.clone());
             // Threads waiting for a device keep waiting; a hub part that was running stops at once.
@@ -181,4 +209,36 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn include_workspaces_flag_parses_false() {
+        let cli =
+            Cli::try_parse_from(["grouper-hub", "--data", "hub-data", "backup", "--include-workspaces=false", "out.tar.gz"])
+                .unwrap();
+        match cli.cmd {
+            Cmd::Backup { include_workspaces, output } => {
+                assert!(!include_workspaces);
+                assert_eq!(output.as_os_str(), "out.tar.gz");
+            }
+            _ => panic!("expected backup"),
+        }
+        assert_eq!(cli.data.as_os_str(), "hub-data");
+    }
+
+    #[test]
+    fn restore_force_flag_parses() {
+        let cli = Cli::try_parse_from(["grouper-hub", "restore", "snap.tar.gz", "--force"]).unwrap();
+        match cli.cmd {
+            Cmd::Restore { force, backup } => {
+                assert!(force);
+                assert_eq!(backup.as_os_str(), "snap.tar.gz");
+            }
+            _ => panic!("expected restore"),
+        }
+    }
 }
