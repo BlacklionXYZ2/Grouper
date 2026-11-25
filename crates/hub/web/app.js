@@ -6,12 +6,16 @@
 //   #/chat/<id>            a conversation
 //   #/chat/<id>/thread/<t> a conversation with a thread open in the inspector
 //   #/threads #/devices #/devices/<id> #/models #/usage #/memory #/skills #/settings #/more
+//
+// The shell (sidebar, tab bar) is built once per sign-in and updated in place, so
+// focus and scroll survive the live updates. Everything it subscribes to is torn
+// down on sign-out.
 
-import { h, icon, setChildren } from './lib/dom.js';
+import { h, icon, setChildren, syncList, setText, setAttr } from './lib/dom.js';
 import { get, onApiError } from './lib/api.js';
 import { store, on, emit, pendingApprovals } from './lib/store.js';
 import { startLive, stopLive, loadConversations, loadThreads, loadDevices, loadModels, scanApprovals } from './lib/live.js';
-import { closeDrawer, navigate } from './lib/ui.js';
+import { closeDrawer, navigate, syncInert } from './lib/ui.js';
 import { ago, isActive } from './lib/format.js';
 import { renderLogin } from './views/login.js';
 import { renderChat } from './views/chat.js';
@@ -30,10 +34,12 @@ const root = document.getElementById('app');
 const LAST_CONV = 'grouper.lastConversation';
 
 let els = null; // shell elements
+let shellAbort = null; // listeners and subscriptions of this sign-in
 let mainKey = null;
 let mainCleanup = null;
 let inspectorKey = null;
 let inspectorCleanup = null;
+let inspectorOpener = null;
 let started = false;
 
 export function applyTheme() {
@@ -63,7 +69,7 @@ async function boot() {
     }
     setChildren(
       root,
-      h('div', { class: 'login' }, h('div', { class: 'login-card glass' }, h('h1', null, "Can't reach the hub"), h('p', null, e.message), h('button', { class: 'btn btn-primary', onclick: () => location.reload() }, 'Try again'))),
+      h('div', { class: 'login' }, h('div', { class: 'login-card' }, h('h1', null, "Can't reach the hub"), h('p', null, e.message), h('button', { class: 'btn btn-primary', onclick: () => location.reload() }, 'Try again'))),
     );
     root.removeAttribute('aria-busy');
     return;
@@ -85,14 +91,15 @@ function startApp() {
   root.removeAttribute('aria-busy');
   buildShell();
   if (!started) {
+    // Once per page: these outlive sign-outs and check `store.me` themselves.
     started = true;
     window.addEventListener('hashchange', route);
     onApiError((e) => {
       if (e.status === 401 && store.me) signedOut();
     });
-    setInterval(() => {
-      if (store.online && store.me) loadDevices().catch(() => {});
-    }, 30000);
+    on('session_ended', () => {
+      if (store.me) signedOut();
+    });
   }
   startLive();
   Promise.allSettled([
@@ -117,39 +124,80 @@ function startApp() {
 export function signedOut() {
   stopLive();
   store.me = null;
-  mainKey = null;
-  inspectorKey = null;
   mainCleanup?.();
   inspectorCleanup?.();
   mainCleanup = inspectorCleanup = null;
+  mainKey = null;
+  inspectorKey = null;
+  teardownShell();
   showLogin();
 }
 
 // ---- shell
 
+function teardownShell() {
+  shellAbort?.abort();
+  shellAbort = null;
+  els = null;
+}
+
 function buildShell() {
-  const sidebar = h('aside', { class: 'sidebar glass', 'aria-label': 'Navigation' });
-  const main = h('main', { class: 'main', id: 'main' });
+  teardownShell();
+  shellAbort = new AbortController();
+  const { signal } = shellAbort;
+
+  const skip = h(
+    'a',
+    {
+      class: 'skip-link',
+      href: '#main',
+      onclick: (e) => {
+        // The hash is the router's, so move focus by hand.
+        e.preventDefault();
+        focusMain();
+      },
+    },
+    'Skip to main content',
+  );
+  const sidebar = h('aside', { class: 'sidebar glass', id: 'sidebar', 'aria-label': 'Navigation' });
+  const main = h('main', { class: 'main', id: 'main', tabindex: '-1' });
   const inspector = h('aside', { class: 'inspector', 'aria-label': 'Thread', hidden: true });
   const inspectorScrim = h('div', { class: 'inspector-scrim', hidden: true, onclick: closeInspector });
-  const drawerScrim = h('div', { class: 'drawer-scrim', hidden: true, onclick: closeDrawer });
+  const drawerScrim = h('div', { class: 'drawer-scrim', hidden: true, onclick: () => closeDrawer({ restoreFocus: true }) });
   const tabbar = h('nav', { class: 'tabbar glass', 'aria-label': 'Tabs' });
   const offline = h('div', { class: 'offline-pill glass', role: 'status', hidden: true }, icon('offline'), h('span', null, 'Offline. Showing the last copy; reconnecting…'));
-  const shell = h('div', { class: 'shell' }, sidebar, drawerScrim, main, inspectorScrim, inspector, tabbar, offline);
+  const shell = h('div', { class: 'shell' }, skip, sidebar, drawerScrim, main, inspectorScrim, inspector, tabbar, offline);
   setChildren(root, shell);
   els = { shell, sidebar, main, inspector, inspectorScrim, tabbar, offline };
+  buildNav();
 
-  for (const topic of ['conversations', 'threads', 'approvals', 'online', 'devices', 'route']) on(topic, renderNav);
-  on('online', (online) => {
-    els.offline.hidden = online || !store.everOnline;
+  const subs = ['conversations', 'threads', 'approvals', 'online', 'route'].map((topic) => on(topic, scheduleNav));
+  subs.push(
+    on('online', (online) => {
+      if (els) els.offline.hidden = online || !store.everOnline;
+    }),
+  );
+  signal.addEventListener('abort', () => {
+    subs.forEach((off) => off());
+    cancelAnimationFrame(navFrame);
+    navFrame = 0;
   });
   renderNav();
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !document.querySelector('dialog[open]')) {
-      if (els.shell.classList.contains('drawer-open')) closeDrawer();
+  syncInert();
+  document.addEventListener(
+    'keydown',
+    (e) => {
+      if (e.key !== 'Escape' || document.querySelector('dialog[open]') || !els) return;
+      if (els.shell.classList.contains('drawer-open')) closeDrawer({ restoreFocus: true });
       else if (!els.inspector.hidden) closeInspector();
-    }
-  });
+    },
+    { signal },
+  );
+}
+
+function focusMain() {
+  const target = els?.main.querySelector('h1') || els?.main;
+  target?.focus({ preventScroll: true });
 }
 
 function closeInspector() {
@@ -166,64 +214,54 @@ function needsYouCount() {
   return store.approvals.size + waiting;
 }
 
-function renderNav() {
-  if (!els) return;
-  const r = parseRoute();
-  const navLink = (href, label, iconName, current, badge) =>
-    h(
-      'a',
-      { class: 'side-item', href, 'aria-current': current ? 'page' : null },
-      icon(iconName),
-      h('span', { class: 'label' }, label),
-      badge ? h('span', { class: 'count', 'aria-label': `${badge} waiting` }, String(badge)) : null,
-    );
+// The navigation is built once (buildNav) and updated in place (renderNav).
+let nav = null;
+let navFrame = 0;
 
-  // Chats, newest first.
-  const chats = store.conversations.length
-    ? h(
-        'ul',
-        { class: 'side-list' },
-        store.conversations.slice(0, 50).map((c) =>
-          h(
-            'li',
-            null,
-            h(
-              'a',
-              { class: 'side-item', href: `#/chat/${encodeURIComponent(c.id)}`, 'aria-current': r.view === 'chat' && r.conversation === c.id ? 'page' : null },
-              h('span', { class: 'label' }, h('span', { class: 'title' }, c.title || 'Untitled'), h('span', { class: 'sub' }, `${c.mode === 'standard' ? 'Standard' : 'Project'} · ${ago(c.created)}`)),
-            ),
-          ),
-        ),
-      )
-    : h('p', { class: 'side-empty' }, 'No conversations yet.');
+function scheduleNav() {
+  if (navFrame) return;
+  navFrame = requestAnimationFrame(() => {
+    navFrame = 0;
+    renderNav();
+  });
+}
 
-  // Threads that need you, then running.
-  const approvalsByThread = new Set(pendingApprovals().map((a) => a.thread_id));
-  const active = [...store.threads.values()]
-    .filter((t) => isActive(t.status) || approvalsByThread.has(t.id))
-    .sort((a, b) => rank(a, approvalsByThread) - rank(b, approvalsByThread) || b.created - a.created)
-    .slice(0, 6);
-  const threads = active.length
-    ? h(
-        'ul',
-        { class: 'side-list' },
-        active.map((t) => {
-          const needs = approvalsByThread.has(t.id);
-          return h(
-            'li',
-            null,
-            h(
-              'a',
-              { class: 'side-item', href: `#/chat/${encodeURIComponent(t.conversation_id)}/thread/${encodeURIComponent(t.id)}`, 'aria-current': r.thread === t.id ? 'page' : null },
-              icon(needs ? 'shield' : t.status === 'waiting_device' ? 'offline' : 'threads'),
-              h('span', { class: 'label' }, h('span', { class: 'title' }, t.title), h('span', { class: 'sub' }, needs ? 'Needs approval' : t.status === 'waiting_device' ? 'Waiting for device' : 'Running')),
-            ),
-          );
-        }),
-      )
-    : h('p', { class: 'side-empty' }, 'Nothing running.');
+function countBadge(label) {
+  return h('span', { class: 'count', hidden: true, 'data-label': label });
+}
 
-  const approvals = pendingApprovals();
+function setBadge(badge, n) {
+  badge.hidden = !n;
+  setText(badge, n ? String(n) : '');
+  setAttr(badge, 'aria-label', n ? `${n} ${badge.dataset.label}` : null);
+}
+
+function buildNav() {
+  const footLink = (href, label, iconName, view, badgeLabel) => {
+    const badge = badgeLabel ? countBadge(badgeLabel) : null;
+    const a = h('a', { class: 'side-item', href }, icon(iconName), h('span', { class: 'label' }, label), badge);
+    return { a, view, badge };
+  };
+  const approvalsBtn = h(
+    'button',
+    { class: 'banner warn', type: 'button', hidden: true, onclick: () => openApproval(pendingApprovals()[0]?.approval_id) },
+    icon('shield'),
+    h('span', { class: 'grow' }),
+    icon('chevron'),
+  );
+  const chatList = h('ul', { class: 'side-list' });
+  const chatEmpty = h('p', { class: 'side-empty' }, 'No conversations yet.');
+  const threadList = h('ul', { class: 'side-list' });
+  const threadEmpty = h('p', { class: 'side-empty' }, 'Nothing running.');
+  const foot = [
+    footLink('#/devices', 'Devices', 'devices', ['devices']),
+    footLink('#/models', 'Models', 'models', ['models'], 'waiting'),
+    footLink('#/usage', 'Usage & limits', 'usage', ['usage']),
+    footLink('#/memory', 'Memory', 'memory', ['memory']),
+    footLink('#/skills', 'Skills', 'skills', ['skills']),
+    footLink('#/settings', 'Settings', 'settings', ['settings']),
+  ];
+  const conn = h('div', { class: 'conn', role: 'status' }, h('span', { class: 'conn-dot', 'aria-hidden': 'true' }), h('span', { class: 'conn-text' }));
   setChildren(
     els.sidebar,
     h(
@@ -235,46 +273,109 @@ function renderNav() {
     h(
       'div',
       { class: 'sidebar-scroll' },
-      approvals.length
-        ? h(
-            'button',
-            { class: 'banner warn', type: 'button', onclick: () => openApproval(approvals[0].approval_id) },
-            icon('shield'),
-            h('span', { class: 'grow' }, approvals.length === 1 ? '1 approval waiting' : `${approvals.length} approvals waiting`),
-            icon('chevron'),
-          )
-        : null,
-      h('section', { class: 'side-section', 'aria-labelledby': 'side-chats' }, h('h2', { class: 'side-title', id: 'side-chats' }, 'Chats'), chats),
+      approvalsBtn,
+      h('section', { class: 'side-section', 'aria-labelledby': 'side-chats' }, h('h2', { class: 'side-title', id: 'side-chats' }, 'Chats'), chatList, chatEmpty),
       h(
         'section',
         { class: 'side-section', 'aria-labelledby': 'side-threads' },
         h('h2', { class: 'side-title', id: 'side-threads' }, 'Threads', h('a', { href: '#/threads' }, 'All')),
-        threads,
+        threadList,
+        threadEmpty,
       ),
     ),
-    h(
-      'nav',
-      { class: 'side-foot', 'aria-label': 'Sections' },
-      navLink('#/devices', 'Devices', 'devices', r.view === 'devices'),
-      navLink('#/models', 'Models', 'models', r.view === 'models', store.pendingProposals),
-      navLink('#/usage', 'Usage & limits', 'usage', r.view === 'usage'),
-      navLink('#/memory', 'Memory', 'memory', r.view === 'memory'),
-      navLink('#/skills', 'Skills', 'skills', r.view === 'skills'),
-      navLink('#/settings', 'Settings', 'settings', r.view === 'settings'),
-      h('div', { class: ['conn', store.online && 'online'], role: 'status' }, h('span', { class: 'conn-dot', 'aria-hidden': 'true' }), store.online ? `Connected · ${store.me?.name || 'signed in'}` : 'Offline · reconnecting'),
-    ),
+    h('nav', { class: 'side-foot', 'aria-label': 'Sections' }, foot.map((f) => f.a), conn),
   );
 
-  const needs = needsYouCount();
-  const tab = (href, label, iconName, current, badge) =>
-    h('a', { class: 'tab', href, 'aria-current': current ? 'page' : null }, icon(iconName), h('span', null, label), badge ? h('span', { class: 'count', 'aria-label': `${badge} need you` }, String(badge)) : null);
-  setChildren(
-    els.tabbar,
-    tab('#/chat', 'Chat', 'chat', r.view === 'chat'),
-    tab('#/threads', 'Threads', 'threads', r.view === 'threads', needs),
-    tab('#/devices', 'Devices', 'devices', r.view === 'devices'),
-    tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings'].includes(r.view), store.pendingProposals),
+  const tab = (href, label, iconName, views, badgeLabel) => {
+    const badge = badgeLabel ? countBadge(badgeLabel) : null;
+    const a = h('a', { class: 'tab', href }, icon(iconName), h('span', null, label), badge);
+    return { a, view: views, badge };
+  };
+  const tabs = [
+    tab('#/chat', 'Chat', 'chat', ['chat']),
+    tab('#/threads', 'Threads', 'threads', ['threads'], 'need you'),
+    tab('#/devices', 'Devices', 'devices', ['devices']),
+    tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings'], 'pending'),
+  ];
+  setChildren(els.tabbar, tabs.map((t) => t.a));
+  nav = { approvalsBtn, chatList, chatEmpty, threadList, threadEmpty, foot, conn, tabs };
+}
+
+function sideItem() {
+  const title = h('span', { class: 'title' });
+  const sub = h('span', { class: 'sub' });
+  const a = h('a', { class: 'side-item' }, h('span', { class: 'label' }, title, sub));
+  return h('li', null, a);
+}
+
+function renderNav() {
+  if (!els || !nav) return;
+  const r = parseRoute();
+
+  // Chats, newest first.
+  syncList(
+    nav.chatList,
+    store.conversations.slice(0, 50),
+    (c) => c.id,
+    sideItem,
+    (li, c) => {
+      const a = li.firstChild;
+      setAttr(a, 'href', `#/chat/${encodeURIComponent(c.id)}`);
+      setAttr(a, 'aria-current', r.view === 'chat' && r.conversation === c.id ? 'page' : null);
+      setText(a.querySelector('.title'), c.title || 'Untitled');
+      setText(a.querySelector('.sub'), `${c.mode === 'standard' ? 'Standard' : 'Project'} · ${ago(c.created)}`);
+    },
   );
+  nav.chatEmpty.hidden = store.conversations.length > 0;
+
+  // Threads that need you, then running.
+  const approvalsByThread = new Set(pendingApprovals().map((a) => a.thread_id));
+  const active = [...store.threads.values()]
+    .filter((t) => isActive(t.status) || approvalsByThread.has(t.id))
+    .sort((a, b) => rank(a, approvalsByThread) - rank(b, approvalsByThread) || b.created - a.created)
+    .slice(0, 6);
+  syncList(
+    nav.threadList,
+    active,
+    (t) => t.id,
+    () => {
+      const li = sideItem();
+      li.firstChild.prepend(h('span', { class: 'side-icon' }));
+      return li;
+    },
+    (li, t) => {
+      const a = li.firstChild;
+      const needs = approvalsByThread.has(t.id);
+      const kind = needs ? 'shield' : t.status === 'waiting_device' ? 'offline' : 'threads';
+      const slot = a.querySelector('.side-icon');
+      if (slot.dataset.icon !== kind) {
+        slot.dataset.icon = kind;
+        slot.replaceChildren(icon(kind));
+      }
+      setAttr(a, 'href', `#/chat/${encodeURIComponent(t.conversation_id)}/thread/${encodeURIComponent(t.id)}`);
+      setAttr(a, 'aria-current', r.thread === t.id ? 'page' : null);
+      setText(a.querySelector('.title'), t.title);
+      setText(a.querySelector('.sub'), needs ? 'Needs approval' : t.status === 'waiting_device' ? 'Waiting for device' : 'Running');
+    },
+  );
+  nav.threadEmpty.hidden = active.length > 0;
+
+  const approvals = pendingApprovals();
+  nav.approvalsBtn.hidden = !approvals.length;
+  setText(nav.approvalsBtn.querySelector('.grow'), approvals.length === 1 ? '1 approval waiting' : `${approvals.length} approvals waiting`);
+
+  for (const f of nav.foot) {
+    setAttr(f.a, 'aria-current', f.view.includes(r.view) ? 'page' : null);
+    if (f.badge) setBadge(f.badge, store.pendingProposals);
+  }
+  nav.conn.classList.toggle('online', store.online);
+  setText(nav.conn.querySelector('.conn-text'), store.online ? `Connected · ${store.me?.name || 'signed in'}` : 'Offline · reconnecting');
+
+  const needs = needsYouCount();
+  for (const t of nav.tabs) {
+    setAttr(t.a, 'aria-current', t.view.includes(r.view) ? 'page' : null);
+    if (t.badge) setBadge(t.badge, t.view[0] === 'threads' ? needs : store.pendingProposals);
+  }
 }
 
 function rank(t, approvals) {
@@ -330,8 +431,10 @@ function route() {
     }
   }
 
+  let mainChanged = false;
   const key = r.view === 'chat' ? `chat:${r.conversation || 'new'}` : `${r.view}:${r.id || ''}`;
   if (key !== mainKey) {
+    mainChanged = true;
     mainKey = key;
     mainCleanup?.();
     mainCleanup = null;
@@ -355,7 +458,11 @@ function route() {
   }
 
   const tKey = r.view === 'chat' && r.thread ? r.thread : null;
+  let inspectorClosed = false;
   if (tKey !== inspectorKey) {
+    const active = document.activeElement;
+    if (tKey && !inspectorKey && active && !els.inspector.contains(active) && active !== document.body) inspectorOpener = active;
+    inspectorClosed = Boolean(inspectorKey && !tKey);
     inspectorKey = tKey;
     inspectorCleanup?.();
     inspectorCleanup = null;
@@ -366,7 +473,27 @@ function route() {
       inspectorCleanup = renderThread(els.inspector, { threadId: tKey, conversationId: r.conversation, onClose: closeInspector }) || null;
     }
   }
+  syncInert();
   emit('route', r);
+
+  // Move focus where the person's attention goes: back to what opened a closed
+  // inspector, else to the new view's heading unless the view focused something
+  // itself (the composer, the inspector's title). Views focus in their own frame
+  // callbacks, which run before this one.
+  requestAnimationFrame(() => {
+    if (!els) return;
+    const active = document.activeElement;
+    if (inspectorClosed && !mainChanged) {
+      const back = inspectorOpener?.isConnected && !inspectorOpener.closest('[inert]') ? inspectorOpener : null;
+      inspectorOpener = null;
+      if (back) back.focus({ preventScroll: true });
+      else focusMain();
+      return;
+    }
+    if (!mainChanged) return;
+    const viewFocused = active && active !== document.body && (els.main.contains(active) || els.inspector.contains(active));
+    if (!viewFocused) focusMain();
+  });
 }
 
 function forgetConversation(id) {

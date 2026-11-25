@@ -15,12 +15,22 @@ export function onApiError(fn) {
   listeners.add(fn);
 }
 
-export async function api(method, path, body) {
+/** Whether an error is a request the caller aborted (its view went away). */
+export function isAbort(error) {
+  return error?.name === 'AbortError';
+}
+
+/**
+ * One request. `signal` (an AbortSignal) cancels it; an aborted request rejects
+ * with the AbortError and isn't reported to the error listeners.
+ */
+export async function api(method, path, body, { signal } = {}) {
   const init = {
     method,
     credentials: 'same-origin',
     cache: 'no-store',
     headers: { 'X-Grouper': '1', Accept: 'application/json' },
+    signal,
   };
   if (body !== undefined) {
     init.headers['Content-Type'] = 'application/json';
@@ -30,6 +40,7 @@ export async function api(method, path, body) {
   try {
     response = await fetch(path, init);
   } catch (e) {
+    if (isAbort(e)) throw e;
     const error = new ApiError(0, "Can't reach the hub.");
     for (const fn of listeners) fn(error);
     throw error;
@@ -52,10 +63,10 @@ export async function api(method, path, body) {
   return data;
 }
 
-export const get = (path) => api('GET', path);
-export const post = (path, body) => api('POST', path, body ?? {});
-export const put = (path, body) => api('PUT', path, body ?? {});
-export const del = (path) => api('DELETE', path);
+export const get = (path, opts) => api('GET', path, undefined, opts);
+export const post = (path, body, opts) => api('POST', path, body ?? {}, opts);
+export const put = (path, body, opts) => api('PUT', path, body ?? {}, opts);
+export const del = (path, opts) => api('DELETE', path, undefined, opts);
 
 /** Query string from an object, skipping empty values. */
 export function qs(params) {

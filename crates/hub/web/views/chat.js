@@ -4,12 +4,12 @@
 // until the stored AssistantMessage replaces it. ThreadStarted inserts a card that
 // later thread events update in place; ThreadActivity stays off the transcript.
 
-import { h, icon, setChildren } from '../lib/dom.js';
+import { h, icon, setChildren, throttle } from '../lib/dom.js';
 import { post, describe } from '../lib/api.js';
 import { renderMarkdown } from '../lib/md.js';
 import { store, on, conv, liveOf, deviceName, deviceOnline, threadsIn, approvalsFor, pendingApprovals, isAdmin } from '../lib/store.js';
 import { loadConversation, loadConversations } from '../lib/live.js';
-import { bar, navigate, statusPill, skeleton, toast, announce, autoGrow, toastError } from '../lib/ui.js';
+import { bar, navigate, statusPill, skeleton, toast, announce, sentenceSpeaker, autoGrow, toastError } from '../lib/ui.js';
 import { isActive, usd } from '../lib/format.js';
 import { openApproval } from './approvals.js';
 
@@ -22,8 +22,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   let chipGroup = null;
   let rendered = false;
   let sending = false;
-  let spokenTo = 0;
-  let draftFrame = 0;
+  const speaker = sentenceSpeaker();
   const chipFrames = new Map();
   let openThread = openThreadId;
 
@@ -33,8 +32,14 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   const barSlot = h('div', { class: 'bar-slot' });
   const strip = h('div', { class: 'strip', role: 'status', hidden: true });
   const approvalSlot = h('div', { class: 'approval-banner', hidden: true });
+  // Not a live region: the draft changes many times a second. Screen readers hear
+  // the reply through the throttled #live-region instead (sentences, then "Reply
+  // finished").
   const tail = h('div', { class: 'tail' });
-  const transcript = h('div', { class: 'transcript', role: 'log', 'aria-label': 'Conversation' }, tail);
+  const transcript = h('div', { class: 'transcript', role: 'region', 'aria-label': 'Conversation' }, tail);
+  // The streaming draft: one node, refilled at most every 100 ms.
+  const draftEl = h('div', { class: 'msg msg-assistant md', 'aria-label': 'Reply so far' });
+  const replyingEl = h('div', { class: 'replying' }, h('span', { class: 'pulse', 'aria-hidden': 'true' }), 'Replying');
   const newMessages = h(
     'button',
     { class: 'new-messages glass', type: 'button', hidden: true, onclick: () => scrollToEnd(true) },
@@ -42,7 +47,9 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     icon('down'),
   );
   const composer = buildComposer();
-  const view = h('section', { class: 'view chat-view' }, barSlot, strip, approvalSlot, transcript, newMessages, composer.wrap);
+  // "New messages" floats just above the composer, whatever the composer's height.
+  composer.wrap.prepend(newMessages);
+  const view = h('section', { class: 'view chat-view' }, barSlot, strip, approvalSlot, transcript, composer.wrap);
   container.append(view);
 
   view.addEventListener('scroll', () => {
@@ -74,7 +81,8 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       bar({
         title,
         caption,
-        actions: [h('a', { class: 'icon-btn', href: '#/chat/new', 'aria-label': 'New chat', title: 'New chat' }, icon('plus'))],
+        // The sidebar has New chat on wide screens; the bar has it where the sidebar is a drawer.
+        actions: [h('a', { class: 'icon-btn only-mobile', href: '#/chat/new', 'aria-label': 'New chat', title: 'New chat' }, icon('plus'))],
       }),
     );
     document.title = `${title} · Grouper`;
@@ -133,12 +141,13 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     if (!c.events.length && !sending) {
       add(h('div', { class: 'empty' }, h('p', null, 'No messages here yet.')));
     }
-    for (const e of c.events) appendEvent(e);
+    for (const e of c.events) appendEvent(e, false);
     renderTail();
     requestAnimationFrame(() => scrollToEnd());
   }
 
-  function appendEvent(e) {
+  /** `live`: it just happened (only then does an error interrupt a screen reader). */
+  function appendEvent(e, live = true) {
     switch (e.kind) {
       case 'user_message': {
         const pending = [...transcript.querySelectorAll('.msg-user.pending')].find((n) => n.dataset.text === e.text);
@@ -153,7 +162,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         chipGroup = null;
         break;
       case 'error':
-        add(h('div', { class: 'msg msg-error', role: 'alert' }, icon('warning'), h('div', null, e.message)));
+        add(h('div', { class: 'msg msg-error', role: live ? 'alert' : null }, icon('warning'), h('div', null, e.message)));
         chipGroup = null;
         break;
       case 'budget_warning':
@@ -227,40 +236,31 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
 
   // The streaming draft and the "replying" line sit after the stored events.
   function renderTail() {
+    scheduleTail.cancel();
     const draft = store.drafts.get(cid);
     const replying = store.replying.has(cid);
     if (draft) {
-      const body = h('div', { class: 'msg msg-assistant md', 'aria-label': 'Reply so far' }, renderMarkdown(draft));
+      draftEl.replaceChildren(renderMarkdown(draft));
       const caret = h('span', { class: 'caret', 'aria-hidden': 'true' });
-      const lastBlock = body.lastElementChild;
-      (lastBlock && /^(P|LI|H\d)$/.test(lastBlock.tagName) ? lastBlock : body).append(caret);
-      setChildren(tail, body);
+      const lastBlock = draftEl.lastElementChild;
+      (lastBlock && /^(P|LI|H\d)$/.test(lastBlock.tagName) ? lastBlock : draftEl).append(caret);
+      if (tail.firstChild !== draftEl) tail.replaceChildren(draftEl);
     } else if (replying) {
-      setChildren(tail, h('div', { class: 'replying' }, h('span', { class: 'pulse', 'aria-hidden': 'true' }), 'Replying'));
-    } else {
+      if (tail.firstChild !== replyingEl) tail.replaceChildren(replyingEl);
+    } else if (tail.firstChild) {
       tail.replaceChildren();
     }
   }
 
-  function scheduleTail() {
-    if (draftFrame) return;
-    draftFrame = requestAnimationFrame(() => {
-      draftFrame = 0;
-      const stick = nearBottom();
-      renderTail();
-      if (stick) scrollToEnd();
-    });
-  }
+  // The draft's Markdown is re-rendered at most every 100 ms while it streams.
+  const scheduleTail = throttle(() => {
+    const stick = nearBottom();
+    renderTail();
+    if (stick) scrollToEnd();
+  }, 100);
 
   function speakDraft() {
-    const draft = store.drafts.get(cid) || '';
-    if (draft.length < spokenTo) spokenTo = 0;
-    const rest = draft.slice(spokenTo);
-    const m = rest.match(/^[\s\S]*[.!?](\s|$)/);
-    if (m) {
-      spokenTo += m[0].length;
-      announce(m[0].trim());
-    }
+    speaker.speak(store.drafts.get(cid) || '');
   }
 
   // ---- composer
@@ -491,7 +491,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       const stick = nearBottom();
       appendEvent(e);
       if (e.kind === 'assistant_message') {
-        spokenTo = 0;
+        speaker.reset();
         announce('Reply finished', { force: true });
       }
       renderTail();
@@ -551,7 +551,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
 
   return () => {
     for (const off of subs) off();
-    cancelAnimationFrame(draftFrame);
+    scheduleTail.cancel();
     for (const f of chipFrames.values()) cancelAnimationFrame(f);
   };
 }

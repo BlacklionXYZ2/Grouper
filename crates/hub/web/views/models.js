@@ -2,10 +2,10 @@
 // you, priority rules, and importing a model from a provider's catalog.
 
 import { h, icon, setChildren } from '../lib/dom.js';
-import { get, post, del, qs, enc, describe } from '../lib/api.js';
+import { get, post, del, qs, enc, describe, isAbort } from '../lib/api.js';
 import { store, isAdmin } from '../lib/store.js';
 import { loadModels } from '../lib/live.js';
-import { bar, confirmAction, toast, toastError, skeleton, errorBanner } from '../lib/ui.js';
+import { bar, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { num, usd, pct, duration, ago } from '../lib/format.js';
 
 const CONSTRAINTS = ['local', 'remote', 'free', 'paid'];
@@ -26,6 +26,10 @@ export function renderModels(container) {
   body.append(slots.proposals, slots.models, slots.stats, slots.rules, slots.import);
 
   const head = (id, title, extra) => h('div', { class: 'section-head' }, h('h2', { id }, title), extra || null);
+  // Leaving the view cancels its reads; writes are paused while offline.
+  const aborter = new AbortController();
+  const { signal } = aborter;
+  const unguard = guardWrites(body);
 
   // ---- models
   async function renderModelList() {
@@ -73,6 +77,7 @@ export function renderModels(container) {
                         'button',
                         {
                           class: 'icon-btn',
+                          'data-write': true,
                           type: 'button',
                           'aria-label': `Delete ${m.id}`,
                           title: 'Delete',
@@ -108,8 +113,9 @@ export function renderModels(container) {
     }
     let list;
     try {
-      list = (await get(`/v1/registry/proposals${qs({ status: 'pending' })}`)) || [];
+      list = (await get(`/v1/registry/proposals${qs({ status: 'pending' })}`, { signal })) || [];
     } catch (err) {
+      if (isAbort(err)) return;
       setChildren(slots.proposals, head('m-proposals', 'Proposals'), errorBanner(err, renderProposals));
       return;
     }
@@ -138,8 +144,8 @@ export function renderModels(container) {
             h(
               'div',
               { class: 'bar-actions' },
-              h('button', { class: 'btn btn-sm', type: 'button', onclick: () => decide(p, false) }, 'Reject'),
-              h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => decide(p, true) }, 'Accept'),
+              h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, onclick: () => decide(p, false) }, 'Reject'),
+              h('button', { class: 'btn btn-sm btn-primary', type: 'button', 'data-write': true, onclick: () => decide(p, true) }, 'Accept'),
             ),
           );
         }),
@@ -165,8 +171,9 @@ export function renderModels(container) {
     if (!stats) {
       setChildren(slots.stats, head('m-stats', 'Stats'), skeleton(3));
       try {
-        stats = await get('/v1/registry/stats');
+        stats = await get('/v1/registry/stats', { signal });
       } catch (err) {
+        if (isAbort(err)) return;
         setChildren(slots.stats, head('m-stats', 'Stats'), errorBanner(err, renderStats));
         return;
       }
@@ -240,8 +247,9 @@ export function renderModels(container) {
     }
     let rules;
     try {
-      rules = (await get('/v1/registry/rules')) || [];
+      rules = (await get('/v1/registry/rules', { signal })) || [];
     } catch (err) {
+      if (isAbort(err)) return;
       setChildren(slots.rules, head('m-rules', 'Priority rules'), errorBanner(err, renderRules));
       return;
     }
@@ -273,6 +281,8 @@ export function renderModels(container) {
                   { class: 'switch' },
                   h('input', {
                     type: 'checkbox',
+                    role: 'switch',
+                    'data-write': true,
                     checked: r.enabled,
                     'aria-label': `Rule enabled: ${r.text}`,
                     onchange: async (e) => {
@@ -289,6 +299,7 @@ export function renderModels(container) {
                   'button',
                   {
                     class: 'icon-btn',
+                    'data-write': true,
                     type: 'button',
                     'aria-label': `Delete rule: ${r.text}`,
                     onclick: async () => {
@@ -347,7 +358,7 @@ export function renderModels(container) {
         select('forbid', CONSTRAINTS, 'Forbid'),
         select('prefer', PREFERS, 'Prefer'),
       ),
-      h('div', null, h('button', { class: 'btn btn-primary', type: 'submit' }, icon('plus'), 'Add rule')),
+      h('div', null, h('button', { class: 'btn btn-primary', type: 'submit', 'data-write': true }, icon('plus'), 'Add rule')),
     );
     if (example) requestAnimationFrame(() => (form.elements.require.value = 'local'));
     return form;
@@ -361,10 +372,11 @@ export function renderModels(container) {
     }
     let providers = [];
     try {
-      providers = (await get('/v1/providers')) || [];
+      providers = (await get('/v1/providers', { signal })) || [];
     } catch {
       /* the form still works with a typed provider id */
     }
+    if (signal.aborted) return;
     const status = h('div', { role: 'status', class: 'hint' });
     const form = h(
       'form',
@@ -410,7 +422,7 @@ export function renderModels(container) {
         h('legend', { class: 'field-label' }, 'Default for (optional)'),
         ['orchestrator', 'standard', 'thread'].map((r) => h('label', { class: 'check' }, h('input', { type: 'checkbox', name: `role-${r}` }), r)),
       ),
-      h('div', null, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Import'), ' ', status),
+      h('div', null, h('button', { class: 'btn btn-primary', type: 'submit', 'data-write': true }, 'Import'), ' ', status),
     );
     setChildren(slots.import, head('m-import', 'Import from a catalog'), h('p', { class: 'section-note' }, 'Fills prices, context and modalities from the provider’s catalog (OpenRouter), and drafts use cases for you to accept.'), form);
   }
@@ -420,4 +432,8 @@ export function renderModels(container) {
   renderStats();
   renderRules();
   renderImport();
+  return () => {
+    aborter.abort();
+    unguard();
+  };
 }

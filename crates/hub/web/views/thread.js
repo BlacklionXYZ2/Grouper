@@ -1,11 +1,16 @@
 // The thread sheet (inspector on wide screens, a sheet on narrow ones): live
 // activity, waiting and checkpoint state, step-in, Stop, files and rating.
+//
+// The sheet is built once. Stored activity is appended as it arrives (a tool row is
+// filled in place when its result lands); deltas only refill the streaming-draft
+// node, at most every 100 ms. The small sections (approvals, waiting, result,
+// files) are redrawn only when their own inputs change.
 
-import { h, icon, setChildren } from '../lib/dom.js';
+import { h, icon, setChildren, throttle, setText } from '../lib/dom.js';
 import { get, post, qs, enc, describe } from '../lib/api.js';
 import { renderMarkdown } from '../lib/md.js';
 import { store, on, liveOf, deviceName, approvalsFor, isAdmin } from '../lib/store.js';
-import { statusPill, skeleton, confirmAction, toast, autoGrow, errorBanner } from '../lib/ui.js';
+import { statusPill, skeleton, confirmAction, toast, autoGrow, errorBanner, announce, sentenceSpeaker } from '../lib/ui.js';
 import { ago, dateTime, num, pretty, isActive } from '../lib/format.js';
 import { openApproval } from './approvals.js';
 
@@ -16,27 +21,84 @@ export function setStepInDraft(threadId, text) {
   drafts.set(threadId, text);
 }
 
+/** Stop a thread, asking first while it runs. Resolves true when it was stopped. */
+export async function stopThread(threadId) {
+  const th = store.threads.get(threadId) || {};
+  if (th.status === 'running') {
+    const ok = await confirmAction({
+      title: 'Stop this thread?',
+      body: [`“${th.title || 'This thread'}” stops on ${deviceName(th.device_id)}. Work it hasn’t saved is lost, and the orchestrator is told you stopped it.`],
+      confirmLabel: 'Stop thread',
+      danger: true,
+    });
+    if (!ok) return false;
+  }
+  await post(`/v1/threads/${enc(threadId)}/stop`);
+  toast('Thread stopped.');
+  return true;
+}
+
 export function renderThread(container, { threadId, conversationId, onClose }) {
   const subs = [];
+  const aborter = new AbortController();
   let info = store.threads.get(threadId) || null;
   let cid = conversationId || info?.conversation_id;
   let events = [];
   let lastSeq = 0;
   let loaded = false;
   let loadError = null;
-  let frame = 0;
   let rating = null;
   let files = null; // null: not loaded; {error} or listing
   let filesLoading = false;
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let lastStatus = null;
+  const calls = new Map(); // call_id -> {details, state, body, call, result}
   const openCalls = new Set();
-  let showRaw = false;
+  const speaker = sentenceSpeaker();
 
-  const head = h('header', { class: 'sheet-head' });
-  const body = h('div', { class: 'sheet-body' });
-  const foot = h('div', { class: 'sheet-foot' });
+  // ---- skeleton of the sheet (built once)
+  const titleEl = h('h2', { id: 'thread-title', tabindex: '-1' });
+  const metaEl = h('div', { class: 'meta' });
+  const reasonEl = h('p', { class: 'hint', hidden: true });
+  const head = h(
+    'header',
+    { class: 'sheet-head' },
+    h('div', { class: 'sheet-head-row' }, titleEl, h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Close thread', onclick: onClose }, icon('close'))),
+    metaEl,
+    reasonEl,
+  );
+  const statusSlot = h('div', { class: 'sheet-status' }); // loading and errors
+  const approvalsSlot = h('div', { hidden: true });
+  const waitingSlot = h('section', { 'aria-label': 'Waiting for device', hidden: true });
+  const tokensEl = h('span');
+  const actList = h('div', { class: 'activity' });
+  const draftEl = h('div', { class: 'act-text md', 'aria-label': 'Thread output so far', hidden: true });
+  const emptyEl = h('p', { class: 'hint' });
+  actList.append(draftEl, emptyEl);
+  const activity = h('section', { 'aria-labelledby': 'act-title', hidden: true }, h('h3', { class: 'sub-title', id: 'act-title' }, 'Activity', tokensEl), actList);
+  const resultSlot = h('section', { 'aria-labelledby': 'res-title', hidden: true });
+  const filesSlot = h('section', { 'aria-labelledby': 'files-title', hidden: true });
+  const rawCount = h('span', { class: 'tool-name' });
+  const rawBody = h('pre', { class: 'code' });
+  const raw = h(
+    'details',
+    {
+      class: 'tool-row',
+      hidden: true,
+      ontoggle: () => {
+        if (raw.open) fillRaw();
+      },
+    },
+    h('summary', null, chev(), rawCount),
+    h('div', { class: 'tool-body' }, rawBody),
+  );
+  const body = h('div', { class: 'sheet-body' }, statusSlot, approvalsSlot, waitingSlot, activity, resultSlot, filesSlot, raw);
+  const foot = h('div', { class: 'sheet-foot', hidden: true });
   container.append(head, body, foot);
+  container.setAttribute('aria-labelledby', 'thread-title');
 
-  // Step-in field, built once so typing survives re-renders.
+  // Step-in field, built once so typing survives updates.
   const stepText = h('textarea', {
     class: 'textarea',
     rows: 1,
@@ -61,98 +123,105 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
   const stepBtn = h('button', { class: 'btn btn-primary', type: 'button', onclick: () => sendStepIn() }, 'Send');
   const stepError = h('div', { class: 'composer-error', role: 'alert', hidden: true });
   const stopBtn = h('button', { class: 'btn', type: 'button', onclick: () => stop() }, icon('stop'), 'Stop thread');
+  const stepRow = h('div', { class: 'stepin' }, stepText, stepBtn);
+  const stopRow = h('div', null, stopBtn);
+  const footNote = h('p', { class: 'hint foot-note' });
+  foot.append(stepError, stepRow, stopRow, footNote);
 
   function t() {
     return store.threads.get(threadId) || info || {};
   }
 
   async function load() {
+    const { signal } = aborter;
     try {
-      const [thread, evs] = await Promise.all([
-        get(`/v1/threads/${enc(threadId)}`),
-        (async () => {
-          if (!cid) cid = (await get(`/v1/threads/${enc(threadId)}`)).conversation_id;
-          return get(`/v1/conversations/${enc(cid)}/events${qs({ thread: threadId })}`);
-        })(),
-      ]);
+      // The thread's own record says which conversation holds its events; read it
+      // first only when the route didn't say.
+      let thread;
+      let evs;
+      if (cid) {
+        [thread, evs] = await Promise.all([get(`/v1/threads/${enc(threadId)}`, { signal }), get(`/v1/conversations/${enc(cid)}/events${qs({ thread: threadId })}`, { signal })]);
+      } else {
+        thread = await get(`/v1/threads/${enc(threadId)}`, { signal });
+        evs = await get(`/v1/conversations/${enc(thread.conversation_id)}/events${qs({ thread: threadId })}`, { signal });
+      }
       info = thread;
       const known = store.threads.get(threadId);
       store.threads.set(threadId, { ...known, ...thread, checkpoint: known?.checkpoint });
       cid = thread.conversation_id;
       // Keep events that arrived on the socket while loading.
-      const extra = events.filter((e) => e.seq > ((evs || []).at(-1)?.seq || 0));
-      events = [...(evs || []), ...extra];
+      const fetched = evs || [];
+      const extra = events.filter((e) => e.seq > (fetched.at(-1)?.seq || 0));
+      events = [...fetched, ...extra];
       lastSeq = events.at(-1)?.seq || 0;
       loaded = true;
+      loadError = null;
+      rebuildActivity();
     } catch (err) {
+      if (signal.aborted) return;
       loadError = err;
     }
-    render();
+    renderAll();
   }
 
-  function schedule() {
-    if (frame) return;
-    frame = requestAnimationFrame(() => {
-      frame = 0;
-      render();
-    });
-  }
+  // ---- whole-sheet refresh (cheap parts only; never the activity list)
 
-  function render() {
+  function renderAll() {
     const th = t();
     renderHead(th);
     if (loadError) {
-      setChildren(body, errorBanner(loadError, () => {
-        loadError = null;
-        render();
-        load();
-      }));
-      foot.hidden = true;
+      setChildren(
+        statusSlot,
+        errorBanner(loadError, () => {
+          loadError = null;
+          renderAll();
+          load();
+        }),
+      );
+    } else if (!loaded) {
+      setChildren(statusSlot, h('div', { 'aria-busy': 'true', 'aria-label': 'Loading thread' }, skeleton(3), skeleton(3)));
+    } else {
+      statusSlot.replaceChildren();
+    }
+    const ready = loaded && !loadError;
+    for (const el of [activity, filesSlot, raw]) el.hidden = !ready;
+    foot.hidden = !ready;
+    if (!ready) {
+      approvalsSlot.hidden = waitingSlot.hidden = resultSlot.hidden = true;
       return;
     }
-    if (!loaded) {
-      setChildren(body, h('div', { 'aria-busy': 'true', 'aria-label': 'Loading thread' }, skeleton(3), skeleton(3)));
-      foot.hidden = true;
-      return;
-    }
-    const keepScroll = body.scrollTop;
-    const atEnd = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
-    setChildren(body, approvalsSection(), waitingSection(th), activitySection(th), resultSection(th), filesSection(), rawSection());
-    body.scrollTop = atEnd ? body.scrollHeight : keepScroll;
+    renderApprovals();
+    renderWaiting(th);
+    renderResult(th);
+    renderFiles();
+    renderRawCount();
     renderFoot(th);
+    refreshToolStates(th);
+    renderEmpty(th);
+    lastStatus = th.status;
   }
 
   function renderHead(th) {
     const approval = approvalsFor(threadId).length > 0;
     const started = events.find((e) => e.kind === 'thread_started');
     const reason = th.reason || started?.reason;
+    setText(titleEl, th.title || started?.title || 'Thread');
     setChildren(
-      head,
-      h(
-        'div',
-        { class: 'sheet-head-row' },
-        h('h2', { id: 'thread-title', tabindex: '-1' }, th.title || started?.title || 'Thread'),
-        h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Close thread', onclick: onClose }, icon('close')),
-      ),
-      h(
-        'div',
-        { class: 'meta' },
-        statusPill(th.status, { checkpoint: th.checkpoint, approval }),
-        h('span', null, deviceName(th.device_id)),
-        h('span', { class: 'mono' }, th.model || ''),
-        th.created ? h('span', null, `started ${ago(th.created)}`) : null,
-      ),
-      reason ? h('p', { class: 'hint' }, reason) : null,
+      metaEl,
+      statusPill(th.status, { checkpoint: th.checkpoint, approval }),
+      h('span', null, deviceName(th.device_id)),
+      h('span', { class: 'mono' }, th.model || ''),
+      th.created ? h('span', null, `started ${ago(th.created)}`) : null,
     );
-    container.setAttribute('aria-labelledby', 'thread-title');
+    setText(reasonEl, reason || '');
+    reasonEl.hidden = !reason;
   }
 
-  function approvalsSection() {
+  function renderApprovals() {
     const list = approvalsFor(threadId);
-    if (!list.length) return null;
-    return h(
-      'div',
-      null,
+    approvalsSlot.hidden = !list.length;
+    setChildren(
+      approvalsSlot,
       list.map((a) =>
         h(
           'div',
@@ -165,11 +234,15 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
     );
   }
 
-  function waitingSection(th) {
+  function renderWaiting(th) {
     const waiting = events.filter((e) => e.kind === 'thread_waiting').at(-1);
     const checkpoint = events.filter((e) => e.kind === 'thread_checkpoint').at(-1);
     const handed = events.filter((e) => e.kind === 'thread_handed_over').at(-1);
-    if (th.status !== 'waiting_device' && !checkpoint && !handed) return null;
+    if (th.status !== 'waiting_device' && !checkpoint && !handed) {
+      waitingSlot.hidden = true;
+      waitingSlot.replaceChildren();
+      return;
+    }
     const device = store.devices.find((d) => d.id === th.device_id);
     const parts = [];
     if (th.status === 'waiting_device') {
@@ -185,14 +258,7 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
       );
     }
     if (checkpoint) {
-      parts.push(
-        h(
-          'div',
-          { class: 'callout' },
-          h('h3', null, icon('flag'), 'Checkpoint on the hub'),
-          h('div', { class: 'md' }, renderMarkdown(checkpoint.summary)),
-        ),
-      );
+      parts.push(h('div', { class: 'callout' }, h('h3', null, icon('flag'), 'Checkpoint on the hub'), h('div', { class: 'md' }, renderMarkdown(checkpoint.summary))));
     }
     if (handed) {
       parts.push(
@@ -205,63 +271,60 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
         ),
       );
     }
-    return h('section', { 'aria-label': 'Waiting for device' }, parts);
+    waitingSlot.hidden = false;
+    setChildren(waitingSlot, parts);
   }
 
-  function activitySection(th) {
-    const items = [];
-    const calls = new Map();
-    let input = 0;
-    let output = 0;
-    for (const e of events) {
-      if (e.kind === 'thread_activity') {
-        const a = e.event;
-        if (a.type === 'text') items.push(h('div', { class: 'act-text md' }, renderMarkdown(a.text)));
-        else if (a.type === 'tool_call') {
-          const row = { call: a, result: null, el: null };
+  // ---- activity (appended once, never rebuilt while streaming)
+
+  function rebuildActivity() {
+    for (const node of [...actList.children]) if (node !== draftEl && node !== emptyEl) node.remove();
+    calls.clear();
+    tokensIn = tokensOut = 0;
+    for (const e of events) appendActivity(e);
+    renderTokens();
+    renderDraft();
+  }
+
+  function addItem(node) {
+    actList.insertBefore(node, draftEl);
+  }
+
+  /** Fold one stored event into the activity list. */
+  function appendActivity(e) {
+    if (e.kind === 'thread_activity') {
+      const a = e.event;
+      if (a.type === 'text') addItem(h('div', { class: 'act-text md' }, renderMarkdown(a.text)));
+      else if (a.type === 'tool_call') {
+        const row = toolRow(a);
+        calls.set(a.call_id, row);
+        addItem(row.details);
+        updateToolRow(row);
+      } else if (a.type === 'tool_result') {
+        let row = calls.get(a.call_id);
+        if (!row) {
+          row = toolRow({ call_id: a.call_id, name: a.name, input: null });
           calls.set(a.call_id, row);
-          row.el = h('div');
-          items.push(row.el);
-        } else if (a.type === 'tool_result') {
-          const row = calls.get(a.call_id);
-          if (row) row.result = a;
-          else items.push(toolRow({ call_id: a.call_id, name: a.name, input: null }, a, th));
-        } else if (a.type === 'usage') {
-          input += a.input_tokens + a.cache_read_tokens + a.cache_write_tokens;
-          output += a.output_tokens;
-        } else if (a.type === 'notice') items.push(h('div', { class: 'act-notice' }, a.text));
-      } else if (e.kind === 'thread_input') {
-        items.push(h('div', { class: 'act-input' }, h('span', { class: 'who' }, e.from === 'user' ? 'You' : `From the ${e.from}`), e.text));
-      } else if (e.kind === 'approval_resolved') {
-        items.push(h('div', { class: 'act-notice' }, e.approved ? 'You approved a tool call.' : 'A tool call was denied.'));
-      } else if (e.kind === 'error') {
-        items.push(h('div', { class: 'msg-error' }, icon('warning'), e.message));
-      }
+          addItem(row.details);
+        }
+        row.result = a;
+        updateToolRow(row);
+      } else if (a.type === 'usage') {
+        tokensIn += a.input_tokens + a.cache_read_tokens + a.cache_write_tokens;
+        tokensOut += a.output_tokens;
+      } else if (a.type === 'notice') addItem(h('div', { class: 'act-notice' }, a.text));
+    } else if (e.kind === 'thread_input') {
+      addItem(h('div', { class: 'act-input' }, h('span', { class: 'who' }, e.from === 'user' ? 'You' : `From the ${e.from}`), e.text));
+    } else if (e.kind === 'approval_resolved') {
+      addItem(h('div', { class: 'act-notice' }, e.approved ? 'You approved a tool call.' : 'A tool call was denied.'));
+    } else if (e.kind === 'error') {
+      addItem(h('div', { class: 'msg-error' }, icon('warning'), e.message));
     }
-    // Tool rows were placeholders until their results were known.
-    for (const row of calls.values()) {
-      const at = items.indexOf(row.el);
-      if (at >= 0) items[at] = toolRow(row.call, row.result, th);
-    }
-    const draft = liveOf(threadId).draft;
-    if (draft) {
-      const d = h('div', { class: 'act-text md', 'aria-label': 'Thread output so far' }, renderMarkdown(draft));
-      (d.lastElementChild || d).append(h('span', { class: 'caret', 'aria-hidden': 'true' }));
-      items.push(d);
-    }
-    if (!items.length) {
-      items.push(h('p', { class: 'hint' }, isActive(th.status) ? 'Working… output appears here as it streams.' : 'No output.'));
-    }
-    return h(
-      'section',
-      { 'aria-labelledby': 'act-title' },
-      h('h3', { class: 'sub-title', id: 'act-title' }, 'Activity', input || output ? h('span', null, `${num(input)} in · ${num(output)} out tokens`) : null),
-      h('div', { class: 'activity' }, items),
-    );
   }
 
-  function toolRow(call, result, th) {
-    const state = result ? (result.ok ? h('span', { class: 'ok-word' }, 'ok') : h('span', { class: 'fail-word' }, 'failed')) : isActive(th.status) ? h('span', { class: 'run-word' }, 'running') : h('span', { class: 'hint' }, 'no result');
+  function toolRow(call) {
+    const state = h('span');
+    const bodyEl = h('div', { class: 'tool-body' });
     const details = h(
       'details',
       {
@@ -272,38 +335,103 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
           else openCalls.delete(call.call_id);
         },
       },
-      h('summary', null, icon('chevron', null), h('span', { class: 'tool-name' }, call.name), state),
-      h(
-        'div',
-        { class: 'tool-body' },
-        call.input !== null && call.input !== undefined ? [h('span', { class: 'label' }, 'Input'), h('pre', { class: 'code' }, pretty(call.input))] : null,
-        result ? [h('span', { class: 'label' }, 'Output'), h('pre', { class: 'code' }, result.output || '(empty)')] : null,
-      ),
+      h('summary', null, chev(), h('span', { class: 'tool-name' }, call.name), state),
+      bodyEl,
     );
-    details.querySelector('summary .icon').classList.add('chev');
-    return details;
+    return { details, state, body: bodyEl, call, result: null };
   }
 
-  function resultSection(th) {
-    if (isActive(th.status)) return null;
+  function updateToolRow(row) {
+    const { call, result } = row;
+    setChildren(
+      row.body,
+      call.input !== null && call.input !== undefined ? [h('span', { class: 'label' }, 'Input'), h('pre', { class: 'code' }, pretty(call.input))] : null,
+      result ? [h('span', { class: 'label' }, 'Output'), h('pre', { class: 'code' }, result.output || '(empty)')] : null,
+    );
+    setToolState(row, t());
+  }
+
+  function setToolState(row, th) {
+    const [cls, word] = row.result
+      ? row.result.ok
+        ? ['ok-word', 'ok']
+        : ['fail-word', 'failed']
+      : isActive(th.status)
+        ? ['run-word', 'running']
+        : ['hint', 'no result'];
+    row.state.className = cls;
+    setText(row.state, word);
+  }
+
+  function refreshToolStates(th) {
+    if (th.status === lastStatus) return;
+    for (const row of calls.values()) if (!row.result) setToolState(row, th);
+  }
+
+  function renderTokens() {
+    setText(tokensEl, tokensIn || tokensOut ? `${num(tokensIn)} in · ${num(tokensOut)} out tokens` : '');
+  }
+
+  function renderEmpty(th) {
+    const has = actList.childElementCount > 2 || !draftEl.hidden;
+    emptyEl.hidden = has;
+    setText(emptyEl, isActive(th.status) ? 'Working… output appears here as it streams.' : 'No output.');
+  }
+
+  function renderDraft() {
+    scheduleDraft.cancel();
+    const draft = liveOf(threadId).draft;
+    if (!draft) {
+      if (!draftEl.hidden) {
+        draftEl.hidden = true;
+        draftEl.replaceChildren();
+      }
+    } else {
+      const atEnd = nearEnd();
+      draftEl.replaceChildren(renderMarkdown(draft));
+      (draftEl.lastElementChild || draftEl).append(h('span', { class: 'caret', 'aria-hidden': 'true' }));
+      draftEl.hidden = false;
+      if (atEnd) body.scrollTop = body.scrollHeight;
+    }
+    renderEmpty(t());
+  }
+
+  const scheduleDraft = throttle(renderDraft, 100);
+
+  function nearEnd() {
+    return body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+  }
+
+  // ---- result, rating, files, raw events
+
+  function renderResult(th) {
+    if (isActive(th.status)) {
+      resultSlot.hidden = true;
+      resultSlot.replaceChildren();
+      return;
+    }
     const finished = events.filter((e) => e.kind === 'thread_finished').at(-1);
     const summary = th.summary || finished?.summary;
+    const key = `${th.status}|${th.finished}|${summary}|${isAdmin()}`;
+    if (resultSlot.dataset.key === key) return; // keep focus on the thumbs
+    resultSlot.dataset.key = key;
     const thumb = (value, iconName, label) =>
       h(
         'button',
         {
-          class: 'icon-btn',
+          class: 'icon-btn thumb',
           type: 'button',
           'aria-label': label,
           'aria-pressed': rating === value ? 'true' : 'false',
+          'data-value': value,
           disabled: !isAdmin(),
           onclick: () => rate(rating === value ? 'clear' : value),
         },
         icon(iconName),
       );
-    return h(
-      'section',
-      { 'aria-labelledby': 'res-title' },
+    resultSlot.hidden = false;
+    setChildren(
+      resultSlot,
       h('h3', { class: 'sub-title', id: 'res-title' }, th.status === 'done' ? 'Result' : th.status === 'failed' ? 'Failed' : 'Stopped', th.finished ? h('span', null, dateTime(th.finished)) : null),
       summary ? h('div', { class: 'callout md' }, renderMarkdown(summary)) : h('p', { class: 'hint' }, 'No summary.'),
       h('div', { class: 'rating', role: 'group', 'aria-label': 'Rate this result' }, h('span', { class: 'hint' }, 'Rate the result'), thumb('up', 'up', 'Good result'), thumb('down', 'downvote', 'Poor result')),
@@ -314,14 +442,14 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
     try {
       await post(`/v1/threads/${enc(threadId)}/rating`, { rating: value });
       rating = value === 'clear' ? null : value;
+      for (const b of resultSlot.querySelectorAll('.thumb')) b.setAttribute('aria-pressed', b.dataset.value === rating ? 'true' : 'false');
       toast(value === 'clear' ? 'Rating cleared.' : 'Thanks. Ratings feed the model registry.');
-      render();
     } catch (err) {
       toast(describe(err), 'error');
     }
   }
 
-  function filesSection() {
+  function renderFiles() {
     let content;
     if (filesLoading) content = skeleton(2);
     else if (!files) content = h('button', { class: 'btn btn-sm', type: 'button', disabled: !isAdmin(), onclick: loadFiles }, icon('file'), 'Show files');
@@ -348,56 +476,53 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
         h('p', { class: 'hint' }, `On ${deviceName(files.device_id)}.`),
       );
     }
-    return h('section', { 'aria-labelledby': 'files-title' }, h('h3', { class: 'sub-title', id: 'files-title' }, 'Files'), content);
+    const key = `${filesLoading}|${files ? JSON.stringify(files) : ''}|${isAdmin()}`;
+    if (filesSlot.dataset.key === key) return;
+    const hadFocus = filesSlot.contains(document.activeElement);
+    filesSlot.dataset.key = key;
+    setChildren(filesSlot, h('h3', { class: 'sub-title', id: 'files-title' }, 'Files'), content);
+    if (hadFocus) (filesSlot.querySelector('a, button') || titleEl).focus({ preventScroll: true });
   }
 
   async function loadFiles() {
     filesLoading = true;
-    render();
+    renderFiles();
     try {
-      files = await get(`/v1/threads/${enc(threadId)}/files`);
+      files = await get(`/v1/threads/${enc(threadId)}/files`, { signal: aborter.signal });
     } catch (err) {
+      if (aborter.signal.aborted) return;
       files = { error: describe(err) };
     }
     filesLoading = false;
-    render();
+    renderFiles();
   }
 
-  function rawSection() {
-    const details = h(
-      'details',
-      {
-        class: 'tool-row',
-        open: showRaw,
-        ontoggle: () => {
-          showRaw = details.open;
-          if (showRaw) fill();
-        },
-      },
-      h('summary', null, icon('chevron'), h('span', { class: 'tool-name' }, `Show events (${events.length})`)),
-    );
-    details.querySelector('summary .icon').classList.add('chev');
-    const fill = () => {
-      if (details.querySelector('.tool-body')) return;
-      details.append(h('div', { class: 'tool-body' }, h('pre', { class: 'code' }, events.map((e) => JSON.stringify(e)).join('\n'))));
-    };
-    if (showRaw) fill();
-    return details;
+  function renderRawCount() {
+    setText(rawCount, `Show events (${events.length})`);
   }
+
+  function fillRaw() {
+    setText(rawBody, events.map((e) => JSON.stringify(e)).join('\n'));
+  }
+
+  // ---- foot: step in and stop, or a note once the thread is over
 
   function renderFoot(th) {
-    foot.hidden = false;
     const active = isActive(th.status);
     const canAct = isAdmin() && store.online;
-    stepText.disabled = !active || !canAct;
-    stepBtn.disabled = !active || !canAct;
-    stopBtn.disabled = !active || !canAct;
-    stepText.placeholder = !isAdmin() ? 'Sign in with an admin token to message threads' : active ? 'Message this thread' : 'This thread has finished';
-    if (!foot.childElementCount) {
-      foot.append(stepError, h('div', { class: 'stepin' }, stepText, stepBtn), h('div', null, stopBtn));
-    }
-    stopBtn.className = active && th.status === 'running' ? 'btn' : 'btn btn-ghost';
-    stopBtn.hidden = !active;
+    stepRow.hidden = !active;
+    stopRow.hidden = !active;
+    stepText.disabled = !canAct;
+    stepBtn.disabled = !canAct;
+    stopBtn.disabled = !canAct;
+    stepText.placeholder = !isAdmin() ? 'Sign in with an admin token to message threads' : 'Message this thread';
+    stopBtn.className = th.status === 'running' ? 'btn' : 'btn btn-ghost';
+    let note = '';
+    if (!active) note = th.status === 'done' ? 'This thread has finished. Ask in the chat to follow up.' : `This thread has ${th.status === 'failed' ? 'failed' : 'stopped'}. Ask in the chat to try again.`;
+    else if (!isAdmin()) note = 'Reading only: sign in with an admin token to message or stop threads.';
+    else if (!store.online) note = 'Offline. You can message or stop the thread once the hub reconnects.';
+    setText(footNote, note);
+    footNote.hidden = !note;
   }
 
   async function sendStepIn() {
@@ -413,33 +538,28 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
       stepError.textContent = describe(err);
       stepError.hidden = false;
     } finally {
-      stepBtn.disabled = false;
-      render();
+      renderFoot(t());
     }
   }
 
   async function stop() {
-    const th = t();
-    if (th.status === 'running') {
-      const ok = await confirmAction({
-        title: 'Stop this thread?',
-        body: [`“${th.title}” stops on ${deviceName(th.device_id)}. Work it hasn’t saved is lost, and the orchestrator is told you stopped it.`],
-        confirmLabel: 'Stop thread',
-        danger: true,
-      });
-      if (!ok) return;
-    }
     stopBtn.disabled = true;
     try {
-      await post(`/v1/threads/${enc(threadId)}/stop`);
-      toast('Thread stopped.');
+      await stopThread(threadId);
     } catch (err) {
       stepError.textContent = describe(err);
       stepError.hidden = false;
     } finally {
-      render();
+      renderFoot(t());
     }
   }
+
+  // ---- live updates
+
+  const scheduleAll = throttle(() => {
+    if (!container.isConnected) return;
+    renderAll();
+  }, 100);
 
   subs.push(
     on('event', (e) => {
@@ -448,23 +568,50 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
         if (e.seq <= lastSeq) return;
         events.push(e);
         lastSeq = e.seq;
+        if (!loaded) return; // the load keeps it and draws everything
+        const atEnd = nearEnd();
+        appendActivity(e);
+        if (e.kind === 'thread_activity' && e.event.type === 'usage') renderTokens();
+        if (e.kind === 'thread_activity' && e.event.type === 'text') {
+          speaker.reset();
+          renderDraft();
+        }
+        if (raw.open) fillRaw();
+        renderRawCount();
+        if (e.kind === 'thread_finished') {
+          announce(`Thread ${e.status === 'done' ? 'finished' : e.status}`, { force: true });
+          renderDraft();
+        }
+        if (!['thread_activity', 'thread_input'].includes(e.kind)) scheduleAll();
+        else renderEmpty(t());
+        if (atEnd) body.scrollTop = body.scrollHeight;
+      } else if (e.kind === 'thread_activity' && e.event.type === 'text_delta') {
+        scheduleDraft();
+        speaker.speak(liveOf(threadId).draft);
       }
-      schedule();
     }),
-    on('threads', schedule),
-    on('approvals', schedule),
-    on('devices', schedule),
-    on('online', schedule),
+    on('threads', scheduleAll),
+    on('approvals', scheduleAll),
+    on('devices', scheduleAll),
+    on('online', scheduleAll),
   );
 
-  render();
+  renderAll();
   load();
-  requestAnimationFrame(() => head.querySelector('h2')?.focus?.());
+  requestAnimationFrame(() => titleEl.focus());
 
   return () => {
     for (const off of subs) off();
-    cancelAnimationFrame(frame);
+    aborter.abort();
+    scheduleAll.cancel();
+    scheduleDraft.cancel();
   };
+}
+
+function chev() {
+  const c = icon('chevron');
+  c.classList.add('chev');
+  return c;
 }
 
 function size(bytes) {

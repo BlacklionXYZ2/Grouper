@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 
 use crate::server::Hub;
 
-pub const CSP: &str = "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self'; \
+/// `connect-src 'self'` covers the event socket too: in CSP Level 3 'self' matches
+/// ws:/wss: on the page's own host and port (checked in Edge/Chromium).
+pub const CSP: &str = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; \
                        script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
 
 macro_rules! assets {

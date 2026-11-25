@@ -2,18 +2,31 @@
 // paragraphs, line breaks, headings, fenced and indented code, block quotes,
 // ordered and unordered lists (nested by indentation), rules, inline code,
 // bold, italic, strikethrough, links and bare URLs. Links only for http(s) and
-// mailto, opened with rel="noopener noreferrer".
+// mailto (javascript:, data: and the rest stay text), opened with
+// rel="noopener noreferrer". A link's text never holds another link, URLs may
+// hold one level of balanced parentheses, and nesting is capped so hostile input
+// can't recurse deeply.
 
 const SAFE_URL = /^(https?:\/\/|mailto:)/i;
+/** Deepest block nesting (quotes, lists) rendered as structure; deeper is text. */
+const MAX_BLOCK_DEPTH = 8;
+/** Deepest inline nesting (emphasis in emphasis …); deeper is text. */
+const MAX_INLINE_DEPTH = 8;
 
 export function renderMarkdown(text) {
   const root = document.createDocumentFragment();
   const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
-  renderBlocks(lines, root);
+  renderBlocks(lines, root, 0);
   return root;
 }
 
-function renderBlocks(lines, parent) {
+function renderBlocks(lines, parent, depth) {
+  if (depth > MAX_BLOCK_DEPTH) {
+    const p = document.createElement('p');
+    p.textContent = lines.join('\n');
+    parent.append(p);
+    return;
+  }
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
@@ -54,13 +67,13 @@ function renderBlocks(lines, parent) {
       const body = [];
       while (i < lines.length && /^\s*>/.test(lines[i])) body.push(lines[i++].replace(/^\s*>\s?/, ''));
       const quote = document.createElement('blockquote');
-      renderBlocks(body, quote);
+      renderBlocks(body, quote, depth + 1);
       parent.append(quote);
       continue;
     }
     // List.
     if (listItem(line)) {
-      i = renderList(lines, i, parent);
+      i = renderList(lines, i, parent, depth);
       continue;
     }
     // Indented code (4 spaces or a tab), only at the start of a block.
@@ -98,7 +111,7 @@ function listItem(line) {
   return { indent: m[1].replace(/\t/g, '    ').length, ordered: /\d/.test(m[2]), start: parseInt(m[2], 10), text: m[3] };
 }
 
-function renderList(lines, i, parent) {
+function renderList(lines, i, parent, depth) {
   const first = listItem(lines[i]);
   const list = document.createElement(first.ordered ? 'ol' : 'ul');
   if (first.ordered && first.start !== 1) list.setAttribute('start', String(first.start));
@@ -124,7 +137,7 @@ function renderList(lines, i, parent) {
         nested.push(lines[i].slice(Math.min(item.indent, lines[i].length - lines[i].trimStart().length)));
         i++;
       }
-      renderBlocks(nested, li);
+      renderBlocks(nested, li, depth + 1);
       continue;
     }
     if (!item && li && /^\s{2,}\S/.test(line)) {
@@ -149,20 +162,30 @@ function codeBlock(text, lang) {
   return pre;
 }
 
+// A URL: no spaces or angle brackets, with at most one level of balanced
+// parentheses, e.g. https://en.wikipedia.org/wiki/Rust_(programming_language).
+const URL_PART = String.raw`(?:[^\s()<>]|\([^\s()<>]*\))+`;
+
 // Inline: the earliest match wins; emphasis and link text recurse.
+// `ctx` is {inLink, depth}: inside a link's text, links render as plain text.
 const INLINE = [
   { re: /(`+)([\s\S]+?)\1/, make: (m) => el('code', m[2].replace(/^ (.*) $/, '$1')) },
-  { re: /\[([^\]\n]+)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/, make: (m) => link(m[2], m[1]) },
-  { re: /<(https?:\/\/[^>\s]+)>/, make: (m) => link(m[1]) },
-  { re: /\*\*(?=\S)([\s\S]+?\S)\*\*/, make: (m) => wrap('strong', m[1]) },
-  { re: /__(?=\S)([\s\S]+?\S)__(?!\w)/, make: (m) => wrap('strong', m[1]) },
-  { re: /~~(?=\S)([\s\S]+?\S)~~/, make: (m) => wrap('del', m[1]) },
-  { re: /\*(?=[^\s*])([\s\S]*?[^\s*])\*/, make: (m) => wrap('em', m[1]) },
-  { re: /(?<![\w])_(?=\S)([\s\S]*?\S)_(?![\w])/, make: (m) => wrap('em', m[1]) },
-  { re: /\bhttps?:\/\/[^\s<>"']+[^\s<>"'.,;:!?)\]]/, make: (m) => link(m[0]) },
+  { re: new RegExp(String.raw`\[([^\]\n]+)\]\(\s*(?:<([^>\s]+)>|(${URL_PART}))(?:\s+"[^"]*")?\s*\)`), make: (m, ctx) => link(m[2] || m[3], m[1], ctx) },
+  { re: /<(https?:\/\/[^>\s]+)>/, make: (m, ctx) => link(m[1], null, ctx) },
+  { re: /\*\*(?=\S)([\s\S]+?\S)\*\*/, make: (m, ctx) => wrap('strong', m[1], ctx) },
+  { re: /__(?=\S)([\s\S]+?\S)__(?!\w)/, make: (m, ctx) => wrap('strong', m[1], ctx) },
+  { re: /~~(?=\S)([\s\S]+?\S)~~/, make: (m, ctx) => wrap('del', m[1], ctx) },
+  { re: /\*(?=[^\s*])([\s\S]*?[^\s*])\*/, make: (m, ctx) => wrap('em', m[1], ctx) },
+  { re: /(?<![\w])_(?=\S)([\s\S]*?\S)_(?![\w])/, make: (m, ctx) => wrap('em', m[1], ctx) },
+  // A bare URL ends before trailing punctuation (and an unbalanced ")").
+  { re: /\bhttps?:\/\/(?:[^\s<>"'()]|\([^\s<>"'()]*\))*(?:[^\s<>"'().,;:!?\]]|\([^\s<>"'()]*\))/, make: (m, ctx) => link(m[0], null, ctx) },
 ];
 
-function inline(text, parent) {
+function inline(text, parent, ctx = { inLink: false, depth: 0 }) {
+  if (ctx.depth > MAX_INLINE_DEPTH) {
+    parent.append(document.createTextNode(unescape(text)));
+    return;
+  }
   let rest = text;
   while (rest) {
     let best = null;
@@ -175,7 +198,7 @@ function inline(text, parent) {
       break;
     }
     if (best.m.index) parent.append(document.createTextNode(unescape(rest.slice(0, best.m.index))));
-    parent.append(best.rule.make(best.m));
+    parent.append(best.rule.make(best.m, ctx));
     rest = rest.slice(best.m.index + best.m[0].length);
   }
 }
@@ -190,23 +213,26 @@ function el(tag, text) {
   return e;
 }
 
-function wrap(tag, inner) {
+function wrap(tag, inner, ctx) {
   const e = document.createElement(tag);
-  inline(inner, e);
+  inline(inner, e, { ...ctx, depth: ctx.depth + 1 });
   return e;
 }
 
-function link(url, label) {
-  if (!SAFE_URL.test(url)) {
+/** A link, or its text when the URL isn't allowed or we're already inside a link. */
+function link(url, label, ctx) {
+  const inner = { inLink: true, depth: ctx.depth + 1 };
+  if (ctx.inLink || !SAFE_URL.test(url)) {
     const span = document.createElement('span');
-    inline(label ?? url, span);
+    if (label) inline(label, span, inner);
+    else span.textContent = url;
     return span;
   }
   const a = document.createElement('a');
   a.href = url;
   a.rel = 'noopener noreferrer';
   a.target = '_blank';
-  if (label) inline(label, a);
+  if (label) inline(label, a, inner);
   else a.textContent = url;
   return a;
 }

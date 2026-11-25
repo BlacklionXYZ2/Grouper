@@ -1,9 +1,9 @@
 // Long-term memory: search, add, edit, forget. Shared by every conversation.
 
 import { h, icon, setChildren, debounce } from '../lib/dom.js';
-import { get, post, put, del, qs } from '../lib/api.js';
+import { get, post, put, del, qs, isAbort } from '../lib/api.js';
 import { store, isAdmin } from '../lib/store.js';
-import { bar, confirmAction, toast, toastError, skeletonBlocks, errorBanner } from '../lib/ui.js';
+import { bar, confirmAction, toast, toastError, skeletonBlocks, errorBanner, guardWrites } from '../lib/ui.js';
 import { ago, date } from '../lib/format.js';
 
 export function renderMemory(container) {
@@ -18,16 +18,20 @@ export function renderMemory(container) {
   let list = null;
   let error = null;
   let editing = null;
+  // Leaving the view cancels the read in flight and a pending search.
+  const aborter = new AbortController();
+  let loading = null; // the AbortController of the newest read
+  const onSearch = debounce((e) => {
+    query = e.target.value.trim();
+    load();
+  }, 250);
 
   const search = h('input', {
     class: 'input',
     type: 'search',
     placeholder: 'Search memories',
     'aria-label': 'Search memories',
-    oninput: debounce((e) => {
-      query = e.target.value.trim();
-      load();
-    }, 250),
+    oninput: onSearch,
   });
 
   const addContent = h('textarea', { class: 'textarea', name: 'content', required: true, rows: 2, placeholder: 'Something Grouper should remember, e.g. “I prefer British spelling.”' });
@@ -52,7 +56,7 @@ export function renderMemory(container) {
       },
     },
     h('label', { class: 'field' }, h('span', null, 'Add a memory'), addContent),
-    h('div', { class: 'row-form' }, h('label', { class: 'field' }, h('span', null, 'Tags'), addTags), h('button', { class: 'btn btn-primary', type: 'submit' }, icon('plus'), 'Remember')),
+    h('div', { class: 'row-form' }, h('label', { class: 'field' }, h('span', null, 'Tags'), addTags), h('button', { class: 'btn btn-primary', type: 'submit', 'data-write': true }, icon('plus'), 'Remember')),
   );
 
   const listSlot = h('div');
@@ -111,6 +115,7 @@ export function renderMemory(container) {
           {
             class: 'icon-btn',
             type: 'button',
+            'data-write': true,
             'aria-label': 'Edit memory',
             onclick: () => {
               editing = m.id;
@@ -120,7 +125,7 @@ export function renderMemory(container) {
           },
           icon('edit'),
         ),
-        h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Forget memory', onclick: () => forget(m) }, icon('trash')),
+        h('button', { class: 'icon-btn', type: 'button', 'data-write': true, 'aria-label': 'Forget memory', onclick: () => forget(m) }, icon('trash')),
       ),
     );
   }
@@ -161,7 +166,7 @@ export function renderMemory(container) {
           },
           'Cancel',
         ),
-        h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+        h('button', { class: 'btn btn-primary', type: 'submit', 'data-write': true }, 'Save'),
       ),
     );
   }
@@ -184,16 +189,28 @@ export function renderMemory(container) {
   }
 
   async function load() {
+    // A newer search replaces an older one still in flight.
+    loading?.abort();
+    const mine = new AbortController();
+    loading = mine;
     try {
-      list = (await get(`/v1/memories${qs({ q: query, limit: 200 })}`)) || [];
+      list = (await get(`/v1/memories${qs({ q: query, limit: 200 })}`, { signal: mine.signal })) || [];
       error = null;
     } catch (err) {
+      if (isAbort(err)) return;
       error = err;
     }
+    if (aborter.signal.aborted) return;
     render();
   }
 
+  const unguard = guardWrites(body);
   render();
   load();
-  return null;
+  return () => {
+    aborter.abort();
+    loading?.abort();
+    onSearch.cancel();
+    unguard();
+  };
 }

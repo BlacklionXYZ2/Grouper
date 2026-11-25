@@ -1,7 +1,7 @@
 // Threads across conversations: what needs you (approvals, threads waiting for a
 // device), then running, then finished.
 
-import { h, icon, setChildren } from '../lib/dom.js';
+import { h, icon, setChildren, keepFocus } from '../lib/dom.js';
 import { store, on, deviceName, approvalsFor, pendingApprovals } from '../lib/store.js';
 import { loadThreads, scanApprovals } from '../lib/live.js';
 import { bar, statusPill, skeletonBlocks, errorBanner } from '../lib/ui.js';
@@ -51,7 +51,7 @@ export function renderThreads(container) {
       null,
       h(
         'button',
-        { class: 'list-row', type: 'button', onclick: () => openApproval(a.approval_id) },
+        { class: 'list-row', type: 'button', id: `approval-row-${a.approval_id}`, onclick: () => openApproval(a.approval_id) },
         icon('shield'),
         h(
           'div',
@@ -96,11 +96,14 @@ export function renderThreads(container) {
       );
       return;
     }
-    setChildren(
-      body,
-      section('Needs you', [...approvals.map(approvalRow), ...waiting.map(row)], 'Nothing is waiting for you.'),
-      section('Running', running.map(row), 'Nothing running.'),
-      section('Finished', finished.slice(0, 60).map(row), 'Nothing finished yet.'),
+    // Live updates redraw the lists; the person keeps their place.
+    keepFocus(body, () =>
+      setChildren(
+        body,
+        section('Needs you', [...approvals.map(approvalRow), ...waiting.map(row)], 'Nothing is waiting for you.'),
+        section('Running', running.map(row), 'Nothing running.'),
+        section('Finished', finished.slice(0, 60).map(row), 'Nothing finished yet.'),
+      ),
     );
   }
 

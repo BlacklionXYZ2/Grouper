@@ -1,7 +1,7 @@
 // Sign in: trade a hub token for a session cookie (POST /v1/session).
 // The token goes to the hub once and is never kept by the browser.
 
-import { h, icon } from '../lib/dom.js';
+import { h, icon, srOnly } from '../lib/dom.js';
 import { post, describe } from '../lib/api.js';
 
 export function renderLogin(onSignedIn) {
@@ -17,12 +17,29 @@ export function renderLogin(onSignedIn) {
     required: true,
     'aria-describedby': 'token-help',
   });
+  // Tokens are long and easy to mistype: let people check what they pasted.
+  const revealWord = h('span', null, 'Show');
+  const reveal = h(
+    'button',
+    {
+      class: 'btn btn-ghost reveal-btn',
+      type: 'button',
+      'aria-controls': 'token',
+      onclick: () => {
+        const show = input.type === 'password';
+        input.type = show ? 'text' : 'password';
+        revealWord.textContent = show ? 'Hide' : 'Show';
+      },
+    },
+    revealWord,
+    srOnly(' token'),
+  );
   const error = h('div', { class: 'banner error', role: 'alert', hidden: true });
   const button = h('button', { class: 'btn btn-primary btn-lg', type: 'submit' }, 'Sign in');
   const form = h(
     'form',
     {
-      class: 'login-card glass',
+      class: 'login-card',
       onsubmit: async (e) => {
         e.preventDefault();
         const token = input.value.trim();
@@ -50,7 +67,7 @@ export function renderLogin(onSignedIn) {
     error,
     // Lets password managers file the token under a name.
     h('input', { type: 'text', name: 'username', autocomplete: 'username', value: 'grouper', hidden: true, 'aria-hidden': 'true', tabindex: '-1' }),
-    h('label', { class: 'field', for: 'token' }, h('span', null, 'Hub token'), input),
+    h('div', { class: 'field' }, h('label', { for: 'token' }, h('span', { class: 'field-label' }, 'Hub token')), h('div', { class: 'reveal-field' }, input, reveal)),
     h(
       'p',
       { class: 'hint', id: 'token-help' },

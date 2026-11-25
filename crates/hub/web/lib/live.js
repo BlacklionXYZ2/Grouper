@@ -3,9 +3,15 @@
 //
 // The socket's cursor starts at the hub's latest seq when it opens, so anything
 // stored while it was down is fetched over HTTP (`?after=lastSeq`). Events that
-// arrive on the socket while a fetch is in flight are queued, then applied with
-// those at or below the fetched seq dropped. Deltas (seq 0) are never stored: the
-// stored message replaces the draft.
+// arrive on the socket while a fetch is in flight (the first load or a catch-up)
+// are queued, then applied with those at or below the fetched seq dropped. A
+// failed catch-up keeps queueing and is retried, so no gap is papered over.
+// Deltas (seq 0) are never stored: the stored message replaces the draft.
+//
+// After a few failed reconnects the session is probed (`GET /v1/session`): if it
+// expired or its token was revoked, `session_ended` is emitted instead of retrying
+// forever. Device presence is polled here too (one poller for every view), paused
+// while the page is hidden.
 
 import { get, qs, enc } from './api.js';
 import { store, emit, conv, liveOf } from './store.js';
@@ -15,23 +21,44 @@ let socket = null;
 let attempts = 0;
 let reconnectTimer = null;
 let keepAlive = null;
-let stopped = false;
+let stopped = true;
+let abort = null; // window/document listeners of this sign-in
+const retries = new Map(); // job name -> timer
 
 export function startLive() {
+  if (!stopped) return;
   stopped = false;
+  abort = new AbortController();
+  const { signal } = abort;
+  window.addEventListener('online', () => reconnectNow(), { signal });
+  document.addEventListener(
+    'visibilitychange',
+    () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!store.online) reconnectNow();
+      else if (Date.now() - store.devicesAt > pollEvery()) pollDevices();
+    },
+    { signal },
+  );
   connect();
-  window.addEventListener('online', () => reconnectNow());
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && !store.online) reconnectNow();
-  });
+  schedulePoll();
 }
 
 export function stopLive() {
   stopped = true;
+  abort?.abort();
+  abort = null;
   clearTimeout(reconnectTimer);
   clearInterval(keepAlive);
-  if (socket) socket.close();
+  clearTimeout(pollTimer);
+  clearTimeout(devicesTimer);
+  for (const t of retries.values()) clearTimeout(t);
+  retries.clear();
+  attempts = 0;
+  const ws = socket;
   socket = null;
+  ws?.close();
+  setOnline(false);
 }
 
 function reconnectNow() {
@@ -75,12 +102,32 @@ function connect() {
     // Drafts can't be finished without the socket; the stored text repairs them.
     store.drafts.clear();
     for (const l of store.live.values()) l.draft = '';
-    if (!stopped) {
-      const delay = Math.min(15000, 1000 * 2 ** attempts) + Math.random() * 500;
-      attempts++;
-      reconnectTimer = setTimeout(connect, delay);
-    }
+    // Nor can "replying" end without it; catch-up works it out again.
+    const replying = [...store.replying];
+    store.replying.clear();
+    for (const id of replying) emit('replying', id);
+    if (stopped) return;
+    attempts++;
+    if (attempts >= 2) probeSession();
+    const delay = Math.min(15000, 1000 * 2 ** (attempts - 1)) + Math.random() * 500;
+    reconnectTimer = setTimeout(connect, delay);
   });
+}
+
+/** After failed reconnects: is the session still good? A 401 here is handled by the API listener too. */
+async function probeSession() {
+  try {
+    const me = await get('/v1/session');
+    if (!stopped && !me?.signed_in) sessionEnded();
+  } catch (e) {
+    if (!stopped && e.status === 401) sessionEnded();
+    // Anything else (the hub is down): keep reconnecting.
+  }
+}
+
+function sessionEnded() {
+  stopLive();
+  emit('session_ended');
 }
 
 function setOnline(online) {
@@ -90,13 +137,36 @@ function setOnline(online) {
   emit('online', online);
 }
 
+/**
+ * Run `job` now; if it fails while we're live, try again with backoff
+ * (2 s, 4 s … 30 s) until it works, the socket drops (resync runs it again) or
+ * live updates stop.
+ */
+function retrying(name, job, attempt = 0) {
+  clearTimeout(retries.get(name));
+  retries.delete(name);
+  return job().catch((e) => {
+    if (stopped || !store.online) return;
+    const delay = Math.min(30000, 2000 * 2 ** attempt);
+    retries.set(
+      name,
+      setTimeout(() => {
+        retries.delete(name);
+        if (!stopped && store.online) retrying(name, job, attempt + 1);
+      }, delay),
+    );
+    console.warn(`${name} failed; retrying in ${Math.round(delay / 1000)} s`, e);
+  });
+}
+
 /** After (re)connecting: fill gaps in loaded conversations and refresh lists. */
-async function resync() {
-  const jobs = [loadThreads().then(scanApprovals), loadConversations(), loadDevices()];
+function resync() {
+  retrying('threads', () => loadThreads().then(() => scanApprovals({ strict: true })));
+  retrying('conversations', loadConversations);
+  retrying('devices', loadDevices);
   for (const [id, c] of store.convs) {
-    if (c.loaded) jobs.push(catchUp(id));
+    if (c.loaded) retrying(`catch-up ${id}`, () => catchUp(id));
   }
-  await Promise.allSettled(jobs);
 }
 
 // ---- reducer
@@ -106,13 +176,10 @@ export function ingest(e, { derive }) {
   if (derive) applyDerived(e);
   if (e.seq > 0) {
     const c = store.convs.get(e.conversation_id);
-    if (c && c.loaded) {
-      if (c.catching) {
-        c.queue.push(e);
-      } else {
-        store_(c, e);
-      }
-    }
+    // While the first load or a catch-up is fetching, queue: the fetch may end
+    // before this event, and dropping it would leave a hole.
+    if (c && c.catching) c.queue.push(e);
+    else if (c && c.loaded) store_(c, e);
   }
   emit('event', e);
 }
@@ -191,6 +258,7 @@ function applyDerived(e) {
       upsertThread(tid, { status: e.status, summary: e.summary, finished: e.ts });
       for (const [id, a] of store.approvals) if (a.thread_id === tid) store.approvals.delete(id);
       liveOf(tid).tool = null;
+      liveOf(tid).draft = '';
       emit('approvals');
       break;
     case 'approval_requested':
@@ -218,6 +286,24 @@ function applyDerived(e) {
   }
 }
 
+/**
+ * Whether the orchestrator is mid-turn, from the stored events: a user message
+ * (or a thread result it wakes on) after the last finished turn.
+ */
+function reconcileReplying(id) {
+  const c = store.convs.get(id);
+  if (!c?.loaded) return;
+  let replying = false;
+  for (const e of c.events) {
+    if (e.kind === 'user_message') replying = true;
+    else if (e.kind === 'turn_finished') replying = false;
+  }
+  if (replying === store.replying.has(id)) return;
+  if (replying) store.replying.add(id);
+  else store.replying.delete(id);
+  emit('replying', id);
+}
+
 // Presence isn't on the event stream; re-read devices when a thread hints it changed.
 let devicesTimer = null;
 function refreshDevicesSoon() {
@@ -233,7 +319,41 @@ function upsertThread(id, fields) {
 }
 
 function bumpConversation(id) {
-  if (!store.conversations.some((c) => c.id === id)) loadConversations();
+  if (!store.conversations.some((c) => c.id === id)) loadConversations().catch(() => {});
+}
+
+// ---- device presence poller (one for the whole app)
+
+let pollTimer = null;
+let fastPollers = 0;
+
+function pollEvery() {
+  return fastPollers > 0 ? 15000 : 30000;
+}
+
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  if (stopped) return;
+  pollTimer = setTimeout(pollDevices, pollEvery());
+}
+
+async function pollDevices() {
+  clearTimeout(pollTimer);
+  if (!stopped && store.online && !document.hidden) await loadDevices().catch(() => {});
+  schedulePoll();
+}
+
+/** A view that shows presence asks for the 15 s cadence; call the result to stop. */
+export function wantFastDevicePolling() {
+  fastPollers++;
+  schedulePoll();
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    fastPollers--;
+    schedulePoll();
+  };
 }
 
 // ---- loaders
@@ -270,6 +390,7 @@ export async function loadModels() {
 export async function loadConversation(id) {
   const c = conv(id);
   if (c.loaded) return catchUp(id);
+  if (c.catching) return undefined;
   c.catching = true;
   c.queue = [];
   try {
@@ -283,20 +404,28 @@ export async function loadConversation(id) {
       }
       if (e.kind === 'thread_activity' && e.event.type === 'text') liveOf(e.thread_id).lastText = e.event.text;
     }
-  } finally {
+  } catch (err) {
     c.catching = false;
-    const queued = c.queue;
     c.queue = [];
-    for (const e of queued) store_(c, e);
+    throw err;
   }
+  c.catching = false;
+  const queued = c.queue;
+  c.queue = [];
+  for (const e of queued) store_(c, e);
+  reconcileReplying(id);
   emit('loaded', id);
+  return undefined;
 }
 
 async function catchUp(id) {
   const c = conv(id);
-  if (!c.loaded || c.catching) return;
-  c.catching = true;
-  c.queue = [];
+  if (!c.loaded || c.fetching) return;
+  c.fetching = true;
+  if (!c.catching) {
+    c.catching = true;
+    c.queue = [];
+  }
   try {
     const events = (await get(`/v1/conversations/${enc(id)}/events${qs({ after: c.lastSeq })}`)) || [];
     for (const e of events) {
@@ -307,21 +436,25 @@ async function catchUp(id) {
       }
     }
   } finally {
-    c.catching = false;
-    const queued = c.queue;
-    c.queue = [];
-    for (const e of queued) store_(c, e);
+    c.fetching = false;
   }
+  // Only a successful fetch ends the catch-up: on failure the queue keeps the live
+  // events until the retry fills the gap before them.
+  c.catching = false;
+  const queued = c.queue;
+  c.queue = [];
+  for (const e of queued) store_(c, e);
+  reconcileReplying(id);
 }
 
 /**
  * Approvals waiting now. There is no list route, so read the events of each
  * running or waiting thread and keep the requests nobody has answered.
  */
-export async function scanApprovals() {
+export async function scanApprovals({ strict = false } = {}) {
   const active = [...store.threads.values()].filter((t) => isActive(t.status));
   const found = new Map();
-  await Promise.allSettled(
+  const results = await Promise.allSettled(
     active.map(async (t) => {
       const events = (await get(`/v1/conversations/${enc(t.conversation_id)}/events${qs({ thread: t.id })}`)) || [];
       const open = new Map();
@@ -349,11 +482,15 @@ export async function scanApprovals() {
       }
     }),
   );
-  // Keep requests that arrived on the socket meanwhile.
+  // Keep requests that arrived on the socket meanwhile, and those of threads we
+  // couldn't read this time.
+  const unread = new Set(active.filter((_, i) => results[i].status === 'rejected').map((t) => t.id));
   for (const [id, a] of store.approvals) {
-    if (!found.has(id) && !store.answered.has(id) && isActive(store.threads.get(a.thread_id)?.status)) found.set(id, a);
+    if (!found.has(id) && !store.answered.has(id) && (unread.has(a.thread_id) || isActive(store.threads.get(a.thread_id)?.status))) found.set(id, a);
   }
   store.approvals = found;
   emit('approvals');
   emit('threads');
+  const failed = results.find((r) => r.status === 'rejected');
+  if (failed && strict) throw failed.reason;
 }

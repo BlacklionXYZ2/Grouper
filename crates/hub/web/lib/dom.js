@@ -112,11 +112,102 @@ export function srOnly(text) {
   return h('span', { class: 'visually-hidden' }, text);
 }
 
-/** Debounce. */
+/** Debounce; `.cancel()` drops a pending call (use it when the view goes away). */
 export function debounce(fn, ms) {
   let t;
-  return (...args) => {
+  const run = (...args) => {
     clearTimeout(t);
     t = setTimeout(() => fn(...args), ms);
   };
+  run.cancel = () => clearTimeout(t);
+  return run;
+}
+
+/**
+ * Run `fn` at most every `ms` milliseconds: the first call runs at once, calls in
+ * between collapse into one trailing run. `.cancel()` drops a pending run.
+ */
+export function throttle(fn, ms) {
+  let last = 0;
+  let timer = 0;
+  const run = () => {
+    timer = 0;
+    last = Date.now();
+    fn();
+  };
+  const call = () => {
+    if (timer) return;
+    const wait = ms - (Date.now() - last);
+    if (wait <= 0) run();
+    else timer = setTimeout(run, wait);
+  };
+  call.cancel = () => {
+    clearTimeout(timer);
+    timer = 0;
+  };
+  return call;
+}
+
+/**
+ * Keep `parent`'s children in step with `items` without rebuilding them: nodes are
+ * keyed by `keyOf(item)`, made once by `create(item)`, refreshed by `update(node,
+ * item)`, moved only when the order changed and removed when their item is gone.
+ * Focus inside `parent` survives (a moved node is focused again).
+ */
+export function syncList(parent, items, keyOf, create, update) {
+  const existing = new Map();
+  for (const child of parent.children) existing.set(child.dataset.key, child);
+  const focused = parent.contains(document.activeElement) ? document.activeElement : null;
+  let i = 0;
+  for (const item of items) {
+    const key = String(keyOf(item));
+    let node = existing.get(key);
+    if (node) existing.delete(key);
+    else {
+      node = create(item);
+      node.dataset.key = key;
+    }
+    update(node, item);
+    const at = parent.children[i];
+    if (at !== node) parent.insertBefore(node, at || null);
+    i++;
+  }
+  for (const node of existing.values()) node.remove();
+  if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
+}
+
+/** Set an element's text only when it changed (no needless DOM writes). */
+export function setText(el, text) {
+  const value = String(text ?? '');
+  if (el.textContent !== value) el.textContent = value;
+}
+
+/** Set or remove an attribute only when it changed. */
+export function setAttr(el, name, value) {
+  if (value === null || value === undefined || value === false) {
+    if (el.hasAttribute(name)) el.removeAttribute(name);
+  } else if (el.getAttribute(name) !== String(value)) {
+    el.setAttribute(name, String(value));
+  }
+}
+
+/**
+ * Rebuild `root` with `rebuild()` without losing the person's place: the focused
+ * control (found again by id, or by name and value for radios) and the scroll
+ * position of the view it's in.
+ */
+export function keepFocus(root, rebuild) {
+  const active = document.activeElement;
+  const view = root.closest('.view');
+  const scroll = view?.scrollTop;
+  let selector = null;
+  if (active && root.contains(active)) {
+    if (active.id) selector = `#${CSS.escape(active.id)}`;
+    else if (active.name) selector = `[name="${CSS.escape(active.name)}"]${active.value ? `[value="${CSS.escape(active.value)}"]` : ''}`;
+    else if (active.getAttribute('aria-label')) selector = `[aria-label="${CSS.escape(active.getAttribute('aria-label'))}"]`;
+    else if (active.getAttribute('href')) selector = `[href="${CSS.escape(active.getAttribute('href'))}"]`;
+  }
+  rebuild();
+  if (selector) root.querySelector(selector)?.focus({ preventScroll: true });
+  if (view && scroll !== undefined) view.scrollTop = scroll;
 }

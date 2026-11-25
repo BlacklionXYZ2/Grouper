@@ -2,9 +2,9 @@
 // (thread caps, budgets, timeouts) with today's estimated spend.
 
 import { h, icon, setChildren } from '../lib/dom.js';
-import { get, post, put, qs, describe } from '../lib/api.js';
+import { get, post, put, qs, describe, isAbort } from '../lib/api.js';
 import { store, isAdmin } from '../lib/store.js';
-import { bar, toast, toastError, skeleton, errorBanner } from '../lib/ui.js';
+import { bar, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { num, usd, ago, dateTime, isoDay } from '../lib/format.js';
 
 const GROUPS = [
@@ -15,16 +15,18 @@ const GROUPS = [
   ['thread', 'Thread'],
 ];
 
-// Limits as the editor shows them. `off` is what null means for that key.
+// Limits as the editor shows them. `off` is what null (switch off) means for that
+// key; `prefix`/`suffix` show the unit next to the number; `scale` converts what
+// the field shows to what the hub stores (the warning share is shown in percent).
 const LIMITS = [
-  { key: 'daily_budget_usd', label: 'Daily budget', unit: 'USD', step: '0.01', help: 'All usage in one UTC day.', off: 'Off' },
-  { key: 'conversation_budget_usd', label: 'Budget per conversation', unit: 'USD', step: '0.01', help: 'A conversation’s orchestrator or standard chat and its threads.', off: 'Off' },
-  { key: 'thread_budget_usd', label: 'Budget per thread', unit: 'USD', step: '0.01', help: 'Default cap for one thread; the orchestrator may ask for less.', off: 'Off' },
-  { key: 'warn_at_fraction', label: 'Warn at', unit: 'fraction', step: '0.05', help: 'Warn when spend reaches this share of a budget (0.8 = 80%).', off: 'Default (0.8)' },
-  { key: 'max_running_threads', label: 'Running threads', unit: 'threads', step: '1', help: 'Threads running at once across the account.', off: 'Off' },
-  { key: 'max_running_threads_per_device', label: 'Running threads per device', unit: 'threads', step: '1', help: 'Threads running at once on any one device, the hub included.', off: 'Off' },
-  { key: 'approval_timeout_secs', label: 'Approval timeout', unit: 'seconds', step: '1', help: 'How long an approval waits before it’s answered for you.', off: 'Waits for you' },
-  { key: 'ask_timeout_secs', label: 'Question timeout', unit: 'seconds', step: '1', help: 'How long a thread’s ask_orchestrator waits.', off: 'Waits forever' },
+  { key: 'daily_budget_usd', label: 'Daily budget', unit: 'US dollars', prefix: '$', step: '0.01', help: 'All usage in one UTC day.', off: 'Off: no daily budget' },
+  { key: 'conversation_budget_usd', label: 'Budget per conversation', unit: 'US dollars', prefix: '$', step: '0.01', help: 'A conversation’s orchestrator or standard chat and its threads.', off: 'Off: no budget' },
+  { key: 'thread_budget_usd', label: 'Budget per thread', unit: 'US dollars', prefix: '$', step: '0.01', help: 'Default cap for one thread; the orchestrator may ask for less.', off: 'Off: no budget' },
+  { key: 'warn_at_fraction', label: 'Warn at', unit: 'percent of a budget', suffix: '%', step: '5', max: '100', scale: 100, help: 'Warn when spend reaches this share of a budget.', off: 'Default: 80%' },
+  { key: 'max_running_threads', label: 'Running threads', unit: 'threads', suffix: 'threads', step: '1', help: 'Threads running at once across the account.', off: 'Off: no cap' },
+  { key: 'max_running_threads_per_device', label: 'Running threads per device', unit: 'threads', suffix: 'threads', step: '1', help: 'Threads running at once on any one device, the hub included.', off: 'Off: no cap' },
+  { key: 'approval_timeout_secs', label: 'Approval timeout', unit: 'seconds', suffix: 's', step: '1', help: 'How long an approval waits before it’s answered for you.', off: 'Off: waits for you' },
+  { key: 'ask_timeout_secs', label: 'Question timeout', unit: 'seconds', suffix: 's', step: '1', help: 'How long a thread’s ask_orchestrator waits.', off: 'Off: waits forever' },
 ];
 
 export function renderUsage(container) {
@@ -35,6 +37,10 @@ export function renderUsage(container) {
     body.append(h('div', { class: 'banner warn' }, icon('shield'), 'Usage and limits need an admin token. Sign in with one in Settings.'));
     return null;
   }
+  // Leaving the view cancels its reads; a write in flight still finishes.
+  const aborter = new AbortController();
+  const { signal } = aborter;
+  const unguard = guardWrites(body);
   const limitsSlot = h('section', { class: 'section', 'aria-labelledby': 'u-limits' });
   const usageSlot = h('section', { class: 'section', 'aria-labelledby': 'u-usage' });
   const balancesSlot = h('section', { class: 'section', 'aria-labelledby': 'u-balances' });
@@ -84,8 +90,9 @@ export function renderUsage(container) {
     setChildren(usageSlot, h('div', { class: 'section-head' }, h('h2', { id: 'u-usage' }, 'Usage'), seg), dates, skeleton(4));
     let rows;
     try {
-      rows = (await get(`/v1/usage${qs({ since: range.since, until: range.until, group })}`)) || [];
+      rows = (await get(`/v1/usage${qs({ since: range.since, until: range.until, group })}`, { signal })) || [];
     } catch (err) {
+      if (isAbort(err)) return;
       setChildren(usageSlot, h('div', { class: 'section-head' }, h('h2', { id: 'u-usage' }, 'Usage'), seg), dates, errorBanner(err, renderUsageTable));
       return;
     }
@@ -140,6 +147,7 @@ export function renderUsage(container) {
       {
         class: 'btn btn-sm',
         type: 'button',
+        'data-write': true,
         onclick: async () => {
           refreshBtn.disabled = true;
           try {
@@ -147,7 +155,7 @@ export function renderUsage(container) {
           } catch (err) {
             toastError(err);
           }
-          renderBalances(true);
+          if (!signal.aborted) renderBalances(true);
         },
       },
       icon('refresh'),
@@ -156,8 +164,9 @@ export function renderUsage(container) {
     if (!refresh) setChildren(balancesSlot, h('div', { class: 'section-head' }, h('h2', { id: 'u-balances' }, 'Balances'), refreshBtn), skeleton(2));
     let snaps;
     try {
-      snaps = (await get('/v1/usage/snapshots')) || [];
+      snaps = (await get('/v1/usage/snapshots', { signal })) || [];
     } catch (err) {
+      if (isAbort(err)) return;
       setChildren(balancesSlot, h('div', { class: 'section-head' }, h('h2', { id: 'u-balances' }, 'Balances'), refreshBtn), errorBanner(err, () => renderBalances()));
       return;
     }
@@ -197,12 +206,18 @@ export function renderUsage(container) {
   }
 
   // ---- limits
+  // The form is built once; saves update it in place (a field being typed in is
+  // never replaced), and only the stat cards are redrawn.
+  let limitsForm = null; // {stats, rows: Map(key -> row), action}
+
   async function renderLimits() {
+    limitsForm = null;
     setChildren(limitsSlot, h('div', { class: 'section-head' }, h('h2', { id: 'u-limits' }, 'Limits')), skeleton(4));
     let report;
     try {
-      report = await get('/v1/limits');
+      report = await get('/v1/limits', { signal });
     } catch (err) {
+      if (isAbort(err)) return;
       setChildren(limitsSlot, h('div', { class: 'section-head' }, h('h2', { id: 'u-limits' }, 'Limits')), errorBanner(err, renderLimits));
       return;
     }
@@ -210,9 +225,43 @@ export function renderUsage(container) {
   }
 
   function drawLimits(report) {
+    if (limitsForm) {
+      limitsForm.stats.replaceWith((limitsForm.stats = statCards(report)));
+      for (const spec of LIMITS) limitsForm.rows.get(spec.key).set(report.limits[spec.key]);
+      if (document.activeElement !== limitsForm.action) limitsForm.action.value = report.limits.approval_timeout_action;
+      return;
+    }
+    const l = report.limits;
+    const stats = statCards(report);
+    const rows = new Map(LIMITS.map((spec) => [spec.key, limitRow(spec, l[spec.key])]));
+    const actionSelect = h(
+      'select',
+      {
+        class: 'select',
+        name: 'approval_timeout_action',
+        id: 'limit-timeout-action',
+        'data-write': true,
+        onchange: (e) => save({ approval_timeout_action: e.target.value }),
+      },
+      h('option', { value: 'deny', selected: l.approval_timeout_action === 'deny' }, 'Deny the call; the thread goes on'),
+      h('option', { value: 'stop', selected: l.approval_timeout_action === 'stop' }, 'Deny and stop the thread'),
+    );
+    const action = h('label', { class: 'field', for: 'limit-timeout-action' }, h('span', null, 'When an approval times out'), actionSelect);
+    setChildren(
+      limitsSlot,
+      h('div', { class: 'section-head' }, h('h2', { id: 'u-limits' }, 'Limits')),
+      h('p', { class: 'section-note' }, 'All off until you switch them on. Budgets use estimated spend. Changes save when you leave a field.'),
+      stats,
+      h('ul', { class: 'list card' }, [...rows.values()].map((r) => h('li', null, r.el))),
+      h('div', { class: 'card card-pad limit-action' }, action),
+    );
+    limitsForm = { stats, rows, action: actionSelect };
+  }
+
+  function statCards(report) {
     const l = report.limits;
     const daily = l.daily_budget_usd;
-    const stats = h(
+    return h(
       'div',
       { class: 'stat-grid' },
       h(
@@ -226,89 +275,95 @@ export function renderUsage(container) {
       h('div', { class: 'card stat' }, h('div', { class: 'k' }, 'Running threads'), h('div', { class: 'v' }, num(report.running_threads)), h('div', { class: 's' }, l.max_running_threads ? `cap ${l.max_running_threads}` : 'no cap')),
       h('div', { class: 'card stat' }, h('div', { class: 'k' }, 'Warning at'), h('div', { class: 'v' }, `${Math.round(report.warn_at_fraction * 100)}%`), h('div', { class: 's' }, 'of each budget')),
     );
-
-    const rows = LIMITS.map((spec) => limitRow(spec, l[spec.key]));
-    const action = h(
-      'label',
-      { class: 'field' },
-      h('span', null, 'When an approval times out'),
-      h(
-        'select',
-        {
-          class: 'select',
-          name: 'approval_timeout_action',
-          onchange: (e) => save({ approval_timeout_action: e.target.value }),
-        },
-        h('option', { value: 'deny', selected: l.approval_timeout_action === 'deny' }, 'Deny the call; the thread goes on'),
-        h('option', { value: 'stop', selected: l.approval_timeout_action === 'stop' }, 'Deny and stop the thread'),
-      ),
-    );
-    setChildren(
-      limitsSlot,
-      h('div', { class: 'section-head' }, h('h2', { id: 'u-limits' }, 'Limits')),
-      h('p', { class: 'section-note' }, 'All off until you set them. Budgets use estimated spend.'),
-      stats,
-      h('ul', { class: 'list card' }, rows.map((r) => h('li', null, r))),
-      h('div', { class: 'card card-pad section' }, action),
-    );
   }
 
+  /**
+   * One limit: an "Enabled" switch (off means null: no limit, or the default) and
+   * the number with its unit beside it. Returns {el, set(value)}; `set` updates the
+   * row from a saved report without touching a field the person is typing in.
+   */
   function limitRow(spec, value) {
-    const isOff = value === null || value === undefined;
+    const id = `limit-${spec.key}`;
+    const scale = spec.scale || 1;
+    const shown = (v) => (v === null || v === undefined ? '' : String(Math.round(v * scale * 1000) / 1000));
     const input = h('input', {
-      class: 'input limit-input-field',
+      class: 'input',
+      id,
       type: 'number',
       min: '0',
       step: spec.step,
-      max: spec.key === 'warn_at_fraction' ? '1' : null,
-      inputmode: 'decimal',
-      value: isOff ? '' : String(value),
-      disabled: isOff,
-      'aria-label': `${spec.label} in ${spec.unit}`,
+      max: spec.max || null,
+      inputmode: spec.step === '1' ? 'numeric' : 'decimal',
+      'data-write': true,
+      'aria-describedby': `${id}-help`,
       onchange: () => {
         if (input.value === '') return;
         const n = Number(input.value);
-        if (!Number.isFinite(n) || n < 0) {
-          toast(`${spec.label} must be a positive number.`, 'error');
+        if (!Number.isFinite(n) || n < 0 || (spec.max && n > Number(spec.max))) {
+          toast(`${spec.label} must be ${spec.max ? `between 0 and ${spec.max}` : 'zero or more'}.`, 'error');
           return;
         }
-        save({ [spec.key]: spec.step === '1' ? Math.round(n) : n });
+        const stored = n / scale;
+        save({ [spec.key]: spec.step === '1' ? Math.round(stored) : stored });
       },
     });
-    const off = h('input', {
+    const enabled = h('input', {
       type: 'checkbox',
-      checked: isOff,
-      onchange: (e) => {
-        if (e.target.checked) {
-          save({ [spec.key]: null });
-        } else {
+      role: 'switch',
+      'data-write': true,
+      'aria-label': `${spec.label} enabled`,
+      onchange: () => {
+        if (enabled.checked) {
           input.disabled = false;
+          input.placeholder = '';
           input.focus();
+        } else {
+          input.disabled = true;
+          save({ [spec.key]: null });
         }
       },
     });
-    return h(
+    const field = h(
+      'div',
+      { class: 'unit-field' },
+      spec.prefix ? h('span', { class: 'unit', 'aria-hidden': 'true' }, spec.prefix) : null,
+      input,
+      spec.suffix ? h('span', { class: 'unit', 'aria-hidden': 'true' }, spec.suffix) : null,
+    );
+    const set = (v) => {
+      const on = v !== null && v !== undefined;
+      enabled.checked = on;
+      input.disabled = !on || 'offlineDisabled' in input.dataset;
+      input.placeholder = on ? '' : spec.off.replace(/^Off: /, '');
+      if (document.activeElement !== input) input.value = shown(v);
+    };
+    set(value);
+    const el = h(
       'div',
       { class: 'limit-row' },
-      h('div', null, h('div', { class: 'limit-name' }, spec.label), h('div', { class: 'limit-help' }, spec.help)),
-      h('div', { class: 'limit-input' }, input),
-      h('label', { class: 'check', title: spec.off }, off, spec.off),
+      h('div', null, h('label', { class: 'limit-name', for: id }, spec.label, h('span', { class: 'visually-hidden' }, ` in ${spec.unit}`)), h('div', { class: 'limit-help', id: `${id}-help` }, spec.help, ' ', h('span', { class: 'limit-off' }, `Switched off: ${spec.off.replace(/^Off: /, '').replace(/^Default: /, 'default ')}.`))),
+      field,
+      h('label', { class: 'switch' }, enabled, 'Enabled'),
     );
+    return { el, set };
   }
 
   async function save(changes) {
     try {
       const report = await put('/v1/limits', changes);
       toast('Limits saved.');
-      drawLimits(report);
+      if (!signal.aborted) drawLimits(report);
     } catch (err) {
       toast(describe(err), 'error');
-      renderLimits();
+      if (!signal.aborted) renderLimits();
     }
   }
 
   renderLimits();
   renderUsageTable();
   renderBalances();
-  return null;
+  return () => {
+    aborter.abort();
+    unguard();
+  };
 }

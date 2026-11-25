@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -181,9 +181,46 @@ async fn get_file(
         return r;
     }
     match hub.thread_file(&id, &path).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+        Ok(bytes) => file_response(&path, bytes),
         Err(e) => err(e.status(), e),
     }
+}
+
+/// A workspace file as a download. Its bytes come from a model, so the browser must
+/// never render them on the hub's origin: always a download (`attachment`), no type
+/// sniffing, and a CSP that sandboxes and blocks everything should one be opened.
+fn file_response(path: &str, bytes: Vec<u8>) -> Response {
+    let mut response = bytes.into_response();
+    let h = response.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; sandbox"));
+    h.insert(header::CONTENT_DISPOSITION, content_disposition(path));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// `attachment; filename="…"; filename*=UTF-8''…` for the last segment of `path`
+/// (RFC 6266 / RFC 8187). The quoted name is a printable-ASCII fallback with
+/// quotes, backslashes and control characters replaced; the starred one is the
+/// exact name, percent-encoded.
+fn content_disposition(path: &str) -> HeaderValue {
+    let name = path.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or("download");
+    let fallback: String = name
+        .chars()
+        .map(|c| if (c.is_ascii_graphic() && c != '"' && c != '\\') || c == ' ' { c } else { '_' })
+        .collect();
+    let mut encoded = String::new();
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            encoded.push(b as char);
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+        }
+    }
+    let value = format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}");
+    // Only printable ASCII is left, so this can't fail; fall back to a bare attachment anyway.
+    HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static("attachment"))
 }
 
 // ---- orchestrator tool
@@ -266,6 +303,32 @@ mod tests {
         let clipped = clip_chars(long);
         assert!(clipped.starts_with(&"é".repeat(MAX_ORCHESTRATOR_CHARS)));
         assert!(clipped.ends_with(&format!("{MAX_ORCHESTRATOR_CHARS} of {} characters shown]", MAX_ORCHESTRATOR_CHARS + 5)));
+    }
+
+    #[test]
+    fn downloads_are_attachments_that_never_render() {
+        let r = file_response("out/report <final>.html", b"<script>alert(1)</script>".to_vec());
+        let h = r.headers();
+        assert_eq!(h[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(h[header::CONTENT_SECURITY_POLICY], "default-src 'none'; sandbox");
+        assert_eq!(
+            h[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"report <final>.html\"; filename*=UTF-8''report%20%3Cfinal%3E.html"
+        );
+    }
+
+    #[test]
+    fn content_disposition_names_are_safe() {
+        let cd = |p: &str| content_disposition(p).to_str().unwrap().to_string();
+        // Quotes, backslashes, control characters and header-breaking bytes can't escape the quoted name.
+        assert_eq!(cd("a\"b.txt"), "attachment; filename=\"a_b.txt\"; filename*=UTF-8''a%22b.txt");
+        assert_eq!(cd("x\r\nSet-Cookie: y"), "attachment; filename=\"x__Set-Cookie: y\"; filename*=UTF-8''x%0D%0ASet-Cookie%3A%20y");
+        assert_eq!(cd("dir\\evil;.sh"), "attachment; filename=\"evil;.sh\"; filename*=UTF-8''evil%3B.sh");
+        // Non-ASCII keeps its exact name in filename*.
+        assert_eq!(cd("notes/résumé.md"), "attachment; filename=\"r_sum_.md\"; filename*=UTF-8''r%C3%A9sum%C3%A9.md");
+        assert_eq!(cd("trailing/"), "attachment; filename=\"trailing\"; filename*=UTF-8''trailing");
+        assert_eq!(cd(""), "attachment; filename=\"download\"; filename*=UTF-8''download");
     }
 
     #[test]

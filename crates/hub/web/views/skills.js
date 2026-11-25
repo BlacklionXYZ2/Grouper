@@ -2,10 +2,10 @@
 // read, edit, forget. There is no "new" here: the orchestrator saves them.
 
 import { h, icon, setChildren, debounce } from '../lib/dom.js';
-import { get, put, del, qs } from '../lib/api.js';
+import { get, put, del, qs, isAbort } from '../lib/api.js';
 import { isAdmin } from '../lib/store.js';
 import { renderMarkdown } from '../lib/md.js';
-import { bar, confirmAction, toast, toastError, skeletonBlocks, errorBanner } from '../lib/ui.js';
+import { bar, confirmAction, toast, toastError, skeletonBlocks, errorBanner, guardWrites } from '../lib/ui.js';
 import { ago } from '../lib/format.js';
 
 export function renderSkills(container) {
@@ -20,16 +20,19 @@ export function renderSkills(container) {
   let error = null;
   const open = new Set();
   let editing = null;
+  let gone = false;
+  let loading = null; // the AbortController of the newest read
+  const onSearch = debounce((e) => {
+    query = e.target.value.trim();
+    load();
+  }, 250);
 
   const search = h('input', {
     class: 'input',
     type: 'search',
     placeholder: 'Search skills',
     'aria-label': 'Search skills',
-    oninput: debounce((e) => {
-      query = e.target.value.trim();
-      load();
-    }, 250),
+    oninput: onSearch,
   });
   const listSlot = h('div');
   body.append(h('div', { class: 'section' }, search), listSlot);
@@ -93,6 +96,7 @@ export function renderSkills(container) {
             {
               class: 'btn btn-sm',
               type: 'button',
+              'data-write': true,
               onclick: () => {
                 editing = s.id;
                 render();
@@ -101,7 +105,7 @@ export function renderSkills(container) {
             icon('edit'),
             'Edit',
           ),
-          h('button', { class: 'btn btn-sm', type: 'button', onclick: () => forget(s) }, icon('trash'), 'Forget'),
+          h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, onclick: () => forget(s) }, icon('trash'), 'Forget'),
         ),
       ),
     );
@@ -157,7 +161,7 @@ export function renderSkills(container) {
           },
           'Cancel',
         ),
-        h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+        h('button', { class: 'btn btn-primary', type: 'submit', 'data-write': true }, 'Save'),
       ),
     );
     return form;
@@ -175,16 +179,28 @@ export function renderSkills(container) {
   }
 
   async function load() {
+    // A newer search replaces an older one still in flight.
+    loading?.abort();
+    const mine = new AbortController();
+    loading = mine;
     try {
-      list = (await get(`/v1/skills${qs({ q: query })}`)) || [];
+      list = (await get(`/v1/skills${qs({ q: query })}`, { signal: mine.signal })) || [];
       error = null;
     } catch (err) {
+      if (isAbort(err)) return;
       error = err;
     }
+    if (gone) return;
     render();
   }
 
+  const unguard = guardWrites(body);
   render();
   load();
-  return null;
+  return () => {
+    gone = true;
+    loading?.abort();
+    onSearch.cancel();
+    unguard();
+  };
 }
