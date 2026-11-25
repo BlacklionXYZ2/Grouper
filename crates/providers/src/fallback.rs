@@ -104,12 +104,14 @@ impl Provider for Fallback {
                     }
                     last_err = Some(e);
                 }
-                other => {
+                Ok(mut resp) => {
                     if i > 0 {
                         tracing::info!("{} answered with {model} instead of {}", self.provider_id, req.model);
+                        resp.model = Some(model.clone());
                     }
-                    return other;
+                    return Ok(resp);
                 }
+                Err(e) => return Err(e),
             }
         }
         Err(last_err.expect("at least one candidate"))
@@ -141,6 +143,7 @@ mod tests {
             }
             on_delta(Delta::Text(req.model.clone()));
             Ok(Response {
+                model: None,
                 message: Message { role: Role::Assistant, content: vec![Block::Text { text: req.model.clone() }], raw: None },
                 stop: StopReason::EndTurn,
                 usage: Usage::default(),
@@ -163,6 +166,7 @@ mod tests {
         let fb = Fallback::new(inner.clone(), "swap-test", vec!["b".into(), "c".into()]);
         let r = fb.complete_stream(&req("a"), &|_| {}).await.unwrap();
         assert_eq!(r.message.text(), "b");
+        assert_eq!(r.model.as_deref(), Some("b"), "the response names the model that answered");
         // "a" is cooling down now: the next request goes straight to "b".
         let r = fb.complete(&req("a")).await.unwrap();
         assert_eq!(r.message.text(), "b");

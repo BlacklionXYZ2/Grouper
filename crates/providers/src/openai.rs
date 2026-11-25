@@ -145,6 +145,7 @@ fn parse_completion(provider: &str, v: &Value) -> Result<Response, ProviderError
     let n = |p: &str| u.pointer(p).and_then(Value::as_u64).unwrap_or(0);
     let cached = n("/prompt_tokens_details/cached_tokens");
     Ok(Response {
+        model: None,
         message: Message { role: Role::Assistant, content, raw: None },
         stop,
         usage: Usage {

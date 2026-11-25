@@ -904,6 +904,7 @@ mod tests {
 
         // A connection may never reuse a requester call id, even after its route completes.
         let response = Response {
+            model: None,
             message: Message { role: Role::Assistant, content: vec![Block::Text { text: "ok".into() }], raw: None },
             stop: StopReason::EndTurn,
             usage: Usage { input_tokens: 7, output_tokens: 3, cache_read_tokens: 0, cache_write_tokens: 0 },

@@ -117,6 +117,7 @@ fn parse_message(provider: &str, v: &Value) -> Result<Response, ProviderError> {
     let u = v.get("usage").cloned().unwrap_or(json!({}));
     let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
     Ok(Response {
+        model: None,
         message: Message {
             role: Role::Assistant,
             content: parse_content(content),

@@ -109,6 +109,9 @@ pub struct Response {
     pub message: Message,
     pub stop: StopReason,
     pub usage: Usage,
+    /// The model that answered, when it isn't the requested one ([`Fallback`] swapped it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

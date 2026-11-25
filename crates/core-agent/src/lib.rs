@@ -155,7 +155,8 @@ pub async fn run_loop(
         usage.add(&resp.usage);
         hooks.event(AgentEvent::Usage {
             provider_id: cfg.provider_id.clone(),
-            model: cfg.model.clone(),
+            // A free model swapped for another on the same key bills (and counts) as the one that answered.
+            model: resp.model.clone().unwrap_or_else(|| cfg.model.clone()),
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
             cache_read_tokens: resp.usage.cache_read_tokens,

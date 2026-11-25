@@ -42,9 +42,29 @@ impl Db {
     /// from the usage table. Once per thread; then checks whether the model's use
     /// cases should change. Returns false if the thread isn't finished or was recorded.
     pub fn record_outcome(&self, thread_id: &str) -> bool {
-        let Some(t) = self.thread(thread_id) else { return false };
-        let model = self.models().into_iter().find(|m| m.id == t.model);
+        let Some(mut t) = self.thread(thread_id) else { return false };
+        let models = self.models();
+        // A free model swapped for another mid-thread: the outcome belongs to the model
+        // that wrote most of the thread's output, if it is registered.
+        if let Some(answered) = self.main_answering_model(thread_id)
+            && let Some(m) = models.iter().find(|m| m.provider_id == answered.0 && m.model == answered.1)
+        {
+            t.model = m.id.clone();
+        }
+        let model = models.into_iter().find(|m| m.id == t.model);
         core_registry::record_thread_outcome(&self.c(), &t, model.as_ref())
+    }
+
+    /// The (provider, provider model name) with the most output tokens in a thread's usage.
+    fn main_answering_model(&self, thread_id: &str) -> Option<(String, String)> {
+        self.c()
+            .query_row(
+                "SELECT provider_id, model FROM usage WHERE thread_id = ?1 GROUP BY provider_id, model
+                   ORDER BY SUM(output_tokens) DESC, MAX(id) DESC LIMIT 1",
+                [thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
     }
 
     /// Record one deterministic probe outcome into `thread_outcomes` with `source = 'probe'`,
@@ -522,6 +542,25 @@ mod tests {
             local: false,
             modalities: vec![],
         }
+    }
+
+    #[test]
+    fn outcome_goes_to_the_free_model_that_answered() {
+        let db = Db::open(&tmp()).unwrap();
+        provider(&db, "or", None);
+        let mut asked = model("asked", "or", 0.0, &["thread"]);
+        asked.free = true;
+        let mut answered = model("answered", "or", 0.0, &[]);
+        answered.free = true;
+        db.upsert_model(&asked).unwrap();
+        db.upsert_model(&answered).unwrap();
+        let t = db.create_thread("c1", "t", "hub", "asked", None, "brief").unwrap();
+        // The first call was swapped away after a few tokens; the rest came from "answered".
+        db.record_usage(Some("c1"), Some(&t.id), "or", "asked-1", 100, 5, 0, 0);
+        db.record_usage(Some("c1"), Some(&t.id), "or", "answered-1", 100, 400, 0, 0);
+        assert!(db.finish_thread(&t.id, "done", "s"));
+        assert!(db.record_outcome(&t.id));
+        assert_eq!(db.outcome_key(&t.id).unwrap().0, "answered");
     }
 
     fn tags(t: &[&str]) -> Vec<String> {

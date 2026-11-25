@@ -106,6 +106,7 @@ impl Scripted {
         let has_calls = content.iter().any(|b| matches!(b, Block::ToolUse { .. }));
         let chars: usize = req.messages.iter().map(|m| last_text(Some(m)).len()).sum::<usize>() + req.system.len();
         Response {
+            model: None,
             message: Message { role: Role::Assistant, content, raw: None },
             stop: if has_calls { StopReason::ToolUse } else { StopReason::EndTurn },
             usage: Usage { input_tokens: (chars / 4) as u64, output_tokens: 20, ..Default::default() },
