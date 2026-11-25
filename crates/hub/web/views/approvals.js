@@ -153,7 +153,7 @@ export function openApproval(approvalId, { conversationId } = {}) {
       title: 'Run this tool?',
       caption: `${a.tool} · ${device}${thread ? ` · ${thread.title}` : ''}`,
       body: [
-        h('div', { class: ['reason', riskRule && 'risk'] }, icon('warning'), h('div', null, riskRule ? h('strong', { class: 'reason-kind' }, 'A safety rule asked. ') : null, reasonText)),
+        h('div', { class: ['reason', riskRule && 'risk'] }, icon(riskRule ? 'warning' : 'shield'), h('div', null, riskRule ? h('strong', { class: 'reason-kind' }, 'A safety rule asked. ') : null, reasonText)),
         h('div', null, h('div', { class: 'field-label' }, 'What will run'), h('pre', { class: 'code', tabindex: '0', 'aria-label': `Arguments for ${a.tool}` }, pretty(a.input))),
         h(
           'p',

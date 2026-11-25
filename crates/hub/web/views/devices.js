@@ -214,6 +214,7 @@ function renderDetail(container, id) {
           'aria-describedby': `${name}-policy`,
           onchange: () => change(t, value),
         }),
+        value === 'bypass' && bypass ? icon('warning') : null,
         label,
       );
     return h(
