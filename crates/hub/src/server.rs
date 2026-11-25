@@ -15,8 +15,7 @@ use axum::{Json, Router};
 use core_agent::thread::ThreadControl;
 use core_protocol::{
     Capability, ChatRequest, ChatResponse, DeviceInfo, Event, EventBody, HubMessage, IDLE_TIMEOUT_SECS, ModelEntry,
-    NodeMessage, PROTOCOL_VERSION, Permission, ProviderConfig, ProviderInfo, ToolCallRequest, ToolCallResponse,
-    ToolDef,
+    NodeMessage, PROTOCOL_VERSION, Permission, ProviderConfig, ProviderInfo, ToolCallRequest, ToolDef,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -24,19 +23,22 @@ use serde_json::json;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::db::{Auth, Db};
+use crate::mcp::McpSession;
 use crate::orchestrator::Wake;
 
 const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The hub's own id in the device and tool registries.
 pub const HUB_DEVICE: &str = "hub";
 
 pub(crate) struct Live {
-    conn_id: u64,
+    pub(crate) conn_id: u64,
     pub(crate) tx: mpsc::UnboundedSender<HubMessage>,
-    capabilities: Vec<Capability>,
+    /// The device's tools, as its MCP server last listed them.
+    pub(crate) tools: Vec<ToolDef>,
+    /// The hub's MCP client for this connection, once initialized.
+    pub(crate) mcp: Option<rmcp::Peer<rmcp::RoleClient>>,
 }
 
 /// Where to send the answer to an approval request.
@@ -52,7 +54,6 @@ pub struct Hub {
     pub db: Db,
     pub data_dir: PathBuf,
     pub(crate) live: Mutex<HashMap<String, Live>>,
-    pending_calls: Mutex<HashMap<String, oneshot::Sender<ToolCallResponse>>>,
     pub(crate) approvals: Mutex<HashMap<String, ApprovalRoute>>,
     pub(crate) hub_threads: Mutex<HashMap<String, ThreadControl>>,
     pub(crate) orchestrators: Mutex<HashMap<String, mpsc::UnboundedSender<Wake>>>,
@@ -66,7 +67,6 @@ impl Hub {
             db,
             data_dir,
             live: Mutex::new(HashMap::new()),
-            pending_calls: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             hub_threads: Mutex::new(HashMap::new()),
             orchestrators: Mutex::new(HashMap::new()),
@@ -112,7 +112,18 @@ impl Hub {
                 name: d.name,
                 platform: d.platform,
                 online: l.is_some(),
-                capabilities: l.map(|l| l.capabilities.clone()).unwrap_or_default(),
+                capabilities: l
+                    .map(|l| {
+                        l.tools
+                            .iter()
+                            .map(|t| Capability {
+                                name: t.name.clone(),
+                                description: t.description.clone(),
+                                input_schema: t.input_schema.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 last_seen: d.last_seen,
             }
         }));
@@ -133,7 +144,7 @@ impl Hub {
         }
     }
 
-    async fn broadcast_presence(&self) {
+    pub(crate) async fn broadcast_presence(&self) {
         let devices = self.devices().await;
         self.broadcast(HubMessage::Presence { devices }).await;
     }
@@ -148,32 +159,6 @@ impl Hub {
     pub(crate) fn auth(&self, headers: &HeaderMap) -> Option<Auth> {
         let token = headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")?;
         self.db.authenticate(token)
-    }
-
-    /// Send a direct tool call to an online device and wait for its answer.
-    pub async fn call_tool(&self, device_id: &str, tool: &str, args: String) -> Result<ToolCallResponse, CallError> {
-        let call_id = format!("c{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let (tx, rx) = oneshot::channel();
-        {
-            let live = self.live.lock().await;
-            let Some(l) = live.get(device_id) else { return Err(CallError::Offline) };
-            if !l.capabilities.iter().any(|c| c.name == tool) {
-                return Err(CallError::UnknownTool);
-            }
-            self.pending_calls.lock().await.insert(call_id.clone(), tx);
-            if l.tx.send(HubMessage::ToolCall { call_id: call_id.clone(), tool: tool.into(), args }).is_err() {
-                self.pending_calls.lock().await.remove(&call_id);
-                return Err(CallError::Offline);
-            }
-        }
-        match tokio::time::timeout(TOOL_TIMEOUT, rx).await {
-            Ok(Ok(r)) => Ok(r),
-            Ok(Err(_)) => Err(CallError::Offline),
-            Err(_) => {
-                self.pending_calls.lock().await.remove(&call_id);
-                Err(CallError::Timeout)
-            }
-        }
     }
 
     /// A user's message: create the conversation if needed and wake its agent.
@@ -223,6 +208,8 @@ pub enum CallError {
     Offline,
     UnknownTool,
     Timeout,
+    /// Arguments must be a JSON object.
+    BadArguments,
 }
 
 pub fn router(hub: Arc<Hub>) -> Router {
@@ -296,11 +283,12 @@ async fn call_device(
 ) -> Response {
     let caller = admin!(hub, headers).device_id;
     tracing::info!(%caller, device = %id, tool = %req.tool, "tool call");
-    match hub.call_tool(&id, &req.tool, req.args.to_string()).await {
+    match hub.call_tool(&id, &req.tool, req.args).await {
         Ok(r) => Json(r).into_response(),
         Err(CallError::Offline) => err(StatusCode::CONFLICT, "device is offline"),
         Err(CallError::UnknownTool) => err(StatusCode::NOT_FOUND, "device does not offer that tool"),
         Err(CallError::Timeout) => err(StatusCode::GATEWAY_TIMEOUT, "device did not answer in time"),
+        Err(CallError::BadArguments) => err(StatusCode::BAD_REQUEST, "args must be a JSON object"),
     }
 }
 
@@ -610,9 +598,9 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
         .map_err(|_| "no hello")?
         .ok_or("closed before hello")?
         .map_err(|e| e.to_string())?;
-    let (capabilities, thread_tools): (Vec<Capability>, Vec<ToolDef>) = match first {
+    match first {
         Message::Text(t) => match serde_json::from_str::<NodeMessage>(&t) {
-            Ok(NodeMessage::Hello { protocol_version, capabilities, client_version, thread_tools }) => {
+            Ok(NodeMessage::Hello { protocol_version, client_version }) => {
                 if protocol_version != PROTOCOL_VERSION {
                     let msg = HubMessage::Error {
                         message: format!("protocol {protocol_version} unsupported, hub speaks {PROTOCOL_VERSION}"),
@@ -620,19 +608,17 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                     let _ = sink.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
                     return Err("protocol mismatch".into());
                 }
-                tracing::info!(device = %device_id, %client_version, tools = thread_tools.len(), "connected");
-                (capabilities, thread_tools)
+                tracing::info!(device = %device_id, %client_version, "connected");
             }
             _ => return Err("first frame was not hello".into()),
         },
         _ => return Err("first frame was not text".into()),
-    };
+    }
 
     let providers = hub.db.providers().map_err(|error| error.to_string())?;
-    hub.db.upsert_tools(&device_id, &thread_tools);
     let conn_id = hub.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded_channel::<HubMessage>();
-    hub.live.lock().await.insert(device_id.clone(), Live { conn_id, tx: tx.clone(), capabilities });
+    hub.live.lock().await.insert(device_id.clone(), Live { conn_id, tx: tx.clone(), tools: Vec::new(), mcp: None });
     hub.db.touch(&device_id);
     let _ = tx.send(HubMessage::Welcome {
         device_id: device_id.clone(),
@@ -641,6 +627,8 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     });
     let _ = tx.send(HubMessage::Providers { providers });
     hub.broadcast_presence().await;
+    // The hub's MCP client: lists the device's tools now and on every change.
+    let mcp = McpSession::start(&hub, device_id.clone(), conn_id, tx.clone());
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -668,10 +656,8 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
             Ok(NodeMessage::Ping) => {
                 let _ = tx.send(HubMessage::Pong);
             }
-            Ok(NodeMessage::ToolResult { call_id, ok, output }) => {
-                if let Some(waiter) = hub.pending_calls.lock().await.remove(&call_id) {
-                    let _ = waiter.send(ToolCallResponse { ok, output });
-                }
+            Ok(NodeMessage::Mcp { message }) => {
+                let _ = mcp.incoming.send(message);
             }
             Ok(NodeMessage::ThreadEvent { thread_id, event }) => {
                 if hub.owns_thread(&device_id, &thread_id) {
@@ -712,6 +698,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
         }
     };
     hub.db.touch(&device_id);
+    drop(mcp);
     drop(tx);
     writer.abort();
     if !replaced {

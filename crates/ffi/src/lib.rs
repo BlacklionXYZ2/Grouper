@@ -14,8 +14,42 @@ uniffi::setup_scaffolding!();
 
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct Capability {
+    /// `^[a-zA-Z0-9_-]{1,64}$`, e.g. `mac_info` (no dots).
     pub name: String,
     pub description: String,
+    /// JSON Schema for the arguments, as a JSON string. `None`: takes no arguments.
+    #[uniffi(default)]
+    pub input_schema_json: Option<String>,
+}
+
+impl Capability {
+    /// Check the name and parse the schema.
+    fn to_core(&self) -> Result<core_protocol::Capability, ClientError> {
+        if !core_protocol::valid_tool_name(&self.name) {
+            return Err(ClientError::Invalid {
+                message: format!("tool name {:?} must match ^[a-zA-Z0-9_-]{{1,64}}$ (no dots)", self.name),
+            });
+        }
+        let input_schema = match &self.input_schema_json {
+            None => core_protocol::default_input_schema(),
+            Some(json) => {
+                let schema: serde_json::Value = serde_json::from_str(json).map_err(|e| ClientError::Invalid {
+                    message: format!("input schema of {:?} is not valid JSON: {e}", self.name),
+                })?;
+                if !schema.is_object() {
+                    return Err(ClientError::Invalid {
+                        message: format!("input schema of {:?} must be a JSON object", self.name),
+                    });
+                }
+                schema
+            }
+        };
+        Ok(core_protocol::Capability { name: self.name.clone(), description: self.description.clone(), input_schema })
+    }
+
+    fn from_core(c: core_protocol::Capability) -> Self {
+        Self { name: c.name, description: c.description, input_schema_json: Some(c.input_schema.to_string()) }
+    }
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -95,11 +129,7 @@ impl core_client::Events for EventBridge {
                     name: d.name,
                     platform: d.platform,
                     online: d.online,
-                    capabilities: d
-                        .capabilities
-                        .into_iter()
-                        .map(|c| Capability { name: c.name, description: c.description })
-                        .collect(),
+                    capabilities: d.capabilities.into_iter().map(Capability::from_core).collect(),
                     last_seen: d.last_seen,
                 })
                 .collect(),
@@ -138,6 +168,7 @@ impl GrouperClient {
         if core_protocol::split_token(&token).is_none() {
             return Err(ClientError::Invalid { message: "token should look like <device-id>.<secret>".into() });
         }
+        let capabilities = capabilities.iter().map(Capability::to_core).collect::<Result<Vec<_>, _>>()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -149,12 +180,11 @@ impl GrouperClient {
             config: core_client::Config {
                 hub_url,
                 token,
-                capabilities: capabilities
-                    .into_iter()
-                    .map(|c| core_protocol::Capability { name: c.name, description: c.description })
-                    .collect(),
+                capabilities,
                 workspace_root: workspace_root.map(std::path::PathBuf::from),
                 allow_shell,
+                // GROUPER_MCP_CONFIG, else <config dir>/grouper/mcp.json.
+                mcp_config: None,
             },
             handler,
             listener,
@@ -190,4 +220,24 @@ impl GrouperClient {
 #[uniffi::export]
 pub fn core_version() -> String {
     core_client::CLIENT_VERSION.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cap(name: &str, schema: Option<&str>) -> Capability {
+        Capability { name: name.into(), description: "d".into(), input_schema_json: schema.map(String::from) }
+    }
+
+    #[test]
+    fn capabilities_are_validated() {
+        let c = cap("mac_info", None).to_core().unwrap();
+        assert_eq!(c.input_schema, core_protocol::default_input_schema());
+        let c = cap("echo", Some(r#"{"type":"object","properties":{"x":{"type":"string"}}}"#)).to_core().unwrap();
+        assert_eq!(c.input_schema["properties"]["x"]["type"], "string");
+        assert!(cap("mac.info", None).to_core().is_err());
+        assert!(cap("echo", Some("{not json")).to_core().is_err());
+        assert!(cap("echo", Some("[1]")).to_core().is_err());
+    }
 }

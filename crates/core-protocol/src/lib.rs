@@ -5,15 +5,20 @@
 //! Frames are JSON text messages: devices send [`NodeMessage`], the hub sends [`HubMessage`].
 //!
 //! Tool calls travel hub → device over the device's own connection, so devices never
-//! need to accept inbound connections. (MCP JSON-RPC will ride inside these frames later.)
+//! need to accept inbound connections. Each device is an MCP server and the hub its
+//! MCP client: JSON-RPC rides inside [`NodeMessage::Mcp`] and [`HubMessage::Mcp`]
+//! (see the `tunnel` feature for the rmcp transport).
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "tunnel")]
+pub mod tunnel;
+
 /// Bumped on any breaking change to the frames below.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// WebSocket endpoint for devices, relative to the hub's base URL.
 pub const CONNECT_PATH: &str = "/v1/connect";
@@ -30,9 +35,23 @@ pub const IDLE_TIMEOUT_SECS: u64 = 60;
 /// Something a device can do for the orchestrator.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Capability {
-    /// Tool name, namespaced by area, e.g. `shell.run`, `mac.info`.
+    /// Tool name, valid for every provider and for MCP (see [`valid_tool_name`]),
+    /// e.g. `mac_info`, `codex__codex_chat`. No dots.
     pub name: String,
     pub description: String,
+    /// JSON Schema for the tool's arguments (an object schema).
+    #[serde(default = "default_input_schema")]
+    pub input_schema: Value,
+}
+
+/// The input schema of a tool that takes no arguments: `{"type":"object","properties":{}}`.
+pub fn default_input_schema() -> Value {
+    serde_json::json!({"type": "object", "properties": {}})
+}
+
+/// Tool names every provider and MCP accept: `^[a-zA-Z0-9_-]{1,64}$`.
+pub fn valid_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// A registered device as the hub sees it.
@@ -53,22 +72,11 @@ pub struct DeviceInfo {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeMessage {
-    /// Must be the first frame on a new connection.
-    Hello {
-        protocol_version: u32,
-        client_version: String,
-        capabilities: Vec<Capability>,
-        /// Tools subagent threads can use on this device (files, shell, …).
-        #[serde(default)]
-        thread_tools: Vec<ToolDef>,
-    },
-    /// Answer to a [`HubMessage::ToolCall`].
-    ToolResult {
-        call_id: String,
-        ok: bool,
-        /// Tool output (usually JSON) on success, error message on failure.
-        output: String,
-    },
+    /// Must be the first frame on a new connection. The device's tools are listed
+    /// over MCP (`tools/list`) once the hub has welcomed it.
+    Hello { protocol_version: u32, client_version: String },
+    /// One MCP JSON-RPC message from the device's MCP server to the hub's client.
+    Mcp { message: Value },
     Ping,
     /// Something happened in a thread running on this device.
     ThreadEvent { thread_id: String, event: AgentEvent },
@@ -90,13 +98,9 @@ pub enum HubMessage {
     },
     /// Full device list, sent on connect and whenever any device comes or goes.
     Presence { devices: Vec<DeviceInfo> },
-    /// Run one of the capabilities this device advertised.
-    ToolCall {
-        call_id: String,
-        tool: String,
-        /// JSON-encoded arguments.
-        args: String,
-    },
+    /// One MCP JSON-RPC message from the hub's MCP client to the device's server
+    /// (`initialize`, `tools/list`, `tools/call`, `notifications/cancelled`, …).
+    Mcp { message: Value },
     Pong,
     Error { message: String },
     /// The account's providers and keys, sent on connect and whenever they change.
@@ -162,14 +166,45 @@ impl Permission {
             Self::Bypass => "bypass",
         }
     }
-    /// Starting level for a newly seen tool.
+    /// Starting level for a newly seen tool: Auto for workspace file tools and for
+    /// the tools of the CLI-agent MCP servers ([`AGENT_MCP_SERVERS`]), Manual for
+    /// everything else (other MCP tools included).
     pub fn default_for(tool: &str) -> Self {
-        if FILE_TOOLS.contains(&tool) { Self::Auto } else { Self::Manual }
+        let agent = mcp_server_of(tool).is_some_and(|s| AGENT_MCP_SERVERS.contains(&s));
+        if FILE_TOOLS.contains(&tool) || agent { Self::Auto } else { Self::Manual }
     }
 }
 
 /// Tools that only touch the thread's own workspace folder.
 pub const FILE_TOOLS: &[&str] = &["read_file", "write_file", "list_files"];
+
+/// Separator between an MCP server's name and its tool's: `codex__codex_chat`.
+pub const MCP_SEPARATOR: &str = "__";
+
+/// The subagent-chat servers that run CLI agents (and its catalog). Their tools start on Auto.
+pub const AGENT_MCP_SERVERS: &[&str] =
+    &["hermes", "antigravity", "claude-code", "codex", "pi", "opencode", "cursor", "grok", "catalog"];
+
+/// The server part of an MCP host tool name (`codex` for `codex__codex_chat`).
+pub fn mcp_server_of(tool: &str) -> Option<&str> {
+    tool.split_once(MCP_SEPARATOR).map(|(server, _)| server).filter(|s| !s.is_empty())
+}
+
+/// Default time an MCP host tool may run, unless its `timeout_seconds` argument says otherwise.
+pub const MCP_DEFAULT_TIMEOUT_SECS: u64 = 600;
+/// Longest time an MCP host tool may run.
+pub const MCP_MAX_TIMEOUT_SECS: u64 = 1800;
+/// Added on top of a tool's own timeout before the device gives up on it.
+pub const MCP_GRACE_SECS: u64 = 30;
+
+/// How long a device waits for one of its MCP servers' tools: the call's
+/// `timeout_seconds` argument (default 600 s, at most 1,800 s) plus a grace period.
+/// The hub waits [`MCP_GRACE_SECS`] longer still, so the device's answer arrives first.
+pub fn mcp_call_timeout(args: &Value) -> std::time::Duration {
+    let asked = args.get("timeout_seconds").and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)));
+    let secs = asked.unwrap_or(MCP_DEFAULT_TIMEOUT_SECS).clamp(1, MCP_MAX_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs + MCP_GRACE_SECS)
+}
 
 /// Everything a device needs to run a subagent thread.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -581,19 +616,49 @@ mod tests {
 
     #[test]
     fn frames_round_trip() {
-        let m = NodeMessage::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            client_version: "0.1.0".into(),
-            capabilities: vec![Capability { name: "echo".into(), description: "d".into() }],
-            thread_tools: vec![],
-        };
+        let m = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "0.1.0".into() };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""type":"hello""#));
         assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), m);
 
-        let h = HubMessage::ToolCall { call_id: "1".into(), tool: "echo".into(), args: "{}".into() };
+        let rpc = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let h = HubMessage::Mcp { message: rpc.clone() };
         let s = serde_json::to_string(&h).unwrap();
+        assert_eq!(s, format!(r#"{{"type":"mcp","message":{rpc}}}"#));
         assert_eq!(serde_json::from_str::<HubMessage>(&s).unwrap(), h);
+        let n = NodeMessage::Mcp { message: rpc };
+        assert_eq!(serde_json::from_str::<NodeMessage>(&serde_json::to_string(&n).unwrap()).unwrap(), n);
+    }
+
+    #[test]
+    fn mcp_permissions_and_timeouts() {
+        assert_eq!(Permission::default_for("codex__codex_chat"), Permission::Auto);
+        assert_eq!(Permission::default_for("claude-code__claude_code_chat"), Permission::Auto);
+        assert_eq!(Permission::default_for("catalog__list_available_agents"), Permission::Auto);
+        assert_eq!(Permission::default_for("git__git_commit"), Permission::Manual);
+        assert_eq!(Permission::default_for("read_file"), Permission::Auto);
+        assert_eq!(Permission::default_for("run_shell"), Permission::Manual);
+        assert_eq!(Permission::default_for("codex_chat"), Permission::Manual);
+        assert_eq!(mcp_server_of("codex__codex_chat"), Some("codex"));
+        assert_eq!(mcp_server_of("__x"), None);
+        let secs = |v: Value| mcp_call_timeout(&v).as_secs();
+        assert_eq!(secs(serde_json::json!({})), 600 + MCP_GRACE_SECS);
+        assert_eq!(secs(serde_json::json!({"timeout_seconds": 60})), 60 + MCP_GRACE_SECS);
+        assert_eq!(secs(serde_json::json!({"timeout_seconds": 99999})), 1800 + MCP_GRACE_SECS);
+        assert_eq!(secs(serde_json::json!({"timeout_seconds": 12.5})), 12 + MCP_GRACE_SECS);
+    }
+
+    #[test]
+    fn capability_schemas_and_names() {
+        let c: Capability = serde_json::from_str(r#"{"name":"mac_info","description":"d"}"#).unwrap();
+        assert_eq!(c.input_schema, default_input_schema());
+        assert!(valid_tool_name("mac_info"));
+        assert!(valid_tool_name("codex__codex_chat"));
+        assert!(valid_tool_name("a-b_C9"));
+        assert!(!valid_tool_name("mac.info"));
+        assert!(!valid_tool_name(""));
+        assert!(!valid_tool_name(&"a".repeat(65)));
+        assert!(!valid_tool_name("has space"));
     }
 
     #[test]

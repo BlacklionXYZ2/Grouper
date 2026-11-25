@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use core_client::core_protocol::{
     AgentEvent, Capability, ChatRequest, ChatResponse, ConversationInfo, DeviceInfo, Event, EventBody, ModelEntry,
-    ProviderConfig, ProviderInfo, ThreadInfo, ToolCallRequest, ToolCallResponse, ToolInfo,
+    ProviderConfig, ProviderInfo, ThreadInfo, ToolCallRequest, ToolCallResponse, ToolInfo, default_input_schema,
 };
 use core_client::{Events, Status, ToolHandler};
 use futures_util::StreamExt;
@@ -47,6 +47,9 @@ enum Cmd {
         /// Don't offer run_shell to threads.
         #[arg(long)]
         no_shell: bool,
+        /// MCP servers to run here (Claude-style mcp.json). Default: <config dir>/grouper/mcp.json.
+        #[arg(long, env = "GROUPER_MCP_CONFIG")]
+        mcp_config: Option<PathBuf>,
     },
     /// Talk to Grouper. Prints replies and thread activity until the turn and its threads finish.
     Chat {
@@ -272,7 +275,7 @@ impl ToolHandler for CliTools {
     fn call(&self, tool: &str, args: &str) -> Result<String, String> {
         match tool {
             "echo" => Ok(args.to_string()),
-            "system.info" => Ok(json!({
+            "system_info" => Ok(json!({
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
                 "hostname": hostname(),
@@ -588,7 +591,7 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Login | Cmd::Logout => unreachable!(),
-        Cmd::Connect { workspace, no_shell } => {
+        Cmd::Connect { workspace, no_shell, mcp_config } => {
             let workspace = workspace.unwrap_or_else(|| {
                 dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Grouper").join("workspaces")
             });
@@ -597,11 +600,20 @@ async fn main() -> Result<()> {
                 hub_url: api.base.clone(),
                 token: api.token.clone(),
                 capabilities: vec![
-                    Capability { name: "echo".into(), description: "Returns its arguments".into() },
-                    Capability { name: "system.info".into(), description: "OS, architecture and hostname".into() },
+                    Capability {
+                        name: "echo".into(),
+                        description: "Returns its arguments".into(),
+                        input_schema: json!({"type": "object", "additionalProperties": true}),
+                    },
+                    Capability {
+                        name: "system_info".into(),
+                        description: "OS, architecture and hostname".into(),
+                        input_schema: default_input_schema(),
+                    },
                 ],
                 workspace_root: Some(workspace),
                 allow_shell: !no_shell,
+                mcp_config,
             };
             let (tx, rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
@@ -717,7 +729,8 @@ async fn main() -> Result<()> {
         Cmd::Tools(ToolsCmd::List { device }) => {
             let q = device.map(|d| format!("?device={d}")).unwrap_or_default();
             for t in api.get::<Vec<ToolInfo>>(&format!("/v1/tools{q}")).await? {
-                println!("{:<12} {:<14} {:<7} {}", t.device_id, t.name, t.permission.as_str(), t.description);
+                let about = t.description.lines().next().unwrap_or_default();
+                println!("{:<12} {:<34} {:<7} {}", t.device_id, t.name, t.permission.as_str(), about);
             }
         }
         Cmd::Tools(ToolsCmd::Set { device, tool, permission }) => {

@@ -195,6 +195,17 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Tool names lost their dots (`mac.info` → `mac_info`) when devices became MCP
+/// servers. Rename old registry rows, keeping their permission; where both spellings
+/// exist, the underscore row (the one devices report now) wins.
+fn migrate_dotted_tool_names(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "UPDATE OR IGNORE tools SET name = replace(name, '.', '_') WHERE instr(name, '.') > 0;
+         DELETE FROM tools WHERE instr(name, '.') > 0;",
+    )?;
+    Ok(())
+}
+
 impl Db {
     pub fn open(data_dir: &Path) -> Result<Self> {
         let conn = open_connection(data_dir)?;
@@ -211,6 +222,7 @@ impl Db {
 
     fn finish_open(data_dir: &Path, mut conn: Connection, secrets: Secrets) -> Result<Self> {
         migrate_provider_secrets(&mut conn, &secrets)?;
+        migrate_dotted_tool_names(&conn)?;
         let db = Self { connection: Mutex::new(conn), secrets };
         db.import_devices_json(data_dir)?;
         Ok(db)
@@ -799,6 +811,38 @@ mod tests {
         db.set_permission("dev", "run_shell", Permission::Bypass).unwrap();
         db.upsert_tools("dev", &[def("run_shell")]);
         assert_eq!(db.permissions("dev")["run_shell"], Permission::Bypass);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dotted_tool_names_are_migrated() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        {
+            let c = db.c();
+            for (dev, name, perm) in [
+                ("mac", "mac.info", "bypass"),
+                ("pc", "system.info", "auto"),
+                ("pc", "system_info", "manual"),
+            ] {
+                c.execute(
+                    "INSERT INTO tools (device_id, name, description, permission) VALUES (?1, ?2, 'd', ?3)",
+                    params![dev, name, perm],
+                )
+                .unwrap();
+            }
+        }
+        drop(db);
+        let db = Db::open(&dir).unwrap();
+        let names: Vec<(String, String, Permission)> =
+            db.tools(None).into_iter().map(|t| (t.device_id, t.name, t.permission)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("mac".into(), "mac_info".into(), Permission::Bypass),
+                ("pc".into(), "system_info".into(), Permission::Manual),
+            ]
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -2,8 +2,10 @@ import Foundation
 
 /// Swift-side helpers on top of the generated bindings in grouper_ffi.swift.
 public extension Capability {
-    init(_ name: String, _ description: String) {
-        self.init(name: name, description: description)
+    /// `name` must match `^[a-zA-Z0-9_-]{1,64}$` (no dots). `schema` is the JSON Schema
+    /// of the arguments; `nil` means the tool takes none.
+    init(_ name: String, _ description: String, schema: String? = nil) {
+        self.init(name: name, description: description, inputSchemaJson: schema)
     }
 }
 

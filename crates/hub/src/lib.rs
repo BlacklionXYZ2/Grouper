@@ -1,4 +1,5 @@
 pub mod db;
+pub mod mcp;
 pub mod memory;
 pub mod orchestrator;
 pub mod registry;

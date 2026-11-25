@@ -1,10 +1,11 @@
 //! The device side of the Grouper protocol, shared by every client (Swift apps via
 //! the `ffi` crate, the `grouper` CLI, and later Windows/Linux nodes).
 //!
-//! [`run`] keeps one connection to the hub alive: it says hello with the device's
-//! capabilities and thread tools, answers direct tool calls through a
-//! [`ToolHandler`], runs subagent threads the orchestrator starts here, reports
-//! presence and status through [`Events`], pings, and reconnects with backoff.
+//! [`run`] keeps one connection to the hub alive: it says hello, serves the device's
+//! tools to the hub over MCP (platform tools through a [`ToolHandler`], and the tools
+//! of local MCP servers from the [`mcp_host`]), runs subagent threads the
+//! orchestrator starts here, reports presence and status through [`Events`], pings,
+//! and reconnects with backoff.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,17 +15,23 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use core_agent::thread::{ThreadControl, ThreadHost, spawn_thread};
-use core_agent::tools::{Workspace, builtin_defs, file_tools, shell_tool};
+use core_agent::tools::{Workspace, file_tools, shell_tool};
 use core_agent::{Tool, ToolOutput};
 use core_protocol::{
     AgentEvent, Capability, DeviceInfo, HubMessage, NodeMessage, PING_INTERVAL_SECS, PROTOCOL_VERSION, ProviderConfig,
     ThreadSpec, ToolDef,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
+
+pub mod mcp_host;
+mod mcp_server;
+
+use mcp_host::{HostTool, McpHost};
+use mcp_server::{DeviceServer, ServerSession};
 
 pub use core_protocol;
 
@@ -64,6 +71,9 @@ pub struct Config {
     pub workspace_root: Option<PathBuf>,
     /// Offer `run_shell` to threads (still gated by the device's permission level).
     pub allow_shell: bool,
+    /// The MCP host's config file. `None`: `GROUPER_MCP_CONFIG`, else
+    /// `<OS config dir>/grouper/mcp.json` (see [`mcp_host`]).
+    pub mcp_config: Option<PathBuf>,
 }
 
 enum Outcome {
@@ -80,6 +90,11 @@ pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn 
             return;
         }
     };
+    // Local MCP servers start now, in the background, and live across reconnects
+    // (agents keep their chat sessions in memory).
+    let mcp_config = config.mcp_config.clone();
+    let specs = tokio::task::spawn_blocking(move || mcp_host::load(mcp_config.as_deref())).await.unwrap_or_default();
+    let host = McpHost::start(specs);
     let mut backoff = Duration::from_secs(1);
     loop {
         if *shutdown.borrow() {
@@ -88,7 +103,7 @@ pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn 
         events.status(Status::Connecting);
         let started = tokio::time::Instant::now();
         let outcome = tokio::select! {
-            o = connect_once(&url, &config, &handler, &events) => o,
+            o = connect_once(&url, &config, &handler, &events, &host) => o,
             _ = shutdown.changed() => Outcome::Stop,
         };
         match outcome {
@@ -107,6 +122,7 @@ pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn 
         }
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
+    host.shutdown().await;
     events.status(Status::Disconnected { reason: "stopped".into() });
 }
 
@@ -212,19 +228,10 @@ impl Tool for CapabilityTool {
 
 fn capability_def(cap: &Capability) -> ToolDef {
     ToolDef {
-        name: cap.name.replace('.', "_"),
+        name: cap.name.clone(),
         description: cap.description.clone(),
-        input_schema: json!({"type": "object", "additionalProperties": true}),
+        input_schema: cap.input_schema.clone(),
     }
-}
-
-fn thread_tool_defs(config: &Config) -> Vec<ToolDef> {
-    if config.workspace_root.is_none() {
-        return vec![];
-    }
-    let mut defs = builtin_defs(config.allow_shell);
-    defs.extend(config.capabilities.iter().map(capability_def));
-    defs
 }
 
 fn start_thread(
@@ -233,6 +240,7 @@ fn start_thread(
     handler: &Arc<dyn ToolHandler>,
     events: &Arc<dyn Events>,
     threads: &Arc<Threads>,
+    host: &Arc<McpHost>,
 ) {
     let id = spec.thread_id.clone();
     let fail = |msg: String| {
@@ -259,6 +267,9 @@ fn start_thread(
     for cap in &config.capabilities {
         tools.push(Arc::new(CapabilityTool { cap: cap.clone(), handler: handler.clone() }));
     }
+    // `<server>__<tool>` from this device's MCP servers. Stopping the thread drops an
+    // in-flight call, which cancels it on the server.
+    tools.extend(HostTool::all(host));
 
     let title = spec.title.clone();
     events.thread(&id, &title, "running");
@@ -286,7 +297,13 @@ fn start_thread(
     });
 }
 
-async fn connect_once(url: &str, config: &Config, handler: &Arc<dyn ToolHandler>, events: &Arc<dyn Events>) -> Outcome {
+async fn connect_once(
+    url: &str,
+    config: &Config,
+    handler: &Arc<dyn ToolHandler>,
+    events: &Arc<dyn Events>,
+    host: &Arc<McpHost>,
+) -> Outcome {
     let mut request = match url.into_client_request() {
         Ok(r) => r,
         Err(e) => return Outcome::Retry(e.to_string()),
@@ -311,12 +328,7 @@ async fn connect_once(url: &str, config: &Config, handler: &Arc<dyn ToolHandler>
     };
     let (mut sink, mut stream) = ws.split();
 
-    let hello = NodeMessage::Hello {
-        protocol_version: PROTOCOL_VERSION,
-        client_version: CLIENT_VERSION.into(),
-        capabilities: config.capabilities.clone(),
-        thread_tools: thread_tool_defs(config),
-    };
+    let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: CLIENT_VERSION.into() };
     if let Err(e) = sink.send(Message::Text(serde_json::to_string(&hello).unwrap().into())).await {
         return Outcome::Retry(e.to_string());
     }
@@ -324,6 +336,8 @@ async fn connect_once(url: &str, config: &Config, handler: &Arc<dyn ToolHandler>
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NodeMessage>();
     let threads = Arc::new(Threads::new(out_tx.clone()));
     let _stop_threads = StopOnDisconnect(threads.clone());
+    // This device's MCP server; the hub is its client.
+    let mcp = ServerSession::start(DeviceServer::new(config, handler.clone(), host.clone()), out_tx.clone());
     let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.tick().await;
 
@@ -350,21 +364,13 @@ async fn connect_once(url: &str, config: &Config, handler: &Arc<dyn ToolHandler>
                 match serde_json::from_str::<HubMessage>(&text) {
                     Ok(HubMessage::Welcome { device_id, .. }) => events.status(Status::Connected { device_id }),
                     Ok(HubMessage::Presence { devices }) => events.presence(devices),
-                    Ok(HubMessage::ToolCall { call_id, tool, args }) => {
-                        let handler = handler.clone();
-                        let out_tx = out_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let (ok, output) = match handler.call(&tool, &args) {
-                                Ok(o) => (true, o),
-                                Err(e) => (false, e),
-                            };
-                            let _ = out_tx.send(NodeMessage::ToolResult { call_id, ok, output });
-                        });
+                    Ok(HubMessage::Mcp { message }) => {
+                        let _ = mcp.incoming.send(message);
                     }
                     Ok(HubMessage::Providers { providers }) => {
                         *threads.providers.lock().unwrap() = providers;
                     }
-                    Ok(HubMessage::StartThread { spec }) => start_thread(spec, config, handler, events, &threads),
+                    Ok(HubMessage::StartThread { spec }) => start_thread(spec, config, handler, events, &threads, host),
                     Ok(HubMessage::ThreadInput { thread_id, from, text }) => {
                         if let Some(c) = threads.controls.lock().unwrap().get(&thread_id) {
                             c.send(&from, &text);
@@ -401,6 +407,7 @@ async fn connect_once(url: &str, config: &Config, handler: &Arc<dyn ToolHandler>
 mod tests {
     use super::*;
     use core_protocol::Permission;
+    use serde_json::json;
 
     /// A thread waiting for approval must end, and release its host, when the
     /// connection drops (it used to wait forever and keep `Threads` alive).
