@@ -4,3 +4,4 @@ apple/GrouperKit/.build
 apple/GrouperKit/lib
 .DS_Store
 .env
+.claude/worktrees/
