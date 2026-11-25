@@ -212,6 +212,8 @@ needs a decision on how they merge back (open question below).
 
 ## Open questions
 
+The full list of what waits on Oscar, with options: [decisions-needed.md](decisions-needed.md).
+
 - Should a web client come first, to design the screens before the native apps?
 - Offline writes: queue messages typed offline and send them on reconnect, or answer them
   on the device with an API model and merge the reply into the hub's log? How do they
