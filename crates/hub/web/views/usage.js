@@ -2,8 +2,8 @@
 // (thread caps, budgets, timeouts) with today's estimated spend.
 
 import { h, icon, setChildren } from '../lib/dom.js';
-import { get, post, put, qs, describe, isAbort } from '../lib/api.js';
-import { store, isAdmin } from '../lib/store.js';
+import { get, post, put, qs, enc, describe, isAbort } from '../lib/api.js';
+import { store, on, isAdmin } from '../lib/store.js';
 import { bar, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { num, usd, ago, dateTime, isoDay } from '../lib/format.js';
 
@@ -29,10 +29,45 @@ const LIMITS = [
   { key: 'ask_timeout_secs', label: 'Question timeout', unit: 'seconds', suffix: 's', step: '1', help: 'How long a thread’s ask_orchestrator waits.', off: 'Off: waits forever' },
 ];
 
-export function renderUsage(container) {
+export function renderUsage(container, { conversation: filterCid = null } = {}) {
   const admin = isAdmin();
+  const barSlot = h('div', { class: 'bar-slot' });
   const body = h('div', { class: 'view-body' });
-  container.append(h('section', { class: 'view' }, bar({ title: 'Usage & limits', caption: 'Spend is estimated from registry prices' }), body));
+  container.append(h('section', { class: 'view' }, barSlot, body));
+
+  const filterBanner = h('div', { hidden: !filterCid });
+  const chatTitle = () => (filterCid ? store.conversations.find((c) => c.id === filterCid)?.title || filterCid : null);
+
+  function renderHeader() {
+    if (filterCid) {
+      const name = chatTitle();
+      setChildren(
+        barSlot,
+        bar({
+          title: 'Chat usage',
+          caption: name,
+          back: `#/chat/${enc(filterCid)}`,
+          actions: [h('a', { class: 'btn btn-sm', href: '#/usage' }, 'All usage')],
+        }),
+      );
+      setChildren(
+        filterBanner,
+        h(
+          'div',
+          { class: 'banner info' },
+          icon('chat'),
+          h('div', { class: 'grow' }, 'Showing metered usage for ', h('strong', null, name), '.'),
+          h('a', { class: 'btn btn-sm', href: '#/usage' }, 'Show all'),
+        ),
+      );
+      document.title = `${name} · Usage · Grouper`;
+    } else {
+      setChildren(barSlot, bar({ title: 'Usage & limits', caption: 'Spend is estimated from registry prices' }));
+      document.title = 'Usage & limits · Grouper';
+    }
+  }
+  renderHeader();
+
   if (!admin) {
     body.append(h('div', { class: 'banner warn' }, icon('shield'), 'Usage and limits need an admin token. Sign in with one in Settings.'));
     return null;
@@ -44,19 +79,21 @@ export function renderUsage(container) {
   const limitsSlot = h('section', { class: 'section', 'aria-labelledby': 'u-limits' });
   const usageSlot = h('section', { class: 'section', 'aria-labelledby': 'u-usage' });
   const balancesSlot = h('section', { class: 'section', 'aria-labelledby': 'u-balances' });
-  body.append(limitsSlot, usageSlot, balancesSlot);
+  if (filterCid) body.append(filterBanner, usageSlot);
+  else body.append(limitsSlot, usageSlot, balancesSlot);
 
   // ---- usage table
-  let group = 'day';
+  let group = filterCid ? 'model' : 'day';
   const today = new Date();
   const since = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 29));
-  let range = { since: isoDay(since), until: isoDay(today) };
+  let range = filterCid ? { since: '', until: '' } : { since: isoDay(since), until: isoDay(today) };
 
   async function renderUsageTable() {
+    const groups = filterCid ? GROUPS.filter(([v]) => v !== 'conversation') : GROUPS;
     const seg = h(
       'div',
       { class: 'seg', role: 'radiogroup', 'aria-label': 'Group by' },
-      GROUPS.map(([v, label]) =>
+      groups.map(([v, label]) =>
         h(
           'label',
           null,
@@ -90,7 +127,8 @@ export function renderUsage(container) {
     setChildren(usageSlot, h('div', { class: 'section-head' }, h('h2', { id: 'u-usage' }, 'Usage'), seg), dates, skeleton(4));
     let rows;
     try {
-      rows = (await get(`/v1/usage${qs({ since: range.since, until: range.until, group })}`, { signal })) || [];
+      const query = { since: range.since, until: range.until, group, ...(filterCid ? { conversation: filterCid } : null) };
+      rows = (await get(`/v1/usage${qs(query)}`, { signal })) || [];
     } catch (err) {
       if (isAbort(err)) return;
       setChildren(usageSlot, h('div', { class: 'section-head' }, h('h2', { id: 'u-usage' }, 'Usage'), seg), dates, errorBanner(err, renderUsageTable));
@@ -359,11 +397,15 @@ export function renderUsage(container) {
     }
   }
 
-  renderLimits();
+  const offConvs = filterCid ? on('conversations', renderHeader) : null;
+  if (!filterCid) {
+    renderLimits();
+    renderBalances();
+  }
   renderUsageTable();
-  renderBalances();
   return () => {
     aborter.abort();
     unguard();
+    offConvs?.();
   };
 }

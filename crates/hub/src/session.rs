@@ -19,18 +19,20 @@
 
 use std::sync::{Arc, Once};
 
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use core_protocol::SessionInfo;
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::db::{Auth, Db, now, random_hex};
+use crate::registry::deny_unless_admin;
 use crate::server::{Hub, err};
 
 /// The session cookie's name.
@@ -52,7 +54,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS sessions_device ON sessions (device_id);
 ";
 
-fn hash(id: &str) -> String {
+pub(crate) fn hash(id: &str) -> String {
     hex::encode(Sha256::digest(id.as_bytes()))
 }
 
@@ -109,6 +111,48 @@ impl Db {
     /// End a session. Returns whether it existed.
     pub fn delete_session(&self, id: &str) -> bool {
         well_formed(id) && self.c().execute("DELETE FROM sessions WHERE id_hash = ?1", [hash(id)]).unwrap_or(0) > 0
+    }
+
+    /// Active, non-expired browser sessions for non-revoked devices, most recently used first.
+    pub fn list_sessions(&self, current_hash: Option<&str>) -> Vec<SessionInfo> {
+        let current = now() as i64;
+        let c = self.c();
+        let _ = c.execute("DELETE FROM sessions WHERE expires <= ?1", [current]);
+        let mut st = c
+            .prepare(
+                "SELECT s.id_hash, s.device_id, d.name, d.admin, s.created, s.last_used, s.expires
+                 FROM sessions s
+                 JOIN devices d ON d.id = s.device_id
+                 WHERE d.revoked = 0 AND s.expires > ?1
+                 ORDER BY s.last_used DESC, s.created DESC",
+            )
+            .unwrap();
+        st.query_map([current], |r| {
+            let id_hash: String = r.get(0)?;
+            Ok(SessionInfo {
+                current: current_hash.is_some_and(|h| h == id_hash),
+                id: id_hash,
+                device_id: r.get(1)?,
+                device_name: r.get(2)?,
+                admin: r.get::<_, i64>(3)? != 0,
+                created: r.get::<_, i64>(4)? as u64,
+                last_used: r.get::<_, i64>(5)? as u64,
+                expires: r.get::<_, i64>(6)? as u64,
+            })
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    }
+
+    /// Revoke a session by its stored hash (`SessionInfo::id`). Returns whether it existed.
+    pub fn delete_session_by_hash(&self, id_hash: &str) -> bool {
+        well_formed(id_hash)
+            && self
+                .c()
+                .execute("DELETE FROM sessions WHERE id_hash = ?1", [id_hash.to_ascii_lowercase()])
+                .unwrap_or(0)
+                > 0
     }
 }
 
@@ -276,13 +320,24 @@ async fn whoami(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     Json(body).into_response()
 }
 
+/// The hash of the session cookie authenticating this request, if any (Bearer requests have none).
+fn current_session_hash(hub: &Hub, headers: &HeaderMap) -> Option<String> {
+    if headers.contains_key(header::AUTHORIZATION) {
+        return None;
+    }
+    cookie_sessions(headers)
+        .into_iter()
+        .find(|id| hub.db.session_auth(id).is_some())
+        .map(hash)
+}
+
 /// `DELETE /v1/session`: forget this browser's session and clear its cookie.
 async fn logout(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     let mut ended = false;
     for id in cookie_sessions(&headers) {
         let deleted = hub.db.delete_session(id);
         if deleted {
-            hub.invalidate_session(id);
+            hub.invalidate_session(&hash(id));
             ended = true;
         }
     }
@@ -295,8 +350,42 @@ async fn logout(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     response
 }
 
+/// `GET /v1/sessions` (admin): active browser sessions on this hub.
+async fn list_sessions(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+    if let Some(r) = deny_unless_admin(&hub, &headers) {
+        return r;
+    }
+    let current = current_session_hash(&hub, &headers);
+    Json(hub.db.list_sessions(current.as_deref())).into_response()
+}
+
+/// `DELETE /v1/sessions/{id}` (admin): revoke a browser session and close its live sockets.
+async fn revoke_session(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Some(r) = deny_unless_admin(&hub, &headers) {
+        return r;
+    }
+    let target = id.to_ascii_lowercase();
+    let is_current = current_session_hash(&hub, &headers).as_deref() == Some(target.as_str());
+    if !hub.db.delete_session_by_hash(&target) {
+        return err(StatusCode::NOT_FOUND, "no such session");
+    }
+    hub.invalidate_session(&target);
+    let mut response = Json(json!({"revoked": target, "current": is_current})).into_response();
+    if is_current {
+        let secure = is_https(&headers);
+        response.headers_mut().insert(header::SET_COOKIE, set_cookie("", 0, secure));
+        if secure {
+            response.headers_mut().append(header::SET_COOKIE, clear_legacy_cookie());
+        }
+    }
+    response
+}
+
 pub(crate) fn routes() -> Router<Arc<Hub>> {
-    Router::new().route("/v1/session", post(login).get(whoami).delete(logout))
+    Router::new()
+        .route("/v1/session", post(login).get(whoami).delete(logout))
+        .route("/v1/sessions", get(list_sessions))
+        .route("/v1/sessions/{id}", delete(revoke_session))
 }
 
 #[cfg(test)]
@@ -709,5 +798,123 @@ mod tests {
         assert!(csrf_refusal(&Method::GET, "/v1/events", &h).is_some());
         h.insert(header::ORIGIN, "http://hub.local:8080".parse().unwrap());
         assert_eq!(csrf_refusal(&Method::GET, "/v1/events", &h), None);
+    }
+
+    #[tokio::test]
+    async fn list_and_revoke_sessions_marks_current_and_closes_live_sockets() {
+        let f = fixture().await;
+        let (_, c1, _) = f.login(&f.admin_token).await;
+        let (_, c2, _) = f.login(&f.device_token).await;
+        let cookie1 = pair(&c1.unwrap());
+        let cookie2 = pair(&c2.unwrap());
+        let raw1 = cookie1.strip_prefix("grouper_session=").unwrap().to_string();
+        let raw2 = cookie2.strip_prefix("grouper_session=").unwrap().to_string();
+
+        // Auth checks: unauth -> 401, non-admin -> 403.
+        assert_eq!(f.http.get(format!("{}/v1/sessions", f.base)).send().await.unwrap().status(), S::UNAUTHORIZED);
+        assert_eq!(
+            f.http.get(format!("{}/v1/sessions", f.base)).header("cookie", &cookie2).send().await.unwrap().status(),
+            S::FORBIDDEN
+        );
+
+        // Open a live /v1/events socket for session 2 (the non-admin browser).
+        let mut ws_req = format!("ws://{}/v1/events", f.addr).into_client_request().unwrap();
+        ws_req.headers_mut().insert("cookie", cookie2.parse().unwrap());
+        ws_req.headers_mut().insert("origin", f.base.parse().unwrap());
+        let (mut ws2, _) = tokio_tungstenite::connect_async(ws_req).await.unwrap();
+
+        // Admin lists sessions via cookie1: sees both, only session 1 is marked current, raw cookies are never leaked.
+        let r = f.http.get(format!("{}/v1/sessions", f.base)).header("cookie", &cookie1).send().await.unwrap();
+        assert_eq!(r.status(), S::OK);
+        let text = r.text().await.unwrap();
+        assert!(!text.contains(&raw1) && !text.contains(&raw2), "raw session ids must not be exposed");
+        let list: Vec<SessionInfo> = serde_json::from_str(&text).unwrap();
+        assert_eq!(list.len(), 2);
+        let s1 = list.iter().find(|s| s.id == hash(&raw1)).unwrap();
+        let s2 = list.iter().find(|s| s.id == hash(&raw2)).unwrap();
+        assert!(s1.current);
+        assert_eq!(s1.device_name, "Phone");
+        assert!(s1.admin);
+        assert!(!s2.current);
+        assert_eq!(s2.device_name, "Laptop");
+        assert!(!s2.admin);
+        assert!(s1.expires > s1.created && s1.last_used >= s1.created);
+
+        // Bearer admin sees none marked current.
+        let bearer_list: Vec<SessionInfo> = f
+            .http
+            .get(format!("{}/v1/sessions", f.base))
+            .bearer_auth(&f.admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(bearer_list.iter().all(|s| !s.current));
+
+        // Non-admin cannot revoke.
+        let r = f
+            .http
+            .delete(format!("{}/v1/sessions/{}", f.base, s1.id))
+            .header("cookie", &cookie2)
+            .header("x-grouper", "1")
+            .header("origin", &f.base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::FORBIDDEN);
+
+        // Revoking session 2 deletes it and immediately closes ws2 with a Policy close frame.
+        let r = f
+            .http
+            .delete(format!("{}/v1/sessions/{}", f.base, s2.id))
+            .header("cookie", &cookie1)
+            .header("x-grouper", "1")
+            .header("origin", &f.base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws2.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(
+            msg,
+            tokio_tungstenite::tungstenite::Message::Close(Some(frame))
+                if frame.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+        ));
+        // Session 2 cookie no longer authenticates.
+        assert_eq!(
+            f.http.get(format!("{}/v1/devices", f.base)).header("cookie", &cookie2).send().await.unwrap().status(),
+            S::UNAUTHORIZED
+        );
+
+        // Revoking again or nonexistent returns 404.
+        let r = f
+            .http
+            .delete(format!("{}/v1/sessions/{}", f.base, s2.id))
+            .header("cookie", &cookie1)
+            .header("x-grouper", "1")
+            .header("origin", &f.base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::NOT_FOUND);
+
+        // Revoking current session also clears the cookie.
+        let r = f
+            .http
+            .delete(format!("{}/v1/sessions/{}", f.base, s1.id))
+            .header("cookie", &cookie1)
+            .header("x-grouper", "1")
+            .header("origin", &f.base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        assert!(r.headers()["set-cookie"].to_str().unwrap().contains("Max-Age=0"));
+        assert_eq!(
+            f.http.get(format!("{}/v1/devices", f.base)).header("cookie", &cookie1).send().await.unwrap().status(),
+            S::UNAUTHORIZED
+        );
     }
 }

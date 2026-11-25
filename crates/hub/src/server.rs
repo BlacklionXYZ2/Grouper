@@ -15,12 +15,12 @@ use axum::{Json, Router};
 use core_agent::thread::ThreadControl;
 use core_protocol::{
     ChatRequest, ChatResponse, DeviceInfo, Event, EventBody, HubMessage, IDLE_TIMEOUT_SECS, MAX_WS_MESSAGE_BYTES,
-    ModelEntry, NodeMessage, PROTOCOL_VERSION, Permission, ProviderConfig, ProviderInfo, ToolCallRequest, ToolDef,
-    ToolSummary,
+    ModelEntry, NodeMessage, PROTOCOL_VERSION, PendingApproval, Permission, ProviderConfig, ProviderInfo,
+    ToolCallRequest, ToolDef, ToolSummary,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 use crate::db::{Auth, Db};
@@ -102,6 +102,11 @@ pub(crate) struct ApprovalRoute {
     pub(crate) device_id: String,
     pub(crate) conversation_id: String,
     pub(crate) thread_id: String,
+    pub(crate) tool: String,
+    pub(crate) input: Value,
+    pub(crate) reason: String,
+    pub(crate) requested_at: u64,
+    pub(crate) timeout_secs: Option<u64>,
     /// Set for threads running on the hub itself (and for the hub's hand-over copy).
     pub(crate) local: Option<oneshot::Sender<ApprovalAnswer>>,
     /// Distinguishes this route from any later request that happens to use the same id.
@@ -323,9 +328,16 @@ impl Hub {
         }
     }
 
-    pub(crate) async fn broadcast_presence(&self) {
+    pub(crate) async fn broadcast_presence(&self, changed_device: &str) {
         let devices = self.devices().await;
+        let changed = devices.iter().find(|d| d.id == changed_device).cloned();
+        let online = changed.as_ref().is_some_and(|d| d.online);
         self.broadcast(HubMessage::Presence { devices }).await;
+        self.emit_live(
+            "",
+            None,
+            EventBody::DevicePresence { device_id: changed_device.to_string(), online, device: changed },
+        );
     }
 
     pub async fn broadcast_providers(&self) {
@@ -386,6 +398,34 @@ impl Hub {
         self.emit(&id, None, EventBody::UserMessage { text: text.clone() });
         self.wake(&id, Wake::User(text)).await;
         Ok(id)
+    }
+
+    /// Pending approvals, oldest first, optionally filtered to one conversation.
+    pub async fn pending_approvals(&self, conversation: Option<&str>) -> Vec<PendingApproval> {
+        let limits = self.db.limits();
+        let approvals = self.approvals.lock().await;
+        let mut out: Vec<PendingApproval> = approvals
+            .iter()
+            .filter(|(_, r)| conversation.is_none_or(|c| r.conversation_id == c))
+            .map(|(approval_id, r)| {
+                let active_timeout = r.timeout_secs.filter(|_| limits.approval_timeout_secs.is_some());
+                PendingApproval {
+                    approval_id: approval_id.clone(),
+                    device_id: r.device_id.clone(),
+                    thread_id: r.thread_id.clone(),
+                    conversation_id: r.conversation_id.clone(),
+                    tool: r.tool.clone(),
+                    input: r.input.clone(),
+                    reason: r.reason.clone(),
+                    requested_at: r.requested_at,
+                    timeout_secs: active_timeout,
+                    timeout_at: active_timeout.map(|secs| r.requested_at.saturating_add(secs)),
+                    timeout_action: active_timeout.map(|_| limits.approval_timeout_action),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.requested_at.cmp(&b.requested_at).then_with(|| a.approval_id.cmp(&b.approval_id)));
+        out
     }
 
     /// Resolve an approval request. Returns false if it doesn't exist (any more).
@@ -449,6 +489,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/threads/{id}", get(get_thread))
         .route("/v1/threads/{id}/message", post(thread_message))
         .route("/v1/threads/{id}/stop", post(thread_stop))
+        .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(approval))
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/{id}", put(update_memory).delete(delete_memory))
@@ -563,6 +604,7 @@ async fn list_providers(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Resp
             kind: p.kind,
             base_url: p.base_url,
             has_key: p.api_key.as_deref().is_some_and(|k| !k.is_empty()),
+            options: p.options,
         })
         .collect();
     Json(list).into_response()
@@ -759,6 +801,15 @@ async fn thread_stop(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): 
     }
 }
 
+async fn list_approvals(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Query(q): Query<ConversationFilter>,
+) -> Response {
+    admin!(hub, headers);
+    Json(hub.pending_approvals(q.conversation.as_deref()).await).into_response()
+}
+
 #[derive(Deserialize)]
 struct ApprovalBody {
     approve: bool,
@@ -807,8 +858,8 @@ async fn events_ws(
                 }
                 invalidated = invalidations.recv() => {
                     let must_check = match invalidated {
-                        Ok(id) => credential.session_id().is_some_and(|mine| mine == id),
-                        Err(broadcast::error::RecvError::Lagged(_)) => credential.session_id().is_some(),
+                        Ok(id_hash) => credential.session_hash().is_some_and(|mine| mine == id_hash),
+                        Err(broadcast::error::RecvError::Lagged(_)) => credential.session_hash().is_some(),
                         Err(broadcast::error::RecvError::Closed) => false,
                     };
                     if must_check && !credential.valid(&hub) {
@@ -872,7 +923,7 @@ async fn events_ws(
 #[derive(Clone)]
 enum EventCredential {
     Bearer(String),
-    Session(String),
+    Session { id: String, id_hash: String },
 }
 
 impl EventCredential {
@@ -885,20 +936,20 @@ impl EventCredential {
         crate::session::cookie_sessions(headers)
             .into_iter()
             .find(|id| hub.db.session_auth(id).is_some())
-            .map(|id| Self::Session(id.to_string()))
+            .map(|id| Self::Session { id: id.to_string(), id_hash: crate::session::hash(id) })
     }
 
     fn valid(&self, hub: &Hub) -> bool {
         match self {
             Self::Bearer(token) => hub.db.authenticate(token).is_some(),
-            Self::Session(id) => hub.db.session_auth(id).is_some(),
+            Self::Session { id, .. } => hub.db.session_auth(id).is_some(),
         }
     }
 
-    fn session_id(&self) -> Option<&str> {
+    fn session_hash(&self) -> Option<&str> {
         match self {
             Self::Bearer(_) => None,
-            Self::Session(id) => Some(id),
+            Self::Session { id_hash, .. } => Some(id_hash),
         }
     }
 }
@@ -1006,7 +1057,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
         protocol_version: PROTOCOL_VERSION,
     });
     let _ = tx.try_send(HubMessage::Providers { providers });
-    hub.broadcast_presence().await;
+    hub.broadcast_presence(&device_id).await;
     // The hub's MCP client: lists the device's tools now and on every change.
     let mcp = McpSession::start(&hub, device_id.clone(), conn_id, tx.clone(), close_handle);
     // Threads waiting for this device continue here once its tools are known.
@@ -1150,7 +1201,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     let _ = closed_tx.send(true);
     if call_device_gone {
         hub.device_gone(&device_id).await;
-        hub.broadcast_presence().await;
+        hub.broadcast_presence(&device_id).await;
     }
     tracing::info!(device = %device_id, "disconnected");
     result
@@ -1752,6 +1803,363 @@ mod tests {
         assert_eq!(slow_close_rx.try_recv().ok(), Some(CloseReason::Overflow));
         assert!(fast_rx.try_recv().is_ok());
         assert!(fast_rx.try_recv().is_ok());
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn pending_approvals_endpoint_lists_filters_and_requires_admin() {
+        let dir = std::env::temp_dir().join(format!("grouper-approvals-test-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (_, admin_token) = db.add_device("Admin", "ios", true).unwrap();
+        let (worker, worker_token) = db.add_device("Laptop", "windows", false).unwrap();
+        db.set_limits(&core_protocol::Limits {
+            approval_timeout_secs: Some(90),
+            approval_timeout_action: core_protocol::ApprovalTimeoutAction::Stop,
+            ..Default::default()
+        })
+        .unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let base = format!("http://{addr}");
+        let http = reqwest::Client::new();
+
+        // Auth checks: 401 unauth, 403 non-admin.
+        assert_eq!(http.get(format!("{base}/v1/approvals")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            http.get(format!("{base}/v1/approvals")).bearer_auth(&worker_token).send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let c1 = hub.db.create_conversation("project", "first").unwrap();
+        let c2 = hub.db.create_conversation("project", "second").unwrap();
+        let t1 = hub.db.create_thread(&c1, "T1", &worker.id, "m", None, "b").unwrap();
+        let t2 = hub.db.create_thread(&c2, "T2", &worker.id, "m", None, "b").unwrap();
+        let a1 = format!("{}-1", t1.id);
+        let a2 = format!("{}-1", t2.id);
+        let (tx1, _rx1) = oneshot::channel();
+        let (tx2, _rx2) = oneshot::channel();
+        assert!(
+            hub.request_approval(&worker.id, &t1.id, &a1, "run_shell", json!({"command": "ls"}), "shell rule", Some(tx1))
+                .await
+        );
+        assert!(
+            hub.request_approval(&worker.id, &t2.id, &a2, "write_file", json!({"path": "a.txt"}), "manual", Some(tx2))
+                .await
+        );
+
+        let all: Vec<PendingApproval> = http
+            .get(format!("{base}/v1/approvals"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        let first = all.iter().find(|a| a.approval_id == a1).unwrap();
+        assert_eq!(first.device_id, worker.id);
+        assert_eq!(first.thread_id, t1.id);
+        assert_eq!(first.conversation_id, c1);
+        assert_eq!(first.tool, "run_shell");
+        assert_eq!(first.input, json!({"command": "ls"}));
+        assert_eq!(first.reason, "shell rule");
+        assert!(first.requested_at > 0);
+        assert_eq!(first.timeout_secs, Some(90));
+        assert_eq!(first.timeout_at, Some(first.requested_at + 90));
+        assert_eq!(first.timeout_action, Some(core_protocol::ApprovalTimeoutAction::Stop));
+
+        let filtered: Vec<PendingApproval> = http
+            .get(format!("{base}/v1/approvals?conversation={c2}"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].approval_id, a2);
+
+        // Resolving removes it from the list.
+        assert!(hub.resolve_approval(&a1, true).await);
+        let remaining: Vec<PendingApproval> = http
+            .get(format!("{base}/v1/approvals"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].approval_id, a2);
+
+        // Turning off timeout clears timeout fields on pending approvals.
+        hub.db.set_limits(&core_protocol::Limits { approval_timeout_secs: None, ..Default::default() }).unwrap();
+        let after_off: Vec<PendingApproval> = http
+            .get(format!("{base}/v1/approvals"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(after_off[0].timeout_secs, None);
+        assert_eq!(after_off[0].timeout_at, None);
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn device_presence_events_are_live_only_and_not_stored() {
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let dir = std::env::temp_dir().join(format!("grouper-presence-event-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (_, admin_token) = db.add_device("Admin", "ios", true).unwrap();
+        let (worker, worker_token) = db.add_device("Workstation", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // Subscribe to /v1/events with Bearer token.
+        let mut ev_req = format!("ws://{addr}/v1/events").into_client_request().unwrap();
+        ev_req.headers_mut().insert("authorization", format!("Bearer {admin_token}").parse().unwrap());
+        let (mut ev_ws, _) = tokio_tungstenite::connect_async(ev_req).await.unwrap();
+
+        // Connect worker device.
+        let mut dev_req = format!("ws://{addr}{}", core_protocol::CONNECT_PATH).into_client_request().unwrap();
+        dev_req.headers_mut().insert("authorization", format!("Bearer {worker_token}").parse().unwrap());
+        let (mut dev_ws, _) = tokio_tungstenite::connect_async(dev_req).await.unwrap();
+        let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into() };
+        dev_ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
+
+        let online_ev: Event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(WsMsg::Text(t))) = ev_ws.next().await
+                    && let Ok(e) = serde_json::from_str::<Event>(&t)
+                    && matches!(&e.body, EventBody::DevicePresence { device_id, .. } if *device_id == worker.id)
+                {
+                    break e;
+                }
+            }
+        })
+        .await
+        .expect("online presence event");
+        assert_eq!(online_ev.seq, 0);
+        match online_ev.body {
+            EventBody::DevicePresence { device_id, online, device } => {
+                assert_eq!(device_id, worker.id);
+                assert!(online);
+                assert_eq!(device.unwrap().name, "Workstation");
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        // Simulate tool list change broadcast.
+        let conn_id = hub.live.lock().await.get(&worker.id).unwrap().conn_id;
+        assert!(
+            crate::mcp::apply_tool_list(
+                &hub,
+                &worker.id,
+                conn_id,
+                vec![ToolDef { name: "echo".into(), description: "Echo".into(), input_schema: json!({}) }],
+            )
+            .await
+        );
+        hub.broadcast_presence(&worker.id).await;
+        let tools_ev: Event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(WsMsg::Text(t))) = ev_ws.next().await
+                    && let Ok(e) = serde_json::from_str::<Event>(&t)
+                    && matches!(&e.body, EventBody::DevicePresence { device_id, .. } if *device_id == worker.id)
+                {
+                    break e;
+                }
+            }
+        })
+        .await
+        .expect("tool update presence event");
+        assert_eq!(tools_ev.seq, 0);
+        match tools_ev.body {
+            EventBody::DevicePresence { online, device, .. } => {
+                assert!(online);
+                assert_eq!(device.unwrap().capabilities.len(), 1);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        // Disconnect worker device -> offline presence event.
+        let _ = dev_ws.close(None).await;
+        drop(dev_ws);
+        let offline_ev: Event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Ok(WsMsg::Text(t))) = ev_ws.next().await
+                    && let Ok(e) = serde_json::from_str::<Event>(&t)
+                    && matches!(&e.body, EventBody::DevicePresence { device_id, online: false, .. } if *device_id == worker.id)
+                {
+                    break e;
+                }
+            }
+        })
+        .await
+        .expect("offline presence event");
+        assert_eq!(offline_ev.seq, 0);
+
+        // Presence events are live-only and never stored in SQLite.
+        let stored_count: i64 = hub.db.c().query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored_count, 0, "device_presence must never be stored in events");
+
+        let _ = ev_ws.close(None).await;
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn thread_endpoints_include_current_user_rating_and_providers_include_options() {
+        let dir = std::env::temp_dir().join(format!("grouper-rating-provider-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (_, admin_token) = db.add_device("Admin", "ios", true).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "p1".into(),
+            kind: "openai".into(),
+            base_url: Some("https://example.com/v1".into()),
+            api_key: Some("super-secret-key".into()),
+            options: json!({"max_tokens_field": "max_completion_tokens"}),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "m1".into(),
+            provider_id: "p1".into(),
+            model: "gpt-test".into(),
+            input_price: 1.0,
+            output_price: 2.0,
+            cache_read_price: None,
+            cache_write_price: None,
+            context_window: 128000,
+            use_cases: String::new(),
+            free: false,
+            roles: vec!["thread".into()],
+            local: false,
+            modalities: vec![],
+        })
+        .unwrap();
+        let conv = db.create_conversation("project", "rating test").unwrap();
+        let t = db.create_thread(&conv, "Rate me", HUB_DEVICE, "m1", None, "brief").unwrap();
+        assert!(db.finish_thread(&t.id, "done", "all good"));
+        assert!(db.record_outcome(&t.id));
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let base = format!("http://{addr}");
+        let http = reqwest::Client::new();
+
+        // Provider listing includes non-secret options, never the key.
+        let raw_providers = http
+            .get(format!("{base}/v1/providers"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!raw_providers.contains("super-secret-key"));
+        let providers: Vec<ProviderInfo> = serde_json::from_str(&raw_providers).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert!(providers[0].has_key);
+        assert_eq!(providers[0].options, json!({"max_tokens_field": "max_completion_tokens"}));
+
+        // Thread starts unrated.
+        let got: core_protocol::ThreadInfo = http
+            .get(format!("{base}/v1/threads/{}", t.id))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got.rating, None);
+
+        // Rate up -> GET /v1/threads/{id} and GET /v1/threads both return rating = Some(1).
+        let r = http
+            .post(format!("{base}/v1/threads/{}/rating", t.id))
+            .bearer_auth(&admin_token)
+            .json(&json!({"rating": "up"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let got: core_protocol::ThreadInfo = http
+            .get(format!("{base}/v1/threads/{}", t.id))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got.rating, Some(1));
+        let list: Vec<core_protocol::ThreadInfo> = http
+            .get(format!("{base}/v1/threads?conversation={conv}"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list[0].rating, Some(1));
+
+        // Rate down -> -1; clear -> None.
+        http.post(format!("{base}/v1/threads/{}/rating", t.id))
+            .bearer_auth(&admin_token)
+            .json(&json!({"rating": "down"}))
+            .send()
+            .await
+            .unwrap();
+        let got: core_protocol::ThreadInfo = http
+            .get(format!("{base}/v1/threads/{}", t.id))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got.rating, Some(-1));
+
+        http.post(format!("{base}/v1/threads/{}/rating", t.id))
+            .bearer_auth(&admin_token)
+            .json(&json!({"rating": "clear"}))
+            .send()
+            .await
+            .unwrap();
+        let got: core_protocol::ThreadInfo = http
+            .get(format!("{base}/v1/threads/{}", t.id))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got.rating, None);
 
         drop(hub);
         std::fs::remove_dir_all(dir).ok();

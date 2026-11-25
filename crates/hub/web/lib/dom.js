@@ -105,6 +105,7 @@ const ICONS = {
   logout: ['M15 4h4v16h-4', 'M10 8l-4 4 4 4', 'M6 12h10'],
   edit: ['M4 20h4L19 9l-4-4L4 16z'],
   trash: ['M5 7h14', 'M9 7V4h6v3', 'M7 7l1 13h8l1-13'],
+  play: ['M7 5l12 7-12 7z'],
 };
 
 /** Visually hidden text for screen readers. */

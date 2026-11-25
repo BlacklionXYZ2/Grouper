@@ -5,7 +5,7 @@
 import { h, icon, setChildren, setText, setAttr, keepFocus } from '../lib/dom.js';
 import { enc } from '../lib/api.js';
 import { store, on, deviceName, threadsIn, approvalsFor, approvalsIn, pendingApprovals } from '../lib/store.js';
-import { loadThreads, scanApprovals } from '../lib/live.js';
+import { loadThreads, loadApprovals } from '../lib/live.js';
 import { bar, statusPill, skeletonBlocks, errorBanner } from '../lib/ui.js';
 import { ago, isActive, plural } from '../lib/format.js';
 import { openApproval } from './approvals.js';
@@ -229,8 +229,7 @@ export function renderThreads(container, { conversation: cid = null } = {}) {
   async function refresh() {
     error = null;
     try {
-      await loadThreads();
-      await scanApprovals();
+      await Promise.all([loadThreads(), loadApprovals({ strict: true })]);
       loaded = true;
     } catch (e) {
       error = e;

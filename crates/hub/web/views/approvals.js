@@ -134,18 +134,25 @@ export function openApproval(approvalId, { conversationId } = {}) {
       on('online', sync),
     );
 
-    // The real deadline, when the hub has an approval timeout.
-    get('/v1/limits', { signal: aborter.signal })
-      .then((report) => {
-        const secs = report?.limits?.approval_timeout_secs;
-        if (!secs) return;
-        const left = Math.max(0, Math.round(a.ts + secs - Date.now() / 1000));
-        const then = report.limits.approval_timeout_action === 'stop' ? 'it’s denied and the thread is stopped' : 'it’s denied and the thread goes on';
-        waitText.textContent = `Requested ${ago(a.ts)}. If nobody answers within ${duration(secs)} (about ${duration(left)} left), ${then}. `;
-      })
-      .catch(() => {
-        /* keep the general wording */
-      });
+    const setTimeoutCopy = (secs, action, deadline) => {
+      if (!secs) return;
+      const target = deadline || a.ts + secs;
+      const left = Math.max(0, Math.round(target - Date.now() / 1000));
+      const then = action === 'stop' ? 'it’s denied and the thread is stopped' : 'it’s denied and the thread goes on';
+      waitText.textContent = `Requested ${ago(a.ts)}. If nobody answers within ${duration(secs)} (about ${duration(left)} left), ${then}. `;
+    };
+    if (a.timeout_secs) {
+      setTimeoutCopy(a.timeout_secs, a.timeout_action, a.timeout_at);
+    } else if (a.timeout_secs === undefined) {
+      // Live event didn't carry the timeout; check the hub's limits.
+      get('/v1/limits', { signal: aborter.signal })
+        .then((report) => {
+          setTimeoutCopy(report?.limits?.approval_timeout_secs, report?.limits?.approval_timeout_action, null);
+        })
+        .catch(() => {
+          /* keep the general wording */
+        });
+    }
 
     sync();
     const reasonText = a.reason || 'This tool is set to Manual, so every call waits for you.';

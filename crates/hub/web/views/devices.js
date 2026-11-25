@@ -3,13 +3,12 @@
 // CLI agent's chat tool the person types the tool's name. A tool on Bypass is
 // marked in red with a warning icon so it can't be missed.
 //
-// Presence comes from the app's one device poller (live.js), which these views
-// switch to its 15-second cadence while they're open.
+// Presence updates live from the hub's event stream (live.js).
 
 import { h, icon, setChildren, keepFocus } from '../lib/dom.js';
 import { get, put, qs, enc, isAbort } from '../lib/api.js';
 import { store, on, isAdmin } from '../lib/store.js';
-import { loadDevices, wantFastDevicePolling } from '../lib/live.js';
+import { loadDevices } from '../lib/live.js';
 import { bar, confirmAction, toast, toastError, skeletonBlocks, errorBanner } from '../lib/ui.js';
 import { ago, plural } from '../lib/format.js';
 import { renderMarkdown } from '../lib/md.js';
@@ -75,7 +74,7 @@ function renderList(container) {
           ),
         ),
       ),
-      h('p', { class: 'hint' }, `Updated ${ago(store.devicesAt / 1000)}. Presence refreshes every 15 seconds here.`),
+      h('p', { class: 'hint' }, `Updated ${ago(store.devicesAt / 1000)}. Live presence updates automatically.`),
     );
   }
 
@@ -89,7 +88,7 @@ function renderList(container) {
     render();
   }
 
-  const offs = [on('devices', render), on('online', render), wantFastDevicePolling()];
+  const offs = [on('devices', render), on('online', render)];
   render();
   refresh();
   return () => offs.forEach((off) => off());
@@ -300,15 +299,20 @@ function renderDetail(container, id) {
   }
 
   const aborter = new AbortController();
-  const offs = [on('devices', render), on('online', render), wantFastDevicePolling()];
-  const timer = setInterval(() => {
-    if (!document.hidden && store.online) refresh();
-  }, 15000);
+  const offs = [
+    on('devices', render),
+    on('device_presence', (e) => {
+      if (e.device_id === id && store.online) refresh();
+    }),
+    on('online', (online) => {
+      render();
+      if (online) refresh();
+    }),
+  ];
   render();
   refresh({ withDevices: !store.devicesAt });
   return () => {
     offs.forEach((off) => off());
-    clearInterval(timer);
     aborter.abort();
   };
 }

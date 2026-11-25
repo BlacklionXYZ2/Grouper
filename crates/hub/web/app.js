@@ -17,7 +17,7 @@
 import { h, icon, setChildren, syncList, setText, setAttr } from './lib/dom.js';
 import { get, enc, isAbort, onApiError } from './lib/api.js';
 import { store, on, emit, threadsIn, approvalsIn, pendingApprovals, resetStore } from './lib/store.js';
-import { startLive, stopLive, loadConversations, loadThreads, loadDevices, loadModels, scanApprovals } from './lib/live.js';
+import { startLive, stopLive, loadConversations, loadThreads, loadDevices, loadModels, loadApprovals } from './lib/live.js';
 import { closeDrawer, navigate, syncInert, bar, skeletonBlocks, errorBanner } from './lib/ui.js';
 import { ago, isActive, threadStatus } from './lib/format.js';
 import { renderLogin } from './views/login.js';
@@ -109,7 +109,8 @@ function startApp() {
     loadConversations(),
     loadDevices(),
     loadModels(),
-    loadThreads().then(scanApprovals),
+    loadThreads(),
+    loadApprovals(),
     get('/v1/hub').then((info) => {
       store.hub = info;
     }),
@@ -461,8 +462,11 @@ function rank(t, approvals) {
 // ---- router
 
 export function parseRoute() {
-  const parts = currentHash()
-    .replace(/^#\/?/, '')
+  const raw = currentHash().replace(/^#\/?/, '');
+  const qIndex = raw.indexOf('?');
+  const pathStr = qIndex >= 0 ? raw.slice(0, qIndex) : raw;
+  const query = new URLSearchParams(qIndex >= 0 ? raw.slice(qIndex + 1) : '');
+  const parts = pathStr
     .split('/')
     .filter(Boolean)
     .map((p) => {
@@ -484,6 +488,10 @@ export function parseRoute() {
   }
   if ((view === 'threads' || view === 'thread') && a) {
     return { view: 'thread-redirect', thread: a };
+  }
+  if (view === 'usage') {
+    const conversation = query.get('conversation') || (a === 'conversation' ? b : a) || null;
+    return { view: 'usage', conversation };
   }
   return { view, id: a };
 }
@@ -595,7 +603,9 @@ function route() {
         ? `threads:${scopedThreadsCid || 'all'}`
         : r.view === 'thread-redirect'
           ? `thread-redirect:${r.thread || ''}`
-          : `${r.view}:${r.id || ''}`;
+          : r.view === 'usage'
+            ? `usage:${r.conversation || ''}`
+            : `${r.view}:${r.id || ''}`;
   if (key !== mainKey) {
     mainChanged = true;
     mainKey = key;

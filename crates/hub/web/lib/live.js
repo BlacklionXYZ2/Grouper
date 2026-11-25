@@ -10,12 +10,13 @@
 //
 // After a few failed reconnects the session is probed (`GET /v1/session`): if it
 // expired or its token was revoked, `session_ended` is emitted instead of retrying
-// forever. Device presence is polled here too (one poller for every view), paused
-// while the page is hidden.
+// forever. Device presence arrives live on the event stream (`device_presence`,
+// seq 0), with a slow 5-minute fallback poll and a refresh on reconnect.
 
 import { get, qs, enc } from './api.js';
 import { store, emit, conv, liveOf } from './store.js';
-import { isActive } from './format.js';
+
+const FALLBACK_DEVICE_POLL_MS = 5 * 60 * 1000;
 
 let socket = null;
 let attempts = 0;
@@ -36,7 +37,7 @@ export function startLive() {
     () => {
       if (document.visibilityState !== 'visible') return;
       if (!store.online) reconnectNow();
-      else if (Date.now() - store.devicesAt > pollEvery()) pollDevices();
+      else if (Date.now() - store.devicesAt > FALLBACK_DEVICE_POLL_MS) pollDevices();
     },
     { signal },
   );
@@ -51,7 +52,6 @@ export function stopLive() {
   clearTimeout(reconnectTimer);
   clearInterval(keepAlive);
   clearTimeout(pollTimer);
-  clearTimeout(devicesTimer);
   for (const t of retries.values()) clearTimeout(t);
   retries.clear();
   attempts = 0;
@@ -161,7 +161,8 @@ function retrying(name, job, attempt = 0) {
 
 /** After (re)connecting: fill gaps in loaded conversations and refresh lists. */
 function resync() {
-  retrying('threads', () => loadThreads().then(() => scanApprovals({ strict: true })));
+  retrying('threads', loadThreads);
+  retrying('approvals', () => loadApprovals({ strict: true }));
   retrying('conversations', loadConversations);
   retrying('devices', loadDevices);
   for (const [id, c] of store.convs) {
@@ -220,7 +221,6 @@ function applyDerived(e) {
       store.drafts.delete(cid);
       break;
     case 'thread_started':
-      if (!store.devices.some((d) => d.id === e.device_id && d.online)) refreshDevicesSoon();
       upsertThread(tid, {
         id: tid,
         conversation_id: cid,
@@ -245,14 +245,12 @@ function applyDerived(e) {
     }
     case 'thread_waiting':
       upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: 'waiting_device', checkpoint: false });
-      refreshDevicesSoon();
       break;
     case 'thread_checkpoint':
       upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: 'waiting_device', checkpoint: true });
       break;
     case 'thread_handed_over':
       upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: 'running' });
-      refreshDevicesSoon();
       break;
     case 'thread_finished':
       upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: e.status, summary: e.summary, finished: e.ts });
@@ -272,6 +270,7 @@ function applyDerived(e) {
           thread_id: tid,
           conversation_id: cid,
           ts: e.ts,
+          arrivedAt: Date.now(),
         });
         emit('approvals');
       }
@@ -281,9 +280,31 @@ function applyDerived(e) {
       if (store.approvals.delete(e.approval_id)) emit('approvals');
       emit('approval_resolved', e);
       break;
+    case 'device_presence':
+      applyDevicePresence(e);
+      break;
     default:
       break;
   }
+}
+
+function applyDevicePresence(e) {
+  const id = e.device_id;
+  if (!id) return;
+  const idx = store.devices.findIndex((d) => d.id === id);
+  if (e.device) {
+    if (idx >= 0) store.devices[idx] = e.device;
+    else store.devices.push(e.device);
+    store.devicesAt = Date.now();
+    emit('devices');
+  } else if (idx >= 0) {
+    store.devices[idx] = { ...store.devices[idx], online: Boolean(e.online) };
+    store.devicesAt = Date.now();
+    emit('devices');
+  } else {
+    loadDevices().catch(() => {});
+  }
+  emit('device_presence', e);
 }
 
 /**
@@ -304,13 +325,6 @@ function reconcileReplying(id) {
   emit('replying', id);
 }
 
-// Presence isn't on the event stream; re-read devices when a thread hints it changed.
-let devicesTimer = null;
-function refreshDevicesSoon() {
-  clearTimeout(devicesTimer);
-  devicesTimer = setTimeout(() => loadDevices().catch(() => {}), 300);
-}
-
 function upsertThread(id, fields) {
   if (!id) return;
   const t = { ...(store.threads.get(id) || {}), ...fields };
@@ -322,38 +336,20 @@ function bumpConversation(id) {
   if (!store.conversations.some((c) => c.id === id)) loadConversations().catch(() => {});
 }
 
-// ---- device presence poller (one for the whole app)
+// ---- slow fallback device poller (live presence rides on /v1/events)
 
 let pollTimer = null;
-let fastPollers = 0;
-
-function pollEvery() {
-  return fastPollers > 0 ? 15000 : 30000;
-}
 
 function schedulePoll() {
   clearTimeout(pollTimer);
   if (stopped) return;
-  pollTimer = setTimeout(pollDevices, pollEvery());
+  pollTimer = setTimeout(pollDevices, FALLBACK_DEVICE_POLL_MS);
 }
 
 async function pollDevices() {
   clearTimeout(pollTimer);
   if (!stopped && store.online && !document.hidden) await loadDevices().catch(() => {});
   schedulePoll();
-}
-
-/** A view that shows presence asks for the 15 s cadence; call the result to stop. */
-export function wantFastDevicePolling() {
-  fastPollers++;
-  schedulePoll();
-  let done = false;
-  return () => {
-    if (done) return;
-    done = true;
-    fastPollers--;
-    schedulePoll();
-  };
 }
 
 // ---- loaders
@@ -369,7 +365,7 @@ export async function loadThreads() {
   const next = new Map();
   for (const t of list) {
     const old = store.threads.get(t.id);
-    next.set(t.id, { ...t, checkpoint: t.status === 'waiting_device' ? Boolean(old?.checkpoint) : false });
+    next.set(t.id, { ...t, checkpoint: t.status === 'waiting_device' ? Boolean(old?.checkpoint || t.summary) : false });
   }
   store.threads = next;
   store.threadsLoaded = true;
@@ -449,55 +445,49 @@ async function catchUp(id) {
 }
 
 /**
- * Approvals waiting now. There is no list route, so read the events of each
- * running or waiting thread and keep the requests nobody has answered.
+ * Pending approvals from the hub (`GET /v1/approvals`). Used on load, reconnect
+ * and manual refresh; live `approval_requested` / `approval_resolved` events
+ * keep it up to date in between.
  */
-export async function scanApprovals({ strict = false } = {}) {
-  const active = [...store.threads.values()].filter((t) => isActive(t.status));
-  const found = new Map();
-  const results = await Promise.allSettled(
-    active.map(async (t) => {
-      const events = (await get(`/v1/conversations/${enc(t.conversation_id)}/events${qs({ thread: t.id })}`)) || [];
-      const open = new Map();
-      for (const e of events) {
-        if (e.kind === 'approval_requested') open.set(e.approval_id, e);
-        if (e.kind === 'approval_resolved') {
-          open.delete(e.approval_id);
-          store.answered.add(e.approval_id);
-        }
-        if (e.kind === 'thread_checkpoint') {
-          const th = store.threads.get(t.id);
-          if (th) th.checkpoint = true;
-        }
-        if (e.kind === 'thread_handed_over') {
-          const th = store.threads.get(t.id);
-          if (th) th.checkpoint = false;
-        }
-        if (e.kind === 'thread_activity' && e.event.type === 'text') liveOf(t.id).lastText = e.event.text;
-      }
-      for (const e of open.values()) {
-        found.set(e.approval_id, {
-          approval_id: e.approval_id,
-          device_id: e.device_id,
-          tool: e.tool,
-          input: e.input,
-          reason: e.reason,
-          thread_id: e.thread_id,
-          conversation_id: e.conversation_id,
-          ts: e.ts,
-        });
-      }
-    }),
-  );
-  // Keep requests that arrived on the socket meanwhile, and those of threads we
-  // couldn't read this time.
-  const unread = new Set(active.filter((_, i) => results[i].status === 'rejected').map((t) => t.id));
-  for (const [id, a] of store.approvals) {
-    if (!found.has(id) && !store.answered.has(id) && (unread.has(a.thread_id) || isActive(store.threads.get(a.thread_id)?.status))) found.set(id, a);
+export async function loadApprovals({ strict = false } = {}) {
+  if (!store.me?.admin) {
+    if (store.approvals.size) {
+      store.approvals.clear();
+      emit('approvals');
+    }
+    return;
   }
-  store.approvals = found;
+  const startedAt = Date.now();
+  let list;
+  try {
+    list = (await get('/v1/approvals')) || [];
+  } catch (err) {
+    if (strict) throw err;
+    return;
+  }
+  const next = new Map();
+  for (const a of list) {
+    if (store.answered.has(a.approval_id)) continue;
+    next.set(a.approval_id, {
+      approval_id: a.approval_id,
+      device_id: a.device_id,
+      tool: a.tool,
+      input: a.input,
+      reason: a.reason,
+      thread_id: a.thread_id,
+      conversation_id: a.conversation_id,
+      ts: a.requested_at,
+      timeout_secs: a.timeout_secs ?? null,
+      timeout_at: a.timeout_at ?? null,
+      timeout_action: a.timeout_action ?? null,
+    });
+  }
+  // Keep any approval that arrived on the socket while the HTTP fetch was in flight.
+  for (const [id, a] of store.approvals) {
+    if (!next.has(id) && !store.answered.has(id) && (a.arrivedAt || 0) >= startedAt) {
+      next.set(id, a);
+    }
+  }
+  store.approvals = next;
   emit('approvals');
-  emit('threads');
-  const failed = results.find((r) => r.status === 'rejected');
-  if (failed && strict) throw failed.reason;
 }

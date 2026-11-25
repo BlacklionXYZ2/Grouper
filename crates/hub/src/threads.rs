@@ -292,12 +292,19 @@ impl Hub {
         if approvals.contains_key(approval_id) {
             return false;
         }
+        let requested_at = crate::db::now();
+        let timeout_secs = self.db.limits().approval_timeout_secs;
         approvals.insert(
             approval_id.into(),
             ApprovalRoute {
                 device_id: device_id.into(),
                 conversation_id: t.conversation_id.clone(),
                 thread_id: thread_id.into(),
+                tool: tool.into(),
+                input: input.clone(),
+                reason: reason.into(),
+                requested_at,
+                timeout_secs,
                 local,
                 generation,
                 timer: None,
@@ -317,7 +324,7 @@ impl Hub {
         );
         // The limit at request time. Turning it off before the timer fires leaves
         // the approval pending (`approval_timed_out` checks again).
-        if let Some(secs) = self.db.limits().approval_timeout_secs {
+        if let Some(secs) = timeout_secs {
             let hub = Arc::clone(self);
             let timer_id = approval_id.to_string();
             let route_id = timer_id.clone();

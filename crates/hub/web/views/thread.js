@@ -47,9 +47,10 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
   let cid = conversationId || info?.conversation_id;
   let events = [];
   let lastSeq = 0;
+  const toThumb = (r) => (r === 1 || r === 'up' ? 'up' : r === -1 || r === 'down' ? 'down' : null);
   let loaded = false;
   let loadError = null;
-  let rating = null;
+  let rating = toThumb(initial?.rating);
   let files = null; // null: not loaded; {error} or listing
   let filesLoading = false;
   let tokensIn = 0;
@@ -170,6 +171,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
         if (signal.aborted) return;
       }
       info = thread;
+      rating = toThumb(thread.rating);
       verified = true;
       cid = thread.conversation_id;
       // Keep events that arrived on the socket while loading.
@@ -442,7 +444,10 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     const finished = events.filter((e) => e.kind === 'thread_finished').at(-1);
     const summary = th.summary || finished?.summary;
     const key = `${th.status}|${th.finished}|${summary}|${isAdmin()}`;
-    if (resultSlot.dataset.key === key) return; // keep focus on the thumbs
+    if (resultSlot.dataset.key === key) {
+      for (const b of resultSlot.querySelectorAll('.thumb')) b.setAttribute('aria-pressed', b.dataset.value === rating ? 'true' : 'false');
+      return; // keep focus on the thumbs
+    }
     resultSlot.dataset.key = key;
     const thumb = (value, iconName, label) =>
       h(
@@ -469,8 +474,12 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
 
   async function rate(value) {
     try {
-      await post(`/v1/threads/${enc(threadId)}/rating`, { rating: value });
+      const res = await post(`/v1/threads/${enc(threadId)}/rating`, { rating: value });
       rating = value === 'clear' ? null : value;
+      const numeric = res && 'rating' in res ? res.rating : value === 'up' ? 1 : value === 'down' ? -1 : null;
+      if (info) info = { ...info, rating: numeric };
+      const cached = store.threads.get(threadId);
+      if (cached) store.threads.set(threadId, { ...cached, rating: numeric });
       for (const b of resultSlot.querySelectorAll('.thumb')) b.setAttribute('aria-pressed', b.dataset.value === rating ? 'true' : 'false');
       toast(value === 'clear' ? 'Rating cleared.' : 'Thanks. Ratings feed the model registry.');
     } catch (err) {

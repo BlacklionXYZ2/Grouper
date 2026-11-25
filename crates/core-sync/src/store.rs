@@ -600,6 +600,7 @@ fn thread_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadInfo> {
         summary: r.get(7)?,
         created: r.get::<_, i64>(8)? as u64,
         finished: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+        rating: None,
     })
 }
 

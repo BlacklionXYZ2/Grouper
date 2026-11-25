@@ -570,6 +570,9 @@ fn print_event(e: &Event) {
                 spent / limit * 100.0
             )
         }
+        EventBody::DevicePresence { device_id, online, .. } => {
+            println!("  · device {device_id} {}", if *online { "online" } else { "offline" });
+        }
     }
 }
 
@@ -591,7 +594,11 @@ struct Printer {
 
 impl Printer {
     fn prefix(&self, e: &Event) -> String {
-        if self.show_conversation { format!("[{}] ", e.conversation_id) } else { String::new() }
+        if self.show_conversation && !e.conversation_id.is_empty() {
+            format!("[{}] ", e.conversation_id)
+        } else {
+            String::new()
+        }
     }
 
     /// Finish a streaming line so other output starts on a line of its own.

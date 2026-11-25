@@ -463,6 +463,13 @@ pub enum EventBody {
     /// Estimated spend crossed the warning fraction of a budget (see [`Limits`]): once per
     /// `scope` (`thread`, `conversation` or `daily`) and period. Amounts are USD.
     BudgetWarning { scope: String, spent: f64, limit: f64 },
+    /// A device connected, disconnected, or updated its tool list (live only, seq 0, never stored).
+    DevicePresence {
+        device_id: String,
+        online: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<DeviceInfo>,
+    },
 }
 
 /// `POST /v1/chat`
@@ -512,6 +519,47 @@ pub struct ThreadInfo {
     pub summary: Option<String>,
     pub created: u64,
     pub finished: Option<u64>,
+    /// The user's current rating (`1` = up, `-1` = down), when rated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<i64>,
+}
+
+/// A pending tool approval waiting for the user (`GET /v1/approvals`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PendingApproval {
+    pub approval_id: String,
+    pub device_id: String,
+    pub thread_id: String,
+    pub conversation_id: String,
+    pub tool: String,
+    pub input: Value,
+    pub reason: String,
+    /// Unix seconds when the approval was requested.
+    pub requested_at: u64,
+    /// Approval timeout in seconds, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Unix seconds when the approval times out, if a timeout is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_at: Option<u64>,
+    /// What happens when the timeout elapses (`deny` or `stop`), when a timeout is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_action: Option<ApprovalTimeoutAction>,
+}
+
+/// One active browser session on the hub (`GET /v1/sessions`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SessionInfo {
+    /// Opaque session identifier (SHA-256 hash of the session cookie; never the cookie itself).
+    pub id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub admin: bool,
+    pub created: u64,
+    pub last_used: u64,
+    pub expires: u64,
+    /// Whether this session authenticates the current request.
+    pub current: bool,
 }
 
 fn default_true() -> bool {
@@ -839,6 +887,9 @@ pub struct ProviderInfo {
     /// Device id or name that hosts the provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via_device: Option<String>,
+    /// Kind-specific non-secret options (API keys never leave the hub here).
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub options: Value,
 }
 
 /// Body of `POST /v1/devices/{id}/call`.

@@ -492,6 +492,7 @@ mod tests {
             summary: Some("stopped by you".into()),
             created: 0,
             finished: Some(1),
+            rating: None,
         };
         let items = transcript(&events, &[row]);
         let TranscriptItem::Thread(t2) = &items[2] else { panic!() };
@@ -528,6 +529,7 @@ mod tests {
             summary: None,
             created: 0,
             finished: None,
+            rating: None,
         };
         assert!(pending_approvals(&events, &[row]).is_empty());
     }

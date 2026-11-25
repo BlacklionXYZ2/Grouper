@@ -5,12 +5,12 @@
 // later thread events update in place; ThreadActivity stays off the transcript.
 
 import { h, icon, setChildren, throttle } from '../lib/dom.js';
-import { post, describe } from '../lib/api.js';
+import { get, post, qs, enc, describe, isAbort } from '../lib/api.js';
 import { renderMarkdown } from '../lib/md.js';
 import { store, on, conv, liveOf, deviceName, deviceOnline, threadsIn, approvalsFor, approvalsIn, isAdmin } from '../lib/store.js';
 import { loadConversation, loadConversations } from '../lib/live.js';
 import { bar, navigate, statusPill, skeleton, toast, announce, sentenceSpeaker, autoGrow, toastError } from '../lib/ui.js';
-import { isActive, usd } from '../lib/format.js';
+import { isActive, num, plural, usd } from '../lib/format.js';
 import { openApproval } from './approvals.js';
 
 const MODE_KEY = 'grouper.newMode';
@@ -69,20 +69,164 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     transcript.insertBefore(node, tail);
   }
 
-  // ---- bar, strip, approval banner
+  // ---- bar, chat menu, strip, approval banner
+
+  const menuCleanup = [];
+  const chatMenu = isNew ? null : buildChatMenu();
+
+  function buildChatMenu() {
+    let open = false;
+    let usageAbort = null;
+    const usageLine = h('div', { class: 'menu-usage-val' }, 'Loading…');
+    const usageSub = h('div', { class: 'hint' }, '');
+    const summaryBlock = isAdmin()
+      ? h('div', { class: 'menu-summary', role: 'none' }, h('div', { class: 'field-label' }, 'Estimated chat usage'), usageLine, usageSub)
+      : null;
+    const threadsItem = h(
+      'a',
+      { class: 'menu-item', role: 'menuitem', href: `#/chat/${enc(cid)}/threads`, onclick: () => setOpen(false) },
+      icon('threads'),
+      'Threads in this chat',
+    );
+    const usageItem = isAdmin()
+      ? h(
+          'a',
+          { class: 'menu-item', role: 'menuitem', href: `#/usage${qs({ conversation: cid })}`, onclick: () => setOpen(false) },
+          icon('usage'),
+          'View chat usage',
+        )
+      : null;
+    const newChatItem = h(
+      'a',
+      { class: 'menu-item', role: 'menuitem', href: '#/chat/new', onclick: () => setOpen(false) },
+      icon('plus'),
+      'New chat',
+    );
+    const panel = h(
+      'div',
+      { class: 'menu-pop glass', role: 'menu', 'aria-label': 'Chat menu', hidden: true },
+      summaryBlock,
+      summaryBlock ? h('div', { class: 'menu-sep', role: 'separator' }) : null,
+      usageItem,
+      threadsItem,
+      newChatItem,
+    );
+    const trigger = h(
+      'button',
+      {
+        class: 'icon-btn',
+        type: 'button',
+        'aria-label': 'Chat menu',
+        title: 'Chat menu',
+        'aria-haspopup': 'menu',
+        'aria-expanded': 'false',
+        onclick: (e) => {
+          e.stopPropagation();
+          setOpen(!open);
+        },
+      },
+      icon('more'),
+    );
+    const wrap = h('div', { class: 'menu-wrap' }, trigger, panel);
+
+    function syncItems() {
+      threadsItem.hidden = info()?.mode === 'standard';
+    }
+
+    async function refreshMenuUsage() {
+      if (!isAdmin()) return;
+      usageAbort?.abort();
+      const ctrl = new AbortController();
+      usageAbort = ctrl;
+      usageLine.textContent = 'Loading…';
+      usageSub.textContent = '';
+      try {
+        const rows = (await get(`/v1/usage${qs({ conversation: cid, group: 'model' })}`, { signal: ctrl.signal })) || [];
+        if (ctrl.signal.aborted) return;
+        const total = rows.reduce(
+          (acc, r) => ({
+            calls: acc.calls + r.calls,
+            tokens: acc.tokens + r.input_tokens + r.output_tokens + r.cache_read_tokens + r.cache_write_tokens,
+            cost: acc.cost + r.cost,
+          }),
+          { calls: 0, tokens: 0, cost: 0 },
+        );
+        if (!total.calls) {
+          usageLine.textContent = 'No metered calls yet';
+          usageSub.textContent = '';
+        } else {
+          usageLine.textContent = usd(total.cost);
+          usageSub.textContent = `${plural(total.calls, 'call')} · ${num(total.tokens)} tokens`;
+        }
+      } catch (err) {
+        if (isAbort(err)) return;
+        usageLine.textContent = 'Unavailable';
+        usageSub.textContent = describe(err);
+      }
+    }
+
+    function setOpen(next, { restoreFocus = false } = {}) {
+      if (open === next) return;
+      open = next;
+      panel.hidden = !open;
+      trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) {
+        syncItems();
+        refreshMenuUsage();
+        const first = panel.querySelector('[role="menuitem"]:not([hidden])');
+        first?.focus();
+      } else {
+        usageAbort?.abort();
+        if (restoreFocus) trigger.focus();
+      }
+    }
+
+    const onDocClick = (e) => {
+      if (open && !wrap.contains(e.target)) setOpen(false);
+    };
+    const onKeyDown = (e) => {
+      if (!open) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setOpen(false, { restoreFocus: true });
+        return;
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        const items = [...panel.querySelectorAll('[role="menuitem"]:not([hidden])')];
+        if (!items.length) return;
+        e.preventDefault();
+        const i = items.indexOf(document.activeElement);
+        const next = e.key === 'ArrowDown' ? (i + 1) % items.length : (i - 1 + items.length) % items.length;
+        items[next].focus();
+      }
+    };
+    document.addEventListener('click', onDocClick);
+    document.addEventListener('keydown', onKeyDown, true);
+    menuCleanup.push(() => {
+      usageAbort?.abort();
+      document.removeEventListener('click', onDocClick);
+      document.removeEventListener('keydown', onKeyDown, true);
+    });
+    return { wrap, syncItems };
+  }
 
   function renderBar() {
     const c = info();
     const mode = c?.mode || composer.mode();
     const title = isNew ? 'New chat' : c?.title || 'Conversation';
     const caption = isNew ? null : `${mode === 'standard' ? 'Standard' : 'Project'} · ${c?.model || 'Default model'}`;
+    chatMenu?.syncItems();
     setChildren(
       barSlot,
       bar({
         title,
         caption,
-        // The sidebar has New chat on wide screens; the bar has it where the sidebar is a drawer.
-        actions: [h('a', { class: 'icon-btn only-mobile', href: '#/chat/new', 'aria-label': 'New chat', title: 'New chat' }, icon('plus'))],
+        actions: [
+          // The sidebar has New chat on wide screens; the bar has it where the sidebar is a drawer.
+          h('a', { class: 'icon-btn only-mobile', href: '#/chat/new', 'aria-label': 'New chat', title: 'New chat' }, icon('plus')),
+          chatMenu?.wrap || null,
+        ],
       }),
     );
     document.title = `${title} · Grouper`;
@@ -556,6 +700,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
 
   return () => {
     for (const off of subs) off();
+    for (const fn of menuCleanup) fn();
     scheduleTail.cancel();
     for (const f of chipFrames.values()) cancelAnimationFrame(f);
   };

@@ -187,7 +187,7 @@ async fn refresh_tools(hub: &Weak<Hub>, device_id: &str, conn_id: u64, peer: &Pe
         return;
     }
     tracing::info!(device = %device_id, "tool list updated");
-    hub.broadcast_presence().await;
+    hub.broadcast_presence(device_id).await;
 }
 
 impl Hub {

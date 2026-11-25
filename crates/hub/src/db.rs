@@ -121,9 +121,11 @@ fn thread_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadInfo> {
         summary: r.get(7)?,
         created: r.get::<_, i64>(8)? as u64,
         finished: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+        rating: r.get(10)?,
     })
 }
-const THREAD_COLS: &str = "id, conversation_id, title, device_id, model, status, reason, summary, created, finished";
+const THREAD_SELECT: &str = "SELECT t.id, t.conversation_id, t.title, t.device_id, t.model, t.status, t.reason, t.summary, t.created, t.finished, o.user_rating \
+                             FROM threads t LEFT JOIN thread_outcomes o ON o.thread_id = t.id";
 
 fn csv_list(value: String) -> Vec<String> {
     value.split(',').filter(|s| !s.is_empty()).map(String::from).collect()
@@ -722,7 +724,7 @@ impl Db {
 
     pub fn thread(&self, id: &str) -> Option<ThreadInfo> {
         self.c()
-            .query_row(&format!("SELECT {THREAD_COLS} FROM threads WHERE id = ?1"), [id], thread_row)
+            .query_row(&format!("{THREAD_SELECT} WHERE t.id = ?1"), [id], thread_row)
             .optional()
             .ok()
             .flatten()
@@ -732,7 +734,7 @@ impl Db {
         let c = self.c();
         let mut st = c
             .prepare(&format!(
-                "SELECT {THREAD_COLS} FROM threads WHERE ?1 IS NULL OR conversation_id = ?1 ORDER BY created"
+                "{THREAD_SELECT} WHERE ?1 IS NULL OR t.conversation_id = ?1 ORDER BY t.created"
             ))
             .unwrap();
         st.query_map([conversation_id], thread_row).unwrap().filter_map(Result::ok).collect()
