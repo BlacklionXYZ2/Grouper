@@ -62,3 +62,17 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.macos
         MACOSX_DEPLOYMENT_TARGET: "26.0"
+
+# Shared schemes, so `xcodebuild -scheme ...` (and CI) can resolve the local Swift package.
+schemes:
+  Grouper-macOS:
+    build:
+      targets:
+        Grouper-macOS: all
+      buildImplicitDependencies: true
+  Grouper-iOS:
+    build:
+      targets:
+        GrouperWidgets: all
+        Grouper-iOS: all
+      buildImplicitDependencies: true

@@ -95,37 +95,6 @@ jobs:
         working-directory: apple/GrouperApp
         run: |
           set -euo pipefail
-          # project.yml declares no schemes. XcodeGen writes a shared scheme
-          # only from a target `scheme:` or a top-level `schemes:` map, and
-          # xcodebuild cannot resolve the local Swift package without one.
-          # Append schemes for this checkout only.
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("project.yml")
-          text = path.read_text()
-          if "\nschemes:" in text or text.startswith("schemes:"):
-              raise SystemExit("project.yml already declares schemes; update the CI step")
-          if not text.endswith("\n"):
-              text += "\n"
-          text += """
-          schemes:
-            Grouper-macOS:
-              build:
-                targets:
-                  Grouper-macOS: all
-                buildImplicitDependencies: true
-                buildArchitectures: matchRunDestination
-            Grouper-iOS:
-              build:
-                targets:
-                  GrouperWidgets: all
-                  Grouper-iOS: all
-                buildImplicitDependencies: true
-                buildArchitectures: matchRunDestination
-          """
-          path.write_text(text)
-          PY
           xcodegen generate
           xcodebuild -project Grouper.xcodeproj -list
 
