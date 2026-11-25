@@ -30,6 +30,9 @@ struct Cli {
     /// This device's token from `grouper-hub device add`.
     #[arg(long, env = "GROUPER_TOKEN", global = true, hide_env_values = true)]
     token: Option<String>,
+    /// Local cache for `grouper sync` and for reading offline. Default: <local data dir>/grouper/cache.db.
+    #[arg(long, env = "GROUPER_CACHE", global = true)]
+    cache: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -101,6 +104,9 @@ enum Cmd {
         #[arg(long, short)]
         conversation: Option<String>,
     },
+    /// Copy conversations, threads and events (and memories, with an admin token) into the
+    /// local cache. `log`, `conversations` and `threads` read it when the hub is unreachable.
+    Sync,
     /// Send a message into a running thread (the orchestrator is told).
     Say { thread: String, text: String },
     /// Stop a running thread.
@@ -660,6 +666,39 @@ impl Printer {
     }
 }
 
+/// Where the local cache lives: `--cache`, else `<local data dir>/grouper/cache.db`.
+fn cache_path(arg: Option<PathBuf>) -> Result<PathBuf> {
+    arg.or_else(|| dirs::data_local_dir().map(|d| d.join("grouper").join("cache.db")))
+        .context("no local data folder: pass --cache <path>")
+}
+
+/// The hub didn't answer at all (as opposed to answering with an error).
+fn hub_unreachable(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_connect() || r.is_timeout() || r.is_request()))
+}
+
+/// After the hub didn't answer: the local cache, with a note saying how old it is.
+/// Any other error (and a missing cache) is returned as it was.
+fn offline_cache(arg: Option<PathBuf>, err: anyhow::Error) -> Result<core_sync::Store> {
+    if !hub_unreachable(&err) {
+        return Err(err);
+    }
+    let path = cache_path(arg)?;
+    match core_sync::Store::open_existing(&path) {
+        Ok(Some(store)) => {
+            let when = store.last_update()?.map(core_sync::utc_string).unwrap_or_else(|| "an unknown time".into());
+            eprintln!("(offline, cached at {when} in {})", path.display());
+            Ok(store)
+        }
+        Ok(None) => Err(err.context(format!(
+            "no offline cache at {} (run `grouper sync` while the hub is reachable)",
+            path.display()
+        ))),
+        Err(e) => Err(err.context(format!("offline cache {}: {e}", path.display()))),
+    }
+}
+
 fn read_key() -> Result<String> {
     if let Ok(k) = std::env::var("GROUPER_PROVIDER_KEY") {
         return Ok(k);
@@ -711,6 +750,7 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
+    let cache = cli.cache;
     let (hub, token) = credentials::resolve(cli.hub, cli.token, DEFAULT_HUB)?;
     let api = Api { base: hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
 
@@ -797,7 +837,11 @@ async fn main() -> Result<()> {
         }
         Cmd::Conversations { cmd } => match cmd {
             None => {
-                for c in api.get::<Vec<ConversationInfo>>("/v1/conversations").await? {
+                let list = match api.get::<Vec<ConversationInfo>>("/v1/conversations").await {
+                    Ok(list) => list,
+                    Err(e) => offline_cache(cache, e)?.conversations()?,
+                };
+                for c in list {
                     let model = c.model.as_deref().unwrap_or("default");
                     println!("{}  {:<8} {:<16} {}", c.id, c.mode, model, c.title);
                 }
@@ -810,17 +854,47 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Log { conversation, thread } => {
-            let q = thread.map(|t| format!("?thread={t}")).unwrap_or_default();
-            for e in api.get::<Vec<Event>>(&format!("/v1/conversations/{conversation}/events{q}")).await? {
+            let q = thread.as_ref().map(|t| format!("?thread={t}")).unwrap_or_default();
+            let events = match api.get::<Vec<Event>>(&format!("/v1/conversations/{conversation}/events{q}")).await {
+                Ok(events) => events,
+                Err(e) => {
+                    let events = offline_cache(cache, e)?.events(&conversation, 0, thread.as_deref())?;
+                    if events.is_empty() {
+                        eprintln!("(nothing cached for {conversation})");
+                    }
+                    events
+                }
+            };
+            for e in events {
                 print_event(&e);
             }
         }
         Cmd::Threads { conversation } => {
-            let q = conversation.map(|c| format!("?conversation={c}")).unwrap_or_default();
-            for t in api.get::<Vec<ThreadInfo>>(&format!("/v1/threads{q}")).await? {
+            let q = conversation.as_ref().map(|c| format!("?conversation={c}")).unwrap_or_default();
+            let threads = match api.get::<Vec<ThreadInfo>>(&format!("/v1/threads{q}")).await {
+                Ok(threads) => threads,
+                Err(e) => offline_cache(cache, e)?.threads(conversation.as_deref())?,
+            };
+            for t in threads {
                 let why = t.reason.map(|r| format!(" ({r})")).unwrap_or_default();
                 println!("{}  {:<8} {:<12} {:<14} {}{why}", t.id, t.status, t.device_id, t.model, t.title);
             }
+        }
+        Cmd::Sync => {
+            let path = cache_path(cache)?;
+            let store = Arc::new(core_sync::Store::open(&path)?);
+            let report = core_sync::SyncClient::new(&api.base, &api.token, store)?.sync_once().await?;
+            let memories = match report.memories {
+                Some(n) => format!("{n} memories"),
+                None => "no memories (they need an admin token)".into(),
+            };
+            println!(
+                "synced {} conversations, {} threads, {} new events and {memories} into {}",
+                report.conversations,
+                report.threads,
+                report.new_events,
+                path.display()
+            );
         }
         Cmd::Say { thread, text } => {
             api.post(&format!("/v1/threads/{thread}/message"), &json!({"text": text})).await?;

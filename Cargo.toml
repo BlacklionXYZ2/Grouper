@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core-protocol", "crates/providers", "crates/core-agent", "crates/core-client", "crates/hub", "crates/ffi", "crates/cli"]
+members = ["crates/core-protocol", "crates/providers", "crates/core-agent", "crates/core-client", "crates/hub", "crates/core-sync", "crates/ffi", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ license = "UNLICENSED"
 [workspace.dependencies]
 core-protocol = { path = "crates/core-protocol" }
 core-client = { path = "crates/core-client" }
+core-sync = { path = "crates/core-sync" }
 providers = { path = "crates/providers" }
 core-agent = { path = "crates/core-agent" }
 anyhow = "1"

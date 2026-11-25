@@ -544,6 +544,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-sync"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "core-protocol",
+ "futures-util",
+ "hub",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -884,6 +902,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "core-client",
+ "core-sync",
  "dirs",
  "futures-util",
  "reqwest",
@@ -903,6 +922,7 @@ name = "grouper-ffi"
 version = "0.1.0"
 dependencies = [
  "core-client",
+ "core-sync",
  "serde_json",
  "thiserror",
  "tokio",

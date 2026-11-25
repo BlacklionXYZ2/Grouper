@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 core-client.workspace = true
+core-sync.workspace = true
 anyhow.workspace = true
 base64 = "0.22"
 clap.workspace = true
