@@ -75,12 +75,79 @@ export function renderModels(container) {
       );
       return;
     }
+    // A wide table hides Edit / Refresh prices / Run probes / Delete past the
+    // first columns. On a narrow window those actions are buttons on the card.
+    if (matchMedia('(max-width: 760px)').matches) {
+      setChildren(
+        slots.models,
+        head('m-models', 'Models'),
+        h(
+          'ul',
+          { class: 'list card' },
+          models.map((m) => {
+            const isCatalog = isOpenRouterProvider(providersById.get(m.provider_id));
+            return h(
+              'li',
+              { class: 'list-row' },
+              h(
+                'div',
+                { class: 'grow' },
+                h('div', { class: 'row-title' }, m.id),
+                h('div', { class: 'row-sub mono' }, `${m.provider_id} / ${m.model}`),
+                h(
+                  'div',
+                  { class: 'meta' },
+                  h('span', null, m.roles.length ? m.roles.join(', ') : 'No roles'),
+                  h('span', null, `$${m.input_price.toFixed(2)} in / $${m.output_price.toFixed(2)} out`),
+                  m.free ? h('span', { class: 'badge accent' }, 'Free') : null,
+                  m.local ? h('span', { class: 'badge' }, 'Local') : null,
+                ),
+              ),
+              admin
+                ? h(
+                    'div',
+                    { class: 'bar-actions' },
+                    h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, 'aria-label': `Edit ${m.id}`, onclick: () => openEditModelSheet(m) }, icon('edit'), 'Edit'),
+                    isCatalog
+                      ? h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, 'aria-label': `Refresh prices for ${m.id}`, onclick: (e) => refreshModelPrices(m, e.currentTarget) }, icon('refresh'), 'Refresh prices')
+                      : null,
+                    h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, 'aria-label': `Run probes for ${m.id}`, onclick: () => openProbeSheet(m) }, icon('play'), 'Run probes'),
+                    h(
+                      'button',
+                      {
+                        class: 'btn btn-sm',
+                        type: 'button',
+                        'data-write': true,
+                        'aria-label': `Delete ${m.id}`,
+                        onclick: async () => {
+                          if (!(await confirmAction({ title: `Delete ${m.id}?`, body: 'It leaves the registry. Conversations pinned to it fall back to the default.', confirmLabel: 'Delete', danger: true }))) return;
+                          try {
+                            await del(`/v1/models/${enc(m.id)}`);
+                            toast(`Deleted ${m.id}.`);
+                            renderModelList();
+                          } catch (err) {
+                            toastError(err);
+                          }
+                        },
+                      },
+                      icon('trash'),
+                      'Delete',
+                    ),
+                  )
+                : null,
+            );
+          }),
+        ),
+        h('p', { class: 'hint' }, 'Prices are USD per million tokens. Edit a model to change roles, prices (including cache prices), context window, use cases or local flag.'),
+      );
+      return;
+    }
     setChildren(
       slots.models,
       head('m-models', 'Models'),
       h(
         'div',
-        { class: 'table-wrap' },
+        { class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Models table' },
         h(
           'table',
           { class: 'table' },
@@ -344,7 +411,7 @@ export function renderModels(container) {
         caption: `${m.provider_id} / ${m.model}`,
         body: [form],
         foot: [h('button', { class: 'btn', type: 'button', onclick: () => close(false) }, 'Cancel'), saveBtn],
-        onOpen: () => inputPrice.focus(),
+        onOpen: () => roleBoxes[0].input.focus(),
       };
     });
   }
@@ -572,7 +639,7 @@ export function renderModels(container) {
       rows.length
         ? h(
             'div',
-            { class: 'table-wrap' },
+            { class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Stats table' },
             h(
               'table',
               { class: 'table' },
@@ -787,12 +854,18 @@ export function renderModels(container) {
     setChildren(slots.import, head('m-import', 'Import from a catalog'), h('p', { class: 'section-note' }, 'Fills prices, context and modalities from the provider’s catalog (OpenRouter), and drafts use cases for you to accept.'), form);
   }
 
+  const narrowMq = matchMedia('(max-width: 760px)');
+  const onNarrow = () => {
+    if (!signal.aborted) renderModelList();
+  };
+  narrowMq.addEventListener('change', onNarrow);
   renderProposals();
   renderModelList();
   renderStats();
   renderRules();
   renderImport();
   return () => {
+    narrowMq.removeEventListener('change', onNarrow);
     aborter.abort();
     unguard();
   };

@@ -79,8 +79,10 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     let usageAbort = null;
     const usageLine = h('div', { class: 'menu-usage-val' }, 'Loading…');
     const usageSub = h('div', { class: 'hint' }, '');
+    // Outside the menu: a usage total is not a menuitem, and role=none would still
+    // expose these divs as menu children (axe aria-required-children).
     const summaryBlock = isAdmin()
-      ? h('div', { class: 'menu-summary', role: 'none' }, h('div', { class: 'field-label' }, 'Estimated chat usage'), usageLine, usageSub)
+      ? h('div', { class: 'menu-summary', tabindex: '0' }, h('div', { class: 'field-label' }, 'Estimated chat usage'), usageLine, usageSub)
       : null;
     const threadsItem = h(
       'a',
@@ -102,14 +104,13 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       icon('plus'),
       'New chat',
     );
+    const menuList = h('div', { class: 'menu-list', role: 'menu', 'aria-label': 'Chat menu' }, usageItem, threadsItem, newChatItem);
     const panel = h(
       'div',
-      { class: 'menu-pop glass', role: 'menu', 'aria-label': 'Chat menu', hidden: true },
+      { class: 'menu-pop', hidden: true },
       summaryBlock,
-      summaryBlock ? h('div', { class: 'menu-sep', role: 'separator' }) : null,
-      usageItem,
-      threadsItem,
-      newChatItem,
+      summaryBlock ? h('div', { class: 'menu-sep', 'aria-hidden': 'true' }) : null,
+      menuList,
     );
     const trigger = h(
       'button',
@@ -165,6 +166,10 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       }
     }
 
+    function menuStops() {
+      return [...(summaryBlock ? [summaryBlock] : []), ...menuList.querySelectorAll('[role="menuitem"]:not([hidden])')];
+    }
+
     function setOpen(next, { restoreFocus = false } = {}) {
       if (open === next) return;
       open = next;
@@ -173,8 +178,8 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       if (open) {
         syncItems();
         refreshMenuUsage();
-        const first = panel.querySelector('[role="menuitem"]:not([hidden])');
-        first?.focus();
+        // Usage total first, then the actions. The total is not a menuitem.
+        menuStops()[0]?.focus();
       } else {
         usageAbort?.abort();
         if (restoreFocus) trigger.focus();
@@ -193,7 +198,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         return;
       }
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-        const items = [...panel.querySelectorAll('[role="menuitem"]:not([hidden])')];
+        const items = menuStops();
         if (!items.length) return;
         e.preventDefault();
         const i = items.indexOf(document.activeElement);
@@ -354,9 +359,10 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     const { text, tool } = chipLine(tid);
     const device = deviceName(t.device_id || s.device_id);
     const pill = statusPill(t.status, { checkpoint: t.checkpoint, approval });
-    const statusWord = pill.textContent;
-    entry.el.setAttribute('aria-label', `${t.title || s.title}, ${statusWord}, on ${device}`);
-    entry.el.setAttribute('aria-description', text || '');
+    // No aria-label: it replaced the visible title, status, device and line, so the
+    // accessible name no longer contained that text (label-content-name-mismatch).
+    entry.el.removeAttribute('aria-label');
+    entry.el.removeAttribute('aria-description');
     entry.el.setAttribute('aria-current', openThread === tid ? 'true' : 'false');
     setChildren(
       entry.el,

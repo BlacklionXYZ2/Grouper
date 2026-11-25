@@ -313,6 +313,11 @@ a {
   background: var(--accent-soft);
 }
 
+::placeholder {
+  color: var(--text-3);
+  opacity: 1;
+}
+
 .visually-hidden {
   position: absolute !important;
   width: 1px;
@@ -670,6 +675,8 @@ a {
 .bar-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
@@ -1071,6 +1078,11 @@ button.list-row:hover {
   min-width: 0;
 }
 
+.list-row > .btn,
+.list-row > .bar-actions {
+  flex-shrink: 0;
+}
+
 .row-title {
   font-weight: 600;
   overflow-wrap: anywhere;
@@ -1147,14 +1159,17 @@ button.list-row:hover {
 .dot {
   width: 8px;
   height: 8px;
+  box-sizing: border-box;
   border-radius: 50%;
   display: inline-block;
   flex: none;
-  background: var(--text-3);
+  background: transparent;
+  border: 2px solid var(--text-3);
 }
 
 .dot.on {
   background: var(--ok);
+  border-color: var(--ok);
 }
 
 .banner {
@@ -2066,6 +2081,7 @@ dialog.sheet-dialog::backdrop {
 
 .dialog-head {
   padding: 18px 20px 6px;
+  flex: none;
 }
 
 .dialog-head h2 {
@@ -2085,6 +2101,8 @@ dialog.sheet-dialog::backdrop {
   overflow-y: auto;
   display: grid;
   gap: 14px;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .dialog-foot {
@@ -2093,6 +2111,7 @@ dialog.sheet-dialog::backdrop {
   gap: 10px;
   justify-content: flex-end;
   flex-wrap: wrap;
+  flex: none;
 }
 
 .reason {
@@ -2939,15 +2958,28 @@ code.nowrap {
   position: relative;
 }
 
+/* Solid on purpose. Glass here is nested inside the glass bar and sits over the
+   transcript, so a right-aligned message pill shows through as a faint chip
+   (a one-word message reads as a ghost "PING"). */
 .menu-pop {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
   min-width: 230px;
-  max-width: min(300px, calc(100vw - 24px));
+  max-width: min(320px, calc(100vw - 24px));
   padding: 6px;
   border-radius: var(--radius);
   z-index: 45;
+  display: grid;
+  gap: 2px;
+  align-content: start;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+.menu-list {
   display: grid;
   gap: 2px;
 }
@@ -3058,6 +3090,11 @@ code.nowrap {
     height: 44px;
   }
 
+  .check input {
+    width: 22px;
+    height: 22px;
+  }
+
   .side-title a {
     display: inline-flex;
     align-items: center;
@@ -3076,6 +3113,39 @@ code.nowrap {
 }
 
 @media (max-width: 760px) {
+  .list-row:has(> .btn),
+  .list-row:has(> .bar-actions) {
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  /* The text keeps the full row. Otherwise a row of actions shrinks the title
+     until overflow-wrap splits it one letter at a time. */
+  .list-row:has(> .btn) > .grow,
+  .list-row:has(> .bar-actions) > .grow {
+    flex: 1 0 100%;
+  }
+
+  .list-row > .btn,
+  .list-row > .bar-actions {
+    margin-left: auto;
+  }
+
+  /* Shrink to the row. flex-shrink: 0 plus a max-content basis kept every
+     button on one line, so Delete slid off the card. */
+  .list-row > .bar-actions {
+    flex: 1 1 100%;
+    min-width: 0;
+    max-width: 100%;
+    justify-content: flex-end;
+  }
+
+  .seg {
+    flex-wrap: wrap;
+    max-width: 100%;
+    border-radius: 16px;
+  }
+
   .limit-row {
     grid-template-columns: minmax(0, 1fr) auto;
   }

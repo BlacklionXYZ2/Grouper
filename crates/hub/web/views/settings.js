@@ -208,7 +208,7 @@ export function renderSettings(container) {
                   class: 'btn btn-sm',
                   type: 'button',
                   'data-write': true,
-                  'aria-label': s.current ? `Revoke current session for ${s.device_name}` : `Revoke session for ${s.device_name}`,
+                  'aria-label': s.current ? `Revoke current session for ${s.device_name || s.device_id}` : `Revoke session for ${s.device_name || s.device_id}`,
                   onclick: () => revokeSession(s),
                 },
                 'Revoke',
@@ -347,7 +347,6 @@ export function renderSettings(container) {
         name: 'id',
         required: true,
         readonly: isEdit,
-        disabled: isEdit,
         placeholder: 'openrouter',
         value: existing?.id || '',
       });
@@ -466,7 +465,7 @@ export function renderSettings(container) {
           h('button', { class: 'btn', type: 'button', onclick: () => close(false) }, 'Cancel'),
           saveBtn,
         ],
-        onOpen: () => (isEdit ? keyInput : idInput).focus(),
+        onOpen: () => idInput.focus(),
       };
     });
   }

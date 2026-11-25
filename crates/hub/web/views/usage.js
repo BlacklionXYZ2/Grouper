@@ -165,7 +165,7 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
       rows.length
         ? h(
             'div',
-            { class: 'table-wrap' },
+            { class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Usage table' },
             h(
               'table',
               { class: 'table' },
@@ -215,7 +215,7 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
       snaps.length
         ? h(
             'div',
-            { class: 'table-wrap' },
+            { class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Balances table' },
             h(
               'table',
               { class: 'table' },

@@ -435,6 +435,12 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
 
   // ---- result, rating, files, raw events
 
+  function ratingWords(value) {
+    if (value === 'up') return 'Rated: good result';
+    if (value === 'down') return 'Rated: poor result';
+    return 'Not rated yet';
+  }
+
   function renderResult(th) {
     if (isActive(th.status)) {
       resultSlot.hidden = true;
@@ -446,6 +452,8 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     const key = `${th.status}|${th.finished}|${summary}|${isAdmin()}`;
     if (resultSlot.dataset.key === key) {
       for (const b of resultSlot.querySelectorAll('.thumb')) b.setAttribute('aria-pressed', b.dataset.value === rating ? 'true' : 'false');
+      const state = resultSlot.querySelector('.rating-state');
+      if (state) state.textContent = ratingWords(rating);
       return; // keep focus on the thumbs
     }
     resultSlot.dataset.key = key;
@@ -468,7 +476,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
       resultSlot,
       h('h3', { class: 'sub-title', id: 'res-title' }, th.status === 'done' ? 'Result' : th.status === 'failed' ? 'Failed' : 'Stopped', th.finished ? h('span', null, dateTime(th.finished)) : null),
       summary ? h('div', { class: 'callout md' }, renderMarkdown(summary)) : h('p', { class: 'hint' }, 'No summary.'),
-      h('div', { class: 'rating', role: 'group', 'aria-label': 'Rate this result' }, h('span', { class: 'hint' }, 'Rate the result'), thumb('up', 'up', 'Good result'), thumb('down', 'downvote', 'Poor result')),
+      h('div', { class: 'rating', role: 'group', 'aria-label': 'Rate this result' }, h('span', { class: 'hint rating-state' }, ratingWords(rating)), thumb('up', 'up', 'Good result'), thumb('down', 'downvote', 'Poor result')),
     );
   }
 
@@ -481,6 +489,8 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
       const cached = store.threads.get(threadId);
       if (cached) store.threads.set(threadId, { ...cached, rating: numeric });
       for (const b of resultSlot.querySelectorAll('.thumb')) b.setAttribute('aria-pressed', b.dataset.value === rating ? 'true' : 'false');
+      const state = resultSlot.querySelector('.rating-state');
+      if (state) state.textContent = ratingWords(rating);
       toast(value === 'clear' ? 'Rating cleared.' : 'Thanks. Ratings feed the model registry.');
     } catch (err) {
       toast(describe(err), 'error');
