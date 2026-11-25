@@ -145,6 +145,12 @@ impl SyncClient {
     /// Catch up once: conversations, their new events, threads, and memories when the
     /// token may read them. Safe to repeat; nothing is stored twice.
     pub async fn sync_once(&self) -> Result<SyncReport> {
+        // Older hubs have no /v1/hub; then the live seq-collision check is all there is.
+        match self.get_as::<core_protocol::HubInfo>("/v1/hub").await {
+            Ok(info) => self.store.check_hub_id(&info.hub_id)?,
+            Err(SyncError::Http { status: 404, .. }) => {}
+            Err(e) => return Err(e),
+        }
         let conversations: Vec<ConversationInfo> = self.get_as("/v1/conversations").await?;
         self.store.upsert_conversations(&conversations)?;
         let mut new_events = 0;

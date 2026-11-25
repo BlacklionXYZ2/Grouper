@@ -46,6 +46,7 @@ const MIGRATIONS: &[&str] = &[
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 const META_HUB: &str = "hub";
+const META_HUB_ID: &str = "hub_id";
 const META_FULL_REFRESH: &str = "last_full_refresh";
 const META_UPDATE: &str = "last_update";
 const META_MEMORIES: &str = "memories";
@@ -287,6 +288,18 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Record the hub's id the first time, and refuse a different one afterwards: one
+    /// cache holds one hub's data (`seq` numbers from two hubs would collide).
+    pub fn check_hub_id(&self, hub_id: &str) -> Result<()> {
+        match self.meta(META_HUB_ID)? {
+            None => self.set_meta(META_HUB_ID, hub_id),
+            Some(known) if known == hub_id => Ok(()),
+            Some(known) => Err(crate::SyncError::Protocol(format!(
+                "this cache belongs to a different hub (id {known}, this hub is {hub_id});                  use another cache file (--cache) or delete this one"
+            ))),
+        }
     }
 
     fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -665,6 +678,15 @@ fn fts_query(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn one_cache_one_hub() {
+        let s = Store::open_in_memory().unwrap();
+        s.check_hub_id("aaa").unwrap();
+        s.check_hub_id("aaa").unwrap();
+        let err = s.check_hub_id("bbb").unwrap_err().to_string();
+        assert!(err.contains("different hub"), "{err}");
+    }
 
     pub(crate) fn raw(seq: i64, conv: &str, thread: Option<&str>, body: Value) -> RawEvent {
         let mut v = json!({"seq": seq, "conversation_id": conv, "thread_id": thread, "ts": 1000 + seq});

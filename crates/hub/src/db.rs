@@ -226,6 +226,7 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
     ensure_column(&conn, "devices", "folders", "ALTER TABLE devices ADD COLUMN folders TEXT NOT NULL DEFAULT '[]'")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
     Ok(conn)
 }
 
@@ -275,6 +276,22 @@ impl Db {
 
     pub(crate) fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.connection.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// This hub's random id, made on first use and kept in the database.
+    pub fn hub_id(&self) -> String {
+        let c = self.c();
+        let existing: Option<String> = c
+            .query_row("SELECT value FROM hub_meta WHERE key = 'hub_id'", [], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(id) = existing {
+            return id;
+        }
+        let id = random_hex(16);
+        let _ = c.execute("INSERT OR IGNORE INTO hub_meta (key, value) VALUES ('hub_id', ?1)", [&id]);
+        c.query_row("SELECT value FROM hub_meta WHERE key = 'hub_id'", [], |r| r.get(0)).unwrap_or(id)
     }
 
     /// Milestone 1 kept devices in devices.json; bring them over once.
@@ -865,6 +882,18 @@ mod tests {
 
     fn tmp() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("grouper-db-test-{}", random_hex(4)))
+    }
+
+    #[test]
+    fn hub_id_is_stable() {
+        let dir = tmp();
+        let id = Db::open(&dir).unwrap().hub_id();
+        assert_eq!(id.len(), 32);
+        assert_eq!(Db::open(&dir).unwrap().hub_id(), id, "same database, same id");
+        let other = tmp();
+        assert_ne!(Db::open(&other).unwrap().hub_id(), id, "another hub, another id");
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(other).ok();
     }
 
     #[test]

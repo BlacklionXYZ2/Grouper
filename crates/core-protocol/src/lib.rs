@@ -698,6 +698,15 @@ pub struct LimitsReport {
     pub running_threads: u32,
 }
 
+/// `GET /v1/hub`: who this hub is. Public; nothing private in it. `hub_id` is random,
+/// made once per hub database, so a client cache can tell two hubs apart.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HubInfo {
+    pub hub_id: String,
+    pub hub_version: String,
+    pub protocol_version: u32,
+}
+
 /// A provider as listed to clients (keys never leave the hub this way).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ProviderInfo {

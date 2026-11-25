@@ -372,6 +372,7 @@ pub enum CallError {
 pub fn router(hub: Arc<Hub>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/v1/hub", get(hub_info))
         .route(core_protocol::CONNECT_PATH, any(connect))
         .route("/v1/events", any(events_ws))
         .route("/v1/devices", get(list_devices))
@@ -1075,6 +1076,16 @@ async fn delete_memory(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id)
         Ok(false) => err(StatusCode::NOT_FOUND, format!("no memory #{id}")),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
+}
+
+/// `GET /v1/hub`: public identity (no token needed; nothing private).
+async fn hub_info(State(hub): State<Arc<Hub>>) -> Response {
+    Json(core_protocol::HubInfo {
+        hub_id: hub.db.hub_id(),
+        hub_version: HUB_VERSION.into(),
+        protocol_version: PROTOCOL_VERSION,
+    })
+    .into_response()
 }
 
 #[cfg(test)]
