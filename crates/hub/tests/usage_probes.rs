@@ -209,7 +209,15 @@ async fn usage_probe_tool_is_unlisted_and_snapshots_persist_when_device_goes_off
     .await
     .expect("orchestrator finished");
 
-    let history = hub.db.history(&conv);
+    // History is saved when the turn ends, just after its reply is streamed, so wait for it.
+    let mut history = hub.db.history(&conv);
+    for _ in 0..100 {
+        if serde_json::to_string(&history).unwrap().contains("Checked usage snapshots.") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        history = hub.db.history(&conv);
+    }
     let history_json = serde_json::to_string(&history).unwrap();
     let parsed_tool_output: Value = history
         .iter()
