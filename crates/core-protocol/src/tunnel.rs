@@ -29,20 +29,31 @@ impl std::fmt::Display for TunnelClosed {
 
 impl std::error::Error for TunnelClosed {}
 
+/// Maximum incoming MCP JSON-RPC frames buffered per tunnel.
+pub const TUNNEL_QUEUE_CAP: usize = 1024;
+
 type SendFn = Arc<dyn Fn(Value) -> bool + Send + Sync>;
 
 /// One end of an MCP session carried in connection frames.
 pub struct Tunnel {
     send: SendFn,
-    incoming: mpsc::UnboundedReceiver<Value>,
+    incoming: mpsc::Receiver<Value>,
 }
 
 impl Tunnel {
     /// `send` queues one outgoing JSON-RPC message (as a frame) and returns false once
-    /// the connection is gone. Feed incoming messages into the returned sender; dropping
-    /// it ends the session.
-    pub fn new(send: impl Fn(Value) -> bool + Send + Sync + 'static) -> (Self, mpsc::UnboundedSender<Value>) {
-        let (tx, incoming) = mpsc::unbounded_channel();
+    /// the connection is gone or its queue overflows. Feed incoming messages into the
+    /// returned bounded sender (using `try_send`); dropping it ends the session.
+    pub fn new(send: impl Fn(Value) -> bool + Send + Sync + 'static) -> (Self, mpsc::Sender<Value>) {
+        Self::with_capacity(TUNNEL_QUEUE_CAP, send)
+    }
+
+    /// Like [`Tunnel::new`], with an explicit incoming buffer capacity.
+    pub fn with_capacity(
+        capacity: usize,
+        send: impl Fn(Value) -> bool + Send + Sync + 'static,
+    ) -> (Self, mpsc::Sender<Value>) {
+        let (tx, incoming) = mpsc::channel(capacity.max(1));
         (Self { send: Arc::new(send), incoming }, tx)
     }
 }
@@ -150,5 +161,13 @@ mod tests {
         assert_eq!(result_text(&result_from_text(false, "no".into())), (false, "no".into()));
         let structured = CallToolResult::structured(serde_json::json!({"a": 1}));
         assert!(result_text(&structured).1.contains("\"a\""));
+    }
+
+    #[test]
+    fn tunnel_incoming_queue_is_bounded() {
+        let (_tunnel, tx) = Tunnel::with_capacity(2, |_| true);
+        assert!(tx.try_send(serde_json::json!(1)).is_ok());
+        assert!(tx.try_send(serde_json::json!(2)).is_ok());
+        assert!(matches!(tx.try_send(serde_json::json!(3)), Err(mpsc::error::TrySendError::Full(_))));
     }
 }

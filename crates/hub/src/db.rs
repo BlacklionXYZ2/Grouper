@@ -129,6 +129,13 @@ fn csv_list(value: String) -> Vec<String> {
     value.split(',').filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
+fn check_price(field: &str, value: f64) -> Result<()> {
+    if !value.is_finite() || value < 0.0 {
+        bail!("{field} must be a non-negative finite number, got {value}");
+    }
+    Ok(())
+}
+
 fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
     let roles: String = r.get(10)?;
     let modalities: String = r.get(12)?;
@@ -509,6 +516,14 @@ impl Db {
     pub fn upsert_model(&self, m: &ModelEntry) -> Result<()> {
         if self.provider(&m.provider_id)?.is_none() {
             bail!("no provider {}; add it first", m.provider_id);
+        }
+        check_price("input_price", m.input_price)?;
+        check_price("output_price", m.output_price)?;
+        if let Some(p) = m.cache_read_price {
+            check_price("cache_read_price", p)?;
+        }
+        if let Some(p) = m.cache_write_price {
+            check_price("cache_write_price", p)?;
         }
         self.c().execute(
             "INSERT OR REPLACE INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
@@ -1243,6 +1258,53 @@ mod tests {
         drop(db);
         let db = Db::open(&dir).unwrap();
         assert_eq!(db.conversation("c1").unwrap().model, None);
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn upsert_model_rejects_negative_and_non_finite_prices() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "p".into(),
+            kind: "openai".into(),
+            base_url: None,
+            api_key: None,
+            options: Value::Null,
+        })
+        .unwrap();
+        let base = ModelEntry {
+            id: "m".into(),
+            provider_id: "p".into(),
+            model: "m".into(),
+            input_price: 1.0,
+            output_price: 2.0,
+            cache_read_price: Some(0.5),
+            cache_write_price: Some(1.5),
+            context_window: 0,
+            use_cases: String::new(),
+            free: false,
+            roles: vec![],
+            local: false,
+            modalities: vec![],
+        };
+        db.upsert_model(&base).unwrap();
+        for bad in [-0.01, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(db.upsert_model(&ModelEntry { input_price: bad, ..base.clone() }).is_err(), "input {bad}");
+            assert!(db.upsert_model(&ModelEntry { output_price: bad, ..base.clone() }).is_err(), "output {bad}");
+            assert!(db.upsert_model(&ModelEntry { cache_read_price: Some(bad), ..base.clone() }).is_err(), "cache_read {bad}");
+            assert!(db.upsert_model(&ModelEntry { cache_write_price: Some(bad), ..base.clone() }).is_err(), "cache_write {bad}");
+        }
+        // Zero prices remain valid.
+        db.upsert_model(&ModelEntry {
+            input_price: 0.0,
+            output_price: 0.0,
+            cache_read_price: Some(0.0),
+            cache_write_price: Some(0.0),
+            ..base
+        })
+        .unwrap();
         drop(db);
         std::fs::remove_dir_all(dir).ok();
     }

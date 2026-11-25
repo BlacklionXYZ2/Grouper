@@ -18,8 +18,8 @@ use core_agent::thread::{ThreadControl, ThreadHost, spawn_thread};
 use core_agent::tools::{Workspace, file_tools, shell_tool};
 use core_agent::{Tool, ToolOutput};
 use core_protocol::{
-    AgentEvent, Capability, DeviceInfo, HubMessage, NodeMessage, PING_INTERVAL_SECS, PROTOCOL_VERSION, ProviderConfig,
-    ThreadSpec, ToolDef,
+    AgentEvent, Capability, DeviceInfo, HubMessage, MAX_WS_MESSAGE_BYTES, NodeMessage, PING_INTERVAL_SECS,
+    PROTOCOL_VERSION, ProviderConfig, ThreadSpec, ToolDef,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -37,6 +37,9 @@ use mcp_server::{DeviceServer, ServerSession};
 pub use core_protocol;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Maximum outgoing frames buffered for the hub connection before dropping it.
+const CONN_QUEUE_CAP: usize = 1024;
 
 /// Implemented by the platform layer (Swift, CLI, …). Called off the async runtime,
 /// so blocking is fine.
@@ -133,7 +136,8 @@ pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn 
 /// on `Drop` to stop them: [`StopOnDisconnect`] calls [`Threads::shutdown`] when the
 /// connection ends.
 struct Threads {
-    out: mpsc::UnboundedSender<NodeMessage>,
+    out: mpsc::Sender<NodeMessage>,
+    on_overflow: Arc<dyn Fn() + Send + Sync>,
     controls: Mutex<HashMap<String, ThreadControl>>,
     approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     providers: Mutex<Vec<ProviderConfig>>,
@@ -143,14 +147,21 @@ struct Threads {
 }
 
 impl Threads {
-    fn new(out: mpsc::UnboundedSender<NodeMessage>) -> Self {
+    fn new(out: mpsc::Sender<NodeMessage>, on_overflow: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
             out,
+            on_overflow,
             controls: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             providers: Mutex::new(Vec::new()),
             next: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+        }
+    }
+
+    fn send(&self, msg: NodeMessage) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.out.try_send(msg) {
+            (self.on_overflow)();
         }
     }
 
@@ -180,7 +191,7 @@ impl Drop for StopOnDisconnect {
 #[async_trait]
 impl ThreadHost for Threads {
     fn emit(&self, thread_id: &str, event: AgentEvent) {
-        let _ = self.out.send(NodeMessage::ThreadEvent { thread_id: thread_id.into(), event });
+        self.send(NodeMessage::ThreadEvent { thread_id: thread_id.into(), event });
     }
     async fn approve(&self, thread_id: &str, tool: &str, input: &Value, reason: &str) -> bool {
         let approval_id = format!("{thread_id}-a{}", self.next.fetch_add(1, Ordering::Relaxed));
@@ -192,7 +203,7 @@ impl ThreadHost for Threads {
             }
             approvals.insert(approval_id.clone(), tx);
         }
-        let _ = self.out.send(NodeMessage::ApprovalRequest {
+        self.send(NodeMessage::ApprovalRequest {
             approval_id,
             thread_id: thread_id.into(),
             tool: tool.into(),
@@ -202,7 +213,7 @@ impl ThreadHost for Threads {
         rx.await.unwrap_or(false)
     }
     fn ask_orchestrator(&self, thread_id: &str, question: &str) {
-        let _ = self.out.send(NodeMessage::AskOrchestrator { thread_id: thread_id.into(), question: question.into() });
+        self.send(NodeMessage::AskOrchestrator { thread_id: thread_id.into(), question: question.into() });
     }
 }
 
@@ -245,7 +256,7 @@ fn start_thread(
 ) {
     let id = spec.thread_id.clone();
     let fail = |msg: String| {
-        let _ = threads.out.send(NodeMessage::ThreadFinished { thread_id: id.clone(), ok: false, summary: msg });
+        threads.send(NodeMessage::ThreadFinished { thread_id: id.clone(), ok: false, summary: msg });
     };
     let Some(root) = &config.workspace_root else {
         return fail("This device doesn't run threads.".into());
@@ -293,7 +304,7 @@ fn start_thread(
         events.thread(&id, &title, if result.ok { "done" } else { "failed" });
         if let Some(t) = threads.upgrade() {
             t.controls.lock().unwrap().remove(&id);
-            let _ = t.out.send(NodeMessage::ThreadFinished { thread_id: id, ok: result.ok, summary: result.summary });
+            t.send(NodeMessage::ThreadFinished { thread_id: id, ok: result.ok, summary: result.summary });
         }
     });
 }
@@ -319,7 +330,10 @@ async fn connect_once(
         }
     }
 
-    let ws = match tokio_tungstenite::connect_async(request).await {
+    let mut ws_config = tungstenite::protocol::WebSocketConfig::default();
+    ws_config.max_message_size = Some(MAX_WS_MESSAGE_BYTES);
+    ws_config.max_frame_size = Some(MAX_WS_MESSAGE_BYTES);
+    let ws = match tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false).await {
         Ok((ws, _)) => ws,
         Err(tungstenite::Error::Http(resp)) if resp.status() == 401 => {
             events.status(Status::Unauthorized);
@@ -334,16 +348,26 @@ async fn connect_once(
         return Outcome::Retry(e.to_string());
     }
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NodeMessage>();
-    let threads = Arc::new(Threads::new(out_tx.clone()));
+    let (out_tx, mut out_rx) = mpsc::channel::<NodeMessage>(CONN_QUEUE_CAP);
+    let (overflow_tx, mut overflow_rx) = oneshot::channel::<&'static str>();
+    let overflow_slot = Arc::new(Mutex::new(Some(overflow_tx)));
+    let on_overflow: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Some(tx) = overflow_slot.lock().unwrap().take() {
+            let _ = tx.send("outgoing queue full");
+        }
+    });
+    let threads = Arc::new(Threads::new(out_tx.clone(), on_overflow.clone()));
     let _stop_threads = StopOnDisconnect(threads.clone());
     // This device's MCP server; the hub is its client.
-    let mcp = ServerSession::start(DeviceServer::new(config, handler.clone(), host.clone()), out_tx.clone());
+    let mcp = ServerSession::start(DeviceServer::new(config, handler.clone(), host.clone()), out_tx.clone(), on_overflow);
     let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.tick().await;
 
     loop {
         tokio::select! {
+            reason = &mut overflow_rx => {
+                return Outcome::Retry(reason.unwrap_or("outgoing queue full").into());
+            }
             _ = ping.tick() => {
                 if let Err(e) = sink.send(Message::Text(serde_json::to_string(&NodeMessage::Ping).unwrap().into())).await {
                     return Outcome::Retry(e.to_string());
@@ -366,7 +390,9 @@ async fn connect_once(
                     Ok(HubMessage::Welcome { device_id, .. }) => events.status(Status::Connected { device_id }),
                     Ok(HubMessage::Presence { devices }) => events.presence(devices),
                     Ok(HubMessage::Mcp { message }) => {
-                        let _ = mcp.incoming.send(message);
+                        if let Err(mpsc::error::TrySendError::Full(_)) = mcp.incoming.try_send(message) {
+                            return Outcome::Retry("MCP incoming queue full".into());
+                        }
                     }
                     Ok(HubMessage::Providers { providers }) => {
                         *threads.providers.lock().unwrap() = providers;
@@ -391,14 +417,19 @@ async fn connect_once(
                     }
                     // Written before the thread's StartThread, which follows on this connection.
                     Ok(HubMessage::WorkspaceFile { thread_id, path, content_base64 }) => {
-                        let written = match &config.workspace_root {
-                            Some(root) => handover::write_file(root, &thread_id, &path, &content_base64),
-                            None => Err("this device doesn't run threads".into()),
-                        };
-                        if let Err(e) = written {
-                            tracing::warn!("hand-over file for {thread_id}: {e}");
-                            let text = format!("Couldn't write the hub's file {path}: {e}");
-                            let _ = out_tx.send(NodeMessage::ThreadEvent { thread_id, event: AgentEvent::Notice { text } });
+                        let root = config.workspace_root.clone();
+                        let ack = tokio::task::spawn_blocking(move || {
+                            handover::apply_file(root.as_deref(), thread_id, path, &content_base64)
+                        })
+                        .await
+                        .unwrap_or_else(|e| NodeMessage::WorkspaceFileResult {
+                            thread_id: String::new(),
+                            path: String::new(),
+                            ok: false,
+                            error: Some(e.to_string()),
+                        });
+                        if let Err(mpsc::error::TrySendError::Full(_)) = out_tx.try_send(ack) {
+                            return Outcome::Retry("outgoing queue full".into());
                         }
                     }
                     Ok(HubMessage::Pong) => {}
@@ -426,8 +457,8 @@ mod tests {
     /// connection drops (it used to wait forever and keep `Threads` alive).
     #[tokio::test]
     async fn disconnect_stops_threads_and_denies_approvals() {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let threads = Arc::new(Threads::new(out_tx));
+        let (out_tx, mut out_rx) = mpsc::channel(CONN_QUEUE_CAP);
+        let threads = Arc::new(Threads::new(out_tx, Arc::new(|| {})));
         let guard = StopOnDisconnect(threads.clone());
 
         let provider = providers::build(&ProviderConfig {

@@ -24,6 +24,7 @@
 //! [`EventBody::ThreadHandedOver`]. The hub prepares at once; a configurable wait
 //! (for the user to answer the orchestrator first) is for later.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -37,11 +38,11 @@ use core_agent::tools::{Workspace, file_tools};
 use core_protocol::{AgentEvent, EventBody, HubMessage, Permission, ThreadInfo, ThreadSpec};
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::db::{Db, now};
 use crate::orchestrator::Wake;
-use crate::server::{HUB_DEVICE, Hub};
+use crate::server::{HUB_DEVICE, HandoverAckRoute, Hub};
 use crate::threads::{HubHost, MAX_THREAD_TURNS, thread_system};
 
 /// Thread status while its device is offline.
@@ -84,6 +85,10 @@ const PROGRESS_ITEM_CHARS: usize = 600;
 const PROGRESS_CHARS: usize = 6_000;
 /// How long a reconnecting device has to list its tools before the hand-over goes ahead anyway.
 const TOOLS_WAIT: Duration = Duration::from_secs(60);
+/// Total time the hub waits for a device's `WorkspaceFileResult` acknowledgements.
+pub const HANDOVER_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum queued messages kept per waiting thread before oldest ones are dropped.
+pub const MAX_QUEUED_MESSAGES: usize = 50;
 
 /// The instruction the harness adds to a hub part's brief.
 pub fn offline_instruction(device: &str, disconnected: bool) -> String {
@@ -208,7 +213,19 @@ impl Db {
             return false;
         };
         let mut list: Vec<String> = serde_json::from_str(&queued).unwrap_or_default();
+        let mut dropped = list.first().and_then(|s| parse_dropped_note(s)).unwrap_or(0);
+        if dropped > 0 {
+            list.remove(0);
+        }
         list.push(message.to_string());
+        if list.len() > MAX_QUEUED_MESSAGES {
+            let extra = list.len() - MAX_QUEUED_MESSAGES;
+            list.drain(0..extra);
+            dropped += extra;
+        }
+        if dropped > 0 {
+            list.insert(0, format_dropped_note(dropped));
+        }
         c.execute(
             "UPDATE offline_threads SET queued = ?1 WHERE thread_id = ?2",
             params![serde_json::to_string(&list).unwrap_or_default(), id],
@@ -231,6 +248,17 @@ impl Db {
             .filter_map(|(id, phase)| self.thread(&id).filter(|t| t.status == WAITING_DEVICE).map(|t| (t, phase)))
             .collect()
     }
+}
+
+fn parse_dropped_note(s: &str) -> Option<usize> {
+    let rest = s.strip_prefix('(')?;
+    let (num, tail) = rest.split_once(" earlier message")?;
+    tail.contains("dropped").then(|| num.parse().ok()).flatten()
+}
+
+fn format_dropped_note(dropped: usize) -> String {
+    let plural = if dropped == 1 { "" } else { "s" };
+    format!("({dropped} earlier message{plural} dropped; queue limit is {MAX_QUEUED_MESSAGES})")
 }
 
 fn hub_workspace(data_dir: &Path, thread_id: &str) -> PathBuf {
@@ -486,7 +514,7 @@ impl Hub {
     }
 
     /// The device is back: copy the hub's files over and continue the thread there.
-    pub(crate) async fn hand_over(self: &Arc<Self>, thread_id: &str) {
+    pub async fn hand_over(self: &Arc<Self>, thread_id: &str) {
         if !self.db.set_phase(thread_id, READY, HANDING_OVER) {
             return;
         }
@@ -524,24 +552,74 @@ impl Hub {
                 names.clear();
             }
         }
-        if !self.is_online(&t.device_id).await {
+        let Some(conn_id) = self.live.lock().await.get(&t.device_id).map(|l| l.conn_id) else {
             return Err("the device is offline again".into());
-        }
+        };
         let mut copied = Vec::new();
-        for (f, name) in files.iter().zip(names) {
-            let bytes = match std::fs::read(&f.path) {
-                Ok(b) => b,
-                Err(e) => {
-                    skipped.push(format!("{} (unreadable: {e})", f.rel));
-                    continue;
+        let mut unconfirmed = Vec::new();
+        if !files.is_empty() {
+            let (ack_tx, mut ack_rx) = mpsc::channel(files.len().saturating_add(16));
+            self.handover_acks.lock().await.insert(
+                thread_id.to_string(),
+                HandoverAckRoute { device_id: t.device_id.clone(), conn_id, tx: ack_tx },
+            );
+            let mut sent = Vec::new();
+            let mut send_err = None;
+            for (f, name) in files.iter().zip(names) {
+                let bytes = match std::fs::read(&f.path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        skipped.push(format!("{} (unreadable: {e})", f.rel));
+                        continue;
+                    }
+                };
+                let content_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                let frame = HubMessage::WorkspaceFile { thread_id: thread_id.into(), path: name.clone(), content_base64 };
+                if !self.send_to_conn(&t.device_id, conn_id, frame).await {
+                    send_err = Some("the device went offline while files were copied".to_string());
+                    break;
                 }
-            };
-            let content_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-            let frame = HubMessage::WorkspaceFile { thread_id: thread_id.into(), path: name.clone(), content_base64 };
-            if !self.send_to(&t.device_id, frame).await {
+                sent.push(name);
+            }
+            if let Some(err) = send_err {
+                self.handover_acks.lock().await.remove(thread_id);
+                return Err(err);
+            }
+            let mut pending: HashSet<String> = sent.iter().cloned().collect();
+            let mut results: HashMap<String, (bool, Option<String>)> = HashMap::new();
+            let deadline = tokio::time::Instant::now() + self.handover_ack_timeout();
+            let mut disconnected = false;
+            while !pending.is_empty() {
+                match tokio::time::timeout_at(deadline, ack_rx.recv()).await {
+                    Err(_) => break,
+                    Ok(None) => {
+                        disconnected = true;
+                        break;
+                    }
+                    Ok(Some((path, ok, error))) => {
+                        if pending.remove(&path) {
+                            results.insert(path, (ok, error));
+                        }
+                    }
+                }
+            }
+            self.handover_acks.lock().await.remove(thread_id);
+            if disconnected {
                 return Err("the device went offline while files were copied".into());
             }
-            copied.push(name);
+            for path in sent {
+                match results.remove(&path) {
+                    Some((true, _)) => copied.push(path),
+                    Some((false, err)) => {
+                        let why = err.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "write failed".into());
+                        skipped.push(format!("{path} ({why})"));
+                    }
+                    None => unconfirmed.push(path),
+                }
+            }
+        }
+        if !self.is_live_conn(&t.device_id, conn_id).await {
+            return Err("the device went offline during the hand-over".into());
         }
 
         let Some(model) = self.db.find_model(&t.model).or_else(|| self.db.default_model("thread")) else {
@@ -553,14 +631,16 @@ impl Hub {
         }
         self.db.drop_waiting(thread_id);
         let original = self.db.thread_brief(thread_id).unwrap_or_default();
-        let brief = continuation_brief(&original, &w, &device, prefix, &copied, &skipped);
+        let brief = continuation_brief(&original, &w, &device, prefix, &copied, &skipped, &unconfirmed);
+        let mut event_skipped = skipped.clone();
+        event_skipped.extend(unconfirmed.iter().map(|p| format!("{p} (unconfirmed)")));
         self.emit(
             &t.conversation_id,
             Some(thread_id),
             EventBody::ThreadHandedOver {
                 device_id: t.device_id.clone(),
                 files: copied.clone(),
-                skipped: skipped.clone(),
+                skipped: event_skipped,
                 brief: brief.clone(),
             },
         );
@@ -575,7 +655,7 @@ impl Hub {
             permissions: self.db.permissions(&t.device_id),
             max_turns: MAX_THREAD_TURNS,
         };
-        if !self.send_to(&t.device_id, HubMessage::StartThread { spec }).await {
+        if !self.send_to_conn(&t.device_id, conn_id, HubMessage::StartThread { spec }).await {
             self.wait_for_device(thread_id, "the device went offline during the hand-over", true).await;
             return Ok(());
         }
@@ -587,6 +667,9 @@ impl Hub {
         );
         if !skipped.is_empty() {
             details.push_str(&format!(" Not copied: {}.", skipped.join("; ")));
+        }
+        if !unconfirmed.is_empty() {
+            details.push_str(&format!(" Unconfirmed: {}.", unconfirmed.join("; ")));
         }
         self.wake(
             &t.conversation_id,
@@ -627,6 +710,7 @@ fn continuation_brief(
     prefix: &str,
     files: &[String],
     skipped: &[String],
+    unconfirmed: &[String],
 ) -> String {
     let mut s = original.trim_end().to_string();
     s.push('\n');
@@ -643,6 +727,9 @@ fn continuation_brief(
     }
     if !skipped.is_empty() {
         s.push_str(&format!("Not copied: {}.\n", skipped.join("; ")));
+    }
+    if !unconfirmed.is_empty() {
+        s.push_str(&format!("Unconfirmed (device did not acknowledge): {}.\n", unconfirmed.join("; ")));
     }
     if !w.queued.is_empty() {
         s.push_str("\n## Messages that arrived while the thread waited\n");
@@ -802,6 +889,33 @@ mod tests {
         assert!(p.starts_with("(earlier steps left out)\n"), "{p}");
         assert!(!p.contains("step 10\n") && p.contains("step 29"), "{p}");
         assert!(p.contains("- read_file returned: xxx") && p.len() < PROGRESS_CHARS + 100, "{}", p.len());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn queued_messages_are_capped_with_note() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let t = db.create_thread("c1", "t", "laptop", "m", None, "b").unwrap();
+        assert!(db.set_thread_status(&t.id, "running", WAITING_DEVICE));
+        db.put_waiting(&t.id, READY, false, None, Some("ok"));
+
+        for i in 1..=MAX_QUEUED_MESSAGES {
+            assert!(db.queue_message(&t.id, &format!("msg {i}")));
+        }
+        let w = db.waiting(&t.id).unwrap();
+        assert_eq!(w.queued.len(), MAX_QUEUED_MESSAGES);
+        assert_eq!(w.queued.first().map(String::as_str), Some("msg 1"));
+        assert_eq!(w.queued.last().map(String::as_str), Some("msg 50"));
+
+        for i in (MAX_QUEUED_MESSAGES + 1)..=(MAX_QUEUED_MESSAGES + 5) {
+            assert!(db.queue_message(&t.id, &format!("msg {i}")));
+        }
+        let w = db.waiting(&t.id).unwrap();
+        assert_eq!(w.queued.len(), MAX_QUEUED_MESSAGES + 1);
+        assert!(w.queued[0].contains("5 earlier messages dropped"), "{:?}", w.queued[0]);
+        assert_eq!(w.queued[1], "msg 6");
+        assert_eq!(w.queued.last().map(String::as_str), Some("msg 55"));
         std::fs::remove_dir_all(dir).ok();
     }
 }

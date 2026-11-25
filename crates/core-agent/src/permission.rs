@@ -23,6 +23,8 @@ pub fn needs_approval(level: Permission, tool: &str, input: &Value) -> Option<St
             } else if tool == "run_shell" {
                 let cmd = input.get("command").and_then(Value::as_str).unwrap_or_default();
                 shell_risk(cmd).map(|r| format!("run_shell on Auto, but the command {r}"))
+            } else if agents::agent_tool(tool).is_some() {
+                agents::auto_risk(tool, input, None, &agents::Clamped::default())
             } else {
                 None
             }
@@ -286,6 +288,91 @@ mod tests {
         let mut input = json!({"command": "rm -rf x"});
         assert!(check_call(Permission::Auto, "run_shell", &mut input, &ws).is_some());
         assert_eq!(input, json!({"command": "rm -rf x"}));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unconfined_agents_require_approval_on_auto() {
+        let dir = std::env::temp_dir().join(format!("grouper-gate-unconfined-{}", std::process::id()));
+        let ws = Workspace::create(dir.clone()).unwrap();
+
+        // hermes, grok, opencode: every *_chat asks on Auto with the unconfined reason;
+        // Manual always asks; Bypass runs; list_* never asks on Auto.
+        for (chat, list) in [
+            ("hermes__hermes_chat", "hermes__list_hermes_chats"),
+            ("grok__grok_chat", "grok__list_grok_chats"),
+            ("opencode__opencode_chat", "opencode__list_opencode_chats"),
+        ] {
+            let mut input = json!({"message": "hi"});
+            let reason = check_call(Permission::Auto, chat, &mut input, &ws).unwrap();
+            assert!(reason.contains(agents::UNCONFINED_REASON), "{chat}: {reason}");
+
+            let mut input = json!({"message": "hi"});
+            let reason = check_call(Permission::Manual, chat, &mut input, &ws).unwrap();
+            assert!(reason.contains("Manual"), "{chat}: {reason}");
+
+            let mut input = json!({"message": "hi"});
+            assert_eq!(check_call(Permission::Bypass, chat, &mut input, &ws), None, "{chat}");
+
+            let mut input = json!({});
+            assert_eq!(check_call(Permission::Auto, list, &mut input, &ws), None, "{list}");
+            let mut input = json!({});
+            assert_eq!(check_call(Permission::Bypass, list, &mut input, &ws), None, "{list}");
+            let mut input = json!({});
+            assert!(check_call(Permission::Manual, list, &mut input, &ws).unwrap().contains("Manual"), "{list}");
+        }
+
+        // opencode with auto_approve: false still asks on Auto.
+        let mut input = json!({"message": "hi", "auto_approve": false});
+        let reason = check_call(Permission::Auto, "opencode__opencode_chat", &mut input, &ws).unwrap();
+        assert!(reason.contains(agents::UNCONFINED_REASON), "{reason}");
+
+        // pi: Auto asks when tools is "all", missing, or invalid (removed by clamp);
+        // runs without asking with "read-only" or "none".
+        let pi = "pi__pi_chat";
+        for args in [
+            json!({"message": "hi"}),
+            json!({"message": "hi", "tools": "all"}),
+            json!({"message": "hi", "tools": "everything"}),
+        ] {
+            let mut input = args.clone();
+            let reason = check_call(Permission::Auto, pi, &mut input, &ws).unwrap();
+            assert!(reason.contains(agents::UNCONFINED_REASON), "{args}: {reason}");
+        }
+        for safe in ["read-only", "none"] {
+            let mut input = json!({"message": "hi", "tools": safe});
+            assert_eq!(check_call(Permission::Auto, pi, &mut input, &ws), None, "pi {safe}");
+            assert_eq!(input["tools"], safe);
+            // Manual still asks even for read-only/none.
+            let mut input = json!({"message": "hi", "tools": safe});
+            assert!(check_call(Permission::Manual, pi, &mut input, &ws).unwrap().contains("Manual"));
+            // Risky message or outside workspace still asks on Auto for read-only/none.
+            let mut input = json!({"message": "git push origin main", "tools": safe});
+            assert!(check_call(Permission::Auto, pi, &mut input, &ws).is_some());
+        }
+        // pi on Bypass: runs and sets tools: all when omitted.
+        let mut input = json!({"message": "hi"});
+        assert_eq!(check_call(Permission::Bypass, pi, &mut input, &ws), None);
+        assert_eq!(input["tools"], "all");
+        // pi list_* never asks on Auto.
+        let mut input = json!({});
+        assert_eq!(check_call(Permission::Auto, "pi__list_pi_chats", &mut input, &ws), None);
+
+        // Confined agents still run on Auto without asking.
+        for chat in [
+            "codex__codex_chat",
+            "claude-code__claude_code_chat",
+            "antigravity__antigravity_chat",
+            "cursor__cursor_chat",
+        ] {
+            let mut input = json!({"message": "Write tests"});
+            assert_eq!(check_call(Permission::Auto, chat, &mut input, &ws), None, "{chat}");
+            let mut input = json!({"message": "Write tests"});
+            assert_eq!(check_call(Permission::Bypass, chat, &mut input, &ws), None, "{chat}");
+            let mut input = json!({"message": "Write tests"});
+            assert!(check_call(Permission::Manual, chat, &mut input, &ws).unwrap().contains("Manual"), "{chat}");
+        }
+
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -18,12 +18,14 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::server::{CallError, Hub};
+use crate::server::{CallError, CloseHandle, CloseReason, Hub};
 
 /// How long a platform tool (Swift, CLI) may take.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the device has to answer `initialize` and `tools/list`.
 const LIST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bounded capacity for coalesced `tools/list_changed` notifications per device.
+const REFRESH_QUEUE_CAP: usize = 16;
 
 /// How long the hub waits for a direct call. Tools of a device's MCP servers
 /// (`<server>__<tool>`) run as long as their `timeout_seconds` argument allows; the
@@ -38,12 +40,13 @@ pub(crate) fn call_timeout(tool: &str, args: &Value) -> Duration {
 
 /// The hub's side of one device's MCP session.
 struct DeviceClient {
-    refresh: mpsc::UnboundedSender<()>,
+    refresh: mpsc::Sender<()>,
 }
 
 impl ClientHandler for DeviceClient {
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        let _ = self.refresh.send(());
+        // Coalesced: if a refresh is already queued, dropping duplicates is intentional.
+        let _ = self.refresh.try_send(());
     }
 
     fn get_info(&self) -> ClientConfig {
@@ -54,7 +57,7 @@ impl ClientHandler for DeviceClient {
 /// The MCP session of one device connection. Dropping it ends the session.
 pub(crate) struct McpSession {
     /// Feed the `message` of every [`NodeMessage::Mcp`](core_protocol::NodeMessage::Mcp) here.
-    pub(crate) incoming: mpsc::UnboundedSender<Value>,
+    pub(crate) incoming: mpsc::Sender<Value>,
     task: JoinHandle<()>,
 }
 
@@ -66,12 +69,25 @@ impl Drop for McpSession {
 
 impl McpSession {
     /// Start the session for connection `conn_id` of `device_id`; `out` is that
-    /// connection's outgoing frame queue.
-    pub(crate) fn start(hub: &Arc<Hub>, device_id: String, conn_id: u64, out: mpsc::UnboundedSender<HubMessage>) -> Self {
-        let (tunnel, incoming) = Tunnel::new(move |message| out.send(HubMessage::Mcp { message }).is_ok());
+    /// connection's bounded outgoing frame queue.
+    pub(crate) fn start(
+        hub: &Arc<Hub>,
+        device_id: String,
+        conn_id: u64,
+        out: mpsc::Sender<HubMessage>,
+        close: CloseHandle,
+    ) -> Self {
+        let (tunnel, incoming) = Tunnel::new(move |message| match out.try_send(HubMessage::Mcp { message }) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                close.trigger(CloseReason::Overflow);
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
         let hub = Arc::downgrade(hub);
         let task = tokio::spawn(async move {
-            let (refresh, mut refreshes) = mpsc::unbounded_channel();
+            let (refresh, mut refreshes) = mpsc::channel(REFRESH_QUEUE_CAP);
             let client = match tokio::time::timeout(LIST_TIMEOUT, DeviceClient { refresh }.serve(tunnel)).await {
                 Ok(Ok(client)) => client,
                 Ok(Err(e)) => return tracing::warn!(device = %device_id, "MCP initialize failed: {e}"),
@@ -100,6 +116,18 @@ impl McpSession {
     }
 }
 
+/// Apply a listed tool set only if `conn_id` is still the live connection for `device_id`.
+/// Checked before writing to the database so a replaced connection can't clobber a newer one.
+pub(crate) async fn apply_tool_list(hub: &Hub, device_id: &str, conn_id: u64, defs: Vec<ToolDef>) -> bool {
+    let mut live = hub.live.lock().await;
+    let Some(l) = live.get_mut(device_id).filter(|l| l.conn_id == conn_id) else {
+        return false;
+    };
+    hub.db.upsert_tools(device_id, &defs);
+    l.tools = defs;
+    true
+}
+
 /// List the device's tools into the registry and its live entry, then tell everyone.
 async fn refresh_tools(hub: &Weak<Hub>, device_id: &str, conn_id: u64, peer: &Peer<RoleClient>) {
     let tools = match tokio::time::timeout(LIST_TIMEOUT, peer.list_all_tools()).await {
@@ -119,13 +147,8 @@ async fn refresh_tools(hub: &Weak<Hub>, device_id: &str, conn_id: u64, peer: &Pe
         })
         .collect();
     let Some(hub) = hub.upgrade() else { return };
-    hub.db.upsert_tools(device_id, &defs);
-    {
-        let mut live = hub.live.lock().await;
-        match live.get_mut(device_id).filter(|l| l.conn_id == conn_id) {
-            Some(l) => l.tools = defs,
-            None => return,
-        }
+    if !apply_tool_list(&hub, device_id, conn_id, defs).await {
+        return;
     }
     tracing::info!(device = %device_id, "tool list updated");
     hub.broadcast_presence().await;
@@ -176,5 +199,29 @@ mod tests {
         assert_eq!(agent, Duration::from_secs(100 + 2 * MCP_GRACE_SECS));
         let default = call_timeout("codex__codex_chat", &json!({}));
         assert_eq!(default, Duration::from_secs(600 + 2 * MCP_GRACE_SECS));
+    }
+
+    #[tokio::test]
+    async fn stale_connection_does_not_write_tools_to_db() {
+        let dir = std::env::temp_dir().join(format!("grouper-mcp-stale-{}", crate::db::random_hex(4)));
+        let db = crate::db::Db::open(&dir).unwrap();
+        let (dev, _) = db.add_device("Laptop", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let (tx, _rx) = mpsc::channel(4);
+        let (close, _close_rx) = CloseHandle::new();
+        let (_closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        hub.live.lock().await.insert(
+            dev.id.clone(),
+            crate::server::Live { conn_id: 2, tx, tools: Vec::new(), mcp: None, close, closed: closed_rx },
+        );
+        let tool = |name: &str| ToolDef { name: name.into(), description: "d".into(), input_schema: json!({}) };
+        // Current connection (conn_id 2) writes its tool list.
+        assert!(apply_tool_list(&hub, &dev.id, 2, vec![tool("fresh_tool")]).await);
+        // Stale connection (conn_id 1) is rejected BEFORE touching the DB.
+        assert!(!apply_tool_list(&hub, &dev.id, 1, vec![tool("stale_tool")]).await);
+        let names: Vec<String> = hub.db.tools(Some(&dev.id)).into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["fresh_tool".to_string()]);
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

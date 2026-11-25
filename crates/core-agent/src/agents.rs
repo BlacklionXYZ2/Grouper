@@ -9,9 +9,9 @@
 //! | claude-code | `permission_mode: acceptEdits` (or `plan`/`default` if asked) | `bypassPermissions` unless the model asked for less |
 //! | antigravity | `mode: accept-edits` (or `plan`), `allow_all_tools: false` | `allow_all_tools: true`, no `mode` (unless `plan`) |
 //! | cursor | `sandbox: enabled` | `sandbox: disabled` unless the model asked for it on |
-//! | pi | as the model asked (`all` at most) | `tools: all` unless the model asked for less |
-//! | opencode | left as is (`auto_approve` defaults to true: it can't ask) | same |
-//! | hermes, grok | no safety option exists: unconfined | same |
+//! | pi | as the model asked (`all` at most); Auto asks unless `read-only`/`none` | `tools: all` unless the model asked for less |
+//! | opencode | left as is (`auto_approve` defaults to true); Auto always asks | same |
+//! | hermes, grok | no safety option exists (unconfined); Auto always asks | same |
 //!
 //! Every `*_chat` call also gets `working_directory` (the thread's workspace when the
 //! model gave none) and `timeout_seconds` (Grouper's default when the model gave none,
@@ -155,13 +155,27 @@ pub fn clamp(level: Permission, tool: &str, input: &mut Value, workspace: &Works
     out
 }
 
+/// Reason used on Auto when a CLI agent cannot be confined to its workspace.
+pub const UNCONFINED_REASON: &str = "this agent can't be confined to its workspace";
+
+/// Whether a `*_chat` call on Auto runs without workspace confinement.
+fn is_unconfined(server: &str, input: &Value) -> bool {
+    match server {
+        "hermes" | "grok" | "opencode" => true,
+        "pi" => !matches!(s(input, "tools"), Some("read-only" | "none")),
+        _ => false,
+    }
+}
+
 /// Why an agent call on Auto needs the user's approval, if it does.
 ///
 /// `list_*` tools never ask. `*_chat` asks when its working directory leaves the
-/// workspace, when the model asked for a bypass mode itself, or when the message holds
-/// clearly destructive or outward-facing instructions.
+/// workspace, when the model asked for a bypass mode itself, when the agent cannot
+/// be confined to its workspace (`hermes`, `grok`, `opencode`, and `pi` unless
+/// `tools` is `read-only` or `none`), or when the message holds clearly destructive
+/// or outward-facing instructions.
 pub fn auto_risk(tool: &str, input: &Value, workspace: Option<&Workspace>, clamped: &Clamped) -> Option<String> {
-    let (_, own) = agent_tool(tool)?;
+    let (server, own) = agent_tool(tool)?;
     if own.starts_with("list_") || !own.ends_with("_chat") {
         return None;
     }
@@ -172,6 +186,9 @@ pub fn auto_risk(tool: &str, input: &Value, workspace: Option<&Workspace>, clamp
     }
     if let Some(asked) = &clamped.asked_for_bypass {
         return Some(format!("the model asked {tool} for {asked}"));
+    }
+    if is_unconfined(server, input) {
+        return Some(UNCONFINED_REASON.into());
     }
     let message = s(input, "message").unwrap_or_default();
     message_risk(message).map(|why| format!("{tool}'s message {why}"))
@@ -427,6 +444,20 @@ mod tests {
         ] {
             let input = json!({"message": msg, "working_directory": display_root(&w)});
             assert!(auto_risk(t, &input, Some(&w), &none).is_some(), "{msg}");
+        }
+        // Unconfined agents ask on Auto; list_* never asks; pi allows read-only/none.
+        for chat in ["hermes__hermes_chat", "grok__grok_chat", "opencode__opencode_chat"] {
+            assert_eq!(auto_risk(chat, &ok, Some(&w), &none).as_deref(), Some(UNCONFINED_REASON));
+        }
+        for list in ["hermes__list_hermes_chats", "grok__list_grok_chats", "opencode__list_opencode_chats", "pi__list_pi_chats"] {
+            assert_eq!(auto_risk(list, &json!({}), Some(&w), &none), None);
+        }
+        assert_eq!(auto_risk("pi__pi_chat", &ok, Some(&w), &none).as_deref(), Some(UNCONFINED_REASON));
+        let pi_all = json!({"message": "Add a README", "working_directory": display_root(&w), "tools": "all"});
+        assert_eq!(auto_risk("pi__pi_chat", &pi_all, Some(&w), &none).as_deref(), Some(UNCONFINED_REASON));
+        for safe in ["read-only", "none"] {
+            let pi_safe = json!({"message": "Add a README", "working_directory": display_root(&w), "tools": safe});
+            assert_eq!(auto_risk("pi__pi_chat", &pi_safe, Some(&w), &none), None);
         }
         std::fs::remove_dir_all(dir).ok();
     }

@@ -32,6 +32,10 @@ pub const PING_INTERVAL_SECS: u64 = 20;
 /// The hub drops a connection that has been silent for this long.
 pub const IDLE_TIMEOUT_SECS: u64 = 60;
 
+/// Maximum incoming WebSocket message size accepted by the hub and clients (16 MB).
+/// Fits an 8 MB base64-encoded hand-over file plus framing overhead.
+pub const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Something a device can do for the orchestrator.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Capability {
@@ -94,6 +98,14 @@ pub enum NodeMessage {
     ApprovalRequest { approval_id: String, thread_id: String, tool: String, input: Value, reason: String },
     /// A thread needs something from the orchestrator (often another device's data).
     AskOrchestrator { thread_id: String, question: String },
+    /// Offline hand-over: acknowledgement for one [`HubMessage::WorkspaceFile`].
+    WorkspaceFileResult {
+        thread_id: String,
+        path: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Hub → device.
@@ -756,12 +768,27 @@ mod tests {
         assert_eq!(serde_json::from_str::<HubMessage>(&s).unwrap(), h);
         let n = NodeMessage::Mcp { message: rpc };
         assert_eq!(serde_json::from_str::<NodeMessage>(&serde_json::to_string(&n).unwrap()).unwrap(), n);
+
+        let ack = NodeMessage::WorkspaceFileResult {
+            thread_id: "t1".into(),
+            path: "a/b.txt".into(),
+            ok: false,
+            error: Some("denied".into()),
+        };
+        let s = serde_json::to_string(&ack).unwrap();
+        assert!(s.contains(r#""type":"workspace_file_result""#), "{s}");
+        assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), ack);
     }
 
     #[test]
     fn mcp_permissions_and_timeouts() {
         assert_eq!(Permission::default_for("codex__codex_chat"), Permission::Auto);
         assert_eq!(Permission::default_for("claude-code__claude_code_chat"), Permission::Auto);
+        assert_eq!(Permission::default_for("hermes__hermes_chat"), Permission::Auto);
+        assert_eq!(Permission::default_for("grok__grok_chat"), Permission::Auto);
+        assert_eq!(Permission::default_for("opencode__opencode_chat"), Permission::Auto);
+        assert_eq!(Permission::default_for("pi__pi_chat"), Permission::Auto);
+        assert_eq!(Permission::default_for("hermes__list_hermes_chats"), Permission::Auto);
         assert_eq!(Permission::default_for("catalog__list_available_agents"), Permission::Auto);
         assert_eq!(Permission::default_for("git__git_commit"), Permission::Manual);
         assert_eq!(Permission::default_for("read_file"), Permission::Auto);

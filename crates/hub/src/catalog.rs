@@ -30,17 +30,50 @@ const CATALOG_REASON: &str = "Drafted from the OpenRouter model card.";
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogModel {
     pub id: String,
-    /// USD per million input tokens.
-    pub input_price: f64,
-    /// USD per million output tokens.
-    pub output_price: f64,
+    /// USD per million input tokens. `None` when missing or invalid on the card.
+    pub input_price: Option<f64>,
+    /// USD per million output tokens. `None` when missing or invalid on the card.
+    pub output_price: Option<f64>,
     pub cache_read_price: Option<f64>,
     pub cache_write_price: Option<f64>,
+    /// Why pricing on the card could not be parsed, if any.
+    pub price_error: Option<String>,
     pub context_window: u64,
     pub free: bool,
     pub modalities: Vec<String>,
     /// Use-case text to propose, not written onto the model until you accept it.
     pub use_cases_draft: String,
+}
+
+impl CatalogModel {
+    fn validated_prices(&self) -> Result<(f64, f64)> {
+        if let Some(err) = &self.price_error {
+            bail!("model {:?} has invalid pricing: {err}", self.id);
+        }
+        let Some(input) = self.input_price else {
+            bail!("model {:?} is missing prompt price", self.id);
+        };
+        let Some(output) = self.output_price else {
+            bail!("model {:?} is missing completion price", self.id);
+        };
+        if !input.is_finite() || input < 0.0 {
+            bail!("model {:?} has invalid prompt price {input}", self.id);
+        }
+        if !output.is_finite() || output < 0.0 {
+            bail!("model {:?} has invalid completion price {output}", self.id);
+        }
+        if let Some(p) = self.cache_read_price
+            && (!p.is_finite() || p < 0.0)
+        {
+            bail!("model {:?} has invalid cache read price {p}", self.id);
+        }
+        if let Some(p) = self.cache_write_price
+            && (!p.is_finite() || p < 0.0)
+        {
+            bail!("model {:?} has invalid cache write price {p}", self.id);
+        }
+        Ok((input, output))
+    }
 }
 
 #[derive(Debug)]
@@ -124,17 +157,22 @@ fn cap_chars(text: &str, max: usize) -> String {
 }
 
 /// USD per million tokens from an OpenRouter per-token price (`"0.000003"` → `3.0`).
+/// Rejects empty, unparseable, negative, or non-finite values.
 fn per_million_tokens(raw: &str) -> Option<f64> {
     let s = raw.trim();
-    if s.is_empty() {
+    if s.is_empty() || s.starts_with('-') {
         return None;
     }
-    decimal_per_million(s).or_else(|| s.parse::<f64>().ok().filter(|n| n.is_finite()).map(|n| n * 1_000_000.0))
+    let scaled = decimal_per_million(s)
+        .or_else(|| s.parse::<f64>().ok().filter(|n| n.is_finite()).map(|n| n * 1_000_000.0))?;
+    (scaled.is_finite() && scaled >= 0.0).then_some(scaled)
 }
 
 fn decimal_per_million(s: &str) -> Option<f64> {
-    let neg = s.starts_with('-');
-    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if s.starts_with('-') {
+        return None;
+    }
+    let s = s.strip_prefix('+').unwrap_or(s);
     if s.is_empty() || s.contains(['e', 'E']) {
         return None;
     }
@@ -153,18 +191,26 @@ fn decimal_per_million(s: &str) -> Option<f64> {
     let million = 1_000_000u128;
     let num = whole.checked_mul(million)?.checked_mul(scale)?.checked_add(frac_val.checked_mul(million)?)?;
     let value = (num as f64) / (scale as f64);
-    Some(if neg { -value } else { value })
+    (value.is_finite() && value >= 0.0).then_some(value)
 }
 
-fn price_field(pricing: &Value, key: &str) -> Option<f64> {
-    let value = pricing.get(key)?;
+fn parse_price_field(pricing: &Value, key: &str, required: bool) -> Result<Option<f64>, String> {
+    let Some(value) = pricing.get(key) else {
+        return if required { Err(format!("missing {key} price")) } else { Ok(None) };
+    };
     if value.is_null() {
-        return None;
+        return if required { Err(format!("missing {key} price")) } else { Ok(None) };
     }
     if let Some(text) = value.as_str() {
-        return per_million_tokens(text);
+        return per_million_tokens(text).map(Some).ok_or_else(|| format!("invalid {key} price {text:?}"));
     }
-    value.as_f64().filter(|n| n.is_finite()).map(|n| n * 1_000_000.0)
+    if let Some(n) = value.as_f64() {
+        let scaled = n * 1_000_000.0;
+        if scaled.is_finite() && scaled >= 0.0 {
+            return Ok(Some(scaled));
+        }
+    }
+    Err(format!("invalid {key} price {value}"))
 }
 
 fn context_length(row: &Value) -> u64 {
@@ -194,17 +240,32 @@ fn modalities_of(row: &Value) -> Vec<String> {
 fn parse_one(row: &Value) -> Option<CatalogModel> {
     let id = row.get("id").and_then(Value::as_str).map(str::trim).filter(|id| !id.is_empty())?;
     let pricing = row.get("pricing").cloned().unwrap_or(Value::Null);
-    let input_price = price_field(&pricing, "prompt").unwrap_or(0.0);
-    let output_price = price_field(&pricing, "completion").unwrap_or(0.0);
+    let prompt = parse_price_field(&pricing, "prompt", true);
+    let completion = parse_price_field(&pricing, "completion", true);
+    let cache_read = parse_price_field(&pricing, "input_cache_read", false);
+    let cache_write = parse_price_field(&pricing, "input_cache_write", false);
+    let price_error = prompt
+        .as_ref()
+        .err()
+        .or_else(|| completion.as_ref().err())
+        .or_else(|| cache_read.as_ref().err())
+        .or_else(|| cache_write.as_ref().err())
+        .cloned();
+    let input_price = prompt.ok().flatten();
+    let output_price = completion.ok().flatten();
+    let free = id.ends_with(":free")
+        || (price_error.is_none()
+            && matches!((input_price, output_price), (Some(i), Some(o)) if i == 0.0 && o == 0.0));
     let description = row.get("description").and_then(Value::as_str).unwrap_or("");
     Some(CatalogModel {
         id: id.to_string(),
         input_price,
         output_price,
-        cache_read_price: price_field(&pricing, "input_cache_read"),
-        cache_write_price: price_field(&pricing, "input_cache_write"),
+        cache_read_price: cache_read.ok().flatten(),
+        cache_write_price: cache_write.ok().flatten(),
+        price_error,
         context_window: context_length(row),
-        free: id.ends_with(":free") || (input_price == 0.0 && output_price == 0.0),
+        free,
         modalities: modalities_of(row),
         use_cases_draft: draft_use_cases(description),
     })
@@ -272,6 +333,7 @@ pub fn import_from_catalog(
         bail!("model name is empty");
     }
     let Some(card) = find_card(cards, wanted) else { bail!("OpenRouter has no model {wanted:?}") };
+    let (input_price, output_price) = card.validated_prices()?;
     let id = registry_id(req, card)?;
     let existing = db.models().into_iter().find(|model| model.id == id);
     let roles = match &req.roles {
@@ -279,17 +341,18 @@ pub fn import_from_catalog(
         None => existing.as_ref().map(|model| model.roles.clone()).unwrap_or_default(),
     };
     let local = req.local.unwrap_or_else(|| existing.as_ref().is_some_and(|model| model.local));
+    let free = card.id.ends_with(":free") || (input_price == 0.0 && output_price == 0.0);
     let entry = ModelEntry {
         id: id.clone(),
         provider_id: provider_id.to_string(),
         model: card.id.clone(),
-        input_price: card.input_price,
-        output_price: card.output_price,
+        input_price,
+        output_price,
         cache_read_price: card.cache_read_price,
         cache_write_price: card.cache_write_price,
         context_window: card.context_window,
         use_cases: existing.as_ref().map(|model| model.use_cases.clone()).unwrap_or_default(),
-        free: card.free,
+        free,
         roles,
         local,
         modalities: card.modalities.clone(),
@@ -302,12 +365,13 @@ pub fn import_from_catalog(
 
 /// Replace prices (and the free flag, which is derived from them) from a catalog card.
 pub fn update_prices(db: &Db, model: &ModelEntry, card: &CatalogModel) -> Result<ModelEntry> {
+    let (input_price, output_price) = card.validated_prices()?;
     let mut updated = model.clone();
-    updated.input_price = card.input_price;
-    updated.output_price = card.output_price;
+    updated.input_price = input_price;
+    updated.output_price = output_price;
     updated.cache_read_price = card.cache_read_price;
     updated.cache_write_price = card.cache_write_price;
-    updated.free = card.free;
+    updated.free = card.id.ends_with(":free") || (input_price == 0.0 && output_price == 0.0);
     db.upsert_model(&updated)?;
     db.models().into_iter().find(|saved| saved.id == model.id).context("saved model is missing")
 }
@@ -398,18 +462,22 @@ pub async fn refresh_openrouter_prices(hub: &Hub) -> PriceRefresh {
 
 async fn refresh_provider(db: &Db, client: &reqwest::Client, provider: &ProviderConfig, models: &[ModelEntry]) -> Result<usize> {
     let cards = parse_openrouter_models(&fetch_openrouter_models(client, provider).await?);
+    Ok(apply_price_refresh(db, &provider.id, &cards, models))
+}
+
+fn apply_price_refresh(db: &Db, provider_id: &str, cards: &[CatalogModel], models: &[ModelEntry]) -> usize {
     let mut updated = 0;
-    for model in models.iter().filter(|model| model.provider_id == provider.id) {
-        let Some(card) = find_card(&cards, &model.model) else {
+    for model in models.iter().filter(|model| model.provider_id == provider_id) {
+        let Some(card) = find_card(cards, &model.model) else {
             tracing::warn!(model = %model.id, "not in the OpenRouter catalog; prices left as they are");
             continue;
         };
         match update_prices(db, model, card) {
             Ok(_) => updated += 1,
-            Err(error) => tracing::warn!(model = %model.id, "could not save refreshed prices: {error:#}"),
+            Err(error) => tracing::warn!(model = %model.id, "could not save refreshed prices; keeping existing: {error:#}"),
         }
     }
-    Ok(updated)
+    updated
 }
 
 pub(crate) fn routes() -> Router<Arc<Hub>> {
@@ -512,10 +580,11 @@ mod tests {
 
         let sonnet = &cards[0];
         assert_eq!(sonnet.id, "anthropic/claude-sonnet-4");
-        near(sonnet.input_price, 3.0);
-        near(sonnet.output_price, 15.0);
+        near(sonnet.input_price.unwrap(), 3.0);
+        near(sonnet.output_price.unwrap(), 15.0);
         near(sonnet.cache_read_price.unwrap(), 0.3);
         near(sonnet.cache_write_price.unwrap(), 3.75);
+        assert_eq!(sonnet.price_error, None);
         assert_eq!(sonnet.context_window, 200_000);
         assert!(!sonnet.free);
         assert_eq!(sonnet.modalities, vec!["text".to_string(), "image".to_string()]);
@@ -526,8 +595,8 @@ mod tests {
 
         let free = &cards[1];
         assert!(free.free);
-        assert_eq!(free.input_price, 0.0);
-        assert_eq!(free.output_price, 0.0);
+        assert_eq!(free.input_price, Some(0.0));
+        assert_eq!(free.output_price, Some(0.0));
         assert_eq!(free.cache_read_price, None);
         assert_eq!(free.cache_write_price, None);
         assert_eq!(free.context_window, 131_072);
@@ -536,8 +605,8 @@ mod tests {
 
         let promo = &cards[2];
         assert!(promo.free, "an id ending in :free is free even when the card lists prices");
-        near(promo.input_price, 1.0);
-        near(promo.output_price, 2.0);
+        near(promo.input_price.unwrap(), 1.0);
+        near(promo.output_price.unwrap(), 2.0);
         assert!(promo.use_cases_draft.is_empty());
     }
 
@@ -606,7 +675,7 @@ mod tests {
         assert!(proposal.text.starts_with("Claude Sonnet 4"));
 
         let mut cheaper = cards();
-        cheaper[0].input_price = 4.0;
+        cheaper[0].input_price = Some(4.0);
         let again = import_from_catalog(
             &db,
             "openrouter",
@@ -725,5 +794,84 @@ mod tests {
         assert!(cards[0].modalities.is_empty());
         assert_eq!(cards[0].context_window, 0);
         assert_eq!(cards[0].cache_read_price, None);
+    }
+
+    #[test]
+    fn missing_or_invalid_catalog_prices_fail_import_and_preserve_existing_on_refresh() {
+        let dir = std::env::temp_dir().join(format!("grouper-catalog-badprice-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        provider(&db, "openrouter", Some("https://openrouter.ai/api/v1"));
+
+        let bad_cases = [
+            ("no-pricing", json!({"id": "m/no-pricing"})),
+            ("no-prompt", json!({"id": "m/no-prompt", "pricing": {"completion": "0.000001"}})),
+            ("no-completion", json!({"id": "m/no-completion", "pricing": {"prompt": "0.000001"}})),
+            ("null-prompt", json!({"id": "m/null-prompt", "pricing": {"prompt": null, "completion": "0"}})),
+            ("bad-text", json!({"id": "m/bad-text", "pricing": {"prompt": "free", "completion": "0"}})),
+            ("empty-text", json!({"id": "m/empty-text", "pricing": {"prompt": "", "completion": "0"}})),
+            ("neg-str", json!({"id": "m/neg-str", "pricing": {"prompt": "-1", "completion": "0"}})),
+            ("neg-num", json!({"id": "m/neg-num", "pricing": {"prompt": 0.0, "completion": -0.000001}})),
+            ("nan-str", json!({"id": "m/nan-str", "pricing": {"prompt": "NaN", "completion": "0"}})),
+            ("inf-str", json!({"id": "m/inf-str", "pricing": {"prompt": "Infinity", "completion": "0"}})),
+            ("overflow", json!({"id": "m/overflow", "pricing": {"prompt": "1e305", "completion": "0"}})),
+            ("neg-cache", json!({"id": "m/neg-cache", "pricing": {"prompt": "0", "completion": "0", "input_cache_read": "-1"}})),
+            ("free-suffix-missing", json!({"id": "m/free-suffix-missing:free", "pricing": {"prompt": "0"}})),
+        ];
+
+        let rows: Vec<Value> = bad_cases.iter().map(|(_, v)| v.clone()).collect();
+        let parsed = parse_openrouter_models(&json!({"data": rows}));
+        assert_eq!(parsed.len(), bad_cases.len());
+
+        for (tag, row) in &bad_cases {
+            let model_name = row["id"].as_str().unwrap();
+            let card = find_card(&parsed, model_name).unwrap();
+            assert!(card.price_error.is_some(), "{tag}: expected price_error");
+            if !model_name.ends_with(":free") {
+                assert!(!card.free, "{tag}: invalid pricing must not be marked free");
+            }
+            let req = ModelImportRequest {
+                provider: "openrouter".into(),
+                model: model_name.into(),
+                id: None,
+                roles: None,
+                local: None,
+            };
+            assert!(import_from_catalog(&db, "openrouter", &parsed, &req).is_err(), "{tag}: import must fail");
+        }
+        assert!(db.models().is_empty());
+
+        // Half-zero is not free unless id ends with :free.
+        let half_zero = parse_openrouter_models(&json!({"data": [
+            {"id": "m/half", "pricing": {"prompt": "0", "completion": "0.000001"}}
+        ]}));
+        assert!(!half_zero[0].free);
+
+        // Refresh keeps existing prices when the catalog card has missing/invalid prices.
+        db.upsert_model(&ModelEntry {
+            id: "existing".into(),
+            provider_id: "openrouter".into(),
+            model: "m/neg-str".into(),
+            input_price: 2.5,
+            output_price: 7.5,
+            cache_read_price: Some(0.25),
+            cache_write_price: None,
+            context_window: 100_000,
+            use_cases: "kept".into(),
+            free: false,
+            roles: vec![],
+            local: false,
+            modalities: vec![],
+        })
+        .unwrap();
+        let updated = apply_price_refresh(&db, "openrouter", &parsed, &db.models());
+        assert_eq!(updated, 0);
+        let kept = db.find_model("existing").unwrap();
+        near(kept.input_price, 2.5);
+        near(kept.output_price, 7.5);
+        near(kept.cache_read_price.unwrap(), 0.25);
+        assert!(!kept.free);
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

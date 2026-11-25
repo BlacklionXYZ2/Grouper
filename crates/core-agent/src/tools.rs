@@ -107,6 +107,25 @@ impl Tool for WriteFile {
     }
 }
 
+/// Whether a directory entry is a symlink or (on Windows) a reparse point such as
+/// a junction or mount point. Never follows the link.
+fn is_link_entry(entry: &std::fs::DirEntry, ft: &std::fs::FileType) -> bool {
+    if ft.is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if let Ok(meta) = std::fs::symlink_metadata(entry.path())
+            && (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        {
+            return true;
+        }
+    }
+    false
+}
+
 struct ListFiles(Arc<Workspace>);
 #[async_trait]
 impl Tool for ListFiles {
@@ -132,6 +151,7 @@ impl Tool for ListFiles {
             while let Some(d) = stack.pop() {
                 let Ok(rd) = std::fs::read_dir(&d) else { continue };
                 for e in rd.flatten() {
+                    let Ok(ft) = e.file_type() else { continue };
                     let p = e.path();
                     // Always `/`, so models see the same paths on every OS.
                     let shown = p
@@ -141,7 +161,9 @@ impl Tool for ListFiles {
                         .map(|c| c.as_os_str().to_string_lossy())
                         .collect::<Vec<_>>()
                         .join("/");
-                    if p.is_dir() {
+                    if is_link_entry(&e, &ft) {
+                        out.push(format!("{shown}@"));
+                    } else if ft.is_dir() {
                         out.push(format!("{shown}/"));
                         stack.push(p);
                     } else {
@@ -310,6 +332,50 @@ mod tests {
         let sh = shell_tool(&ws).call(json!({"command": "cat a/b.txt"})).await;
         assert!(sh.content.contains("hi"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn list_files_does_not_follow_links() {
+        let base = std::env::temp_dir().join(format!("grouper-list-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws_dir = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "top-secret").unwrap();
+        let ws = Workspace::create(ws_dir.clone()).unwrap();
+        std::fs::write(ws.root().join("inside.txt"), "ok").unwrap();
+
+        let link = ws_dir.join("escape");
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        #[cfg(windows)]
+        let created = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .is_ok_and(|o| o.status.success());
+
+        if !created {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let tools = file_tools(&ws);
+        let listing = tools[2].call(json!({})).await;
+        assert!(!listing.is_error, "{listing:?}");
+        let lines: Vec<&str> = listing.content.lines().collect();
+        assert!(lines.contains(&"inside.txt"), "{lines:?}");
+        assert!(lines.contains(&"escape@"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("secret.txt") || *l == "escape/"), "{lines:?}");
+        // Reading through the link is still refused.
+        assert!(tools[0].call(json!({"path": "escape/secret.txt"})).await.is_error);
+
+        #[cfg(windows)]
+        let _ = std::fs::remove_dir(&link);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

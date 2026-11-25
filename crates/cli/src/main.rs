@@ -415,7 +415,12 @@ impl Api {
         }
         let mut req = url.into_client_request()?;
         req.headers_mut().insert("authorization", format!("Bearer {}", self.token).parse()?);
-        let (ws, _) = tokio_tungstenite::connect_async(req).await.context("can't open the event stream")?;
+        let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        ws_config.max_message_size = Some(core_client::core_protocol::MAX_WS_MESSAGE_BYTES);
+        ws_config.max_frame_size = Some(core_client::core_protocol::MAX_WS_MESSAGE_BYTES);
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(req, Some(ws_config), false)
+            .await
+            .context("can't open the event stream")?;
         Ok(ws.filter_map(|m| async move {
             match m {
                 Ok(Message::Text(t)) => serde_json::from_str::<Event>(&t).ok(),

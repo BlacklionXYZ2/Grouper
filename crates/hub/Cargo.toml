@@ -35,3 +35,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 # A real device for the MCP tunnel test.
 core-client.workspace = true
+tokio-tungstenite.workspace = true

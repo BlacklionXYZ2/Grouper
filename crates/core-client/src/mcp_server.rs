@@ -96,7 +96,7 @@ impl ServerHandler for DeviceServer {
 /// The device's MCP server for one connection. Dropping it ends the session.
 pub(crate) struct ServerSession {
     /// Feed the `message` of every [`HubMessage::Mcp`](core_protocol::HubMessage::Mcp) here.
-    pub(crate) incoming: mpsc::UnboundedSender<Value>,
+    pub(crate) incoming: mpsc::Sender<Value>,
     task: JoinHandle<()>,
 }
 
@@ -107,8 +107,19 @@ impl Drop for ServerSession {
 }
 
 impl ServerSession {
-    pub(crate) fn start(server: DeviceServer, out: mpsc::UnboundedSender<NodeMessage>) -> Self {
-        let (tunnel, incoming) = Tunnel::new(move |message| out.send(NodeMessage::Mcp { message }).is_ok());
+    pub(crate) fn start(
+        server: DeviceServer,
+        out: mpsc::Sender<NodeMessage>,
+        on_overflow: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let (tunnel, incoming) = Tunnel::new(move |message| match out.try_send(NodeMessage::Mcp { message }) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                on_overflow();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
         // Subscribe before serving so no change is missed while the hub lists tools.
         let mut changes = server.host.subscribe();
         changes.borrow_and_update();

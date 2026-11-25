@@ -392,13 +392,17 @@ struct Server {
     stderr: Arc<Mutex<VecDeque<String>>>,
 }
 
+/// Bounded capacity for coalesced `tools/list_changed` notifications per local server.
+const REFRESH_QUEUE_CAP: usize = 16;
+
 struct HostClient {
-    refresh: mpsc::UnboundedSender<()>,
+    refresh: mpsc::Sender<()>,
 }
 
 impl ClientHandler for HostClient {
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        let _ = self.refresh.send(());
+        // Coalesced: if a refresh is already queued, dropping duplicates is intentional.
+        let _ = self.refresh.try_send(());
     }
 
     fn get_info(&self) -> ClientConfig {
@@ -777,7 +781,7 @@ async fn connect_server(
     }
     let spec = &server.spec;
     let mut stop = stop_rx.clone();
-    let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
+    let (refresh_tx, mut refresh_rx) = mpsc::channel(REFRESH_QUEUE_CAP);
     let watchers: ResponseWatchers = Arc::new(Mutex::new(HashMap::new()));
     // Abandoning the start (timeout, or the client stopping) drops the process,
     // which kills it.

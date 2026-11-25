@@ -375,3 +375,141 @@ async fn waiting_threads_take_messages_and_can_be_stopped() {
     s.disconnect(device).await;
     s.cleanup();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handover_reports_failed_write_in_continuation_brief() {
+    let s = setup(
+        "ack-fail",
+        json!({"rules": [
+            {"system": ORCH, "last": "prepare two files on Laptop", "reply": [{"type": "tool_use", "name": "start_thread",
+                "input": {"title": "Two files", "device": "Laptop", "goal": "Prepare two files."}}]},
+            {"system": ORCH, "last": " done]", "reply": reply("All done.")},
+            {"system": HUB_PART, "last": "Define the next checkpoint", "reply": [
+                {"type": "tool_use", "name": "write_file", "input": {"path": "good.txt", "content": "ok"}},
+                {"type": "tool_use", "name": "write_file", "input": {"path": "blocked.txt", "content": "nope"}}
+            ]},
+            {"system": HUB_PART, "last": "wrote ", "reply": reply("Checkpoint: wrote good.txt and blocked.txt.")},
+            {"system": ON_LAPTOP, "last": "Continue from the checkpoint", "reply": reply("Finished with available files.")}
+        ], "default": reply("OK")}),
+    )
+    .await;
+    let conv = s.chat("please prepare two files on Laptop").await;
+    s.until_event(&conv, "the hub checkpoint", |e| matches!(e.body, EventBody::ThreadCheckpoint { .. })).await;
+    let t = s.only_thread(&conv);
+
+    // Pre-create a directory at blocked.txt in the device's thread workspace so writing it fails on the device.
+    std::fs::create_dir_all(s.device_workspaces().join(&t.id).join("blocked.txt")).unwrap();
+
+    let device = s.connect();
+    s.until("the thread finished on Laptop", || async { s.hub.db.thread(&t.id).unwrap().status == "done" }).await;
+    assert_eq!(read(&s.device_workspaces().join(&t.id).join("good.txt")), "ok");
+
+    let (files, skipped, brief) = s
+        .hub
+        .db
+        .events(&conv, 0, Some(&t.id))
+        .into_iter()
+        .find_map(|e| match e.body {
+            EventBody::ThreadHandedOver { files, skipped, brief, .. } => Some((files, skipped, brief)),
+            _ => None,
+        })
+        .expect("handed over");
+    assert_eq!(files, vec!["good.txt".to_string()]);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(skipped[0].starts_with("blocked.txt ("), "{skipped:?}");
+    assert!(brief.contains("- good.txt"), "{brief}");
+    assert!(!brief.contains("- blocked.txt"), "{brief}");
+    assert!(brief.contains("Not copied: blocked.txt ("), "{brief}");
+
+    s.disconnect(device).await;
+    s.cleanup();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handover_marks_unacknowledged_files_unconfirmed_on_timeout() {
+    use core_client::core_protocol::{HubMessage, NodeMessage, PROTOCOL_VERSION};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let s = setup(
+        "ack-timeout",
+        json!({"rules": [
+            {"system": ORCH, "last": "prepare a file on Laptop", "reply": [{"type": "tool_use", "name": "start_thread",
+                "input": {"title": "Legacy", "device": "Laptop", "goal": "Prepare a file."}}]},
+            {"system": HUB_PART, "last": "Define the next checkpoint", "reply": [
+                {"type": "tool_use", "name": "write_file", "input": {"path": "draft.txt", "content": "hello"}}
+            ]},
+            {"system": HUB_PART, "last": "wrote ", "reply": reply("Checkpoint: wrote draft.txt.")}
+        ], "default": reply("OK")}),
+    )
+    .await;
+    // Short ack timeout so the test runs quickly.
+    s.hub.set_handover_ack_timeout(Duration::from_millis(300));
+
+    let conv = s.chat("please prepare a file on Laptop").await;
+    s.until_event(&conv, "the hub checkpoint", |e| matches!(e.body, EventBody::ThreadCheckpoint { .. })).await;
+    let t = s.only_thread(&conv);
+
+    // Connect a minimal protocol v4 device that never sends WorkspaceFileResult.
+    let ws_url = core_client::core_protocol::connect_url(&s.url).unwrap();
+    let mut req = ws_url.into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {}", s.token).parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "legacy-v4".into() };
+    ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
+
+    // Wait for Welcome, then trigger hand_over directly (no MCP server needed for this mock socket).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(WsMsg::Text(text))) = ws.next().await {
+            if matches!(serde_json::from_str::<HubMessage>(&text), Ok(HubMessage::Welcome { .. })) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("welcomed");
+
+    let hub_clone = s.hub.clone();
+    let tid = t.id.clone();
+    tokio::spawn(async move { hub_clone.hand_over(&tid).await });
+
+    // Read WorkspaceFile (do NOT ack it) and wait for StartThread after timeout.
+    let mut saw_file = false;
+    let mut start_brief = None;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(WsMsg::Text(text))) = ws.next().await {
+            match serde_json::from_str::<HubMessage>(&text) {
+                Ok(HubMessage::WorkspaceFile { path, .. }) if path == "draft.txt" => saw_file = true,
+                Ok(HubMessage::StartThread { spec }) if spec.thread_id == t.id => {
+                    start_brief = Some(spec.brief);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("handover timed out to unconfirmed and started thread");
+
+    assert!(saw_file);
+    let brief = start_brief.unwrap();
+    assert!(brief.contains("Unconfirmed (device did not acknowledge): draft.txt."), "{brief}");
+    assert!(!brief.contains("- draft.txt"), "{brief}");
+
+    let (files, skipped) = s
+        .hub
+        .db
+        .events(&conv, 0, Some(&t.id))
+        .into_iter()
+        .find_map(|e| match e.body {
+            EventBody::ThreadHandedOver { files, skipped, .. } => Some((files, skipped)),
+            _ => None,
+        })
+        .expect("handed over");
+    assert!(files.is_empty(), "{files:?}");
+    assert_eq!(skipped, vec!["draft.txt (unconfirmed)".to_string()]);
+
+    let _ = ws.close(None).await;
+    s.cleanup();
+}

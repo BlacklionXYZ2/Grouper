@@ -14,13 +14,14 @@ use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use core_agent::thread::ThreadControl;
 use core_protocol::{
-    ChatRequest, ChatResponse, DeviceInfo, Event, EventBody, HubMessage, IDLE_TIMEOUT_SECS, ModelEntry,
-    NodeMessage, PROTOCOL_VERSION, Permission, ProviderConfig, ProviderInfo, ToolCallRequest, ToolDef, ToolSummary,
+    ChatRequest, ChatResponse, DeviceInfo, Event, EventBody, HubMessage, IDLE_TIMEOUT_SECS, MAX_WS_MESSAGE_BYTES,
+    ModelEntry, NodeMessage, PROTOCOL_VERSION, Permission, ProviderConfig, ProviderInfo, ToolCallRequest, ToolDef,
+    ToolSummary,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 use crate::db::{Auth, Db};
 use crate::mcp::McpSession;
@@ -28,17 +29,53 @@ use crate::orchestrator::Wake;
 
 const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum outgoing frames buffered per device connection before dropping a slow peer.
+pub(crate) const CONN_QUEUE_CAP: usize = 1024;
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// The hub's own id in the device and tool registries.
 pub const HUB_DEVICE: &str = "hub";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseReason {
+    Replaced,
+    Overflow,
+}
+
+/// One-shot trigger to close a live device session from outside its read loop.
+#[derive(Clone)]
+pub(crate) struct CloseHandle(Arc<std::sync::Mutex<Option<oneshot::Sender<CloseReason>>>>);
+
+impl CloseHandle {
+    pub(crate) fn new() -> (Self, oneshot::Receiver<CloseReason>) {
+        let (tx, rx) = oneshot::channel();
+        (Self(Arc::new(std::sync::Mutex::new(Some(tx)))), rx)
+    }
+
+    pub(crate) fn trigger(&self, reason: CloseReason) {
+        if let Some(tx) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = tx.send(reason);
+        }
+    }
+}
+
 pub(crate) struct Live {
     pub(crate) conn_id: u64,
-    pub(crate) tx: mpsc::UnboundedSender<HubMessage>,
+    pub(crate) tx: mpsc::Sender<HubMessage>,
     /// The device's tools, as its MCP server last listed them.
     pub(crate) tools: Vec<ToolDef>,
     /// The hub's MCP client for this connection, once initialized.
     pub(crate) mcp: Option<rmcp::Peer<rmcp::RoleClient>>,
+    pub(crate) close: CloseHandle,
+    /// Becomes `true` once the session has sent any final error, dropped its writer and aborted its tasks.
+    pub(crate) closed: watch::Receiver<bool>,
+}
+
+/// Where to deliver `WorkspaceFileResult` frames for an in-flight hand-over.
+pub(crate) struct HandoverAckRoute {
+    pub(crate) device_id: String,
+    pub(crate) conn_id: u64,
+    pub(crate) tx: mpsc::Sender<(String, bool, Option<String>)>,
 }
 
 /// Where to send the answer to an approval request.
@@ -55,6 +92,8 @@ pub struct Hub {
     pub data_dir: PathBuf,
     pub(crate) live: Mutex<HashMap<String, Live>>,
     pub(crate) approvals: Mutex<HashMap<String, ApprovalRoute>>,
+    pub(crate) handover_acks: Mutex<HashMap<String, HandoverAckRoute>>,
+    handover_ack_timeout: std::sync::Mutex<Duration>,
     pub(crate) hub_threads: Mutex<HashMap<String, ThreadControl>>,
     pub(crate) orchestrators: Mutex<HashMap<String, mpsc::UnboundedSender<Wake>>>,
     events: broadcast::Sender<Event>,
@@ -69,6 +108,8 @@ impl Hub {
             data_dir,
             live: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
+            handover_acks: Mutex::new(HashMap::new()),
+            handover_ack_timeout: std::sync::Mutex::new(crate::offline::HANDOVER_ACK_TIMEOUT),
             hub_threads: Mutex::new(HashMap::new()),
             orchestrators: Mutex::new(HashMap::new()),
             // Roomy: streamed text sends many small events.
@@ -76,6 +117,15 @@ impl Hub {
             next_id: AtomicU64::new(1),
             limits: Default::default(),
         })
+    }
+
+    /// Override how long a hand-over waits for `WorkspaceFileResult` acknowledgements.
+    pub fn set_handover_ack_timeout(&self, timeout: Duration) {
+        *self.handover_ack_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
+    }
+
+    pub(crate) fn handover_ack_timeout(&self) -> Duration {
+        *self.handover_ack_timeout.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Store an event and send it to everyone watching.
@@ -135,13 +185,80 @@ impl Hub {
         device_id == HUB_DEVICE || self.live.lock().await.contains_key(device_id)
     }
 
+    pub(crate) async fn is_live_conn(&self, device_id: &str, conn_id: u64) -> bool {
+        self.live.lock().await.get(device_id).is_some_and(|l| l.conn_id == conn_id)
+    }
+
     pub async fn send_to(&self, device_id: &str, msg: HubMessage) -> bool {
-        self.live.lock().await.get(device_id).is_some_and(|l| l.tx.send(msg).is_ok())
+        let mut live = self.live.lock().await;
+        let Some(l) = live.get(device_id) else { return false };
+        match l.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(device = %device_id, conn_id = l.conn_id, "connection queue full; dropping slow peer");
+                if let Some(dropped) = live.remove(device_id) {
+                    dropped.close.trigger(CloseReason::Overflow);
+                }
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    pub(crate) async fn send_to_conn(&self, device_id: &str, conn_id: u64, msg: HubMessage) -> bool {
+        let mut live = self.live.lock().await;
+        let Some(l) = live.get(device_id).filter(|l| l.conn_id == conn_id) else { return false };
+        match l.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(device = %device_id, conn_id, "connection queue full; dropping slow peer");
+                if let Some(dropped) = live.remove(device_id) {
+                    dropped.close.trigger(CloseReason::Overflow);
+                }
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 
     async fn broadcast(&self, msg: HubMessage) {
-        for l in self.live.lock().await.values() {
-            let _ = l.tx.send(msg.clone());
+        let mut live = self.live.lock().await;
+        let mut overflowed = Vec::new();
+        for (device_id, l) in live.iter() {
+            if let Err(mpsc::error::TrySendError::Full(_)) = l.tx.try_send(msg.clone()) {
+                tracing::warn!(
+                    device = %device_id,
+                    conn_id = l.conn_id,
+                    "connection queue full during broadcast; dropping slow peer"
+                );
+                overflowed.push(device_id.clone());
+            }
+        }
+        for device_id in overflowed {
+            if let Some(dropped) = live.remove(&device_id) {
+                dropped.close.trigger(CloseReason::Overflow);
+            }
+        }
+    }
+
+    pub(crate) async fn workspace_file_result(
+        &self,
+        device_id: &str,
+        conn_id: u64,
+        thread_id: &str,
+        path: String,
+        ok: bool,
+        error: Option<String>,
+    ) {
+        let tx = self
+            .handover_acks
+            .lock()
+            .await
+            .get(thread_id)
+            .filter(|r| r.device_id == device_id && r.conn_id == conn_id)
+            .map(|r| r.tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.try_send((path, ok, error));
         }
     }
 
@@ -581,7 +698,9 @@ async fn events_ws(
     authed!(hub, headers);
     let mut last_seq = hub.db.last_event_seq();
     let mut rx = hub.events.subscribe();
-    ws.on_upgrade(move |mut socket| async move {
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |mut socket| async move {
         loop {
             tokio::select! {
                 e = rx.recv() => match e {
@@ -630,11 +749,13 @@ async fn events_ws(
 
 async fn connect(State(hub): State<Arc<Hub>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     let device_id = authed!(hub, headers).device_id;
-    ws.on_upgrade(move |socket| async move {
-        if let Err(e) = session(hub, device_id.clone(), socket).await {
-            tracing::info!(device = %device_id, "session ended: {e}");
-        }
-    })
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            if let Err(e) = session(hub, device_id.clone(), socket).await {
+                tracing::info!(device = %device_id, "session ended: {e}");
+            }
+        })
 }
 
 async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<(), String> {
@@ -663,41 +784,94 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     }
 
     let providers = hub.db.providers().map_err(|error| error.to_string())?;
-    let conn_id = hub.next_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, mut rx) = mpsc::unbounded_channel::<HubMessage>();
-    // A device runs one connection: threads still marked running from an earlier one
-    // (dropped without the hub noticing yet) died with it on the device.
-    let orphans = hub.db.running_threads_on(&device_id);
-    hub.live.lock().await.insert(device_id.clone(), Live { conn_id, tx: tx.clone(), tools: Vec::new(), mcp: None });
+    // Close any live connection for this device before registering the new one and
+    // before collecting orphan threads, so old tasks stop and cannot race the new session.
+    let (conn_id, tx, mut rx, close_handle, mut close_rx, closed_tx, orphans) = loop {
+        let mut live = hub.live.lock().await;
+        if let Some(mut old) = live.remove(&device_id) {
+            drop(live);
+            old.close.trigger(CloseReason::Replaced);
+            let _ = tokio::time::timeout(Duration::from_secs(2), old.closed.wait_for(|done| *done)).await;
+            hub.approvals.lock().await.retain(|_, r| r.device_id != device_id);
+            continue;
+        }
+        let conn_id = hub.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel::<HubMessage>(CONN_QUEUE_CAP);
+        let (close_handle, close_rx) = CloseHandle::new();
+        let (closed_tx, closed_rx) = watch::channel(false);
+        // A device runs one connection: threads still marked running from an earlier one
+        // died with it on the device (and any live older connection is now closed).
+        let orphans = hub.db.running_threads_on(&device_id);
+        live.insert(
+            device_id.clone(),
+            Live {
+                conn_id,
+                tx: tx.clone(),
+                tools: Vec::new(),
+                mcp: None,
+                close: close_handle.clone(),
+                closed: closed_rx,
+            },
+        );
+        break (conn_id, tx, rx, close_handle, close_rx, closed_tx, orphans);
+    };
     hub.db.touch(&device_id);
-    let _ = tx.send(HubMessage::Welcome {
+    let _ = tx.try_send(HubMessage::Welcome {
         device_id: device_id.clone(),
         hub_version: HUB_VERSION.into(),
         protocol_version: PROTOCOL_VERSION,
     });
-    let _ = tx.send(HubMessage::Providers { providers });
+    let _ = tx.try_send(HubMessage::Providers { providers });
     hub.broadcast_presence().await;
     // The hub's MCP client: lists the device's tools now and on every change.
-    let mcp = McpSession::start(&hub, device_id.clone(), conn_id, tx.clone());
+    let mcp = McpSession::start(&hub, device_id.clone(), conn_id, tx.clone(), close_handle);
     // Threads waiting for this device continue here once its tools are known.
     tokio::spawn(crate::offline::device_connected(Arc::downgrade(&hub), device_id.clone(), conn_id, orphans));
 
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let text = serde_json::to_string(&msg).expect("serialize");
-            if sink.send(Message::Text(text.into())).await.is_err() {
-                break;
+    let (writer_close_tx, mut writer_close_rx) = oneshot::channel::<Option<HubMessage>>();
+    let mut writer = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                final_msg = &mut writer_close_rx => {
+                    if let Ok(Some(msg)) = final_msg {
+                        let text = serde_json::to_string(&msg).expect("serialize");
+                        let _ = tokio::time::timeout(CLOSE_GRACE, sink.send(Message::Text(text.into()))).await;
+                    }
+                    break;
+                }
+                msg = rx.recv() => match msg {
+                    Some(msg) => {
+                        let text = serde_json::to_string(&msg).expect("serialize");
+                        if sink.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
             }
         }
-        let _ = sink.close().await;
+        let _ = tokio::time::timeout(CLOSE_GRACE, sink.close()).await;
     });
 
+    let mut close_reason: Option<CloseReason> = None;
     let result = loop {
-        let next = match tokio::time::timeout(Duration::from_secs(IDLE_TIMEOUT_SECS), stream.next()).await {
-            Err(_) => break Err("idle timeout".to_string()),
-            Ok(None) => break Ok(()),
-            Ok(Some(Err(e))) => break Err(e.to_string()),
-            Ok(Some(Ok(m))) => m,
+        let next = tokio::select! {
+            biased;
+            reason = &mut close_rx => {
+                let r = reason.unwrap_or(CloseReason::Replaced);
+                close_reason = Some(r);
+                break Err(match r {
+                    CloseReason::Replaced => "replaced by a newer connection".to_string(),
+                    CloseReason::Overflow => "connection queue full".to_string(),
+                });
+            }
+            next = tokio::time::timeout(Duration::from_secs(IDLE_TIMEOUT_SECS), stream.next()) => match next {
+                Err(_) => break Err("idle timeout".to_string()),
+                Ok(None) => break Ok(()),
+                Ok(Some(Err(e))) => break Err(e.to_string()),
+                Ok(Some(Ok(m))) => m,
+            }
         };
         let text = match next {
             Message::Text(t) => t,
@@ -706,59 +880,104 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
         };
         match serde_json::from_str::<NodeMessage>(&text) {
             Ok(NodeMessage::Ping) => {
-                let _ = tx.send(HubMessage::Pong);
+                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(HubMessage::Pong) {
+                    close_reason = Some(CloseReason::Overflow);
+                    break Err("connection queue full".to_string());
+                }
             }
             Ok(NodeMessage::Mcp { message }) => {
-                let _ = mcp.incoming.send(message);
-            }
-            Ok(NodeMessage::ThreadEvent { thread_id, event }) => {
-                if hub.owns_thread(&device_id, &thread_id) {
-                    hub.thread_event(&thread_id, event);
+                if hub.is_live_conn(&device_id, conn_id).await
+                    && let Err(mpsc::error::TrySendError::Full(_)) = mcp.incoming.try_send(message)
+                {
+                    close_reason = Some(CloseReason::Overflow);
+                    break Err("MCP incoming queue full".to_string());
                 }
             }
-            Ok(NodeMessage::ThreadFinished { thread_id, ok, summary }) => {
-                if hub.owns_thread(&device_id, &thread_id) {
-                    hub.thread_finished(&thread_id, ok, &summary).await;
-                }
+            Ok(
+                msg @ (NodeMessage::ThreadEvent { .. }
+                | NodeMessage::ThreadFinished { .. }
+                | NodeMessage::ApprovalRequest { .. }
+                | NodeMessage::AskOrchestrator { .. }),
+            ) => {
+                handle_thread_frame(&hub, &device_id, conn_id, msg).await;
             }
-            Ok(NodeMessage::ApprovalRequest { approval_id, thread_id, tool, input, reason }) => {
-                if hub.owns_thread(&device_id, &thread_id) {
-                    hub.request_approval(&device_id, &thread_id, &approval_id, &tool, input, &reason, None).await;
-                }
-            }
-            Ok(NodeMessage::AskOrchestrator { thread_id, question }) => {
-                if hub.owns_thread(&device_id, &thread_id) {
-                    hub.thread_ask(&thread_id, &question).await;
+            Ok(NodeMessage::WorkspaceFileResult { thread_id, path, ok, error }) => {
+                if hub.is_live_conn(&device_id, conn_id).await {
+                    hub.workspace_file_result(&device_id, conn_id, &thread_id, path, ok, error).await;
                 }
             }
             Ok(NodeMessage::Hello { .. }) => {
-                let _ = tx.send(HubMessage::Error { message: "already said hello".into() });
+                if let Err(mpsc::error::TrySendError::Full(_)) =
+                    tx.try_send(HubMessage::Error { message: "already said hello".into() })
+                {
+                    close_reason = Some(CloseReason::Overflow);
+                    break Err("connection queue full".to_string());
+                }
             }
             Err(e) => {
-                let _ = tx.send(HubMessage::Error { message: format!("bad frame: {e}") });
+                if let Err(mpsc::error::TrySendError::Full(_)) =
+                    tx.try_send(HubMessage::Error { message: format!("bad frame: {e}") })
+                {
+                    close_reason = Some(CloseReason::Overflow);
+                    break Err("connection queue full".to_string());
+                }
             }
         }
     };
 
-    let replaced = {
+    let call_device_gone = {
         let mut live = hub.live.lock().await;
         if live.get(&device_id).is_some_and(|l| l.conn_id == conn_id) {
             live.remove(&device_id);
-            false
-        } else {
             true
+        } else {
+            matches!(close_reason, Some(CloseReason::Overflow)) && !live.contains_key(&device_id)
         }
     };
+    hub.handover_acks.lock().await.retain(|_, r| !(r.device_id == device_id && r.conn_id == conn_id));
     hub.db.touch(&device_id);
     drop(mcp);
+    let final_error = match close_reason {
+        Some(CloseReason::Replaced) => Some(HubMessage::Error { message: "replaced by a newer connection".into() }),
+        Some(CloseReason::Overflow) => Some(HubMessage::Error { message: "connection queue full".into() }),
+        None => None,
+    };
+    let _ = writer_close_tx.send(final_error);
     drop(tx);
-    writer.abort();
-    if !replaced {
-        hub.device_gone(&device_id).await;
+    if tokio::time::timeout(CLOSE_GRACE + Duration::from_millis(200), &mut writer).await.is_err() {
+        writer.abort();
     }
-    hub.broadcast_presence().await;
+    let _ = closed_tx.send(true);
+    if call_device_gone {
+        hub.device_gone(&device_id).await;
+        hub.broadcast_presence().await;
+    }
     tracing::info!(device = %device_id, "disconnected");
     result
+}
+
+/// Process a device thread frame only when `conn_id` is still the live connection for `device_id`.
+async fn handle_thread_frame(hub: &Arc<Hub>, device_id: &str, conn_id: u64, msg: NodeMessage) {
+    if !hub.is_live_conn(device_id, conn_id).await {
+        return;
+    }
+    match msg {
+        NodeMessage::ThreadEvent { thread_id, event } if hub.owns_thread(device_id, &thread_id) => {
+            hub.thread_event(&thread_id, event);
+        }
+        NodeMessage::ThreadFinished { thread_id, ok, summary } if hub.owns_thread(device_id, &thread_id) => {
+            hub.thread_finished(&thread_id, ok, &summary).await;
+        }
+        NodeMessage::ApprovalRequest { approval_id, thread_id, tool, input, reason }
+            if hub.owns_thread(device_id, &thread_id) =>
+        {
+            hub.request_approval(device_id, &thread_id, &approval_id, &tool, input, &reason, None).await;
+        }
+        NodeMessage::AskOrchestrator { thread_id, question } if hub.owns_thread(device_id, &thread_id) => {
+            hub.thread_ask(&thread_id, &question).await;
+        }
+        _ => {}
+    }
 }
 
 // ---- long-term memory (personal, so admin only, reads included)
@@ -1106,6 +1325,216 @@ mod tests {
             matches!(&event.body, EventBody::Error { message } if message.contains("not in the registry"))
         })
         .await;
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn replaced_connection_closes_old_and_ignores_stale_thread_frames() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let dir = std::env::temp_dir().join(format!("grouper-replace-test-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (device, token) = db.add_device("Laptop", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let ws_connect = |token: String| async move {
+            let mut req = format!("ws://{addr}{}", core_protocol::CONNECT_PATH).into_client_request().unwrap();
+            req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into() };
+            ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
+            ws
+        };
+
+        let mut ws1 = ws_connect(token.clone()).await;
+        // Wait for Welcome on ws1.
+        let mut welcomed = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(WsMsg::Text(t))) = ws1.next().await {
+                if matches!(serde_json::from_str::<HubMessage>(&t), Ok(HubMessage::Welcome { .. })) {
+                    welcomed = true;
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ws1 welcomed");
+        assert!(welcomed);
+        let conn1 = hub.live.lock().await.get(&device.id).unwrap().conn_id;
+
+        // Create a running thread on this device before ws2 connects.
+        let conv = hub.db.create_conversation("project", "test").unwrap();
+        let thread = hub.db.create_thread(&conv, "T", &device.id, "m", None, "brief").unwrap();
+
+        // Connect ws2 on the same token.
+        let mut ws2 = ws_connect(token.clone()).await;
+
+        // ws1 must receive the replaced Error frame and then close.
+        let mut saw_replaced_error = false;
+        let mut saw_close = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws1.next().await {
+                    Some(Ok(WsMsg::Text(t))) => {
+                        if let Ok(HubMessage::Error { message }) = serde_json::from_str::<HubMessage>(&t)
+                            && message.contains("replaced by a newer connection")
+                        {
+                            saw_replaced_error = true;
+                        }
+                    }
+                    Some(Ok(WsMsg::Close(_))) | None => {
+                        saw_close = true;
+                        break;
+                    }
+                    Some(Err(_)) => {
+                        saw_close = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("ws1 closed after replacement");
+        assert!(saw_replaced_error, "ws1 must receive replaced error frame");
+        assert!(saw_close, "ws1 must close");
+
+        // ws2 receives Welcome and owns the live entry with a newer conn_id.
+        let mut ws2_welcomed = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(WsMsg::Text(t))) = ws2.next().await {
+                if matches!(serde_json::from_str::<HubMessage>(&t), Ok(HubMessage::Welcome { .. })) {
+                    ws2_welcomed = true;
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ws2 welcomed");
+        assert!(ws2_welcomed);
+        let conn2 = hub.live.lock().await.get(&device.id).unwrap().conn_id;
+        assert_ne!(conn1, conn2);
+
+        // Orphan thread from conn1 becomes waiting_device.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hub.db.thread(&thread.id).unwrap().status != crate::offline::WAITING_DEVICE {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("orphan marked waiting_device");
+
+        // Thread frames from the stale conn_id (conn1) are ignored, while conn2's work.
+        let fresh_thread = hub.db.create_thread(&conv, "T2", &device.id, "m", None, "brief").unwrap();
+        let before_events = hub.db.events(&conv, 0, Some(&fresh_thread.id)).len();
+        handle_thread_frame(
+            &hub,
+            &device.id,
+            conn1,
+            NodeMessage::ThreadEvent { thread_id: fresh_thread.id.clone(), event: AgentEvent::Text { text: "stale".into() } },
+        )
+        .await;
+        handle_thread_frame(
+            &hub,
+            &device.id,
+            conn1,
+            NodeMessage::ApprovalRequest {
+                approval_id: "stale-a1".into(),
+                thread_id: fresh_thread.id.clone(),
+                tool: "run_shell".into(),
+                input: json!({}),
+                reason: "stale".into(),
+            },
+        )
+        .await;
+        handle_thread_frame(
+            &hub,
+            &device.id,
+            conn1,
+            NodeMessage::AskOrchestrator { thread_id: fresh_thread.id.clone(), question: "stale?".into() },
+        )
+        .await;
+        handle_thread_frame(
+            &hub,
+            &device.id,
+            conn1,
+            NodeMessage::ThreadFinished { thread_id: fresh_thread.id.clone(), ok: false, summary: "stale".into() },
+        )
+        .await;
+        assert_eq!(hub.db.events(&conv, 0, Some(&fresh_thread.id)).len(), before_events);
+        assert_eq!(hub.db.thread(&fresh_thread.id).unwrap().status, "running");
+        assert!(hub.approvals.lock().await.is_empty());
+
+        // Same ThreadEvent from the live conn2 is accepted.
+        handle_thread_frame(
+            &hub,
+            &device.id,
+            conn2,
+            NodeMessage::ThreadEvent { thread_id: fresh_thread.id.clone(), event: AgentEvent::Text { text: "live".into() } },
+        )
+        .await;
+        assert_eq!(hub.db.events(&conv, 0, Some(&fresh_thread.id)).len(), before_events + 1);
+
+        let _ = ws2.close(None).await;
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn slow_peer_queue_overflow_drops_connection_without_blocking() {
+        let dir = std::env::temp_dir().join(format!("grouper-overflow-test-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (device, _) = db.add_device("Slow", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+
+        let (tx, _rx) = mpsc::channel(2);
+        let (close, mut close_rx) = CloseHandle::new();
+        let (_closed_tx, closed_rx) = watch::channel(false);
+        hub.live.lock().await.insert(
+            device.id.clone(),
+            Live { conn_id: 1, tx, tools: Vec::new(), mcp: None, close, closed: closed_rx },
+        );
+
+        assert!(hub.send_to(&device.id, HubMessage::Pong).await);
+        assert!(hub.send_to(&device.id, HubMessage::Pong).await);
+        // Third message overflows the bounded queue: returns false immediately, evicts peer, signals Overflow.
+        assert!(!hub.send_to(&device.id, HubMessage::Pong).await);
+        assert!(!hub.is_online(&device.id).await);
+        assert_eq!(close_rx.try_recv().ok(), Some(CloseReason::Overflow));
+
+        // Same for broadcast: slow peer dropped, healthy peer keeps receiving.
+        let (other, _) = hub.db.add_device("Fast", "linux", false).unwrap();
+        let (slow_tx, _slow_rx) = mpsc::channel(1);
+        let (slow_close, mut slow_close_rx) = CloseHandle::new();
+        let (_s_tx, s_rx) = watch::channel(false);
+        let (fast_tx, mut fast_rx) = mpsc::channel(4);
+        let (fast_close, _fast_close_rx) = CloseHandle::new();
+        let (_f_tx, f_rx) = watch::channel(false);
+        {
+            let mut live = hub.live.lock().await;
+            live.insert(
+                device.id.clone(),
+                Live { conn_id: 2, tx: slow_tx, tools: Vec::new(), mcp: None, close: slow_close, closed: s_rx },
+            );
+            live.insert(
+                other.id.clone(),
+                Live { conn_id: 3, tx: fast_tx, tools: Vec::new(), mcp: None, close: fast_close, closed: f_rx },
+            );
+        }
+        hub.broadcast(HubMessage::Pong).await;
+        hub.broadcast(HubMessage::Pong).await;
+        assert!(!hub.is_online(&device.id).await);
+        assert!(hub.is_online(&other.id).await);
+        assert_eq!(slow_close_rx.try_recv().ok(), Some(CloseReason::Overflow));
+        assert!(fast_rx.try_recv().is_ok());
+        assert!(fast_rx.try_recv().is_ok());
 
         drop(hub);
         std::fs::remove_dir_all(dir).ok();
