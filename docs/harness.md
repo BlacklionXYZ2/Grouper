@@ -168,10 +168,16 @@ can be pinned to a model.
 Later: limits on threads and spending,
 sandboxing hub threads (file tools only until then), the Swift apps, and a web client.
 
+## Limits and timeouts
+
+All off until you set them (`grouper limits set <key> <value|off>`): running threads
+(account, per device), budgets per thread, conversation and UTC day (with a warning at
+80 %), how long an approval waits before it's denied or the thread stopped, and how long
+`ask_orchestrator` waits (30 minutes by default). Spend is estimated from the registry's
+prices.
+
 ## Known gaps
 
-- Approvals have no timeout; a thread waits until you answer or stop it.
-- No limit yet on how many threads run at once, or on spending.
 - Auto's shell rules are a blocklist: they ask more than needed for ordinary words, and
   obfuscated commands can get past them. Use Manual for shells you don't trust.
 - Model routing judges "local" from the hub's view of a provider URL, not the device's.
@@ -179,5 +185,4 @@ sandboxing hub threads (file tools only until then), the Swift apps, and a web c
 ## Open questions
 
 - Should a web client come first, to design the screens before the native apps?
-- How long does a thread's `ask_orchestrator` wait before giving up?
-- Spending limits per thread, per conversation and per day.
+- What values do you want for limits, budgets and timeouts? (Mechanisms exist; all off.)

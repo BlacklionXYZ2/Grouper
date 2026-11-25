@@ -118,6 +118,7 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 | `grouper memory list\|add\|edit\|forget` | Long-term memory |
 | `grouper skills list\|show\|forget` | Saved skills |
 | `grouper usage [--by day\|provider\|model\|conversation]`, `grouper usage balances` | Tokens, cost and provider balances |
+| `grouper limits`, `grouper limits set <key> <value\|off>` | Thread caps, budgets, approval and ask timeouts (all off by default) |
 | `grouper devices`, `grouper call <device> <tool>` | Presence and direct device tools |
 
 ## Swift demo node
