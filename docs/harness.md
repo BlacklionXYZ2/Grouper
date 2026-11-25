@@ -63,7 +63,11 @@ The orchestrator starts a thread with a **brief**, not a transcript:
   workspace files over (approval first if `write_file` is Manual) and the same thread
   continues on the device from the checkpoint. A device that drops mid-thread goes the same
   way, with its progress so far added to the brief.
-- **Workspace:** each thread gets its own folder on the device it runs on.
+- **Workspace:** each thread gets its own folder on the device it runs on. A device can
+  also offer **scoped folders** (`@name/...`, read or read/write) for real work on your
+  files; reads run on Auto, writes and shells there ask.
+- **Files back:** `grouper files <thread>` lists and downloads a thread's output from its
+  device; the orchestrator can quote one with `read_thread_file`.
 - **Needs another device?** A thread calls `ask_orchestrator`. The orchestrator
   either answers itself (for example by checking `list_devices`) or starts another
   thread, then replies with `message_thread`.

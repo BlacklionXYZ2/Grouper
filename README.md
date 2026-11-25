@@ -100,7 +100,8 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 | Command | Does |
 |---|---|
 | `grouper login --hub <url>`, `grouper logout` | Store this device's token (DPAPI / Keychain), so `GROUPER_TOKEN` isn't needed |
-| `grouper connect` | Be a device: stay online, run threads here (`--workspace`, `--no-shell`, `--mcp-config`) |
+| `grouper connect` | Be a device: stay online, run threads here (`--workspace`, `--no-shell`, `--mcp-config`, `--folder name=path[:rw]`) |
+| `grouper files <thread> [<path> -o out]` | List or download a thread's output files, from whichever device it ran on |
 | `grouper chat "…"` (`-c <id>`, `--standard`) | Talk to Grouper; prints replies and thread activity |
 | `grouper watch` | Live events from every conversation |
 | `grouper threads`, `grouper log <conversation>` | Threads and history |
@@ -130,6 +131,15 @@ cd apple/GrouperKit && GROUPER_TOKEN=<token> swift run grouper-mac
 
 See [deploy/README.md](deploy/README.md): a Hyper-V VM made by script, the hub in
 Docker, and a Cloudflare Tunnel to `https://grouper.clockmillbarn.uk`.
+
+## Scoped folders
+
+Threads normally see only their own workspace. To let them reach real folders on a
+device, list them in `<config dir>/grouper/folders.json` or with `grouper connect --folder
+projects=C:\Users\you\Documents\GitHub:rw` (read-only unless `:rw`). Threads use
+`@projects/...` paths. On Auto, reads there run; writes, a shell started there, or a CLI
+agent working there ask you first. Paths never leave the device; the hub only sees names
+and modes.
 
 ## Permissions for CLI agents
 
