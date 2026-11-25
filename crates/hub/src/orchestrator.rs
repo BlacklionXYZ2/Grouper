@@ -179,11 +179,15 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     let role = if project { "orchestrator" } else { "standard" };
     let chosen = match hub.db.conversation_model(conversation_id) {
         Ok(model) => model,
+        // The conversation's chosen model was removed from the registry: say so and
+        // carry on with the role default rather than failing every turn.
         Err(e) => {
-            finish(hub, &history);
-            hub.emit(conversation_id, None, EventBody::Error { message: e.to_string() });
-            hub.emit(conversation_id, None, EventBody::TurnFinished { running_threads: 0 });
-            return;
+            hub.emit(
+                conversation_id,
+                None,
+                EventBody::Error { message: format!("{e:#}; using the default model instead") },
+            );
+            None
         }
     };
     let Some(model) = chosen.or_else(|| hub.db.default_model(role)) else {
