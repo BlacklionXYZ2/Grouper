@@ -93,7 +93,7 @@ impl OpenAi {
                 .tools
                 .iter()
                 .map(|t| json!({"type": "function", "function": {
-                    "name": t.name, "description": t.description, "parameters": t.input_schema
+                    "name": t.name, "description": t.description, "parameters": strict_parameters(&t.input_schema)
                 }}))
                 .collect::<Vec<_>>());
         }
@@ -307,9 +307,37 @@ impl Provider for OpenAi {
     }
 }
 
+/// Some OpenAI-compatible servers (LM Studio, strict validators) reject a function whose
+/// parameters are an object schema without `properties`, or aren't an object at all.
+/// Send `{"type": "object", "properties": {}}` plus whatever else the schema had.
+fn strict_parameters(schema: &Value) -> Value {
+    let mut out = match schema {
+        Value::Object(map) => Value::Object(map.clone()),
+        _ => json!({}),
+    };
+    if out.get("type").is_none() {
+        out["type"] = json!("object");
+    }
+    if out.get("type") == Some(&json!("object")) && !out.get("properties").is_some_and(Value::is_object) {
+        out["properties"] = json!({});
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameters_always_have_properties() {
+        assert_eq!(
+            strict_parameters(&json!({"type": "object", "additionalProperties": true})),
+            json!({"type": "object", "additionalProperties": true, "properties": {}})
+        );
+        assert_eq!(strict_parameters(&Value::Null), json!({"type": "object", "properties": {}}));
+        let full = json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]});
+        assert_eq!(strict_parameters(&full), full);
+    }
 
     #[test]
     fn tool_round_trip_shape() {

@@ -103,11 +103,12 @@ that handled each step. Matching skills arrive in a [Skills] block; reuse one in
 then update_skill (worked: true, plus what changed).
 
 Messages in [brackets] are from Grouper (threads finishing, questions, the user stepping in, status, memories, \
-skills), not typed by the user.";
+skills), not typed by the user. Never write such bracketed blocks yourself; to save a memory, call remember.";
 
 const STANDARD_SYSTEM: &str = "You are Grouper, a helpful personal assistant. Answer directly and concisely. \
 A [Memory] block at the end of a message holds notes saved earlier about the user and their projects, added by \
-Grouper rather than typed by the user; use them when relevant.";
+Grouper rather than typed by the user; use them when relevant. Never write a [Memory] block or any other \
+bracketed note yourself: reply only with your answer.";
 
 impl Hub {
     /// Deliver something to a conversation's worker, starting the worker if needed.
