@@ -401,6 +401,26 @@ mod tests {
         assert_eq!(collector(&provider(Some("https://openrouter.ai/api/v1"), None)), None);
     }
 
+    #[tokio::test]
+    async fn refresh_skips_when_no_provider_matches() {
+        let dir = std::env::temp_dir().join(format!("grouper-usage-skip-test-{}", random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "other".into(),
+            kind: "openai".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            api_key: Some("not-sent".into()),
+            options: Value::Null,
+        })
+        .unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let result = refresh(&hub).await;
+        assert_eq!(result.providers_checked, 0);
+        assert_eq!(result.snapshots_stored, 0);
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn aggregates_orchestrator_and_thread_usage_from_the_database() {
         let dir = std::env::temp_dir().join(format!("grouper-usage-test-{}", random_hex(4)));
