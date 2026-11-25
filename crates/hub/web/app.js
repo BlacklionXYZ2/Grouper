@@ -13,7 +13,7 @@
 
 import { h, icon, setChildren, syncList, setText, setAttr } from './lib/dom.js';
 import { get, onApiError } from './lib/api.js';
-import { store, on, emit, pendingApprovals } from './lib/store.js';
+import { store, on, emit, pendingApprovals, resetStore } from './lib/store.js';
 import { startLive, stopLive, loadConversations, loadThreads, loadDevices, loadModels, scanApprovals } from './lib/live.js';
 import { closeDrawer, navigate, syncInert } from './lib/ui.js';
 import { ago, isActive } from './lib/format.js';
@@ -123,7 +123,7 @@ function startApp() {
 /** The session ended on the hub (expired, logged out elsewhere, token revoked). */
 export function signedOut() {
   stopLive();
-  store.me = null;
+  resetStore();
   mainCleanup?.();
   inspectorCleanup?.();
   mainCleanup = inspectorCleanup = null;

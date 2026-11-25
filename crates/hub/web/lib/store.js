@@ -20,6 +20,23 @@ export const store = {
   pendingProposals: 0,
 };
 
+/** Forget everything the last session loaded, so another sign-in starts clean. */
+export function resetStore() {
+  Object.assign(store, {
+    me: null,
+    hub: null,
+    online: false,
+    everOnline: false,
+    devices: [],
+    devicesAt: 0,
+    conversations: [],
+    models: [],
+    pendingProposals: 0,
+  });
+  for (const key of ['threads', 'convs', 'drafts', 'live', 'approvals']) store[key].clear();
+  for (const key of ['replying', 'answered']) store[key].clear();
+}
+
 const subs = new Map();
 
 /** Subscribe to a topic; returns an unsubscribe function. */
