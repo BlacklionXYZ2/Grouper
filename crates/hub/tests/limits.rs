@@ -131,7 +131,7 @@ async fn a_thread_is_stopped_at_its_budget_and_the_orchestrator_is_told() {
     assert_eq!((warnings[0].0.as_deref(), warnings[0].1.as_str(), warnings[0].3), (Some(t.id.as_str()), "thread", 0.05));
     assert!((warnings[0].2 - 0.04).abs() < 1e-9);
     // The orchestrator saw the budget on start_thread's result and the stop as a wake-up.
-    let history = serde_json::to_string(&hub.db.history(&conv)).unwrap();
+    let history = saved_history(&hub, &conv, "Budget stop noted.").await;
     assert!(history.contains(r#"\"budget_usd\": 0.05"#), "{history}");
     assert!(history.contains("stopped]") && history.contains("Stopped: budget of $0.05 reached"), "{history}");
     assert!(history.contains("Limits (spend is estimated, USD): $0.05 per thread."), "status line: {history}");
@@ -158,7 +158,7 @@ async fn a_second_thread_is_refused_at_the_running_thread_cap() {
     let threads = hub.db.threads(Some(&conv));
     assert_eq!(threads.len(), 1, "both start_thread calls ran in parallel; only one may start: {threads:?}");
     assert_eq!(threads[0].status, "running");
-    let history = serde_json::to_string(&hub.db.history(&conv)).unwrap();
+    let history = saved_history(&hub, &conv, "One was refused.").await;
     assert!(history.contains("Not started: 1 thread(s) already running"), "{history}");
 
     hub.stop_thread(&threads[0].id, "user").await.unwrap();
@@ -207,4 +207,18 @@ async fn a_spent_daily_budget_refuses_turns_until_it_is_raised() {
 
     drop(hub);
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// A turn's history is saved when the turn ends, just after its reply is streamed, so
+/// wait until it holds `needle` (or give up after 5 s and return what's there).
+async fn saved_history(hub: &std::sync::Arc<hub::server::Hub>, conv: &str, needle: &str) -> String {
+    let mut history = String::new();
+    for _ in 0..100 {
+        history = serde_json::to_string(&hub.db.history(conv)).unwrap();
+        if history.contains(needle) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    history
 }
