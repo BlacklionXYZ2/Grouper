@@ -162,7 +162,7 @@ struct Threads {
     /// Calls this device is executing for the hub, keyed by hub call id.
     model_tasks: Mutex<HashMap<String, watch::Sender<bool>>>,
     /// Calls a local thread asked the hub to relay, keyed by device call id.
-    model_waiters: Mutex<HashMap<String, mpsc::UnboundedSender<device_provider::ModelReply>>>,
+    model_waiters: Mutex<HashMap<String, device_provider::ModelWaiter>>,
     /// Random for each connection, so a reconnect cannot reuse an old approval id.
     approval_nonce: u64,
     next: AtomicU64,
@@ -303,7 +303,7 @@ fn start_thread(
     let Some(pcfg) = threads.providers.lock().unwrap().iter().find(|p| p.id == spec.provider_id).cloned() else {
         return fail(format!("This device has no provider {:?}.", spec.provider_id));
     };
-    let provider = match device_provider::build(&pcfg, threads) {
+    let provider = match device_provider::build(&pcfg, threads, &id) {
         Ok(p) => p,
         Err(e) => return fail(e.to_string()),
     };

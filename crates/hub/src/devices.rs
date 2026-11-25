@@ -304,6 +304,14 @@ mod tests {
         scripted(&db);
         let (mac, _) = db.add_device("MacBook", "macos", false).unwrap();
         let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "gpu-host".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"via_device": pc.id, "inline": {"default": []}}),
+        })
+        .unwrap();
         db.upsert_tools(&pc.id, &[tool("gpu"), tool("run_shell")]);
         db.upsert_tools(&mac.id, &[tool("run_shell")]);
         let hub = Hub::new(db, dir.clone());
@@ -324,7 +332,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
-            "MacBook lacks gpu (a hosted local model or a tool whose name contains \"gpu\"). Devices that have it: Gaming PC (offline). \
+            "MacBook lacks gpu (an admin-configured hosted model). Devices that have it: Gaming PC (offline). \
              Name one that has every need, or leave device out."
         );
         assert!(hub.db.threads(Some(&conv)).is_empty(), "a refused start records no thread");

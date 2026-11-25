@@ -20,6 +20,7 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+fs2 = "0.4"
 getrandom = "0.4"
 hex = "0.4"
 rusqlite = { version = "0.43", features = ["bundled"] }

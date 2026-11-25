@@ -40,6 +40,7 @@ fn to_probe_output(resp: &ModelResponse) -> ProbeOutput {
 #[derive(Debug)]
 pub enum ProbeError {
     NotFound(String),
+    Busy(String),
     BudgetExceeded(String),
     Unavailable(String),
     BadConfig(String),
@@ -50,6 +51,7 @@ impl std::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound(s)
+            | Self::Busy(s)
             | Self::BudgetExceeded(s)
             | Self::Unavailable(s)
             | Self::BadConfig(s)
@@ -60,6 +62,25 @@ impl std::fmt::Display for ProbeError {
 
 impl std::error::Error for ProbeError {}
 
+struct ProbeRunGuard<'a> {
+    hub: &'a Hub,
+    model_id: String,
+}
+
+impl Drop for ProbeRunGuard<'_> {
+    fn drop(&mut self) {
+        self.hub.probe_runs.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.model_id);
+    }
+}
+
+fn begin_probe<'a>(hub: &'a Hub, model_id: &str) -> Result<ProbeRunGuard<'a>, ProbeError> {
+    let mut running = hub.probe_runs.lock().unwrap_or_else(|e| e.into_inner());
+    if !running.insert(model_id.to_string()) {
+        return Err(ProbeError::Busy(format!("a probe run for model {model_id:?} is already in progress")));
+    }
+    Ok(ProbeRunGuard { hub, model_id: model_id.to_string() })
+}
+
 /// Run the built-in probe suite against `model_key`, record usage and `source = 'probe'`
 /// outcomes, and create or update a pending use-case proposal.
 pub async fn run_probes(hub: &Arc<Hub>, model_key: &str) -> Result<ProbeReport, ProbeError> {
@@ -67,6 +88,9 @@ pub async fn run_probes(hub: &Arc<Hub>, model_key: &str) -> Result<ProbeReport, 
         .db
         .find_model(model_key)
         .ok_or_else(|| ProbeError::NotFound(format!("no model {model_key:?} in the registry")))?;
+    // The guard covers both the budget check and the complete suite, so concurrent
+    // requests for one model cannot both spend against the same remaining budget.
+    let _run = begin_probe(hub, &model.id)?;
     if let Some(why) = crate::limits::daily_budget_refusal(&hub.db) {
         return Err(ProbeError::BudgetExceeded(why));
     }
@@ -267,6 +291,7 @@ async fn probe_model(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): 
     match run_probes(&hub, &id).await {
         Ok(report) => Json(report).into_response(),
         Err(ProbeError::NotFound(msg)) => err(StatusCode::NOT_FOUND, msg),
+        Err(ProbeError::Busy(msg)) => err(StatusCode::CONFLICT, msg),
         Err(ProbeError::BudgetExceeded(msg)) => err(StatusCode::TOO_MANY_REQUESTS, msg),
         Err(ProbeError::Unavailable(msg)) => err(StatusCode::SERVICE_UNAVAILABLE, msg),
         Err(ProbeError::BadConfig(msg)) => err(StatusCode::BAD_REQUEST, msg),
@@ -326,6 +351,11 @@ mod tests {
         })
         .unwrap();
         let hub = Hub::new(db, dir.clone());
+
+        let concurrent = begin_probe(&hub, "test-model").unwrap();
+        let busy = run_probes(&hub, "test-model").await.unwrap_err();
+        assert!(matches!(busy, ProbeError::Busy(_)), "{busy:?}");
+        drop(concurrent);
 
         let report = run_probes(&hub, "test-model").await.unwrap();
         assert_eq!((report.passed, report.total), (3, 5));

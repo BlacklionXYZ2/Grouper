@@ -218,16 +218,24 @@ impl Hub {
         if let AgentEvent::Usage { provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens } =
             &event
         {
-            cost = Some(self.db.record_usage(
-                Some(&t.conversation_id),
-                Some(thread_id),
-                provider_id,
-                model,
-                *input_tokens,
-                *output_tokens,
-                *cache_read_tokens,
-                *cache_write_tokens,
-            ));
+            let usage = providers::Usage {
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
+                cache_read_tokens: *cache_read_tokens,
+                cache_write_tokens: *cache_write_tokens,
+            };
+            if !self.consume_relayed_usage(thread_id, usage) {
+                cost = Some(self.db.record_usage(
+                    Some(&t.conversation_id),
+                    Some(thread_id),
+                    provider_id,
+                    model,
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                ));
+            }
         }
         self.emit(&t.conversation_id, Some(thread_id), EventBody::ThreadActivity { event });
         // After the usage event, so a warning or stop follows what caused it.
@@ -237,6 +245,7 @@ impl Hub {
     }
 
     pub(crate) async fn thread_finished(self: &Arc<Self>, thread_id: &str, ok: bool, summary: &str) {
+        self.relayed_usage.lock().unwrap_or_else(|e| e.into_inner()).remove(thread_id);
         let status = if ok { "done" } else { "failed" };
         // Already stopped or finished: ignore late reports.
         if !self.db.finish_thread(thread_id, status, summary) {

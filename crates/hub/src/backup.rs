@@ -18,6 +18,10 @@ use rusqlite::backup::{Backup as SqliteBackup, StepResult};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use fs2::FileExt;
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 use hub::secrets::Secrets;
 
@@ -32,6 +36,9 @@ const BACKUP_STEP_PAUSE: Duration = Duration::from_millis(5);
 const BACKUP_BUSY_PAUSE: Duration = Duration::from_millis(20);
 const BACKUP_MAX_BUSY_ROUNDS: u32 = 1_500;
 const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LOCK_NAME: &str = "grouper.lock";
+const MAX_ARCHIVE_ENTRIES: u64 = 100_000;
+const MAX_EXTRACTED_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
@@ -89,6 +96,88 @@ struct OpenedBackup {
     cleanup: bool,
 }
 
+pub(crate) struct DataLock {
+    file: File,
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl Drop for DataLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub(crate) fn lock_data_dir(data_dir: &Path) -> Result<DataLock> {
+    create_private_dir_all(data_dir)?;
+    let path = data_dir.join(LOCK_NAME);
+    let remove_on_drop = !path.exists();
+    let file = open_private(&path, true, false).with_context(|| format!("opening {}", path.display()))?;
+    FileExt::try_lock_exclusive(&file).with_context(|| {
+        format!(
+            "{} is locked by a running hub; stop grouper-hub serve before restoring",
+            path.display()
+        )
+    })?;
+    Ok(DataLock { file, path, remove_on_drop })
+}
+
+fn create_private_dir_all(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let existed = path.exists();
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+        if !existed {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn open_private(path: &Path, create_new: bool, truncate: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).truncate(truncate);
+    if create_new {
+        options.create(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn write_private(path: PathBuf, bytes: &[u8]) -> io::Result<()> {
+    let mut file = open_private(&path, true, true)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn create_new_private(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
+fn sibling_stage(target: &Path, label: &str) -> Result<PathBuf> {
+    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    create_private_dir_all(parent)?;
+    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("grouper");
+    let dir = parent.join(format!(".{name}.{label}-{}-{}", std::process::id(), hub::db::random_hex(4)));
+    create_private_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
 impl Drop for OpenedBackup {
     fn drop(&mut self) {
         if self.cleanup {
@@ -109,7 +198,7 @@ pub(crate) fn backup(data_dir: &Path, output: &Path, include_workspaces: bool) -
     if output.exists() {
         bail!("backup destination already exists: {}", output.display());
     }
-    let staging = temp_dir("backup")?;
+    let staging = sibling_stage(output, "backup")?;
     let filled = match fill_staging(&staging, data_dir, include_workspaces) {
         Ok(filled) => filled,
         Err(error) => {
@@ -131,6 +220,7 @@ pub(crate) fn backup(data_dir: &Path, output: &Path, include_workspaces: bool) -
 
 /// Restore `backup` (a snapshot directory or `.tar.gz`) into `data_dir`.
 pub(crate) fn restore(data_dir: &Path, backup_path: &Path, force: bool) -> Result<()> {
+    let _lock = lock_data_dir(data_dir).context("refusing restore while grouper-hub serve is using this data directory")?;
     if data_dir.exists() && !data_dir.is_dir() {
         bail!("{} is not a directory", data_dir.display());
     }
@@ -212,7 +302,7 @@ fn fill_staging(staging: &Path, data_dir: &Path, include_workspaces: bool) -> Re
         files,
     };
     let json = serde_json::to_vec_pretty(&manifest).context("writing the backup manifest")?;
-    fs::write(staging.join(MANIFEST_NAME), json).context("writing manifest.json")?;
+    write_private(staging.join(MANIFEST_NAME), &json).context("writing manifest.json")?;
     Ok(Filled {
         meta,
         files: file_count,
@@ -236,6 +326,8 @@ fn snapshot_database(src_path: &Path, dst_path: &Path) -> Result<SnapshotMeta> {
     let file = OpenOptions::new().read(true).write(true).open(dst_path)?;
     file.sync_all()
         .with_context(|| format!("syncing {}", dst_path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(dst_path, fs::Permissions::from_mode(0o600))?;
     Ok(meta)
 }
 
@@ -345,9 +437,12 @@ fn integrity_ok(conn: &Connection) -> Result<()> {
 }
 
 fn open_backup(path: &Path, data_dir: &Path) -> Result<OpenedBackup> {
+    if path.exists() && fs::symlink_metadata(path)?.file_type().is_symlink() {
+        bail!("refusing to restore from symlink {}", path.display());
+    }
     if path.is_dir() {
         if is_within(path, data_dir) {
-            let root = temp_dir("restore")?;
+            let root = sibling_stage(data_dir, "restore")?;
             copy_dir(path, &root).context("copying the backup out of the data directory")?;
             return Ok(OpenedBackup {
                 root,
@@ -360,7 +455,7 @@ fn open_backup(path: &Path, data_dir: &Path) -> Result<OpenedBackup> {
         });
     }
     if path.is_file() && is_archive(path) {
-        let root = temp_dir("restore")?;
+        let root = sibling_stage(data_dir, "restore")?;
         if let Err(error) = extract_tar_gz(path, &root) {
             let _ = fs::remove_dir_all(&root);
             return Err(error);
@@ -380,6 +475,9 @@ fn open_backup(path: &Path, data_dir: &Path) -> Result<OpenedBackup> {
 }
 
 fn verify_backup(root: &Path) -> Result<Manifest> {
+    // Walk the complete directory first. In particular, reject symlinks before
+    // opening manifest.json or any file named by it.
+    let mut on_disk = list_rel_paths(root)?;
     let manifest_path = root.join(MANIFEST_NAME);
     let file = File::open(&manifest_path).with_context(|| {
         format!(
@@ -444,7 +542,6 @@ fn verify_backup(root: &Path) -> Result<Manifest> {
             bail!("duplicate path in manifest: {}", entry.path);
         }
     }
-    let mut on_disk = list_rel_paths(root)?;
     on_disk.remove(MANIFEST_NAME);
     if listed != on_disk {
         bail!("{}", contents_differ(&listed, &on_disk));
@@ -565,20 +662,42 @@ fn install_with_rollback(data_dir: &Path, root: &Path, force: bool) -> Result<Op
 }
 
 fn install_snapshot(data_dir: &Path, root: &Path) -> Result<()> {
-    fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
-    let partial = data_dir.join(format!("{DB_NAME}.partial"));
-    fs::copy(root.join(DB_NAME), &partial)
-        .with_context(|| format!("copying {DB_NAME} into {}", data_dir.display()))?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&partial)?
-        .sync_all()
-        .context("syncing the restored database")?;
-    fs::rename(&partial, data_dir.join(DB_NAME)).context("placing the restored database")?;
+    create_private_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))?;
     let workspaces = root.join(WORKSPACES);
-    if workspaces.is_dir() {
-        copy_dir(&workspaces, &data_dir.join(WORKSPACES))?;
+    let workspace_stage = if workspaces.is_dir() {
+        let stage = sibling_stage(data_dir, "workspaces")?;
+        if let Err(error) = copy_dir(&workspaces, &stage) {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(error);
+        }
+        Some(stage)
+    } else {
+        None
+    };
+    let partial = data_dir.join(format!("{DB_NAME}.partial"));
+    let installed = (|| -> Result<()> {
+        copy_private_file(&root.join(DB_NAME), &partial)
+            .with_context(|| format!("copying {DB_NAME} into {}", data_dir.display()))?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&partial)?
+            .sync_all()
+            .context("syncing the restored database")?;
+        fs::rename(&partial, data_dir.join(DB_NAME)).context("placing the restored database")?;
+        if let Some(stage) = workspace_stage.as_ref() {
+            fs::rename(stage, data_dir.join(WORKSPACES)).context("placing restored workspaces")?;
+        }
+        sync_dir(data_dir)
+    })();
+    if let Err(error) = installed {
+        let _ = fs::remove_file(&partial);
+        if let Some(stage) = workspace_stage {
+            let _ = fs::remove_dir_all(stage);
+        }
+        return Err(error);
     }
     Ok(())
 }
@@ -616,7 +735,7 @@ fn hub_entries(data_dir: &Path) -> Result<Vec<PathBuf>> {
         fs::read_dir(data_dir).with_context(|| format!("reading {}", data_dir.display()))?
     {
         let entry = entry?;
-        if entry.file_name() == MASTER_KEY_NAME {
+        if entry.file_name() == MASTER_KEY_NAME || entry.file_name() == LOCK_NAME {
             continue;
         }
         paths.push(entry.path());
@@ -632,7 +751,7 @@ fn move_aside(data_dir: &Path, entries: &[PathBuf]) -> Result<PathBuf> {
         n += 1;
         dest = data_dir.join(format!("pre-restore-{}-{n}", stamp(now_secs())));
     }
-    fs::create_dir(&dest).with_context(|| format!("creating {}", dest.display()))?;
+    create_private_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut moved = Vec::new();
     for entry in entries {
         let name = entry.file_name().unwrap_or_default();
@@ -674,6 +793,10 @@ fn move_back(aside: &Path, data_dir: &Path) -> Result<()> {
 
 fn allowed_backup_path(path: &str) -> bool {
     path == DB_NAME || path == WORKSPACES || path.starts_with(&format!("{WORKSPACES}/"))
+}
+
+fn allowed_archive_path(path: &str) -> bool {
+    path == MANIFEST_NAME || allowed_backup_path(path)
 }
 
 fn contents_differ(listed: &BTreeSet<String>, on_disk: &BTreeSet<String>) -> String {
@@ -758,21 +881,11 @@ fn is_within(path: &Path, dir: &Path) -> bool {
     path.starts_with(dir)
 }
 
-fn temp_dir(label: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "grouper-{label}-{}-{}",
-        std::process::id(),
-        hub::db::random_hex(4)
-    ));
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
-}
-
 fn place_tree(staging: &Path, output: &Path) -> Result<()> {
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        create_private_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     match fs::rename(staging, output) {
         Ok(()) => Ok(()),
@@ -793,7 +906,7 @@ fn place_tree(staging: &Path, output: &Path) -> Result<()> {
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+    create_private_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
     for entry in read_dir_sorted(src)? {
         let target = dst.join(entry.file_name());
         let kind = entry.file_type()?;
@@ -805,7 +918,7 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
         } else if kind.is_dir() {
             copy_dir(&entry.path(), &target)?;
         } else if kind.is_file() {
-            fs::copy(entry.path(), &target)
+            copy_private_file(&entry.path(), &target)
                 .with_context(|| format!("copying {}", entry.path().display()))?;
         } else {
             bail!(
@@ -814,6 +927,25 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn copy_private_file(src: &Path, dst: &Path) -> Result<u64> {
+    let mut input = File::open(src)?;
+    let mut output = open_private(dst, true, true)?;
+    let copied = io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    Ok(copied)
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1300,9 +1432,9 @@ impl<W: Write> TarWriter<W> {
         });
         let mut header = [0u8; 512];
         put_bytes(&mut header[0..100], name.as_bytes())?;
-        put_octal(&mut header[100..108], 0o755)?;
+        put_octal(&mut header[100..108], 0o700)?;
         if typeflag != b'5' {
-            put_octal(&mut header[100..108], 0o644)?;
+            put_octal(&mut header[100..108], 0o600)?;
         }
         put_octal(&mut header[108..116], 0)?;
         put_octal(&mut header[116..124], 0)?;
@@ -1323,7 +1455,7 @@ impl<W: Write> TarWriter<W> {
         body.push(0);
         let mut header = [0u8; 512];
         put_bytes(&mut header[0..100], b"././@LongLink")?;
-        put_octal(&mut header[100..108], 0o644)?;
+        put_octal(&mut header[100..108], 0o600)?;
         put_octal(&mut header[124..136], body.len() as u64)?;
         header[156] = b'L';
         put_bytes(&mut header[257..263], b"ustar")?;
@@ -1427,7 +1559,7 @@ fn write_tar_gz(root: &Path, output: &Path) -> Result<()> {
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)?;
+        create_private_dir_all(parent)?;
     }
     let partial = output.with_file_name({
         let mut name = output
@@ -1447,7 +1579,7 @@ fn write_tar_gz(root: &Path, output: &Path) -> Result<()> {
 }
 
 fn write_tar_file(root: &Path, output: &Path) -> Result<()> {
-    let file = File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let file = open_private(output, true, true).with_context(|| format!("creating {}", output.display()))?;
     let mut tar = TarWriter::new(file);
     for node in walk(root)? {
         if node.directory {
@@ -1462,17 +1594,24 @@ fn write_tar_file(root: &Path, output: &Path) -> Result<()> {
 }
 
 fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    create_private_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
     let mut decoder = GzipDecoder::new(file)?;
     let mut long_name: Option<String> = None;
+    let mut entries = 0u64;
+    let mut extracted = 0u64;
     loop {
         let Some(header) = read_tar_header(&mut decoder)? else {
             break;
         };
+        entries += 1;
+        if entries > MAX_ARCHIVE_ENTRIES {
+            bail!("backup archive has more than {MAX_ARCHIVE_ENTRIES} entries");
+        }
         verify_tar_checksum(&header)?;
         let typeflag = header[156];
         let size = parse_octal(&header[124..136])?;
+        extracted = add_extracted_bytes(extracted, size)?;
         let header_name = tar_name(&header)?;
         let name = long_name.take().unwrap_or(header_name);
         if typeflag == b'L' {
@@ -1493,9 +1632,12 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
             continue;
         }
         if typeflag == b'5' || name.ends_with('/') {
+            if !allowed_archive_path(name.trim_end_matches('/')) {
+                bail!("backup archive contains unexpected path {name}");
+            }
             let rel = safe_rel(name.trim_end_matches('/'))?;
             let path = dest.join(rel);
-            fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
+            create_private_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
             ensure_inside(dest, &path)?;
             if size > 0 {
                 skip_n(&mut decoder, size)?;
@@ -1506,27 +1648,40 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
         if typeflag != b'0' && typeflag != 0 {
             bail!("unsupported tar entry type {} for {name}", typeflag as char);
         }
+        if !allowed_archive_path(&name) {
+            bail!("backup archive contains unexpected path {name}");
+        }
         let rel = safe_rel(&name)?;
         let path = dest.join(&rel);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
         }
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut out = create_new_private(&path)
             .with_context(|| format!("creating {}", path.display()))?;
         copy_n(&mut decoder, &mut out, size)?;
         out.sync_all()?;
         ensure_inside(dest, &path)?;
         skip_padding(&mut decoder, size)?;
     }
-    let mut rest = Vec::new();
-    decoder.read_to_end(&mut rest)?;
-    if rest.iter().any(|byte| *byte != 0) {
-        bail!("data after the end of the tar archive");
+    let mut rest = [0u8; 64 * 1024];
+    loop {
+        let n = decoder.read(&mut rest)?;
+        if n == 0 {
+            break;
+        }
+        if rest[..n].iter().any(|byte| *byte != 0) {
+            bail!("data after the end of the tar archive");
+        }
     }
     Ok(())
+}
+
+fn add_extracted_bytes(total: u64, entry: u64) -> Result<u64> {
+    let total = total.checked_add(entry).context("backup archive size overflow")?;
+    if total > MAX_EXTRACTED_BYTES {
+        bail!("backup archive expands beyond the {} byte limit", MAX_EXTRACTED_BYTES);
+    }
+    Ok(total)
 }
 
 fn read_tar_header<R: Read>(reader: &mut R) -> Result<Option<[u8; 512]>> {
@@ -1749,18 +1904,18 @@ mod tests {
     fn tar_gz_round_trip_long_names_and_empty_files() {
         let tmp = TempDir::new("tar");
         let src = tmp.0.join("src");
-        fs::create_dir_all(src.join("sub")).unwrap();
-        fs::write(src.join("sub").join("a.txt"), b"hello").unwrap();
-        fs::write(src.join("empty"), b"").unwrap();
+        fs::create_dir_all(src.join(WORKSPACES).join("sub")).unwrap();
+        fs::write(src.join(WORKSPACES).join("sub").join("a.txt"), b"hello").unwrap();
+        fs::write(src.join(WORKSPACES).join("empty"), b"").unwrap();
         let long = "p".repeat(140);
-        fs::write(src.join(&long), b"xyz").unwrap();
+        fs::write(src.join(WORKSPACES).join(&long), b"xyz").unwrap();
         let archive = tmp.0.join("b.tar.gz");
         write_tar_gz(&src, &archive).unwrap();
         let out = tmp.0.join("out");
         extract_tar_gz(&archive, &out).unwrap();
-        assert_eq!(fs::read(out.join("sub").join("a.txt")).unwrap(), b"hello");
-        assert_eq!(fs::read(out.join("empty")).unwrap(), b"");
-        assert_eq!(fs::read(out.join(&long)).unwrap(), b"xyz");
+        assert_eq!(fs::read(out.join(WORKSPACES).join("sub").join("a.txt")).unwrap(), b"hello");
+        assert_eq!(fs::read(out.join(WORKSPACES).join("empty")).unwrap(), b"");
+        assert_eq!(fs::read(out.join(WORKSPACES).join(&long)).unwrap(), b"xyz");
     }
 
     #[test]
@@ -2174,5 +2329,78 @@ mod tests {
             .expect("old data dir contents were not moved aside");
         assert_eq!(fs::read(aside.join("old-marker.txt")).unwrap(), b"previous");
         assert!(aside.join("backups").join("snap.tar.gz").is_file());
+    }
+
+    #[test]
+    fn restore_refuses_a_held_serve_lock() {
+        let _env = isolate_master_key();
+        let root = TempDir::new("locked");
+        let data = root.0.join("data");
+        setup_hub(&data);
+        let snap = root.0.join("snap");
+        backup(&data, &snap, false).unwrap();
+        let dest = root.0.join("dest");
+        copy_key(&data, &dest);
+        let _serve_lock = lock_data_dir(&dest).unwrap();
+        let error = restore(&dest, &snap, false).unwrap_err();
+        assert!(error.to_string().contains("serve") || error.to_string().contains("locked"), "{error:#}");
+    }
+
+    #[test]
+    fn archive_rejects_unexpected_paths_and_total_size_bombs_before_creation() {
+        let root = TempDir::new("archive-limits");
+        let src = root.0.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("unexpected"), b"no").unwrap();
+        let unexpected = root.0.join("unexpected.tar.gz");
+        write_tar_gz(&src, &unexpected).unwrap();
+        let out = root.0.join("out");
+        let error = extract_tar_gz(&unexpected, &out).unwrap_err();
+        assert!(error.to_string().contains("unexpected path"), "{error:#}");
+        assert!(!out.join("unexpected").exists());
+
+        let error = add_extracted_bytes(MAX_EXTRACTED_BYTES - 1, 2).unwrap_err();
+        assert!(error.to_string().contains("expands beyond"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_restore_rejects_symlinks_before_opening_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let _env = isolate_master_key();
+        let root = TempDir::new("symlink");
+        let data = root.0.join("data");
+        setup_hub(&data);
+        let snap = root.0.join("snap");
+        backup(&data, &snap, false).unwrap();
+        let outside = root.0.join("outside.json");
+        fs::write(&outside, fs::read(snap.join(MANIFEST_NAME)).unwrap()).unwrap();
+        fs::remove_file(snap.join(MANIFEST_NAME)).unwrap();
+        symlink(&outside, snap.join(MANIFEST_NAME)).unwrap();
+        let error = verify_backup(&snap).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_and_restore_use_private_unix_modes() {
+        let _env = isolate_master_key();
+        let root = TempDir::new("modes");
+        let data = root.0.join("data");
+        setup_hub(&data);
+        fs::create_dir_all(data.join(WORKSPACES).join("t")).unwrap();
+        fs::write(data.join(WORKSPACES).join("t/file"), b"private").unwrap();
+        let snap = root.0.join("snap");
+        backup(&data, &snap, true).unwrap();
+        assert_eq!(fs::metadata(&snap).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(snap.join(DB_NAME)).unwrap().permissions().mode() & 0o777, 0o600);
+        let restored = root.0.join("restored");
+        copy_key(&data, &restored);
+        restore(&restored, &snap, false).unwrap();
+        assert_eq!(fs::metadata(&restored).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(restored.join(DB_NAME)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(restored.join(WORKSPACES).join("t")).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(restored.join(WORKSPACES).join("t/file")).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

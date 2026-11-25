@@ -117,6 +117,14 @@ async fn start_thread_without_a_device_picks_from_needs_and_past_results() {
     db.upsert_model(&model()).unwrap();
     let (mac, mac_token) = db.add_device("MacBook", "macos", false).unwrap();
     let (pc, pc_token) = db.add_device("Gaming PC", "windows", false).unwrap();
+    db.upsert_provider(&ProviderConfig {
+        id: "gpu-host".into(),
+        kind: "scripted".into(),
+        base_url: None,
+        api_key: None,
+        options: json!({"via_device": pc.id, "inline": {"default": []}}),
+    })
+    .unwrap();
     for _ in 0..3 {
         finish(&db, &pc.id, "done", Some(5));
         finish(&db, &mac.id, "failed", None);

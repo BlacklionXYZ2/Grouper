@@ -1,6 +1,7 @@
 //! Device-side halves of a provider hosted behind an outbound connection.
 
 use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,6 +13,10 @@ use tokio::sync::{mpsc, watch};
 use super::Threads;
 
 const MODEL_TIMEOUT: Duration = Duration::from_secs(600);
+const MODEL_REPLY_CAP: usize = 64;
+const MAX_MODEL_DELTA_BYTES: usize = 64 * 1024;
+const MAX_MODEL_STREAM_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HOST_MODEL_TASKS: usize = 16;
 
 pub(crate) enum ModelReply {
     Delta(Value),
@@ -19,6 +24,11 @@ pub(crate) enum ModelReply {
         response: Option<Value>,
         error: Option<String>,
     },
+}
+
+pub(crate) struct ModelWaiter {
+    tx: mpsc::Sender<ModelReply>,
+    streamed_bytes: usize,
 }
 
 struct CancelOnDrop {
@@ -46,6 +56,7 @@ struct ViaHub {
     threads: Weak<Threads>,
     provider_id: String,
     host_name: String,
+    thread_id: String,
 }
 
 #[async_trait]
@@ -75,14 +86,15 @@ impl Provider for ViaHub {
                 .next
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let (reply, mut replies) = mpsc::unbounded_channel();
+        let (reply, mut replies) = mpsc::channel(MODEL_REPLY_CAP);
         threads
             .model_waiters
             .lock()
             .unwrap()
-            .insert(call_id.clone(), reply);
+            .insert(call_id.clone(), ModelWaiter { tx: reply, streamed_bytes: 0 });
         threads.send(NodeMessage::ModelRequest {
             call_id: call_id.clone(),
+            thread_id: self.thread_id.clone(),
             provider_id: self.provider_id.clone(),
             request,
         });
@@ -156,6 +168,7 @@ impl Provider for ViaHub {
 pub(crate) fn build(
     config: &ProviderConfig,
     threads: &Arc<Threads>,
+    thread_id: &str,
 ) -> Result<Arc<dyn Provider>, ProviderError> {
     let Some(host) = config.via_device() else {
         return providers::build(config);
@@ -171,6 +184,7 @@ pub(crate) fn build(
             threads: Arc::downgrade(threads),
             provider_id: config.id.clone(),
             host_name: host.to_string(),
+            thread_id: thread_id.to_string(),
         }))
     }
 }
@@ -231,6 +245,9 @@ pub(crate) fn start_host_call(
         if tasks.contains_key(&call_id) {
             return send_error(threads, format!("duplicate model call id {call_id}"));
         }
+        if tasks.len() >= MAX_HOST_MODEL_TASKS {
+            return send_error(threads, "model host is busy; try again later".into());
+        }
         tasks.insert(call_id.clone(), cancel);
     }
     let weak = Arc::downgrade(threads);
@@ -240,8 +257,20 @@ pub(crate) fn start_host_call(
         };
         let delta_threads = threads.clone();
         let delta_call = call_id.clone();
+        let streamed = Arc::new(AtomicUsize::new(0));
+        let stream_failed = Arc::new(AtomicBool::new(false));
+        let (stream_abort, mut stream_aborted) = watch::channel(false);
+        let streamed_for_delta = streamed.clone();
+        let failed_for_delta = stream_failed.clone();
         let on_delta = move |delta: Delta| {
             if let Ok(delta) = serde_json::to_value(delta) {
+                let bytes = serde_json::to_vec(&delta).map_or(MAX_MODEL_DELTA_BYTES + 1, |v| v.len());
+                let total = streamed_for_delta.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
+                if bytes > MAX_MODEL_DELTA_BYTES || total > MAX_MODEL_STREAM_BYTES {
+                    failed_for_delta.store(true, Ordering::Relaxed);
+                    let _ = stream_abort.send(true);
+                    return;
+                }
                 delta_threads.send(NodeMessage::ModelDelta {
                     call_id: delta_call.clone(),
                     delta,
@@ -249,10 +278,20 @@ pub(crate) fn start_host_call(
             }
         };
         let completion = provider.complete_stream(&request, &on_delta);
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             result = completion => Some(result),
             _ = cancelled.wait_for(|cancelled| *cancelled) => None,
+            _ = stream_aborted.wait_for(|aborted| *aborted) => Some(Err(ProviderError::BadResponse {
+                provider: provider_id.clone(),
+                message: "model stream exceeded the 64 KB delta or 8 MB call limit".into(),
+            })),
         };
+        if stream_failed.load(Ordering::Relaxed) {
+            result = Some(Err(ProviderError::BadResponse {
+                provider: provider_id.clone(),
+                message: "model stream exceeded the 64 KB delta or 8 MB call limit".into(),
+            }));
+        }
         threads.model_tasks.lock().unwrap().remove(&call_id);
         if let Some(result) = result {
             let (response, error) = match result {
@@ -278,8 +317,22 @@ pub(crate) fn cancel_host_call(threads: &Threads, call_id: &str) {
 }
 
 pub(crate) fn relay_delta(threads: &Threads, call_id: &str, delta: Value) {
-    if let Some(reply) = threads.model_waiters.lock().unwrap().get(call_id) {
-        let _ = reply.send(ModelReply::Delta(delta));
+    let bytes = serde_json::to_vec(&delta).map_or(MAX_MODEL_DELTA_BYTES + 1, |v| v.len());
+    let mut waiters = threads.model_waiters.lock().unwrap();
+    let Some(waiter) = waiters.get_mut(call_id) else { return };
+    waiter.streamed_bytes = waiter.streamed_bytes.saturating_add(bytes);
+    if bytes > MAX_MODEL_DELTA_BYTES || waiter.streamed_bytes > MAX_MODEL_STREAM_BYTES {
+        let waiter = waiters.remove(call_id).expect("waiter exists");
+        let _ = waiter.tx.try_send(ModelReply::Finished {
+            response: None,
+            error: Some("model stream exceeded the 64 KB delta or 8 MB call limit".into()),
+        });
+        drop(waiters);
+        threads.send(NodeMessage::ModelCancel { call_id: call_id.to_string() });
+    } else if let Err(mpsc::error::TrySendError::Full(_)) = waiter.tx.try_send(ModelReply::Delta(delta)) {
+        waiters.remove(call_id);
+        drop(waiters);
+        threads.send(NodeMessage::ModelCancel { call_id: call_id.to_string() });
     }
 }
 
@@ -289,7 +342,82 @@ pub(crate) fn relay_response(
     response: Option<Value>,
     error: Option<String>,
 ) {
-    if let Some(reply) = threads.model_waiters.lock().unwrap().remove(call_id) {
-        let _ = reply.send(ModelReply::Finished { response, error });
+    if let Some(waiter) = threads.model_waiters.lock().unwrap().remove(call_id) {
+        let _ = waiter.tx.try_send(ModelReply::Finished { response, error });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use providers::{Message, Request};
+    use serde_json::json;
+    use tokio::sync::{mpsc, watch};
+
+    use super::*;
+    use crate::Threads;
+
+    fn hosted_config(reply: &str) -> ProviderConfig {
+        ProviderConfig {
+            id: "hosted".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({
+                "via_device": "device",
+                "inline": {"default": [{"type": "text", "text": reply}]}
+            }),
+        }
+    }
+
+    fn request() -> Value {
+        serde_json::to_value(Request {
+            model: "model".into(),
+            system: String::new(),
+            messages: vec![Message::user_text("hello")],
+            tools: Vec::new(),
+            max_tokens: 32,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn host_caps_tasks_and_aborts_oversized_streams() {
+        let (out, mut output) = mpsc::channel(64);
+        let threads = Arc::new(Threads::new(out, Arc::new(|| {})));
+        *threads.identity.lock().unwrap() = Some(("device".into(), "Host".into()));
+        threads.providers.lock().unwrap().push(hosted_config("ok"));
+        {
+            let mut tasks = threads.model_tasks.lock().unwrap();
+            for n in 0..MAX_HOST_MODEL_TASKS {
+                let (cancel, _rx) = watch::channel(false);
+                tasks.insert(format!("existing-{n}"), cancel);
+            }
+        }
+        start_host_call(&threads, "busy".into(), "hosted".into(), request());
+        assert!(matches!(
+            output.recv().await,
+            Some(NodeMessage::ModelResponse { call_id, error: Some(error), .. })
+                if call_id == "busy" && error.contains("busy")
+        ));
+
+        threads.model_tasks.lock().unwrap().clear();
+        threads.providers.lock().unwrap().clear();
+        threads.providers.lock().unwrap().push(hosted_config(&"x".repeat(MAX_MODEL_DELTA_BYTES)));
+        start_host_call(&threads, "large".into(), "hosted".into(), request());
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(NodeMessage::ModelResponse { call_id, error, .. }) = output.recv().await
+                    && call_id == "large"
+                {
+                    break error;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(response.is_some_and(|error| error.contains("64 KB")));
+        assert!(!threads.model_tasks.lock().unwrap().contains_key("large"));
     }
 }

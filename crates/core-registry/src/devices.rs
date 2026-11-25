@@ -9,8 +9,8 @@
 //! | Token | A device satisfies it when |
 //! |---|---|
 //! | `shell` | it offers `run_shell`. The hub never does: file tools only |
-//! | `gpu` | the device hosts a model provider (`via_device`, e.g. LM Studio on its GPU), or an available tool's name contains `gpu` |
-//! | `xcode` | its platform is macOS (`macos`, `mac`, `darwin`, `osx`), or a tool's name contains `xcode`. Not the hub |
+//! | `gpu` | the device hosts an admin-configured model provider (`via_device`, e.g. LM Studio on its GPU) |
+//! | `xcode` | its admin-set platform is macOS (`macos`, `mac`, `darwin`, `osx`). Not the hub |
 //! | `folder:<name>` | it reported a scoped folder of that name (`folder:projects` is `@projects`) |
 //! | `agent:<server>` | it offers an MCP tool from that server (`agent:codex` is `codex__codex_chat`) |
 //! | `files` | it offers a workspace file tool, or it is the hub |
@@ -154,10 +154,6 @@ fn is_mac(platform: &str) -> bool {
     matches!(platform.trim().to_ascii_lowercase().as_str(), "macos" | "mac" | "darwin" | "osx")
 }
 
-fn tool_has(profile: &DeviceProfile, needle: &str) -> bool {
-    profile.tools.iter().any(|name| name.to_ascii_lowercase().contains(needle))
-}
-
 pub fn satisfies(profile: &DeviceProfile, need: &Need) -> bool {
     match need {
         Need::Files => {
@@ -165,8 +161,8 @@ pub fn satisfies(profile: &DeviceProfile, need: &Need) -> bool {
                 || profile.tools.iter().any(|name| FILE_TOOLS.iter().any(|tool| name.eq_ignore_ascii_case(tool)))
         }
         Need::Shell => !profile.hub && profile.tools.iter().any(|name| name.eq_ignore_ascii_case("run_shell")),
-        Need::Gpu => !profile.hub && (profile.hosts_models || tool_has(profile, "gpu")),
-        Need::Xcode => !profile.hub && (is_mac(&profile.platform) || tool_has(profile, "xcode")),
+        Need::Gpu => !profile.hub && profile.hosts_models,
+        Need::Xcode => !profile.hub && is_mac(&profile.platform),
         Need::Folder(name) => {
             !profile.hub && profile.folders.iter().any(|folder| folder.eq_ignore_ascii_case(name))
         }
@@ -215,8 +211,8 @@ fn explains(need: &Need) -> String {
     match need {
         Need::Files => "file tools".into(),
         Need::Shell => "the run_shell tool".into(),
-        Need::Gpu => "a hosted local model or a tool whose name contains \"gpu\"".into(),
-        Need::Xcode => "macOS, or a tool whose name contains \"xcode\"".into(),
+        Need::Gpu => "an admin-configured hosted model".into(),
+        Need::Xcode => "the admin-set macOS platform".into(),
         Need::Folder(name) => format!("scoped folder @{name}"),
         Need::Agent(name) => format!("an MCP tool from server {name} ({name}__...)"),
     }
@@ -650,10 +646,10 @@ mod tests {
                 "agent:codex".into()
             ]
         );
-        // No file tool: files is not claimed. A Windows box with xcodebuild still has xcode.
+        // Tool-name substrings cannot claim admin-controlled GPU or Xcode capabilities.
         let win = profile("pc", "Gaming PC", "Windows", false, &["GPU_info", "xcodebuild"], &[]);
-        assert!(satisfies(&win, &Need::Gpu));
-        assert!(satisfies(&win, &Need::Xcode));
+        assert!(!satisfies(&win, &Need::Gpu));
+        assert!(!satisfies(&win, &Need::Xcode));
         assert!(!satisfies(&win, &Need::Shell));
         assert!(!satisfies(&win, &Need::Files));
         assert!(!satisfies(
@@ -677,8 +673,16 @@ mod tests {
     fn errors_name_devices_that_have_the_need() {
         let profiles = vec![
             profile("mac", "MacBook", "macos", true, &["run_shell"], &[]),
-            profile("pc", "Gaming PC", "windows", true, &["run_shell", "gpu"], &[]),
-            profile("lap", "Laptop", "linux", false, &["gpu"], &[]),
+            {
+                let mut p = profile("pc", "Gaming PC", "windows", true, &["run_shell", "gpu"], &[]);
+                p.hosts_models = true;
+                p
+            },
+            {
+                let mut p = profile("lap", "Laptop", "linux", false, &["gpu"], &[]);
+                p.hosts_models = true;
+                p
+            },
             hub_profile(),
         ];
         let needs = parse_needs(&["shell".into(), "gpu".into()]).unwrap();
@@ -686,10 +690,12 @@ mod tests {
         let missing = missing_needs(mac, &needs);
         assert_eq!(
             lack_error(&mac.name, &missing, &needs, &profiles, &mac.id),
-            "MacBook lacks gpu (a hosted local model or a tool whose name contains \"gpu\"). Devices that have all of them: Gaming PC (online). \
+            "MacBook lacks gpu (an admin-configured hosted model). Devices that have all of them: Gaming PC (online). \
              Name one that has every need, or leave device out."
         );
-        let offline = vec![profile("pc", "Gaming PC", "windows", false, &["gpu"], &[]), hub_profile()];
+        let mut offline_pc = profile("pc", "Gaming PC", "windows", false, &["gpu"], &[]);
+        offline_pc.hosts_models = true;
+        let offline = vec![offline_pc, hub_profile()];
         let gpu = parse_needs(&["gpu".into()]).unwrap();
         assert_eq!(
             none_fit_error(&gpu, &offline),
@@ -697,7 +703,11 @@ mod tests {
              The hub only does file work, so it can't take this."
         );
         let split = vec![
-            profile("pc", "Gaming PC", "windows", true, &["gpu"], &[]),
+            {
+                let mut p = profile("pc", "Gaming PC", "windows", true, &["gpu"], &[]);
+                p.hosts_models = true;
+                p
+            },
             profile("lap", "Laptop", "linux", false, &["run_shell"], &[]),
             hub_profile(),
         ];

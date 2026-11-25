@@ -124,6 +124,11 @@ async fn main() -> Result<()> {
         Cmd::Restore { backup, force } => return backup::restore(&cli.data, backup, *force),
         _ => {}
     }
+    let _serve_lock = if matches!(&cli.cmd, Cmd::Serve { .. }) {
+        Some(backup::lock_data_dir(&cli.data)?)
+    } else {
+        None
+    };
     let db = Db::open(&cli.data)?;
 
     match cli.cmd {

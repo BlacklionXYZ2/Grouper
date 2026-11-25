@@ -159,7 +159,8 @@ HTTP, so every device shows the same chat and thread panel.
 
 The same per-device outcome stats choose a machine when `start_thread` leaves `device` out.
 `needs` (`shell`, `gpu`, `xcode`, `folder:<name>`, `agent:<name>`) keeps online devices whose
-tools, platform or scoped folders match; proven devices for that task type then win on success
+tools, admin-set platform, scoped folders or admin-configured hosted models match (`xcode` requires
+macOS and `gpu` requires a `via_device` model host); proven devices for that task type then win on success
 rate, grade and duration. The hub is the fallback only for file-only work, and the reason is
 stored on the thread. Naming a device that lacks a need returns an error listing devices which
 have it. `list_devices` shows each device's stats and the needs it satisfies; `suggest_device`

@@ -490,6 +490,23 @@ pub fn turn_refusal(db: &Db, conversation_id: &str) -> Option<String> {
     budget_refusal(&l, today, conversation, at)
 }
 
+/// Why a running device thread cannot start another relayed provider call.
+pub(crate) fn relayed_model_refusal(db: &Db, thread: &ThreadInfo) -> Option<String> {
+    let l = db.limits();
+    if let Some(why) = turn_refusal(db, &thread.conversation_id) {
+        return Some(why);
+    }
+    let limit = db.thread_budget(&thread.id, &l)?;
+    let spent = db.spent_by_thread(&thread.id);
+    reached(spent, limit).then(|| {
+        format!(
+            "This thread's budget of ${} is spent (estimated ${}).",
+            usd(limit),
+            usd(spent)
+        )
+    })
+}
+
 /// Why a daily budget stops new work outside a conversation (such as model probes).
 pub fn daily_budget_refusal(db: &Db) -> Option<String> {
     let l = db.limits();

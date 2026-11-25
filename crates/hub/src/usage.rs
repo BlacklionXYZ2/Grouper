@@ -20,7 +20,11 @@ use crate::server::Hub;
 const COLLECT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const PROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PROBE_RESULTS: usize = 8;
 const MAX_SNAPSHOTS_PER_ENTRY: usize = 32;
+const MAX_PROBE_STRING_BYTES: usize = 256;
+const PROBE_PROVIDERS: &[&str] = &["claude", "codex"];
+const PROBE_KINDS: &[&str] = &["window", "spend", "balance", "status"];
 
 pub use core_registry::cost::parse_time;
 
@@ -80,9 +84,9 @@ impl Db {
         let mut c = self.c();
         let tx = c.transaction()?;
         let mut stored = 0usize;
-        for entry in results {
+        for entry in results.iter().take(MAX_PROBE_RESULTS) {
             let provider = entry.provider.trim().to_ascii_lowercase();
-            if provider.is_empty() || provider.len() > 64 {
+            if !PROBE_PROVIDERS.contains(&provider.as_str()) {
                 continue;
             }
             tx.execute(
@@ -96,12 +100,20 @@ impl Db {
                     } else {
                         snap.provider.trim().to_ascii_lowercase()
                     };
-                    let account = if snap.account.trim().is_empty() {
+                    if !PROBE_PROVIDERS.contains(&snap_provider.as_str()) {
+                        continue;
+                    }
+                    let kind = snap.kind.trim().to_ascii_lowercase();
+                    if !PROBE_KINDS.contains(&kind.as_str()) {
+                        continue;
+                    }
+                    let account = cap_probe_string(if snap.account.trim().is_empty() {
                         snap_provider.clone()
                     } else {
                         snap.account.trim().to_string()
-                    };
-                    let ts = if snap.fetched_at > 0 { snap.fetched_at } else { fetched_at };
+                    });
+                    let window = cap_probe_string(snap.window.trim().to_string());
+                    let currency = snap.currency.as_deref().map(|s| cap_probe_string(s.trim().to_string()));
                     tx.execute(
                         "INSERT INTO usage_snapshots
                          (account, provider, kind, window, used_pct, used_amount, limit_amount, currency,
@@ -110,27 +122,30 @@ impl Db {
                         params![
                             account,
                             snap_provider,
-                            snap.kind,
-                            snap.window,
+                            kind,
+                            window,
                             snap.used_pct,
                             snap.used_amount,
                             snap.limit_amount,
-                            snap.currency,
+                            currency,
                             snap.resets_at.map(|v| v as i64),
                             "probe",
                             Some(device_id),
-                            ts as i64,
+                            fetched_at as i64,
                         ],
                     )?;
                     stored += 1;
                 }
             } else {
-                let status_text = entry
-                    .message
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&entry.status);
+                let status_text = cap_probe_string(
+                    entry
+                        .message
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&entry.status)
+                        .to_string(),
+                );
                 tx.execute(
                     "INSERT INTO usage_snapshots
                      (account, provider, kind, window, used_pct, used_amount, limit_amount, currency,
@@ -180,6 +195,18 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
+}
+
+fn cap_probe_string(mut value: String) -> String {
+    if value.len() <= MAX_PROBE_STRING_BYTES {
+        return value;
+    }
+    let mut end = MAX_PROBE_STRING_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -363,7 +390,11 @@ pub async fn refresh(hub: &Hub) -> RefreshResult {
             Vec::new()
         }
     };
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build().expect("HTTP client");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("HTTP client");
     let mut result = RefreshResult { providers_checked: 0, devices_probed: 0, snapshots_stored: 0 };
     for provider in providers {
         let Some(kind) = collector(&provider) else { continue };
@@ -738,6 +769,50 @@ mod tests {
         assert_eq!(a_5h.fetched_at, 2200);
 
         drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn device_probe_input_is_allowlisted_bounded_and_hub_timestamped() {
+        let dir = std::env::temp_dir().join(format!("grouper-probe-bounds-{}", random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let long = "é".repeat(200);
+        let results: Vec<UsageProbeEntry> = (0..9)
+            .map(|index| UsageProbeEntry {
+                provider: "claude".into(),
+                status: "ok".into(),
+                message: None,
+                snapshots: vec![UsageSnapshot {
+                    account: long.clone(),
+                    provider: "claude".into(),
+                    kind: "window".into(),
+                    window: if index == 0 { long.clone() } else { format!("window-{index}") },
+                    used_pct: Some(index as f64),
+                    used_amount: None,
+                    limit_amount: None,
+                    currency: Some(long.clone()),
+                    resets_at: None,
+                    source: "spoofed".into(),
+                    device_id: Some("spoofed".into()),
+                    fetched_at: 1,
+                }],
+            })
+            .collect();
+        assert_eq!(db.store_device_probe_results("device", &results, 42).unwrap(), MAX_PROBE_RESULTS);
+        let rows = db.latest_usage_snapshots().unwrap();
+        assert_eq!(rows.len(), MAX_PROBE_RESULTS);
+        assert!(rows.iter().all(|row| row.fetched_at == 42 && row.source == "probe"));
+        assert!(rows.iter().all(|row| row.account.len() <= MAX_PROBE_STRING_BYTES));
+        assert!(rows.iter().all(|row| row.window.len() <= MAX_PROBE_STRING_BYTES));
+        assert!(rows.iter().all(|row| row.currency.as_ref().is_none_or(|s| s.len() <= MAX_PROBE_STRING_BYTES)));
+
+        let invalid = [UsageProbeEntry {
+            provider: "attacker".into(),
+            status: "ok".into(),
+            message: None,
+            snapshots: vec![],
+        }];
+        assert_eq!(db.store_device_probe_results("device", &invalid, 43).unwrap(), 0);
         std::fs::remove_dir_all(dir).ok();
     }
 

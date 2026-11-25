@@ -18,7 +18,7 @@ use serde_json::Value;
 pub mod tunnel;
 
 /// Bumped on any breaking change to the frames below.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// WebSocket endpoint for devices, relative to the hub's base URL.
 pub const CONNECT_PATH: &str = "/v1/connect";
@@ -169,7 +169,7 @@ pub enum NodeMessage {
     Mcp { message: Value },
     /// Ask the hub to relay a model call to the device named by the provider's
     /// `options.via_device`. Used by a thread running on a different device.
-    ModelRequest { call_id: String, provider_id: String, request: Value },
+    ModelRequest { call_id: String, thread_id: String, provider_id: String, request: Value },
     /// A streamed model delta from this device when it is hosting the provider.
     ModelDelta { call_id: String, delta: Value },
     /// The final model response, or an error, from this provider host.

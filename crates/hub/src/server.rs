@@ -1,6 +1,6 @@
 //! The hub: device connections, presence, the HTTP API and the live event stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +41,13 @@ pub const HUB_DEVICE: &str = "hub";
 pub(crate) enum CloseReason {
     Replaced,
     Overflow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueueResult {
+    Sent,
+    Full,
+    Gone,
 }
 
 /// One-shot trigger to close a live device session from outside its read loop.
@@ -111,6 +118,14 @@ pub struct Hub {
     pub(crate) handover_acks: Mutex<HashMap<String, HandoverAckRoute>>,
     /// Concurrent model calls currently relayed through hosting devices.
     pub(crate) model_calls: Mutex<HashMap<String, ModelRoute>>,
+    /// Requester call ids already used on each live connection; prevents reuse
+    /// after a route finishes as well as simultaneous duplicates.
+    pub(crate) model_request_ids: Mutex<HashMap<(String, u64), HashSet<String>>>,
+    /// Usage already accounted from a relayed ModelResponse, awaiting the device's
+    /// matching informational AgentEvent::Usage.
+    pub(crate) relayed_usage: std::sync::Mutex<HashMap<String, Vec<providers::Usage>>>,
+    /// Model ids with an in-progress built-in probe suite.
+    pub(crate) probe_runs: std::sync::Mutex<HashSet<String>>,
     handover_ack_timeout: std::sync::Mutex<Duration>,
     pub(crate) hub_threads: Mutex<HashMap<String, ThreadControl>>,
     pub(crate) orchestrators: Mutex<HashMap<String, mpsc::UnboundedSender<Wake>>>,
@@ -132,6 +147,9 @@ impl Hub {
             approvals: Mutex::new(HashMap::new()),
             handover_acks: Mutex::new(HashMap::new()),
             model_calls: Mutex::new(HashMap::new()),
+            model_request_ids: Mutex::new(HashMap::new()),
+            relayed_usage: std::sync::Mutex::new(HashMap::new()),
+            probe_runs: std::sync::Mutex::new(HashSet::new()),
             handover_ack_timeout: std::sync::Mutex::new(crate::offline::HANDOVER_ACK_TIMEOUT),
             hub_threads: Mutex::new(HashMap::new()),
             orchestrators: Mutex::new(HashMap::new()),
@@ -247,6 +265,20 @@ impl Hub {
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Queue a model-control frame without treating backpressure as a reason to
+    /// disconnect the provider host. Callers turn `Full` into a busy response.
+    pub(crate) async fn queue_to_model_host(&self, device_id: &str, conn_id: u64, msg: HubMessage) -> QueueResult {
+        let live = self.live.lock().await;
+        let Some(connection) = live.get(device_id).filter(|connection| connection.conn_id == conn_id) else {
+            return QueueResult::Gone;
+        };
+        match connection.tx.try_send(msg) {
+            Ok(()) => QueueResult::Sent,
+            Err(mpsc::error::TrySendError::Full(_)) => QueueResult::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => QueueResult::Gone,
         }
     }
 
@@ -1045,9 +1077,9 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                     break Err("MCP incoming queue full".to_string());
                 }
             }
-            Ok(NodeMessage::ModelRequest { call_id, provider_id, request }) => {
+            Ok(NodeMessage::ModelRequest { call_id, thread_id, provider_id, request }) => {
                 if hub.is_live_conn(&device_id, conn_id).await {
-                    hub.relay_model_request(&device_id, conn_id, call_id, provider_id, request).await;
+                    hub.relay_model_request(&device_id, conn_id, call_id, thread_id, provider_id, request).await;
                 }
             }
             Ok(NodeMessage::ModelDelta { call_id, delta }) => {

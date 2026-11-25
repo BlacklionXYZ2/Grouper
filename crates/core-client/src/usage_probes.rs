@@ -14,6 +14,7 @@
 //!   from `Debug` output.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -26,6 +27,17 @@ const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_BETA_HEADER: &str = "oauth-2025-04-20";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const MIN_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+struct ProbeCache {
+    completed_at: tokio::time::Instant,
+    result: (bool, String),
+}
+
+fn probe_state() -> &'static tokio::sync::Mutex<Option<ProbeCache>> {
+    static STATE: OnceLock<tokio::sync::Mutex<Option<ProbeCache>>> = OnceLock::new();
+    STATE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
 
 #[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -53,6 +65,23 @@ fn http_client() -> Result<reqwest::Client, String> {
 /// `args` may pass `{"providers": ["claude", "codex"]}`; omitted or empty probes all
 /// supported providers.
 pub(crate) async fn call(args: &Value) -> (bool, String) {
+    // Holding this mutex through the provider requests makes probes single-flight.
+    // A completed result is reused briefly even if a hostile hub asks repeatedly.
+    let mut state = probe_state().lock().await;
+    if let Some(cached) = state.as_ref()
+        && cached.completed_at.elapsed() < MIN_PROBE_INTERVAL
+    {
+        return cached.result.clone();
+    }
+    let result = call_uncached(args).await;
+    *state = Some(ProbeCache {
+        completed_at: tokio::time::Instant::now(),
+        result: result.clone(),
+    });
+    result
+}
+
+async fn call_uncached(args: &Value) -> (bool, String) {
     let requested: Vec<&str> = match args.get("providers").and_then(Value::as_array) {
         Some(arr) if !arr.is_empty() => {
             let mut list = Vec::new();
@@ -1054,5 +1083,23 @@ mod tests {
         assert_eq!(entry.message.as_deref(), Some("unavailable: HTTP 302"));
 
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[tokio::test]
+    async fn probe_calls_inside_minimum_interval_return_the_cached_result() {
+        let expected = (true, r#"{"results":[]}"#.to_string());
+        let mut state = probe_state().lock().await;
+        let previous = state.take();
+        *state = Some(ProbeCache {
+            completed_at: tokio::time::Instant::now(),
+            result: expected.clone(),
+        });
+        drop(state);
+
+        let actual = call(&json!({"providers": ["claude"]})).await;
+        assert_eq!(actual, expected);
+
+        let mut state = probe_state().lock().await;
+        *state = previous;
     }
 }
