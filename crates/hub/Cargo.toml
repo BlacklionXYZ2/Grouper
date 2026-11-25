@@ -15,6 +15,7 @@ core-agent.workspace = true
 providers.workspace = true
 async-trait.workspace = true
 rusqlite.workspace = true
+reqwest.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64 = "0.22"

@@ -56,6 +56,10 @@ enum Cmd {
         input_price: f64,
         #[arg(long, default_value_t = 0.0)]
         output_price: f64,
+        #[arg(long)]
+        cache_read_price: Option<f64>,
+        #[arg(long)]
+        cache_write_price: Option<f64>,
     },
 }
 
@@ -99,6 +103,7 @@ async fn main() -> Result<()> {
             for t in hub.db.threads(None).into_iter().filter(|t| t.status == "running") {
                 hub.db.finish_thread(&t.id, "failed", "The hub restarted while this thread was running.");
             }
+            tokio::spawn(hub::usage::collector_loop(hub.clone()));
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!("grouper-hub listening on {bind}, data in {}", cli.data.display());
             axum::serve(listener, server::router(hub))
@@ -140,13 +145,25 @@ async fn main() -> Result<()> {
             db.upsert_provider(&ProviderConfig { id: id.clone(), kind, base_url, api_key: key, options })?;
             println!("Saved provider {id}. Connected devices get it when the hub restarts or via `grouper keys set`.");
         }
-        Cmd::Model { id, provider, model, roles, free, input_price, output_price } => {
+        Cmd::Model {
+            id,
+            provider,
+            model,
+            roles,
+            free,
+            input_price,
+            output_price,
+            cache_read_price,
+            cache_write_price,
+        } => {
             db.upsert_model(&ModelEntry {
                 id: id.clone(),
                 provider_id: provider,
                 model,
                 input_price,
                 output_price,
+                cache_read_price,
+                cache_write_price,
                 context_window: 0,
                 use_cases: String::new(),
                 free,

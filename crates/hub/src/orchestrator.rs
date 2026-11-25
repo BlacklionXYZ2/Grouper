@@ -67,7 +67,7 @@ You'll be woken when a thread finishes, asks you something, or the user steps in
 when the device is back.
 - When a thread asks you something, answer it with message_thread (or start another thread to find out first).
 - When results come in, give the user a clear, short summary. Mention files by device and path.
-- Use list_devices and list_models when you need to choose where and with what model to run something.
+- Use list_devices, list_models and list_usage when you need to choose where and with what model to run something.
 - You can't change tool permissions; only the user can.
 
 Memory:
@@ -260,6 +260,7 @@ fn orchestrator_tools(hub: &Arc<Hub>, conversation_id: &str) -> Vec<Arc<dyn Tool
         Arc::new(ListThreads(ctx())),
         Arc::new(ListDevices(ctx())),
         Arc::new(ListModels(ctx())),
+        Arc::new(ListUsage(ctx())),
     ];
     tools.extend(crate::memory::memory_tools(hub, conversation_id));
     tools
@@ -424,5 +425,31 @@ impl Tool for ListModels {
     }
     async fn call(&self, _input: Value) -> ToolOutput {
         to_json(self.0.hub.db.models())
+    }
+}
+
+struct ListUsage(Ctx);
+#[async_trait]
+impl Tool for ListUsage {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "list_usage".into(),
+            description: "Read cost and availability information: Grouper's metered totals for the last 7 days, \
+                          grouped by provider, plus the latest provider-reported balances."
+                .into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(&self, _input: Value) -> ToolOutput {
+        let now = crate::db::now();
+        let totals = match self.0.hub.db.usage_totals(now.saturating_sub(7 * 86_400), i64::MAX as u64, "provider", None) {
+            Ok(rows) => rows,
+            Err(error) => return ToolOutput::err(error.to_string()),
+        };
+        let snapshots = match self.0.hub.db.latest_usage_snapshots() {
+            Ok(rows) => rows,
+            Err(error) => return ToolOutput::err(error.to_string()),
+        };
+        to_json(json!({"period": "last_7_days", "totals": totals, "latest_snapshots": snapshots}))
     }
 }

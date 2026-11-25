@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS providers (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS models (
   id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, input_price REAL NOT NULL DEFAULT 0,
-  output_price REAL NOT NULL DEFAULT 0, context_window INTEGER NOT NULL DEFAULT 0,
+  output_price REAL NOT NULL DEFAULT 0, cache_read_price REAL, cache_write_price REAL,
+  context_window INTEGER NOT NULL DEFAULT 0,
   use_cases TEXT NOT NULL DEFAULT '', free INTEGER NOT NULL DEFAULT 0, roles TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created INTEGER NOT NULL);
@@ -98,6 +99,12 @@ CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT, thread_id TEXT, provider_id TEXT NOT NULL,
   model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
   cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL, cost REAL NOT NULL, ts INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS usage_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL,
+  window TEXT NOT NULL, used_pct REAL, used_amount REAL, limit_amount REAL, currency TEXT, resets_at INTEGER,
+  source TEXT NOT NULL, device_id TEXT, fetched_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS usage_snapshots_latest ON usage_snapshots
+  (provider, account, kind, window, fetched_at DESC);
 ";
 
 fn thread_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadInfo> {
@@ -117,20 +124,23 @@ fn thread_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadInfo> {
 const THREAD_COLS: &str = "id, conversation_id, title, device_id, model, status, reason, summary, created, finished";
 
 fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
-    let roles: String = r.get(8)?;
+    let roles: String = r.get(10)?;
     Ok(ModelEntry {
         id: r.get(0)?,
         provider_id: r.get(1)?,
         model: r.get(2)?,
         input_price: r.get(3)?,
         output_price: r.get(4)?,
-        context_window: r.get::<_, i64>(5)? as u64,
-        use_cases: r.get(6)?,
-        free: r.get::<_, i64>(7)? != 0,
+        cache_read_price: r.get(5)?,
+        cache_write_price: r.get(6)?,
+        context_window: r.get::<_, i64>(7)? as u64,
+        use_cases: r.get(8)?,
+        free: r.get::<_, i64>(9)? != 0,
         roles: roles.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
     })
 }
-const MODEL_COLS: &str = "id, provider_id, model, input_price, output_price, context_window, use_cases, free, roles";
+const MODEL_COLS: &str = "id, provider_id, model, input_price, output_price, cache_read_price, cache_write_price, \
+                          context_window, use_cases, free, roles";
 
 fn migrate_provider_secrets(conn: &mut Connection, secrets: &Secrets) -> Result<()> {
     let tx = conn.transaction()?;
@@ -171,6 +181,14 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
         .exists([])?;
     if !has_admin {
         conn.execute_batch("ALTER TABLE devices ADD COLUMN admin INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    for column in ["cache_read_price", "cache_write_price"] {
+        let exists = conn
+            .prepare("SELECT 1 FROM pragma_table_info('models') WHERE name = ?1")?
+            .exists([column])?;
+        if !exists {
+            conn.execute(&format!("ALTER TABLE models ADD COLUMN {column} REAL"), [])?;
+        }
     }
     Ok(conn)
 }
@@ -408,14 +426,17 @@ impl Db {
             bail!("no provider {}; add it first", m.provider_id);
         }
         self.c().execute(
-            "INSERT OR REPLACE INTO models (id, provider_id, model, input_price, output_price, context_window,
-               use_cases, free, roles) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
+               cache_write_price, context_window, use_cases, free, roles)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 m.id,
                 m.provider_id,
                 m.model,
                 m.input_price,
                 m.output_price,
+                m.cache_read_price,
+                m.cache_write_price,
                 m.context_window as i64,
                 m.use_cases,
                 m.free,
@@ -646,10 +667,18 @@ impl Db {
         cache_write: u64,
     ) -> f64 {
         let price = self.models().into_iter().find(|m| m.provider_id == provider_id && m.model == model);
+        let provider_kind = self.provider(provider_id).ok().flatten().map(|p| p.kind);
         let cost = price
             .map(|m| {
-                (m.input_price * (input as f64 + 1.25 * cache_write as f64 + 0.1 * cache_read as f64)
-                    + m.output_price * output as f64)
+                let anthropic = provider_kind.as_deref() == Some("anthropic");
+                let cache_read_price =
+                    m.cache_read_price.unwrap_or(m.input_price * if anthropic { 0.1 } else { 0.5 });
+                let cache_write_price =
+                    m.cache_write_price.unwrap_or(m.input_price * if anthropic { 1.25 } else { 1.0 });
+                (m.input_price * input as f64
+                    + m.output_price * output as f64
+                    + cache_read_price * cache_read as f64
+                    + cache_write_price * cache_write as f64)
                     / 1_000_000.0
             })
             .unwrap_or(0.0);
@@ -727,6 +756,35 @@ mod tests {
     }
 
     #[test]
+    fn old_databases_get_cache_price_columns_idempotently() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("grouper.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE models (
+               id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL,
+               input_price REAL NOT NULL DEFAULT 0, output_price REAL NOT NULL DEFAULT 0,
+               context_window INTEGER NOT NULL DEFAULT 0, use_cases TEXT NOT NULL DEFAULT '',
+               free INTEGER NOT NULL DEFAULT 0, roles TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        drop(conn);
+        drop(Db::open(&dir).unwrap());
+        let db = Db::open(&dir).unwrap();
+        for column in ["cache_read_price", "cache_write_price"] {
+            assert!(
+                db.c()
+                    .prepare("SELECT 1 FROM pragma_table_info('models') WHERE name = ?1")
+                    .unwrap()
+                    .exists([column])
+                    .unwrap()
+            );
+        }
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn tool_permissions_survive_reports() {
         let dir = tmp();
         let db = Db::open(&dir).unwrap();
@@ -759,6 +817,8 @@ mod tests {
             model: id.into(),
             input_price: 1.0,
             output_price: 2.0,
+            cache_read_price: None,
+            cache_write_price: None,
             context_window: 0,
             use_cases: String::new(),
             free,
@@ -788,6 +848,42 @@ mod tests {
         })
         .unwrap();
         assert_eq!(db.provider("or").unwrap().unwrap().api_key.as_deref(), Some("k"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn cache_cost_uses_provider_defaults_and_registry_overrides() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        for (id, kind) in [("anthropic", "anthropic"), ("openai", "openai"), ("override", "openai")] {
+            db.upsert_provider(&ProviderConfig {
+                id: id.into(),
+                kind: kind.into(),
+                base_url: None,
+                api_key: Some("k".into()),
+                options: Value::Null,
+            })
+            .unwrap();
+            db.upsert_model(&ModelEntry {
+                id: id.into(),
+                provider_id: id.into(),
+                model: id.into(),
+                input_price: 10.0,
+                output_price: 20.0,
+                cache_read_price: (id == "override").then_some(3.0),
+                cache_write_price: (id == "override").then_some(4.0),
+                context_window: 0,
+                use_cases: String::new(),
+                free: false,
+                roles: vec![],
+            })
+            .unwrap();
+        }
+        let cost = |provider: &str| db.record_usage(None, None, provider, provider, 100, 100, 100, 100);
+        assert!((cost("anthropic") - 0.00435).abs() < 1e-12);
+        assert!((cost("openai") - 0.0045).abs() < 1e-12);
+        assert!((cost("override") - 0.0037).abs() < 1e-12);
+        drop(db);
         std::fs::remove_dir_all(dir).ok();
     }
 

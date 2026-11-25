@@ -305,6 +305,12 @@ pub struct ModelEntry {
     pub input_price: f64,
     #[serde(default)]
     pub output_price: f64,
+    /// USD per million tokens read from the provider's prompt cache.
+    #[serde(default)]
+    pub cache_read_price: Option<f64>,
+    /// USD per million tokens written to the provider's prompt cache.
+    #[serde(default)]
+    pub cache_write_price: Option<f64>,
     #[serde(default)]
     pub context_window: u64,
     #[serde(default)]
@@ -314,6 +320,48 @@ pub struct ModelEntry {
     /// Roles this model is the default for: `orchestrator`, `standard`, `thread`.
     #[serde(default)]
     pub roles: Vec<String>,
+}
+
+/// Aggregated metered usage returned by `GET /v1/usage`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageTotal {
+    /// The day, provider, model, conversation or thread represented by this row.
+    pub key: String,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost: f64,
+}
+
+impl UsageTotal {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
+/// A provider-reported usage, spend or balance observation.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageSnapshot {
+    pub account: String,
+    pub provider: String,
+    pub kind: String,
+    pub window: String,
+    #[serde(default)]
+    pub used_pct: Option<f64>,
+    #[serde(default)]
+    pub used_amount: Option<f64>,
+    #[serde(default)]
+    pub limit_amount: Option<f64>,
+    #[serde(default)]
+    pub currency: Option<String>,
+    #[serde(default)]
+    pub resets_at: Option<u64>,
+    pub source: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    pub fetched_at: u64,
 }
 
 /// A provider as listed to clients (keys never leave the hub this way).

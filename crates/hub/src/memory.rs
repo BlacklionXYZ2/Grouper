@@ -599,6 +599,8 @@ mod tests {
             model: "fake-1".into(),
             input_price: 0.0,
             output_price: 0.0,
+            cache_read_price: None,
+            cache_write_price: None,
             context_window: 0,
             use_cases: String::new(),
             free: true,

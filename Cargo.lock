@@ -936,6 +936,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "providers",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

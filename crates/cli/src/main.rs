@@ -1,4 +1,5 @@
 mod credentials;
+mod usage;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
@@ -101,6 +102,8 @@ enum Cmd {
     /// The model registry.
     #[command(subcommand)]
     Models(ModelsCmd),
+    /// Metered token/cost totals and provider-reported balances.
+    Usage(usage::UsageArgs),
     /// Long-term memory about you and your projects, shared by every conversation.
     #[command(subcommand)]
     Memory(MemoryCmd),
@@ -186,6 +189,12 @@ enum ModelsCmd {
         /// USD per million output tokens
         #[arg(long, default_value_t = 0.0)]
         output_price: f64,
+        /// USD per million cached input tokens (provider default when omitted)
+        #[arg(long)]
+        cache_read_price: Option<f64>,
+        /// USD per million cache-write tokens (provider default when omitted)
+        #[arg(long)]
+        cache_write_price: Option<f64>,
         #[arg(long, default_value_t = 0)]
         context_window: u64,
         #[arg(long, default_value = "")]
@@ -249,7 +258,7 @@ fn print_devices(devices: &[DeviceInfo]) {
     }
 }
 
-struct Api {
+pub(crate) struct Api {
     base: String,
     token: String,
     http: reqwest::Client,
@@ -266,10 +275,10 @@ impl Api {
         }
         Ok(body)
     }
-    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+    pub(crate) async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         Ok(serde_json::from_value(self.send(self.http.get(format!("{}{path}", self.base))).await?)?)
     }
-    async fn post(&self, path: &str, body: &impl serde::Serialize) -> Result<Value> {
+    pub(crate) async fn post(&self, path: &str, body: &impl serde::Serialize) -> Result<Value> {
         self.send(self.http.post(format!("{}{path}", self.base)).json(body)).await
     }
     async fn put(&self, path: &str, body: &impl serde::Serialize) -> Result<Value> {
@@ -562,7 +571,7 @@ async fn main() -> Result<()> {
                 if let EventBody::TurnFinished { running_threads: 0 } = e.body {
                     let threads: Vec<ThreadInfo> = api.get(&format!("/v1/threads?conversation={id}")).await?;
                     if threads.iter().all(|t| t.status != "running") {
-                        let cost = usage_line(&api, &id).await;
+                        let cost = usage::conversation_line(&api, &id).await;
                         println!("\n{cost}\ncontinue with: grouper chat -c {id} \"…\"");
                         break;
                     }
@@ -673,6 +682,8 @@ async fn main() -> Result<()> {
             free,
             input_price,
             output_price,
+            cache_read_price,
+            cache_write_price,
             context_window,
             use_cases,
         }) => {
@@ -682,6 +693,8 @@ async fn main() -> Result<()> {
                 model,
                 input_price,
                 output_price,
+                cache_read_price,
+                cache_write_price,
                 context_window,
                 use_cases,
                 free,
@@ -694,22 +707,10 @@ async fn main() -> Result<()> {
             api.delete(&format!("/v1/models/{id}")).await?;
             println!("removed {id}");
         }
+        Cmd::Usage(args) => usage::run(&api, args).await?,
         Cmd::Memory(cmd) => memory_cmd(&api, cmd).await?,
     }
     Ok(())
-}
-
-async fn usage_line(api: &Api, conversation: &str) -> String {
-    // Thread usage, counted from events (the orchestrator's own usage is recorded on the hub).
-    let events: Vec<Event> = api.get(&format!("/v1/conversations/{conversation}/events")).await.unwrap_or_default();
-    let (mut i, mut o) = (0u64, 0u64);
-    for e in &events {
-        if let EventBody::ThreadActivity { event: AgentEvent::Usage { input_tokens, output_tokens, .. } } = &e.body {
-            i += input_tokens;
-            o += output_tokens;
-        }
-    }
-    format!("threads used {i} input / {o} output tokens")
 }
 
 async fn memory_cmd(api: &Api, cmd: MemoryCmd) -> Result<()> {

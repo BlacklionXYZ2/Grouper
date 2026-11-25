@@ -238,6 +238,9 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/providers/{id}", put(put_provider))
         .route("/v1/models", get(list_models))
         .route("/v1/models/{id}", put(put_model).delete(delete_model))
+        .route("/v1/usage", get(list_usage))
+        .route("/v1/usage/snapshots", get(list_usage_snapshots))
+        .route("/v1/usage/refresh", post(refresh_usage))
         .route("/v1/chat", post(chat))
         .route("/v1/conversations", get(list_conversations))
         .route("/v1/conversations/{id}/events", get(conversation_events))
@@ -389,6 +392,49 @@ async fn delete_model(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id):
         Ok(()) => Json(json!({"deleted": id})).into_response(),
         Err(e) => err(StatusCode::NOT_FOUND, e),
     }
+}
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    since: Option<String>,
+    until: Option<String>,
+    group: Option<String>,
+    conversation: Option<String>,
+}
+
+/// Metered totals. Dates are UTC; the end of the range is exclusive unless a
+/// date-only `until` is supplied, in which case that whole day is included.
+async fn list_usage(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q): Query<UsageQuery>) -> Response {
+    admin!(hub, headers);
+    let current = crate::db::now();
+    let since = match crate::usage::parse_time(q.since.as_deref(), current, false) {
+        Ok(value) => value,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error),
+    };
+    let until = match crate::usage::parse_time(q.until.as_deref(), current, true) {
+        Ok(value) => value,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error),
+    };
+    if since >= until {
+        return err(StatusCode::BAD_REQUEST, "since must be before until");
+    }
+    match hub.db.usage_totals(since, until, q.group.as_deref().unwrap_or("day"), q.conversation.as_deref()) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(error) => err(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn list_usage_snapshots(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+    admin!(hub, headers);
+    match hub.db.latest_usage_snapshots() {
+        Ok(rows) => Json(rows).into_response(),
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+async fn refresh_usage(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+    admin!(hub, headers);
+    Json(crate::usage::refresh(&hub).await).into_response()
 }
 
 async fn chat(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(req): Json<ChatRequest>) -> Response {
@@ -761,6 +807,8 @@ mod tests {
             model: "fake-1".into(),
             input_price: 0.0,
             output_price: 0.0,
+            cache_read_price: None,
+            cache_write_price: None,
             context_window: 0,
             use_cases: String::new(),
             free: true,
