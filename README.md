@@ -93,6 +93,20 @@ target/debug/grouper chat "Write two haiku, one on my Mac and one in the cloud"
 
 The Mac thread's shell command waits for approval: run the `grouper approve …` it prints.
 
+## End-to-end test
+
+Run the full smoke test against the real `grouper-hub` and `grouper` binaries (no API keys needed):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/e2e.ps1
+```
+
+```bash
+scripts/e2e.sh
+```
+
+Pass `--no-build` to reuse existing `target/debug` binaries, and `--keep` to keep the temporary directory for debugging.
+
 ## Use a real model
 
 ```bash
