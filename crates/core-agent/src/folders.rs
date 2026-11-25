@@ -74,8 +74,23 @@ pub fn parse_config(text: &str) -> Result<Vec<FolderSpec>, String> {
     let folders = folders.as_object().ok_or("`folders` must be an object of name: {path, mode}")?;
     let mut out = Vec::new();
     for (name, entry) in folders {
+        if name.contains('=') {
+            return Err(format!("folder name {name:?} must not contain `=`"));
+        }
+        if out.iter().any(|spec: &FolderSpec| spec.name.eq_ignore_ascii_case(name)) {
+            return Err(format!("folder name {name:?} differs only by case from another folder"));
+        }
         let spec = match entry {
-            Value::String(s) => FolderSpec::parse_arg(&format!("{name}={s}"))?,
+            Value::String(s) => {
+                let (path, mode) = match s.rsplit_once(':') {
+                    Some((p, m)) if !p.is_empty() => match FolderMode::parse(m) {
+                        Some(mode) => (p, mode),
+                        None => (s.as_str(), FolderMode::Read),
+                    },
+                    _ => (s.as_str(), FolderMode::Read),
+                };
+                FolderSpec::new(name, path, mode)?
+            }
             Value::Object(o) => {
                 let path = o.get("path").and_then(Value::as_str).ok_or_else(|| format!("folder {name} has no path"))?;
                 let mode = match o.get("mode").and_then(Value::as_str) {
@@ -185,6 +200,18 @@ pub fn confine(root: &Path, rel: &str, what: &str) -> Result<PathBuf, String> {
         || p.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_) | Component::RootDir))
     {
         return Err(format!("{rel:?} is outside {what}; use a relative path without `..`"));
+    }
+    #[cfg(windows)]
+    for component in p.components() {
+        if let Component::Normal(name) = component {
+            let name = name.to_string_lossy();
+            if name.contains(':') {
+                return Err(format!("{rel:?} is unsafe on Windows; path components must not contain `:`"));
+            }
+            if name.ends_with(['.', ' ']) {
+                return Err(format!("{rel:?} is unsafe on Windows; path components must not end in a dot or space"));
+            }
+        }
     }
     let full = root.join(p);
     let mut existing = full.clone();
@@ -360,6 +387,8 @@ mod tests {
             vec![("a".into(), FolderMode::ReadWrite), ("b".into(), FolderMode::Read), ("c".into(), FolderMode::ReadWrite)]
         );
         assert!(parse_config(r#"{"folders": {"a": {"path": "/a", "mode": "everything"}}}"#).is_err());
+        assert!(parse_config(r#"{"folders": {"a=b": "/tmp"}}"#).is_err());
+        assert!(parse_config(r#"{"folders": {"Docs": "/a", "docs": "/b"}}"#).is_err());
         assert!(parse_config("{}").unwrap().is_empty());
         assert_eq!(split_scoped("@a/b/c"), Some(("a", "b/c")));
         assert_eq!(split_scoped(r"@a\b"), Some(("a", "b")));
@@ -424,6 +453,25 @@ mod tests {
             std::os::unix::fs::symlink(f.outside.join("new.txt"), f.out.join("dangling")).unwrap();
             assert!(write.call(json!({"path": "@out/dangling", "content": "x"})).await.is_error);
             assert!(!f.outside.join("new.txt").exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_alias_components_are_refused_before_junction_walk() {
+        let f = fixture("windows-aliases");
+        let link = f.notes.join("escape");
+        if !link_dir(&link, &f.outside) {
+            return;
+        }
+        let tools = file_tools(&f.ws);
+        for path in ["@notes/escape:evil/secret.txt", "@notes/escape./secret.txt", "@notes/escape /secret.txt"] {
+            let result = tools[0].call(json!({"path": path})).await;
+            assert!(result.is_error, "{path}: {result:?}");
+            assert!(!result.content.contains("top-secret"), "{path}: {result:?}");
+        }
+        for path in ["escape:evil/secret.txt", "escape./secret.txt", "escape /secret.txt"] {
+            assert!(confine(&f.notes, path, "the workspace").is_err(), "{path}");
         }
     }
 

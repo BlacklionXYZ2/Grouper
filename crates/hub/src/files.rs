@@ -137,10 +137,21 @@ impl Hub {
         }
         let v = self.call_workspace_tool(&t.device_id, WORKSPACE_READ_TOOL, json!({"thread_id": t.id, "path": path})).await?;
         let b64 = v["content_base64"].as_str().ok_or_else(|| FilesError::Failed("the device sent no content".into()))?;
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| FilesError::Failed(format!("unreadable file from the device: {e}")))
+        decode_device_file(b64)
     }
+}
+
+fn decode_device_file(b64: &str) -> Result<Vec<u8>, FilesError> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| FilesError::Failed(format!("unreadable file from the device: {e}")))?;
+    if bytes.len() as u64 > MAX_WORKSPACE_FILE_BYTES {
+        return Err(FilesError::File(FileError::TooLarge(format!(
+            "the device sent {} bytes; the limit is {MAX_WORKSPACE_FILE_BYTES}",
+            bytes.len()
+        ))));
+    }
+    Ok(bytes)
 }
 
 // ---- HTTP API (admin only)
@@ -255,5 +266,14 @@ mod tests {
         let clipped = clip_chars(long);
         assert!(clipped.starts_with(&"é".repeat(MAX_ORCHESTRATOR_CHARS)));
         assert!(clipped.ends_with(&format!("{MAX_ORCHESTRATOR_CHARS} of {} characters shown]", MAX_ORCHESTRATOR_CHARS + 5)));
+    }
+
+    #[test]
+    fn decoded_device_files_are_capped() {
+        let over = vec![0u8; MAX_WORKSPACE_FILE_BYTES as usize + 1];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(over);
+        assert!(matches!(decode_device_file(&encoded), Err(FilesError::File(FileError::TooLarge(_)))));
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"ok");
+        assert_eq!(decode_device_file(&encoded).unwrap(), b"ok");
     }
 }

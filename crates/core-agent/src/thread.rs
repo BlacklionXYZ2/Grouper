@@ -1,6 +1,8 @@
 //! Runs one subagent thread: the loop, its tools, approvals, `ask_orchestrator`,
 //! messages from the user or orchestrator, and stopping. Used on devices and on the hub.
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,7 +81,8 @@ impl ThreadControl {
 
 struct State {
     queue: Mutex<Vec<String>>,
-    pending_ask: Mutex<Option<oneshot::Sender<String>>>,
+    pending_asks: Mutex<VecDeque<(u64, oneshot::Sender<String>)>>,
+    next_ask: AtomicU64,
 }
 
 struct ThreadHooks {
@@ -139,7 +142,8 @@ impl Tool for AskOrchestrator {
             return ToolOutput::err("missing question");
         };
         let (tx, rx) = oneshot::channel();
-        *self.state.pending_ask.lock().unwrap() = Some(tx);
+        let id = self.state.next_ask.fetch_add(1, Ordering::Relaxed);
+        self.state.pending_asks.lock().unwrap().push_back((id, tx));
         self.host.ask_orchestrator(&self.thread_id, q);
         let answered = match self.timeout {
             Some(limit) => match tokio::time::timeout(limit, rx).await {
@@ -151,7 +155,7 @@ impl Tool for AskOrchestrator {
         match answered {
             Ok(answer) => ToolOutput::ok(answer),
             Err(()) => {
-                self.state.pending_ask.lock().unwrap().take();
+                self.state.pending_asks.lock().unwrap().retain(|(pending, _)| *pending != id);
                 ToolOutput::err("the orchestrator didn't answer in time")
             }
         }
@@ -169,7 +173,11 @@ pub fn spawn_thread(
 ) -> (ThreadControl, tokio::task::JoinHandle<ThreadResult>) {
     let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<(String, String)>();
     let (stop_tx, mut stop_rx) = watch::channel(false);
-    let state = Arc::new(State { queue: Mutex::new(Vec::new()), pending_ask: Mutex::new(None) });
+    let state = Arc::new(State {
+        queue: Mutex::new(Vec::new()),
+        pending_asks: Mutex::new(VecDeque::new()),
+        next_ask: AtomicU64::new(1),
+    });
 
     // Route incoming messages: an orchestrator reply answers a pending ask, everything
     // else is added before the thread's next model call.
@@ -177,7 +185,7 @@ pub fn spawn_thread(
     tokio::spawn(async move {
         while let Some((from, text)) = inbox_rx.recv().await {
             if from == "orchestrator"
-                && let Some(tx) = st.pending_ask.lock().unwrap().take()
+                && let Some((_, tx)) = st.pending_asks.lock().unwrap().pop_front()
             {
                 let _ = tx.send(text);
                 continue;
@@ -255,6 +263,25 @@ mod tests {
             self.decision.clone()
         }
         fn ask_orchestrator(&self, _: &str, _: &str) {}
+    }
+
+    #[derive(Default)]
+    struct AskRec {
+        events: Mutex<Vec<AgentEvent>>,
+        questions: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ThreadHost for AskRec {
+        fn emit(&self, _: &str, event: AgentEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+        async fn approve(&self, _: &str, _: &str, _: &Value, _: &str) -> ApprovalDecision {
+            ApprovalDecision::Denied
+        }
+        fn ask_orchestrator(&self, _: &str, question: &str) {
+            self.questions.lock().unwrap().push(question.to_string());
+        }
     }
 
     fn spec(ask: Option<u64>) -> ThreadSpec {
@@ -370,6 +397,48 @@ mod tests {
         control.stop();
         let result = tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap();
         assert!(!result.ok);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parallel_asks_are_answered_oldest_first() {
+        let dir = std::env::temp_dir().join(format!("grouper-parallel-asks-{}", std::process::id()));
+        let ws = Workspace::create(dir.clone()).unwrap();
+        let host = Arc::new(AskRec::default());
+        let script = json!({"rules": [
+            {"last": "first answer", "reply": [{"type": "text", "text": "Both answered."}]},
+            {"last": "go", "reply": [
+                {"type": "tool_use", "name": "ask_orchestrator", "input": {"question": "first?"}},
+                {"type": "tool_use", "name": "ask_orchestrator", "input": {"question": "second?"}}
+            ]}
+        ]});
+        let (control, handle) = spawn_thread(spec(Some(10)), provider(script), vec![], host.clone(), ws);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if host.questions.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("parallel asks never started");
+        assert_eq!(*host.questions.lock().unwrap(), ["first?", "second?"]);
+        control.send("orchestrator", "first answer");
+        control.send("orchestrator", "second answer");
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+        assert_eq!(result.summary, "Both answered.");
+        let outputs: Vec<String> = host
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolResult { name, output, .. } if name == "ask_orchestrator" => Some(output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs, ["first answer", "second answer"]);
         std::fs::remove_dir_all(dir).ok();
     }
 }

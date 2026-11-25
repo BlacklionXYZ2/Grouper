@@ -71,6 +71,10 @@ mod tests {
         );
         assert!(load(Some(&dir.join("missing.json")), &[]).is_err());
         assert!(load(Some(&file), &["bad".into()]).is_err());
+        std::fs::write(&file, r#"{"folders": {"bad=name": "/a"}}"#).unwrap();
+        assert!(load(Some(&file), &[]).is_err());
+        std::fs::write(&file, r#"{"folders": {"Docs": "/a", "docs": "/b"}}"#).unwrap();
+        assert!(load(Some(&file), &[]).is_err());
         std::fs::remove_dir_all(dir).ok();
     }
 }

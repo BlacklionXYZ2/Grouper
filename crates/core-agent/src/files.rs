@@ -2,6 +2,7 @@
 //! output files (on the device that ran it, or in its own workspaces). Same
 //! confinement as the thread's file tools; links are never followed when listing.
 
+use std::io::Read;
 use std::path::Path;
 
 use core_protocol::WorkspaceFile;
@@ -76,14 +77,27 @@ pub fn read_workspace_file(root: &Path, path: &str, cap: u64) -> Result<Vec<u8>,
         return Err(FileError::Refused("name a file".into()));
     }
     let full = confine(&root, path, "the workspace").map_err(FileError::Refused)?;
-    let meta = std::fs::metadata(&full).map_err(|_| FileError::NotFound(format!("{path}: no such file")))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    let file = options.open(&full).map_err(|_| FileError::NotFound(format!("{path}: no such file")))?;
+    let meta = file.metadata().map_err(|e| FileError::NotFound(format!("{path}: {e}")))?;
     if !meta.is_file() {
         return Err(FileError::Refused(format!("{path} is not a file")));
     }
-    if meta.len() > cap {
-        return Err(FileError::TooLarge(format!("{path} is {} bytes; the limit is {cap}", meta.len())));
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| FileError::NotFound(format!("{path}: {e}")))?;
+    if bytes.len() as u64 > cap {
+        return Err(FileError::TooLarge(format!("{path} is over the {cap}-byte limit")));
     }
-    std::fs::read(&full).map_err(|e| FileError::NotFound(format!("{path}: {e}")))
+    Ok(bytes)
 }
 
 #[cfg(test)]

@@ -726,6 +726,24 @@ impl Db {
             .unwrap_or(false)
     }
 
+    /// Finish a thread from either live state in one conditional update. This is used
+    /// by stop paths that can race a device disconnect or hand-over transition.
+    pub(crate) fn finish_active_thread(&self, id: &str, status: &str, summary: &str) -> bool {
+        let c = self.c();
+        let done = c
+            .execute(
+                "UPDATE threads SET status = ?1, summary = ?2, finished = ?3
+                 WHERE id = ?4 AND status IN ('running', 'waiting_device')",
+                params![status, summary, ts(), id],
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false);
+        if done {
+            let _ = c.execute("DELETE FROM offline_threads WHERE thread_id = ?1", [id]);
+        }
+        done
+    }
+
     // ---- events and usage
 
     pub fn add_event(&self, conversation_id: &str, thread_id: Option<&str>, body: EventBody) -> Event {

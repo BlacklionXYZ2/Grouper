@@ -152,6 +152,8 @@ struct Threads {
     controls: Mutex<HashMap<String, ThreadControl>>,
     approvals: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
     providers: Mutex<Vec<ProviderConfig>>,
+    /// Random for each connection, so a reconnect cannot reuse an old approval id.
+    approval_nonce: u64,
     next: AtomicU64,
     /// Set once the connection is gone: no new threads or approvals.
     closed: AtomicBool,
@@ -159,12 +161,15 @@ struct Threads {
 
 impl Threads {
     fn new(out: mpsc::Sender<NodeMessage>, on_overflow: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).expect("system randomness for approval ids");
         Self {
             out,
             on_overflow,
             controls: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             providers: Mutex::new(Vec::new()),
+            approval_nonce: u64::from_le_bytes(nonce),
             next: AtomicU64::new(1),
             closed: AtomicBool::new(false),
         }
@@ -205,7 +210,11 @@ impl ThreadHost for Threads {
         self.send(NodeMessage::ThreadEvent { thread_id: thread_id.into(), event });
     }
     async fn approve(&self, thread_id: &str, tool: &str, input: &Value, reason: &str) -> ApprovalDecision {
-        let approval_id = format!("{thread_id}-a{}", self.next.fetch_add(1, Ordering::Relaxed));
+        let approval_id = format!(
+            "{thread_id}-{:016x}-a{}",
+            self.approval_nonce,
+            self.next.fetch_add(1, Ordering::Relaxed)
+        );
         let (tx, rx) = oneshot::channel();
         {
             let mut approvals = self.approvals.lock().unwrap();
@@ -426,7 +435,7 @@ async fn connect_once(
                         if let Some(c) = threads.controls.lock().unwrap().remove(&thread_id) {
                             c.stop();
                         }
-                        let prefix = format!("{thread_id}-a");
+                        let prefix = format!("{thread_id}-");
                         threads.approvals.lock().unwrap().retain(|id, _| !id.starts_with(&prefix));
                     }
                     Ok(HubMessage::ApprovalResult { approval_id, approved, timeout_secs }) => {
@@ -478,6 +487,15 @@ mod tests {
     use super::*;
     use core_protocol::Permission;
     use serde_json::json;
+
+    #[test]
+    fn approval_nonce_is_fresh_for_each_connection() {
+        let (tx1, _rx1) = mpsc::channel(CONN_QUEUE_CAP);
+        let (tx2, _rx2) = mpsc::channel(CONN_QUEUE_CAP);
+        let first = Threads::new(tx1, Arc::new(|| {}));
+        let second = Threads::new(tx2, Arc::new(|| {}));
+        assert_ne!(first.approval_nonce, second.approval_nonce);
+    }
 
     /// A thread waiting for approval must end, and release its host, when the
     /// connection drops (it used to wait forever and keep `Threads` alive).

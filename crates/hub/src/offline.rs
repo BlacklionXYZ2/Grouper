@@ -130,21 +130,6 @@ impl Db {
             .is_ok_and(|n| n > 0)
     }
 
-    /// Finish a waiting thread (stopped by the user or orchestrator). False if it wasn't waiting.
-    pub(crate) fn finish_waiting_thread(&self, id: &str, status: &str, summary: &str) -> bool {
-        let c = self.c();
-        let done = c
-            .execute(
-                "UPDATE threads SET status = ?1, summary = ?2, finished = ?3 WHERE id = ?4 AND status = ?5",
-                params![status, summary, now() as i64, id, WAITING_DEVICE],
-            )
-            .is_ok_and(|n| n > 0);
-        if done {
-            let _ = c.execute("DELETE FROM offline_threads WHERE thread_id = ?1", [id]);
-        }
-        done
-    }
-
     fn waiting(&self, id: &str) -> Option<Waiting> {
         self.c()
             .query_row(

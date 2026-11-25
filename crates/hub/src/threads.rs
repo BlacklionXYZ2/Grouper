@@ -262,17 +262,34 @@ impl Hub {
         input: Value,
         reason: &str,
         local: Option<oneshot::Sender<ApprovalAnswer>>,
-    ) {
-        let Some(t) = self.db.thread(thread_id) else { return };
-        self.approvals.lock().await.insert(
+    ) -> bool {
+        let internal = local.is_some();
+        if !internal && !approval_id.starts_with(&format!("{thread_id}-")) {
+            return false;
+        }
+        let generation = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut approvals = self.approvals.lock().await;
+        // Re-read status while holding the route lock. If a finisher changed it
+        // first we reject; if it changes after this check, its clear pass removes us.
+        let Some(t) = self.db.thread(thread_id) else { return false };
+        if t.status != "running" && !(internal && t.status == WAITING_DEVICE) {
+            return false;
+        }
+        if approvals.contains_key(approval_id) {
+            return false;
+        }
+        approvals.insert(
             approval_id.into(),
             ApprovalRoute {
                 device_id: device_id.into(),
                 conversation_id: t.conversation_id.clone(),
                 thread_id: thread_id.into(),
                 local,
+                generation,
+                timer: None,
             },
         );
+        drop(approvals);
         self.emit(
             &t.conversation_id,
             Some(thread_id),
@@ -288,24 +305,43 @@ impl Hub {
         // the approval pending (`approval_timed_out` checks again).
         if let Some(secs) = self.db.limits().approval_timeout_secs {
             let hub = Arc::clone(self);
-            let approval_id = approval_id.to_string();
-            tokio::spawn(async move {
+            let timer_id = approval_id.to_string();
+            let route_id = timer_id.clone();
+            let task = tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                hub.approval_timed_out(approval_id, secs).await;
+                hub.approval_timed_out(timer_id, generation, secs).await;
             });
+            let timer = task.abort_handle();
+            let mut approvals = self.approvals.lock().await;
+            match approvals.get_mut(&route_id) {
+                Some(route) if route.generation == generation => route.timer = Some(timer),
+                _ => timer.abort(),
+            }
         }
+        true
     }
 
     /// The timer for one approval. Does nothing if that approval was already resolved
     /// or cleared, or if the timeout has since been turned off.
-    pub(crate) async fn approval_timed_out(self: &Arc<Self>, approval_id: String, secs: u64) {
+    pub(crate) async fn approval_timed_out(self: &Arc<Self>, approval_id: String, generation: u64, secs: u64) {
         if self.db.limits().approval_timeout_secs.is_none() {
             return;
         }
-        let Some(route) = self.approvals.lock().await.remove(&approval_id) else { return };
+        let mut approvals = self.approvals.lock().await;
+        if !approvals.get(&approval_id).is_some_and(|route| route.generation == generation) {
+            return;
+        }
+        let Some(route) = approvals.remove(&approval_id) else { return };
+        drop(approvals);
         let action = self.db.limits().approval_timeout_action;
         let phrase = approval_timeout_phrase(secs);
         tracing::info!(approval_id, thread = %route.thread_id, secs, action = action.as_str(), "approval timed out");
+        if action == ApprovalTimeoutAction::Stop {
+            let summary = format!("Stopped: no answer to an approval within {phrase}.");
+            if self.stop_thread_as(&route.thread_id, "approval", &summary).await.is_err() {
+                return;
+            }
+        }
         match route.local {
             Some(tx) => {
                 let _ = tx.send(ApprovalAnswer::TimedOut { secs });
@@ -340,9 +376,6 @@ impl Hub {
         if action == ApprovalTimeoutAction::Stop {
             let summary = format!("Stopped: no answer to an approval within {phrase}.");
             let id = route.thread_id.clone();
-            if self.stop_thread_as(&id, "approval", &summary).await.is_err() {
-                return;
-            }
             if let Some(t) = self.db.thread(&id) {
                 self.wake(
                     &t.conversation_id,
@@ -416,23 +449,18 @@ impl Hub {
     pub(crate) async fn stop_thread_as(self: &Arc<Self>, thread_id: &str, by: &str, summary: &str) -> Result<(), String> {
         let t = self.db.thread(thread_id).ok_or("no such thread")?;
         let summary = summary.to_string();
-        // A waiting thread's live part, if any, is its hub part.
-        let waiting = t.status == WAITING_DEVICE;
-        let stopped = if waiting {
-            self.db.finish_waiting_thread(thread_id, "stopped", &summary)
-        } else {
-            self.db.finish_thread(thread_id, "stopped", &summary)
-        };
+        let stopped = self.db.finish_active_thread(thread_id, "stopped", &summary);
         if !stopped {
             return Err(format!("thread {} is already {}", t.id, t.status));
         }
         self.db.record_outcome(thread_id);
         self.clear_approvals(thread_id).await;
-        if t.device_id == HUB_DEVICE || waiting {
-            if let Some(c) = self.hub_threads.lock().await.get(&t.id) {
-                c.stop();
-            }
-        } else {
+        // Stop a hub-side part whenever one exists. This also covers a concurrent
+        // running -> waiting_device transition after the snapshot above.
+        if let Some(c) = self.hub_threads.lock().await.get(&t.id) {
+            c.stop();
+        }
+        if t.device_id != HUB_DEVICE {
             self.send_to(&t.device_id, HubMessage::StopThread { thread_id: t.id.clone() }).await;
         }
         self.emit(
@@ -452,13 +480,31 @@ impl Hub {
 
     /// Pending approvals die with their thread (a hub thread waiting on one gets "denied").
     async fn clear_approvals(&self, thread_id: &str) {
-        self.approvals.lock().await.retain(|_, r| r.thread_id != thread_id);
+        self.approvals.lock().await.retain(|_, r| {
+            if r.thread_id == thread_id {
+                if let Some(timer) = r.timer.take() {
+                    timer.abort();
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// A device disconnected: its approvals are moot, and its threads wait for it to
     /// come back while the hub works towards a checkpoint (see `offline.rs`).
     pub(crate) async fn device_gone(self: &Arc<Self>, device_id: &str) {
-        self.approvals.lock().await.retain(|_, r| r.device_id != device_id);
+        self.approvals.lock().await.retain(|_, r| {
+            if r.device_id == device_id {
+                if let Some(timer) = r.timer.take() {
+                    timer.abort();
+                }
+                false
+            } else {
+                true
+            }
+        });
         for t in self.db.running_threads_on(device_id) {
             self.wait_for_device(&t.id, "the device disconnected while the thread was running", true).await;
         }

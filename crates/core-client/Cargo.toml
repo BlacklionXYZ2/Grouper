@@ -13,6 +13,7 @@ async-trait.workspace = true
 base64 = "0.22"
 dirs = "6"
 futures-util.workspace = true
+getrandom.workspace = true
 # Same version rmcp's child-process transport uses; adds killing the whole process tree.
 process-wrap = { version = "10", features = ["tokio1", "job-object", "process-group", "kill-on-drop"] }
 rmcp = { workspace = true, features = ["server", "client", "transport-child-process"] }

@@ -1015,6 +1015,8 @@ mod tests {
                 conversation_id: conv.clone(),
                 thread_id: thread.to_string(),
                 local,
+                generation: 1,
+                timer: None,
             };
             let hub = hub.clone();
             let id2 = id.clone();
@@ -1025,7 +1027,7 @@ mod tests {
 
         // Off: a stale timer must not resolve it.
         insert("a-off", &on_device.id, &device.id, None).await;
-        hub.approval_timed_out("a-off".into(), 30).await;
+        hub.approval_timed_out("a-off".into(), 1, 30).await;
         assert!(hub.approvals.lock().await.contains_key("a-off"));
         assert_eq!(resolved(), 0);
         assert!(rx.try_recv().is_err());
@@ -1033,7 +1035,9 @@ mod tests {
         let mut limits = hub.db.limits();
         limits.approval_timeout_secs = Some(30);
         hub.db.set_limits(&limits).unwrap();
-        hub.approval_timed_out("a-off".into(), 30).await;
+        hub.approval_timed_out("a-off".into(), 2, 30).await;
+        assert!(hub.approvals.lock().await.contains_key("a-off"));
+        hub.approval_timed_out("a-off".into(), 1, 30).await;
         match rx.try_recv().unwrap() {
             HubMessage::ApprovalResult { approval_id, approved, timeout_secs } => {
                 assert_eq!((approval_id.as_str(), approved, timeout_secs), ("a-off", false, Some(30)));
@@ -1052,7 +1056,7 @@ mod tests {
             .collect();
         assert_eq!(notices, vec!["No answer within 30 seconds; the call was denied.".to_string()]);
         // Already resolved: a second pass does not send again.
-        hub.approval_timed_out("a-off".into(), 30).await;
+        hub.approval_timed_out("a-off".into(), 1, 30).await;
         assert!(rx.try_recv().is_err());
         assert_eq!(resolved(), 1);
         assert!(!hub.resolve_approval("a-off", true).await);
@@ -1066,7 +1070,7 @@ mod tests {
             }
             other => panic!("expected ApprovalResult, got {other:?}"),
         }
-        hub.approval_timed_out("a-user".into(), 30).await;
+        hub.approval_timed_out("a-user".into(), 1, 30).await;
         assert!(rx.try_recv().is_err());
         assert_eq!(resolved(), 2);
 
@@ -1075,18 +1079,80 @@ mod tests {
         insert("a-cleared", &stopped.id, &device.id, None).await;
         hub.stop_thread(&stopped.id, "user").await.unwrap();
         assert!(rx.try_recv().is_ok(), "StopThread");
-        hub.approval_timed_out("a-cleared".into(), 30).await;
+        hub.approval_timed_out("a-cleared".into(), 1, 30).await;
         assert!(rx.try_recv().is_err(), "a cleared approval is not resolved");
         assert_eq!(resolved(), 2);
 
         // Hub thread: the waiter hears the timeout, once.
         let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
         insert("a-hub", &on_hub.id, HUB_DEVICE, Some(answer_tx)).await;
-        hub.approval_timed_out("a-hub".into(), 30).await;
+        hub.approval_timed_out("a-hub".into(), 1, 30).await;
         assert_eq!(answer_rx.await.unwrap(), ApprovalAnswer::TimedOut { secs: 30 });
-        hub.approval_timed_out("a-hub".into(), 30).await;
+        hub.approval_timed_out("a-hub".into(), 1, 30).await;
         assert_eq!(resolved(), 3);
 
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn device_approval_ids_are_scoped_unique_and_only_for_running_threads() {
+        let (dir, hub) = scripted_hub("approval-validation");
+        let (device, _) = hub.db.add_device("Mac", "macos", false).unwrap();
+        let conv = hub.db.create_conversation("project", "approvals").unwrap();
+        let thread = hub.db.create_thread(&conv, "T", &device.id, "m", None, "brief").unwrap();
+        let id = format!("{}-connection-a1", thread.id);
+
+        assert!(
+            hub.request_approval(&device.id, &thread.id, &id, "run_shell", json!({}), "test", None).await
+        );
+        assert!(!hub.request_approval(&device.id, &thread.id, &id, "run_shell", json!({}), "duplicate", None).await);
+        assert_eq!(hub.approvals.lock().await.get(&id).unwrap().thread_id, thread.id);
+        assert!(!
+            hub.request_approval(&device.id, &thread.id, "someone-elses-a1", "run_shell", json!({}), "bad", None)
+                .await
+        );
+        assert!(hub.resolve_approval(&id, false).await);
+
+        assert!(hub.db.finish_thread(&thread.id, "done", "done"));
+        let late = format!("{}-connection-a2", thread.id);
+        assert!(!hub.request_approval(&device.id, &thread.id, &late, "run_shell", json!({}), "late", None).await);
+        assert!(hub.approvals.lock().await.is_empty());
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stop_timeout_stops_before_delivering_the_denial() {
+        use core_protocol::HubMessage;
+        use crate::server::{CloseHandle, Live};
+
+        let (dir, hub) = scripted_hub("approval-stop-order");
+        let (device, _) = hub.db.add_device("Mac", "macos", false).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (close, _close_rx) = CloseHandle::new();
+        let (_closed_tx, closed) = tokio::sync::watch::channel(false);
+        hub.live.lock().await.insert(
+            device.id.clone(),
+            Live { conn_id: 1, tx, tools: vec![], mcp: None, close, closed },
+        );
+        let conv = hub.db.create_conversation("project", "approval stop").unwrap();
+        let thread = hub.db.create_thread(&conv, "T", &device.id, "m", None, "brief").unwrap();
+        let mut limits = hub.db.limits();
+        limits.approval_timeout_secs = Some(30);
+        limits.approval_timeout_action = ApprovalTimeoutAction::Stop;
+        hub.db.set_limits(&limits).unwrap();
+        let id = format!("{}-connection-a1", thread.id);
+        assert!(hub.request_approval(&device.id, &thread.id, &id, "run_shell", json!({}), "test", None).await);
+        let generation = hub.approvals.lock().await.get(&id).unwrap().generation;
+
+        hub.approval_timed_out(id.clone(), generation, 30).await;
+        assert!(matches!(rx.recv().await, Some(HubMessage::StopThread { thread_id }) if thread_id == thread.id));
+        assert!(matches!(
+            rx.recv().await,
+            Some(HubMessage::ApprovalResult { approval_id, approved: false, timeout_secs: Some(30) }) if approval_id == id
+        ));
+        assert_eq!(hub.db.thread(&thread.id).unwrap().status, "stopped");
         drop(hub);
         std::fs::remove_dir_all(dir).ok();
     }

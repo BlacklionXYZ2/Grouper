@@ -23,20 +23,34 @@
 //! read-only mode get it at every level (codex `read-only`, claude-code `plan`,
 //! antigravity `plan`, pi `read-only`, cursor's sandbox stays on).
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use core_protocol::{
     AGENT_MCP_SERVERS, FolderMode, MCP_DEFAULT_TIMEOUT_SECS, MCP_MAX_TIMEOUT_SECS, Permission, mcp_server_of,
 };
 use serde_json::{Value, json};
 
-use crate::folders::{display_path, split_scoped};
+use crate::folders::{display_path, split_scoped, within};
 use crate::tools::Workspace;
 
 /// `(server, tool)` when `name` is a tool of one of the CLI-agent servers.
 pub fn agent_tool(name: &str) -> Option<(&str, &str)> {
     let server = mcp_server_of(name)?;
     AGENT_MCP_SERVERS.contains(&server).then(|| (server, &name[server.len() + core_protocol::MCP_SEPARATOR.len()..]))
+}
+
+fn is_chat_tool(server: &str, own: &str) -> bool {
+    matches!(
+        (server, own),
+        ("codex", "codex_chat")
+            | ("claude-code", "claude_code_chat")
+            | ("antigravity", "antigravity_chat")
+            | ("cursor", "cursor_chat")
+            | ("pi", "pi_chat")
+            | ("opencode", "opencode_chat")
+            | ("hermes", "hermes_chat")
+            | ("grok", "grok_chat")
+    )
 }
 
 /// What clamping did to a call's arguments.
@@ -48,6 +62,8 @@ pub struct Clamped {
     pub asked_for_bypass: Option<String>,
     /// The scoped folder the agent works in (`@projects on Laptop`), when it named one.
     pub folder: Option<String>,
+    /// The scoped folder is read-only.
+    pub read_only_folder: bool,
 }
 
 fn s<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
@@ -78,13 +94,28 @@ fn remove(input: &mut Value, key: &str, out: &mut Clamped) {
 pub fn clamp(level: Permission, tool: &str, input: &mut Value, workspace: &Workspace) -> Clamped {
     let mut out = Clamped::default();
     let Some((server, own)) = agent_tool(tool) else { return out };
-    if !own.ends_with("_chat") {
+    if !is_chat_tool(server, own) {
         return out;
     }
     if !input.is_object() {
         *input = json!({});
     }
     let bypass = level == Permission::Bypass;
+
+    // Remember what the model requested before read-only folder clamping changes it.
+    if !bypass {
+        out.asked_for_bypass = match server {
+            "codex" if s(input, "sandbox") == Some("danger-full-access") => Some("sandbox: danger-full-access".into()),
+            "claude-code" if s(input, "permission_mode") == Some("bypassPermissions") => {
+                Some("permission_mode: bypassPermissions".into())
+            }
+            "antigravity" if input.get("allow_all_tools").and_then(Value::as_bool) == Some(true) => {
+                Some("allow_all_tools: true".into())
+            }
+            "cursor" if s(input, "sandbox") == Some("disabled") => Some("sandbox: disabled".into()),
+            _ => None,
+        };
+    }
 
     // Shared: where it runs, and how long it may take.
     if s(input, "working_directory").is_none_or(|d| d.trim().is_empty()) {
@@ -98,8 +129,22 @@ pub fn clamp(level: Permission, tool: &str, input: &mut Value, workspace: &Works
         && let Some(folder) = located.folder
     {
         read_only = folder.mode == FolderMode::Read;
+        out.read_only_folder = read_only;
         out.folder = Some(format!("@{} on {}", folder.name, workspace.device_label()));
         set(input, "working_directory", json!(display_path(&located.full)), &mut out);
+    }
+    // Relative paths are interpreted by the local MCP server, whose cwd is unrelated
+    // to the thread. Resolve confined paths here and give the server an absolute path.
+    if let Some(dir) = s(input, "working_directory").map(String::from) {
+        let path = Path::new(&dir);
+        if split_scoped(&dir).is_none()
+            && !path.is_absolute()
+            && !dir.starts_with('/')
+            && !dir.starts_with('\\')
+            && let Ok(full) = workspace.resolve(&dir)
+        {
+            set(input, "working_directory", json!(display_path(&full)), &mut out);
+        }
     }
     if read_only {
         // Asking for less is always kept below, so these hold at every level.
@@ -127,10 +172,7 @@ pub fn clamp(level: Permission, tool: &str, input: &mut Value, workspace: &Works
             // Asking for less is always fine.
             (_, Some("read-only")) => {}
             (true, _) => set(input, "sandbox", json!("danger-full-access"), &mut out),
-            (false, asked) => {
-                if asked == Some("danger-full-access") {
-                    out.asked_for_bypass = Some("sandbox: danger-full-access".into());
-                }
+            (false, _) => {
                 set(input, "sandbox", json!("workspace-write"), &mut out);
             }
         },
@@ -138,24 +180,18 @@ pub fn clamp(level: Permission, tool: &str, input: &mut Value, workspace: &Works
             (_, Some("plan" | "default")) => {}
             (true, Some("acceptEdits")) => {}
             (true, _) => set(input, "permission_mode", json!("bypassPermissions"), &mut out),
-            (false, asked) => {
-                if asked == Some("bypassPermissions") {
-                    out.asked_for_bypass = Some("permission_mode: bypassPermissions".into());
-                }
+            (false, _) => {
                 set(input, "permission_mode", json!("acceptEdits"), &mut out);
             }
         },
         "antigravity" => {
             let plan = s(input, "mode") == Some("plan");
             if bypass {
-                set(input, "allow_all_tools", json!(true), &mut out);
+                set(input, "allow_all_tools", json!(!read_only), &mut out);
                 if !plan {
                     remove(input, "mode", &mut out);
                 }
             } else {
-                if input.get("allow_all_tools").and_then(Value::as_bool) == Some(true) {
-                    out.asked_for_bypass = Some("allow_all_tools: true".into());
-                }
                 set(input, "allow_all_tools", json!(false), &mut out);
                 if !plan {
                     set(input, "mode", json!("accept-edits"), &mut out);
@@ -165,10 +201,7 @@ pub fn clamp(level: Permission, tool: &str, input: &mut Value, workspace: &Works
         "cursor" => match (bypass, s(input, "sandbox")) {
             (true, Some("enabled")) => {}
             (true, _) => set(input, "sandbox", json!("disabled"), &mut out),
-            (false, asked) => {
-                if asked == Some("disabled") {
-                    out.asked_for_bypass = Some("sandbox: disabled".into());
-                }
+            (false, _) => {
                 set(input, "sandbox", json!("enabled"), &mut out);
             }
         },
@@ -211,26 +244,34 @@ fn is_unconfined(server: &str, input: &Value) -> bool {
 /// or outward-facing instructions.
 pub fn auto_risk(tool: &str, input: &Value, workspace: Option<&Workspace>, clamped: &Clamped) -> Option<String> {
     let (server, own) = agent_tool(tool)?;
-    if own.starts_with("list_") || !own.ends_with("_chat") {
+    if own.starts_with("list_") {
         return None;
     }
+    if !is_chat_tool(server, own) {
+        return Some(format!("{tool} is an unknown non-list agent tool"));
+    }
+    let mut reasons = Vec::new();
     // A scoped folder is allowed space, but the user is asked once per call.
     if let Some(folder) = &clamped.folder {
-        return Some(format!("{tool} works in {folder}"));
+        reasons.push(format!("{tool} works in {folder}"));
     }
-    if let (Some(dir), Some(ws)) = (s(input, "working_directory"), workspace)
+    if clamped.folder.is_none()
+        && let (Some(dir), Some(ws)) = (s(input, "working_directory"), workspace)
         && !inside(ws, dir)
     {
-        return Some(format!("{tool} would work in {dir}, outside the thread's workspace"));
+        reasons.push(format!("{tool} would work in {dir}, outside the thread's workspace"));
     }
     if let Some(asked) = &clamped.asked_for_bypass {
-        return Some(format!("the model asked {tool} for {asked}"));
+        reasons.push(format!("the model asked {tool} for {asked}"));
     }
     if is_unconfined(server, input) {
-        return Some(UNCONFINED_REASON.into());
+        reasons.push(UNCONFINED_REASON.into());
     }
     let message = s(input, "message").unwrap_or_default();
-    message_risk(message).map(|why| format!("{tool}'s message {why}"))
+    if let Some(why) = message_risk(message) {
+        reasons.push(format!("{tool}'s message {why}"));
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
 }
 
 /// Instructions in an agent's message that need a person to look first.
@@ -280,38 +321,24 @@ pub fn inside(workspace: &Workspace, dir: &str) -> bool {
     if !path.is_absolute() && !dir.starts_with('/') && !dir.starts_with('\\') {
         return workspace.resolve(dir).is_ok();
     }
-    let root = normalize(Path::new(&display_root(workspace)));
-    // Follow symlinks for a folder that exists; judge the words otherwise.
-    let target = match path.canonicalize() {
-        Ok(real) => normalize(Path::new(real.to_string_lossy().strip_prefix(r"\\?\").unwrap_or(&real.to_string_lossy()))),
-        Err(_) => normalize(path),
-    };
-    let key = |p: &Path| {
-        let s = p.to_string_lossy().replace('\\', "/");
-        if cfg!(windows) { s.to_ascii_lowercase() } else { s }
-    };
-    let (root, target) = (key(&root), key(&target));
-    target == root || target.starts_with(&format!("{}/", root.trim_end_matches('/')))
-}
-
-/// Resolve `.` and `..` without touching the disk.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    // Canonicalize the deepest existing ancestor so a non-existent child below a
+    // symlink or junction cannot be judged lexically as inside the workspace.
+    let mut existing = path.to_path_buf();
+    while std::fs::symlink_metadata(&existing).is_err() {
+        if !existing.pop() {
+            return false;
         }
     }
-    out
+    existing.canonicalize().is_ok_and(|real| within(&real, workspace.root()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn ws(tag: &str) -> (std::sync::Arc<Workspace>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("grouper-agents-{tag}-{}", std::process::id()));
@@ -463,6 +490,53 @@ mod tests {
         // `@name` is a scoped folder, never the workspace (even with a folder called `@name` in it).
         assert!(!inside(&w, "@projects"));
         assert!(!inside(&w, "@projects/app"));
+
+        let outside = dir.with_file_name(format!("grouper-agents-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = dir.join("escape");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if linked {
+            assert!(!inside(&w, &display_path(&link.join("not-created-yet"))));
+            #[cfg(windows)]
+            let _ = std::fs::remove_dir(&link);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&link);
+        }
+        std::fs::remove_dir_all(outside).ok();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn relative_working_directories_are_made_absolute_before_risk_checks() {
+        let (w, dir) = ws("relative-cwd");
+        let tool = "codex__codex_chat";
+        for relative in [".", "sub", "sub/new"] {
+            let (input, clamped) = run(
+                Permission::Auto,
+                tool,
+                json!({"message": "work", "working_directory": relative}),
+                &w,
+            );
+            let expected = display_path(&w.resolve(relative).unwrap());
+            assert_eq!(input["working_directory"], expected, "{relative}");
+            assert_eq!(auto_risk(tool, &input, Some(&w), &clamped), None, "{relative}");
+        }
+        let (input, clamped) = run(
+            Permission::Auto,
+            tool,
+            json!({"message": "work", "working_directory": "../outside"}),
+            &w,
+        );
+        assert_eq!(input["working_directory"], "../outside");
+        assert!(auto_risk(tool, &input, Some(&w), &clamped).unwrap().contains("outside"));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -489,6 +563,7 @@ mod tests {
         let mut input = json!({"message": "Fix the bug", "working_directory": "@projects/app"});
         let reason = check_call(Permission::Auto, t, &mut input, &w).unwrap();
         assert!(reason.contains("works in @projects on Laptop"), "{reason}");
+        assert!(!reason.contains("outside the thread's workspace"), "{reason}");
         assert_eq!((&input["working_directory"], &input["sandbox"]), (&json!(app), &json!("workspace-write")));
         // Bypass runs it with the agent's own bypass mode; Manual asks.
         let mut input = json!({"message": "Fix the bug", "working_directory": "@projects/app"});
@@ -511,10 +586,29 @@ mod tests {
             let (i, _) =
                 run(level, "antigravity__antigravity_chat", json!({"message": "m", "working_directory": "@docs"}), &w);
             assert_eq!(i["mode"], "plan", "{level:?}");
+            assert_eq!(i["allow_all_tools"], false, "{level:?}");
         }
         // pi in a read folder on Auto runs read-only, still asking because of the folder.
         let mut input = json!({"message": "m", "working_directory": "@docs"});
         assert!(check_call(Permission::Auto, "pi__pi_chat", &mut input, &w).unwrap().contains("works in @docs"));
+        let mut input = json!({"message": "m", "working_directory": "@docs"});
+        assert!(check_call(Permission::Auto, "cursor__cursor_chat", &mut input, &w).unwrap().contains("works in @docs"));
+        for tool in ["hermes__hermes_chat", "grok__grok_chat", "opencode__opencode_chat"] {
+            let mut input = json!({"message": "m", "working_directory": "@docs"});
+            assert!(check_call(Permission::Bypass, tool, &mut input, &w).unwrap().contains("read-only"), "{tool}");
+        }
+
+        // A requested bypass survives read-only clamping, and every applicable risk is reported.
+        let mut input = json!({
+            "message": "git push origin main",
+            "working_directory": "@docs",
+            "sandbox": "danger-full-access"
+        });
+        let reason = check_call(Permission::Auto, t, &mut input, &w).unwrap();
+        assert!(reason.contains("works in @docs"), "{reason}");
+        assert!(reason.contains("danger-full-access"), "{reason}");
+        assert!(reason.contains("publishes to a remote"), "{reason}");
+        assert_eq!(input["sandbox"], "read-only");
 
         // Escapes and unknown folders aren't resolved: they count as outside the workspace.
         for dir in ["@projects/../docs", "@nope", "@projects/../../etc"] {
@@ -535,6 +629,7 @@ mod tests {
         assert!(auto_risk(t, &ok, Some(&w), &none).is_none());
         assert!(auto_risk("codex__list_codex_chats", &json!({}), Some(&w), &none).is_none());
         assert!(auto_risk("catalog__list_available_agents", &json!({}), Some(&w), &none).is_none());
+        assert!(auto_risk("codex__delete_codex_chat", &json!({}), Some(&w), &none).is_some());
         let away = json!({"message": "hi", "working_directory": std::env::temp_dir()});
         assert!(auto_risk(t, &away, Some(&w), &none).unwrap().contains("outside"));
         let asked = Clamped { asked_for_bypass: Some("sandbox: danger-full-access".into()), ..Clamped::default() };

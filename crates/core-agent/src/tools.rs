@@ -8,9 +8,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use core_protocol::{FolderMode, ToolDef};
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 use crate::folders::{Folders, confine};
-use crate::{Tool, ToolOutput};
+use crate::{MAX_TOOL_OUTPUT, Tool, ToolOutput};
 
 /// A thread's own folder. File tools can't reach outside it, except into the
 /// device's scoped folders.
@@ -76,10 +77,42 @@ impl Tool for ReadFile {
         let Some(rel) = s(&input, "path") else { return ToolOutput::err("missing path") };
         match self.0.locate(&rel) {
             Err(e) => ToolOutput::err(e),
-            Ok(l) => match tokio::fs::read_to_string(&l.full).await {
-                Ok(t) => ToolOutput::ok(t),
-                Err(e) => ToolOutput::err(format!("{rel}: {e}")),
-            },
+            Ok(l) => {
+                let file = match tokio::fs::File::open(&l.full).await {
+                    Ok(file) => file,
+                    Err(e) => return ToolOutput::err(format!("{rel}: {e}")),
+                };
+                match file.metadata().await {
+                    Ok(meta) if meta.is_file() => {}
+                    Ok(_) => return ToolOutput::err(format!("{rel} is not a file")),
+                    Err(e) => return ToolOutput::err(format!("{rel}: {e}")),
+                }
+                let mut bytes = Vec::new();
+                if let Err(e) = file.take(MAX_TOOL_OUTPUT as u64 + 1).read_to_end(&mut bytes).await {
+                    return ToolOutput::err(format!("{rel}: {e}"));
+                }
+                let truncated = bytes.len() > MAX_TOOL_OUTPUT;
+                if truncated {
+                    bytes.truncate(MAX_TOOL_OUTPUT);
+                }
+                let mut text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(e) if truncated && e.utf8_error().error_len().is_none() => {
+                        let valid = e.utf8_error().valid_up_to();
+                        String::from_utf8(e.into_bytes()[..valid].to_vec()).expect("valid UTF-8 prefix")
+                    }
+                    Err(e) => return ToolOutput::err(format!("{rel}: file is not UTF-8 text: {}", e.utf8_error())),
+                };
+                if truncated {
+                    let note = format!("\nâ€¦ [truncated at the {MAX_TOOL_OUTPUT}-byte tool output limit]");
+                    let keep = MAX_TOOL_OUTPUT.saturating_sub(note.len());
+                    while text.len() > keep {
+                        text.pop();
+                    }
+                    text.push_str(&note);
+                }
+                ToolOutput::ok(text)
+            }
         }
     }
 }
@@ -387,6 +420,19 @@ mod tests {
         assert!(listing.contains("a/b.txt"), "{listing}");
         let sh = shell_tool(&ws).call(json!({"command": "cat a/b.txt"})).await;
         assert!(sh.content.contains("hi"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_file_streams_only_the_tool_output_limit() {
+        let dir = std::env::temp_dir().join(format!("grouper-read-cap-{}", std::process::id()));
+        let ws = Workspace::create(dir.clone()).unwrap();
+        std::fs::write(dir.join("large.txt"), vec![b'x'; MAX_TOOL_OUTPUT * 4]).unwrap();
+        let output = file_tools(&ws)[0].call(json!({"path": "large.txt"})).await;
+        assert!(!output.is_error, "{output:?}");
+        assert!(output.content.len() <= MAX_TOOL_OUTPUT, "{}", output.content.len());
+        assert!(output.content.contains("truncated at the 30000-byte tool output limit"), "{output:?}");
+        assert!(file_tools(&ws)[0].call(json!({"path": "."})).await.is_error);
         std::fs::remove_dir_all(dir).ok();
     }
 

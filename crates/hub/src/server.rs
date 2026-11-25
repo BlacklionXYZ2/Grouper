@@ -94,6 +94,10 @@ pub(crate) struct ApprovalRoute {
     pub(crate) thread_id: String,
     /// Set for threads running on the hub itself (and for the hub's hand-over copy).
     pub(crate) local: Option<oneshot::Sender<ApprovalAnswer>>,
+    /// Distinguishes this route from any later request that happens to use the same id.
+    pub(crate) generation: u64,
+    /// Cancelled whenever the request is answered or cleared.
+    pub(crate) timer: Option<tokio::task::AbortHandle>,
 }
 
 pub struct Hub {
@@ -326,7 +330,10 @@ impl Hub {
 
     /// Resolve an approval request. Returns false if it doesn't exist (any more).
     pub async fn resolve_approval(&self, approval_id: &str, approved: bool) -> bool {
-        let Some(route) = self.approvals.lock().await.remove(approval_id) else { return false };
+        let Some(mut route) = self.approvals.lock().await.remove(approval_id) else { return false };
+        if let Some(timer) = route.timer.take() {
+            timer.abort();
+        }
         match route.local {
             Some(tx) => {
                 let _ = tx.send(if approved { ApprovalAnswer::Allow } else { ApprovalAnswer::Deny });
@@ -808,7 +815,16 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
             drop(live);
             old.close.trigger(CloseReason::Replaced);
             let _ = tokio::time::timeout(Duration::from_secs(2), old.closed.wait_for(|done| *done)).await;
-            hub.approvals.lock().await.retain(|_, r| r.device_id != device_id);
+            hub.approvals.lock().await.retain(|_, r| {
+                if r.device_id == device_id {
+                    if let Some(timer) = r.timer.take() {
+                        timer.abort();
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
             continue;
         }
         let conn_id = hub.next_id.fetch_add(1, Ordering::Relaxed);
@@ -987,7 +1003,13 @@ async fn handle_thread_frame(hub: &Arc<Hub>, device_id: &str, conn_id: u64, msg:
         NodeMessage::ApprovalRequest { approval_id, thread_id, tool, input, reason }
             if hub.owns_thread(device_id, &thread_id) =>
         {
-            hub.request_approval(device_id, &thread_id, &approval_id, &tool, input, &reason, None).await;
+            if !hub.request_approval(device_id, &thread_id, &approval_id, &tool, input, &reason, None).await {
+                hub.send_to(
+                    device_id,
+                    HubMessage::ApprovalResult { approval_id, approved: false, timeout_secs: None },
+                )
+                .await;
+            }
         }
         NodeMessage::AskOrchestrator { thread_id, question } if hub.owns_thread(device_id, &thread_id) => {
             hub.thread_ask(&thread_id, &question).await;
