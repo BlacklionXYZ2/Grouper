@@ -21,6 +21,8 @@ public final class EventStream: @unchecked Sendable {
     public let conversationId: String?
     private let token: String
     private let session: URLSession
+    private let socketLock = NSLock()
+    private var currentSocket: URLSessionWebSocketTask?
 
     public init(baseURL: URL, token: String, conversationId: String? = nil, session: URLSession = .shared) {
         self.baseURL = baseURL
@@ -41,6 +43,20 @@ public final class EventStream: @unchecked Sendable {
         }
     }
 
+    /// Closes the current socket without ending `updates`. The stream reconnects,
+    /// catches up durable events over HTTP, and then resumes live delivery.
+    ///
+    /// This is also useful when an app moves between networks and wants to replace
+    /// a socket immediately instead of waiting for the next receive to fail.
+    @discardableResult
+    public func forceReconnect() -> Bool {
+        socketLock.lock()
+        let socket = currentSocket
+        socketLock.unlock()
+        socket?.cancel(with: .goingAway, reason: nil)
+        return socket != nil
+    }
+
     private func run(after initialSequence: Int64, continuation: AsyncThrowingStream<EventStreamUpdate, Error>.Continuation) async {
         var lastSequence = initialSequence
         var attempt = 0
@@ -53,6 +69,7 @@ public final class EventStream: @unchecked Sendable {
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
                 let opened = session.webSocketTask(with: request)
                 socket = opened
+                setCurrentSocket(opened)
                 opened.resume()
 
                 // The server chooses its socket cursor at upgrade time. Fetching only
@@ -90,15 +107,20 @@ public final class EventStream: @unchecked Sendable {
                         continuation.yield(.stored(event))
                     }
                 }
+                opened.cancel(with: .goingAway, reason: nil)
+                clearCurrentSocket(opened)
             } catch is CancellationError {
                 socket?.cancel(with: .goingAway, reason: nil)
+                clearCurrentSocket(socket)
                 break
             } catch let error as HubClientError {
                 socket?.cancel(with: .goingAway, reason: nil)
+                clearCurrentSocket(socket)
                 if case .unauthorized = error { continuation.finish(throwing: error); return }
                 if case .forbidden = error { continuation.finish(throwing: error); return }
             } catch {
                 socket?.cancel(with: .goingAway, reason: nil)
+                clearCurrentSocket(socket)
             }
             continuation.yield(.state(.disconnected))
             attempt += 1
@@ -108,6 +130,20 @@ public final class EventStream: @unchecked Sendable {
         }
         continuation.yield(.state(.disconnected))
         continuation.finish()
+    }
+
+    private func setCurrentSocket(_ socket: URLSessionWebSocketTask) {
+        socketLock.lock()
+        currentSocket = socket
+        socketLock.unlock()
+    }
+
+    private func clearCurrentSocket(_ socket: URLSessionWebSocketTask?) {
+        socketLock.lock()
+        if let socket, currentSocket === socket {
+            currentSocket = nil
+        }
+        socketLock.unlock()
     }
 
     private func websocketURL() throws -> URL {

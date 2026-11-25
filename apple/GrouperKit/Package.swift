@@ -16,6 +16,7 @@ var products: [Product] = [
 var targets: [Target] = [
     .target(name: "GrouperAPI"),
     .testTarget(name: "GrouperAPITests", dependencies: ["GrouperAPI"]),
+    .testTarget(name: "GrouperAPILiveTests", dependencies: ["GrouperAPI"]),
 ]
 
 #if !os(Windows)
