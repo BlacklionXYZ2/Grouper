@@ -20,6 +20,7 @@ use crate::server::{ApprovalAnswer, ApprovalRoute, HUB_DEVICE, Hub};
 #[derive(Debug, Default)]
 pub struct ThreadRequest {
     pub title: String,
+    /// Device id or name, or `hub`. Empty: choose from [`Self::needs`] and past results.
     pub device: String,
     pub goal: String,
     pub context: String,
@@ -31,6 +32,8 @@ pub struct ThreadRequest {
     pub task_type: Option<String>,
     /// e.g. `sensitive`, `draft`: priority rules match on these.
     pub tags: Vec<String>,
+    /// What the work requires: `shell`, `gpu`, `xcode`, `files`, `folder:<name>`, `agent:<name>`.
+    pub needs: Vec<String>,
     /// Spending cap for this thread (USD, estimated); never above the user's `thread_budget_usd`.
     pub budget_usd: Option<f64>,
 }
@@ -104,8 +107,8 @@ impl Hub {
         if req.title.trim().is_empty() || req.goal.trim().is_empty() {
             return Err("title and goal are required".into());
         }
-        let (device_id, device_name) =
-            self.resolve_device(&req.device).ok_or_else(|| format!("no device called {:?}", req.device))?;
+        let (device_id, device_name, device_reason) =
+            self.resolve_thread_device(&req.device, req.task_type.as_deref(), &req.needs).await?;
         let on_hub = device_id == HUB_DEVICE;
         // An offline device gets the thread anyway: it waits for the device while the
         // hub prepares the work up to a checkpoint (see `offline.rs`).
@@ -117,8 +120,10 @@ impl Hub {
         let route = self.route_model(req.model.as_deref(), req.task_type.as_deref(), &req.tags, cheaper).await?;
         let model = route.model;
         let offline = (!online).then(|| format!("{device_name} is offline; the hub prepares a checkpoint"));
-        let reason =
-            [req.hub_reason.clone().filter(|_| on_hub), offline, route.reason].into_iter().flatten().collect::<Vec<_>>();
+        let reason = [device_reason, req.hub_reason.clone().filter(|_| on_hub), offline, route.reason]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         let reason = (!reason.is_empty()).then(|| reason.join("; "));
         let brief = render_brief(&req);
         let info = self

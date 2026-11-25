@@ -8,11 +8,11 @@ use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use core_agent::{Ending, Hooks, LoopConfig, Tool, ToolOutput, push_user_text, run_loop};
-use core_protocol::{AgentEvent, EventBody, Permission, ToolDef};
+use core_protocol::{AgentEvent, EventBody, ToolDef};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::server::{HUB_DEVICE, Hub};
+use crate::server::Hub;
 use crate::threads::ThreadRequest;
 
 #[derive(Debug, Clone)]
@@ -83,6 +83,9 @@ read-write. Threads reach them as `@<folder>/<path>`; mention the folder in the 
 - Give start_thread a task_type (code, research, writing, data, ops) and tags such as \"sensitive\" (private data) \
 or \"draft\". Leave model out and the registry chooses by the user's priority rules and past results; if a rule \
 refuses, tell the user.
+- Leave device out of start_thread and set needs (shell, gpu, xcode, folder:<name>, agent:<name> such as \
+agent:codex). Grouper picks the best online device for that task type from past results, and uses the hub only \
+for file-only work. Name a device only to pin it; suggest_device shows the ranking.
 - When a thread's result arrives, grade it with grade_thread (1-5, short note). That's how the registry learns.
 - When list_models stats clearly contradict a model's use cases, suggest new text with propose_use_cases; the user \
 decides.
@@ -331,6 +334,7 @@ fn orchestrator_tools(hub: &Arc<Hub>, conversation_id: &str) -> Vec<Arc<dyn Tool
         Arc::new(StopThread(ctx())),
         Arc::new(ListThreads(ctx())),
         Arc::new(ListDevices(ctx())),
+        Arc::new(SuggestDevice(ctx())),
         Arc::new(ListModels(ctx())),
         Arc::new(ListUsage(ctx())),
         Arc::new(crate::files::ReadThreadFile { hub: hub.clone(), conversation_id: conversation_id.to_string() }),
@@ -350,6 +354,27 @@ fn str_arg(input: &Value, key: &str) -> String {
     input.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
+/// A list of strings, or one comma-separated string. Missing is an empty list.
+fn string_list(input: &Value, key: &str) -> Result<Vec<String>, String> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(text)) => {
+            Ok(text.split(',').map(|part| part.trim().to_string()).filter(|part| !part.is_empty()).collect())
+        }
+        Some(Value::Array(items)) => {
+            let mut out = Vec::new();
+            for item in items {
+                let Some(text) = item.as_str() else {
+                    return Err(format!("{key} must be a list of strings"));
+                };
+                out.push(text.to_string());
+            }
+            Ok(out)
+        }
+        Some(_) => Err(format!("{key} must be a list of strings")),
+    }
+}
+
 fn to_json(v: impl serde::Serialize) -> ToolOutput {
     ToolOutput::ok(serde_json::to_string_pretty(&v).unwrap_or_default())
 }
@@ -361,11 +386,12 @@ impl Tool for StartThread {
         ToolDef {
             name: "start_thread".into(),
             description: "Start a subagent thread on a device. Returns immediately; you're woken when it finishes \
-                          or asks something. Call several times in one response to run work in parallel."
+                          or asks something. Call several times in one response to run work in parallel. \
+                          Leave device out and set needs to let Grouper choose the device."
                 .into(),
             input_schema: json!({"type": "object", "properties": {
                 "title": {"type": "string", "description": "Short title shown to the user"},
-                "device": {"type": "string", "description": "Device id or name, or \"hub\" for your cloud machine"},
+                "device": {"type": "string", "description": "Device id or name, or \"hub\". Leave out and Grouper picks from needs and past results"},
                 "goal": {"type": "string"},
                 "context": {"type": "string", "description": "Everything the thread needs to know; it can't see this chat"},
                 "constraints": {"type": "string"},
@@ -373,12 +399,17 @@ impl Tool for StartThread {
                 "model": {"type": "string", "description": "Model id from list_models (optional; the registry chooses otherwise)"},
                 "task_type": {"type": "string", "description": "code, research, writing, data or ops"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "e.g. [\"sensitive\"] for private data, [\"draft\"]"},
+                "needs": {"type": "array", "items": {"type": "string"}, "description": "What the work requires: shell, gpu, xcode, files, folder:<name>, agent:<name> (for example agent:codex). A named device that lacks one is refused"},
                 "hub_reason": {"type": "string", "description": "When device is hub: why it runs there (e.g. the target device is offline)"},
                 "budget_usd": {"type": "number", "description": "Optional spending cap for this thread in USD (estimated). It can only lower the user's per-thread budget; the thread is stopped when it's reached"}
-            }, "required": ["title", "device", "goal"]}),
+            }, "required": ["title", "goal"]}),
         }
     }
     async fn call(&self, input: Value) -> ToolOutput {
+        let needs = match string_list(&input, "needs") {
+            Ok(needs) => needs,
+            Err(error) => return ToolOutput::err(error),
+        };
         let req = ThreadRequest {
             title: str_arg(&input, "title"),
             device: str_arg(&input, "device"),
@@ -394,6 +425,7 @@ impl Tool for StartThread {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
                 .unwrap_or_default(),
+            needs,
             budget_usd: input.get("budget_usd").and_then(|v| v.as_f64().or_else(|| v.as_str()?.trim().trim_start_matches('$').parse().ok())),
         };
         match self.0.hub.start_thread(&self.0.conversation_id, req).await {
@@ -401,6 +433,9 @@ impl Tool for StartThread {
                 let mut out = json!({"thread_id": t.id, "device": t.device_id, "model": t.model, "status": t.status});
                 if let Some(budget) = self.0.hub.db.thread_budget(&t.id, &self.0.hub.db.limits()) {
                     out["budget_usd"] = json!(budget);
+                }
+                if let Some(reason) = &t.reason {
+                    out["reason"] = json!(reason);
                 }
                 if t.status == crate::offline::WAITING_DEVICE {
                     out["note"] = json!(crate::offline::WAITING_NOTE);
@@ -482,38 +517,43 @@ impl Tool for ListDevices {
         ToolDef {
             name: "list_devices".into(),
             description: "List devices (including \"hub\"), whether they're online, the tools threads can \
-                          use on each with their permission level, and each device's scoped folders \
-                          (`@<name>`, read or read_write)."
+                          use on each with their permission level, each device's scoped folders \
+                          (`@<name>`, read or read_write), outcome stats per task type, and the needs \
+                          each device satisfies (shell, gpu, xcode, files, folder:<name>, agent:<name>)."
                 .into(),
             input_schema: json!({"type": "object", "properties": {}}),
         }
     }
     async fn call(&self, _input: Value) -> ToolOutput {
-        let hub = &self.0.hub;
-        let list: Vec<Value> = hub
-            .devices()
-            .await
-            .into_iter()
-            .map(|d| {
-                let tools: Vec<Value> = if d.id == HUB_DEVICE {
-                    core_protocol::FILE_TOOLS
-                        .iter()
-                        .map(|t| json!({"name": t, "permission": Permission::Auto}))
-                        .collect()
-                } else {
-                    hub.db.tools(Some(&d.id)).into_iter().map(|t| json!({"name": t.name, "permission": t.permission})).collect()
-                };
-                let mut row =
-                    json!({"id": d.id, "name": d.name, "platform": d.platform, "online": d.online, "thread_tools": tools});
-                if !d.folders.is_empty() {
-                    let folders: Vec<Value> =
-                        d.folders.iter().map(|f| json!({"name": format!("@{}", f.name), "mode": f.mode})).collect();
-                    row["scoped_folders"] = json!(folders);
-                }
-                row
-            })
-            .collect();
-        to_json(list)
+        to_json(self.0.hub.device_list_rows().await)
+    }
+}
+
+struct SuggestDevice(Ctx);
+#[async_trait]
+impl Tool for SuggestDevice {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "suggest_device".into(),
+            description: "Rank devices for a task without starting a thread. Returns the device start_thread \
+                          would pick, why, and the full ranking. Pass the same task_type and needs."
+                .into(),
+            input_schema: json!({"type": "object", "properties": {
+                "task_type": {"type": "string", "description": "code, research, writing, data or ops"},
+                "needs": {"type": "array", "items": {"type": "string"}, "description": "shell, gpu, xcode, files, folder:<name>, agent:<name> (for example agent:codex)"}
+            }}),
+        }
+    }
+    async fn call(&self, input: Value) -> ToolOutput {
+        let needs = match string_list(&input, "needs") {
+            Ok(needs) => needs,
+            Err(error) => return ToolOutput::err(error),
+        };
+        let task_type = input.get("task_type").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty());
+        match self.0.hub.suggest_device(task_type, &needs).await {
+            Ok(suggestion) => to_json(suggestion),
+            Err(error) => ToolOutput::err(error),
+        }
     }
 }
 
