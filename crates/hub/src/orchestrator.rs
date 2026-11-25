@@ -40,6 +40,16 @@ impl Wake {
             ),
         }
     }
+
+    /// What to search long-term memory with: what was said, without Grouper's framing.
+    fn recall_text(&self) -> String {
+        match self {
+            Wake::User(t) => t.clone(),
+            Wake::ThreadDone { title, summary, .. } => format!("{title}\n{summary}"),
+            Wake::ThreadAsk { title, question, .. } => format!("{title}\n{question}"),
+            Wake::UserStepIn { text, .. } => text.clone(),
+        }
+    }
 }
 
 const ORCHESTRATOR_SYSTEM: &str = "You are the orchestrator of Grouper, a personal assistant that works across the \
@@ -60,10 +70,21 @@ when the device is back.
 - Use list_devices and list_models when you need to choose where and with what model to run something.
 - You can't change tool permissions; only the user can.
 
-Messages in [brackets] are from Grouper (threads finishing, questions, the user stepping in, status), not typed by \
-the user.";
+Memory:
+- Long-term memory is shared by all of the user's conversations. Memories relevant to a turn are added to it \
+automatically in a [Memory] block; use recall to look for something specific.
+- Use remember for lasting facts and preferences about the user and their projects (who they are, their devices \
+and setups, conventions, decisions, likes and dislikes), not for transient task details or things that only matter \
+in this conversation. One self-contained fact per memory. Never store secrets such as passwords or API keys.
+- When a memory turns out wrong or outdated, fix it with update_memory. Remove it with forget, and always when the \
+user asks you to forget something.
 
-const STANDARD_SYSTEM: &str = "You are Grouper, a helpful personal assistant. Answer directly and concisely.";
+Messages in [brackets] are from Grouper (threads finishing, questions, the user stepping in, status, memories), not \
+typed by the user.";
+
+const STANDARD_SYSTEM: &str = "You are Grouper, a helpful personal assistant. Answer directly and concisely. \
+A [Memory] block at the end of a message holds notes saved earlier about the user and their projects, added by \
+Grouper rather than typed by the user; use them when relevant.";
 
 impl Hub {
     /// Deliver something to a conversation's worker, starting the worker if needed.
@@ -125,6 +146,11 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     let mut history = hub.db.history(conversation_id);
     let merged = history.last().is_some_and(|m| m.role == providers::Role::User);
     let from = if merged { history.len() - 1 } else { history.len() };
+    let recall_query = wakes.iter().map(Wake::recall_text).collect::<Vec<_>>().join("\n");
+    if let Some(block) = crate::memory::recall_block(&hub.db, &recall_query, &crate::memory::seen_text(&history)) {
+        text.push_str("\n\n");
+        text.push_str(&block);
+    }
     push_user_text(&mut history, text);
 
     let finish = |hub: &Arc<Hub>, history: &[providers::Message]| {
@@ -220,14 +246,16 @@ impl Hooks for ConversationHooks {
 
 fn orchestrator_tools(hub: &Arc<Hub>, conversation_id: &str) -> Vec<Arc<dyn Tool>> {
     let ctx = || Ctx { hub: hub.clone(), conversation_id: conversation_id.to_string() };
-    vec![
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(StartThread(ctx())),
         Arc::new(MessageThread(ctx())),
         Arc::new(StopThread(ctx())),
         Arc::new(ListThreads(ctx())),
         Arc::new(ListDevices(ctx())),
         Arc::new(ListModels(ctx())),
-    ]
+    ];
+    tools.extend(crate::memory::memory_tools(hub, conversation_id));
+    tools
 }
 
 struct Ctx {
