@@ -322,4 +322,4 @@ Admin token: chat, approvals, permission writes, providers, model writes, import
 
 **M7 — Mac.** Menu bar, the three-column window, the device half of Settings. Link `apple/GrouperKit` as `grouper-mac` does: `GrouperClient` with the device token, workspace, `allowShell`, a `ToolHandler` (start with `mac_info`) and a `ClientListener` for status, presence and the menu's on-device thread lines. Build the static library with `scripts/build-apple.sh` until an XCFramework exists. Includes `POST /v1/devices/{id}/call`.
 
-**Later, and absent from the v1 controls.** An iOS `GrouperKit` slice (XCFramework, non-admin token, shell off). Hub spend limits and an approval timeout. Push. Image attachments. A web client. `grouper-mac` stays the small demo of the Swift to Rust seam.
+**Later, and absent from the v1 controls.** An iOS `GrouperKit` slice (XCFramework, non-admin token, shell off). An approval timeout. Push. Image attachments. A web client. `grouper-mac` stays the small demo of the Swift to Rust seam.
