@@ -20,7 +20,7 @@
 //! with the client. They never inherit `GROUPER_*` variables. Their tools are named
 //! `<server>__<tool>`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,17 +31,25 @@ use async_trait::async_trait;
 use core_agent::{Tool, ToolOutput};
 use core_protocol::tunnel::{result_text, tool_from_mcp};
 use core_protocol::{MCP_SEPARATOR, ToolDef, mcp_call_timeout, valid_tool_name};
-use rmcp::model::{CallToolRequestParams, JsonObject};
-use rmcp::service::{RoleClient, RunningService};
-use rmcp::transport::TokioChildProcess;
-use rmcp::{Peer, ServiceError, ServiceExt};
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam, ClientCapabilities,
+    ClientConfig, ClientRequest, Implementation, JsonObject, JsonRpcMessage, RequestId, ServerResult, Tool as McpTool,
+};
+use rmcp::service::{
+    NotificationContext, PeerRequestOptions, RequestHandle, RoleClient, RunningService, RxJsonRpcMessage,
+    TxJsonRpcMessage,
+};
+use rmcp::transport::{TokioChildProcess, Transport};
+use rmcp::{ClientHandler, Peer, ServiceError, ServiceExt};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Default time a server has to start and list its tools.
 pub const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 120;
+/// How long a server gets to answer a cancelled call before we restart it.
+pub const CANCEL_RESTART_SECS: u64 = 10;
 
 /// Environment variable naming the config file.
 pub const CONFIG_ENV: &str = "GROUPER_MCP_CONFIG";
@@ -105,6 +113,12 @@ pub struct ServerSpec {
     pub env: BTreeMap<String, String>,
     pub cwd: Option<PathBuf>,
     pub startup_timeout: Duration,
+}
+
+/// Default working folder for a local MCP server whose config sets no `cwd`:
+/// `<dirs::data_local_dir()>/grouper/mcp/<server name>/`.
+pub fn default_cwd(name: &str) -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("grouper").join("mcp").join(name))
 }
 
 /// The config file to read: `explicit`, else `GROUPER_MCP_CONFIG`, else
@@ -246,7 +260,12 @@ fn spec_for(
         command,
         args,
         env: vars,
-        cwd: entry.cwd.as_deref().map(|c| PathBuf::from(expand(c, &lookup))),
+        cwd: entry
+            .cwd
+            .as_deref()
+            .map(|c| expand(c, &lookup))
+            .filter(|c| !c.trim().is_empty())
+            .map(PathBuf::from),
         startup_timeout: Duration::from_secs(entry.startup_timeout_seconds.unwrap_or(DEFAULT_STARTUP_TIMEOUT_SECS)),
     }))
 }
@@ -355,9 +374,11 @@ pub fn find_subagent_chat(plugins_dir: &Path) -> Option<PathBuf> {
 pub struct McpHost {
     servers: Vec<Arc<Server>>,
     /// Bumped whenever the combined tool list changes.
-    changed: watch::Sender<u64>,
+    changed: Arc<watch::Sender<u64>>,
     /// Set once the client stops: starts in progress are abandoned (their process killed).
     stop: watch::Sender<bool>,
+    /// How long a server gets to answer a cancelled call before we restart it.
+    cancel_grace: Duration,
 }
 
 struct Server {
@@ -371,9 +392,76 @@ struct Server {
     stderr: Arc<Mutex<VecDeque<String>>>,
 }
 
+struct HostClient {
+    refresh: mpsc::UnboundedSender<()>,
+}
+
+impl ClientHandler for HostClient {
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        let _ = self.refresh.send(());
+    }
+
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::new(
+            ClientCapabilities::default(),
+            Implementation::new("grouper-device", crate::CLIENT_VERSION),
+        )
+    }
+}
+
+type ResponseWatchers = Arc<Mutex<HashMap<RequestId, oneshot::Sender<()>>>>;
+
+/// Wraps a child-process transport to notice when the server sends a JSON-RPC response or
+/// error for a request id. rmcp retires a request's responder as soon as the client sends
+/// `notifications/cancelled`, so observing incoming frames lets us tell whether the server
+/// actually answered a cancelled call.
+struct ObservingTransport<T> {
+    inner: T,
+    watchers: ResponseWatchers,
+}
+
+impl<T: Transport<RoleClient>> Transport<RoleClient> for ObservingTransport<T> {
+    type Error = T::Error;
+
+    fn send(&mut self, item: TxJsonRpcMessage<RoleClient>) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+        let Some(msg) = self.inner.receive().await else {
+            self.watchers.lock().unwrap().clear();
+            return None;
+        };
+        let resp_id = match &msg {
+            JsonRpcMessage::Response(r) => Some(&r.id),
+            JsonRpcMessage::Error(e) => e.id.as_ref(),
+            _ => None,
+        };
+        if let Some(id) = resp_id
+            && let Some(tx) = self.watchers.lock().unwrap().remove(id)
+        {
+            let _ = tx.send(());
+        }
+        Some(msg)
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.watchers.lock().unwrap().clear();
+        self.inner.close().await
+    }
+}
+
 struct Session {
     id: u64,
-    running: RunningService<RoleClient, ()>,
+    running: RunningService<RoleClient, HostClient>,
+    watchers: ResponseWatchers,
+    refresh_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.refresh_task.abort();
+    }
 }
 
 impl Session {
@@ -383,9 +471,85 @@ impl Session {
     }
 }
 
+/// Drops an in-flight call's handle into a follow-up task: sends `notifications/cancelled`
+/// and restarts the server if it doesn't answer the cancelled request within `cancel_grace`.
+struct CancelGuard {
+    handle: Option<RequestHandle<RoleClient>>,
+    watchers: ResponseWatchers,
+    wire_rx: Option<oneshot::Receiver<()>>,
+    server: Arc<Server>,
+    generation: u64,
+    cancel_grace: Duration,
+    changed: Arc<watch::Sender<u64>>,
+    stop: watch::Receiver<bool>,
+}
+
+impl CancelGuard {
+    fn disarm(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.watchers.lock().unwrap().remove(&handle.id);
+        }
+        self.wire_rx.take();
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        let Some(mut handle) = self.handle.take() else { return };
+        let wire_rx = self.wire_rx.take();
+        // If the server's response already reached rmcp before we were dropped, nothing to cancel.
+        if handle.rx.try_recv().is_ok() || *self.stop.borrow() {
+            self.watchers.lock().unwrap().remove(&handle.id);
+            return;
+        }
+        let watchers = self.watchers.clone();
+        let server = self.server.clone();
+        let generation = self.generation;
+        let cancel_grace = self.cancel_grace;
+        let changed = self.changed.clone();
+        let mut stop = self.stop.clone();
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            watchers.lock().unwrap().remove(&handle.id);
+            return;
+        };
+        rt.spawn(async move {
+            let RequestHandle { id, peer, .. } = handle;
+            let note = CancelledNotification::new(CancelledNotificationParam::new(
+                Some(id.clone()),
+                Some("cancelled".into()),
+            ));
+            let _ = peer.send_notification(note.into()).await;
+            let answered = match wire_rx {
+                Some(rx) => tokio::select! {
+                    _ = rx => true,
+                    _ = tokio::time::sleep(cancel_grace) => false,
+                    _ = stop.wait_for(|s| *s) => true,
+                },
+                None => true,
+            };
+            watchers.lock().unwrap().remove(&id);
+            if answered || *stop.borrow() {
+                return;
+            }
+            tracing::warn!(
+                "MCP server {} didn't answer cancelled request within {} s; restarting",
+                server.spec.name,
+                cancel_grace.as_secs()
+            );
+            restart_session(&server, generation, &changed, &stop).await;
+        });
+    }
+}
+
 impl McpHost {
     /// Start every server in the background and return at once.
     pub fn start(specs: Vec<ServerSpec>) -> Arc<Self> {
+        Self::with_cancel_grace(specs, Duration::from_secs(CANCEL_RESTART_SECS))
+    }
+
+    /// Start every server with a custom grace period before restarting a server that
+    /// ignores a cancelled call.
+    pub fn with_cancel_grace(specs: Vec<ServerSpec>, cancel_grace: Duration) -> Arc<Self> {
         let host = Arc::new(Self {
             servers: specs
                 .into_iter()
@@ -399,14 +563,15 @@ impl McpHost {
                     })
                 })
                 .collect(),
-            changed: watch::channel(0).0,
+            changed: Arc::new(watch::channel(0).0),
             stop: watch::channel(false).0,
+            cancel_grace,
         });
         for server in &host.servers {
             let (host, server) = (Arc::downgrade(&host), server.clone());
             tokio::spawn(async move {
                 let Some(h) = host.upgrade() else { return };
-                if let Err(e) = h.connect(&server).await {
+                if let Err(e) = connect_server(&server, &h.changed, &h.stop.subscribe()).await {
                     tracing::warn!("MCP server {} didn't start: {e}", server.spec.name);
                 }
             });
@@ -444,7 +609,8 @@ impl McpHost {
     }
 
     /// Run `<server>__<tool>`. Restarts the server first if it has exited. Dropping the
-    /// future cancels the call (`notifications/cancelled`). Returns `(ok, output)`.
+    /// future cancels the call (`notifications/cancelled`) and restarts the server if it
+    /// doesn't answer within the cancel grace period. Returns `(ok, output)`.
     pub async fn call(&self, name: &str, args: Value) -> (bool, String) {
         let Some((server, tool)) = self.find(name) else {
             return (false, format!("unknown tool {name}"));
@@ -455,19 +621,46 @@ impl McpHost {
             _ => return (false, "arguments must be a JSON object".into()),
         };
         let timeout = mcp_call_timeout(&Value::Object(arguments.clone()));
-        let (peer, generation) = match self.peer(&server).await {
+        let (peer, generation, watchers) = match self.peer(&server).await {
             Ok(p) => p,
             Err(e) => return (false, format!("the {} MCP server isn't running: {e}", server.spec.name)),
         };
         let params = CallToolRequestParams::new(tool).with_arguments(arguments);
-        match tokio::time::timeout(timeout, peer.call_tool(params)).await {
-            Err(_) => (false, format!("{name} didn't finish within {} s", timeout.as_secs())),
-            Ok(Err(ServiceError::TransportClosed | ServiceError::TransportSend(_))) => {
+        let req = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+        let handle = match peer.send_cancellable_request(req, PeerRequestOptions::no_options()).await {
+            Ok(h) => h,
+            Err(ServiceError::TransportClosed | ServiceError::TransportSend(_)) => {
+                discard_session(&server, generation).await;
+                return (
+                    false,
+                    format!("the {} MCP server stopped during the call; it restarts on the next call", server.spec.name),
+                );
+            }
+            Err(ServiceError::McpError(e)) => return (false, e.message.to_string()),
+            Err(e) => return (false, e.to_string()),
+        };
+        let (wire_tx, wire_rx) = oneshot::channel();
+        watchers.lock().unwrap().insert(handle.id.clone(), wire_tx);
+        let mut guard = CancelGuard {
+            handle: Some(handle),
+            watchers,
+            wire_rx: Some(wire_rx),
+            server: server.clone(),
+            generation,
+            cancel_grace: self.cancel_grace,
+            changed: self.changed.clone(),
+            stop: self.stop.subscribe(),
+        };
+        let Ok(received) = tokio::time::timeout(timeout, &mut guard.handle.as_mut().unwrap().rx).await else {
+            // Leave `guard` armed so dropping it cancels the request and follows up.
+            return (false, format!("{name} didn't finish within {} s", timeout.as_secs()));
+        };
+        // Answered (or transport closed): disarm the cancel follow-up.
+        guard.disarm();
+        match received {
+            Err(_) | Ok(Err(ServiceError::TransportClosed | ServiceError::TransportSend(_))) => {
                 // The process is gone: forget the session so the next call restarts it.
-                let mut conn = server.conn.lock().await;
-                if conn.as_ref().is_some_and(|s| s.id == generation) {
-                    conn.take();
-                }
+                discard_session(&server, generation).await;
                 (
                     false,
                     format!("the {} MCP server stopped during the call; it restarts on the next call", server.spec.name),
@@ -475,81 +668,24 @@ impl McpHost {
             }
             Ok(Err(ServiceError::McpError(e))) => (false, e.message.to_string()),
             Ok(Err(e)) => (false, e.to_string()),
-            Ok(Ok(result)) => result_text(&result),
+            Ok(Ok(ServerResult::CallToolResult(result))) => result_text(&result),
+            Ok(Ok(_)) => (false, format!("{name} returned an unexpected MCP response")),
         }
     }
 
     /// The server's live session, (re)starting it if needed.
-    async fn peer(&self, server: &Arc<Server>) -> Result<(Peer<RoleClient>, u64), String> {
+    async fn peer(&self, server: &Arc<Server>) -> Result<(Peer<RoleClient>, u64, ResponseWatchers), String> {
         {
             let conn = server.conn.lock().await;
             if let Some(s) = conn.as_ref().filter(|s| s.alive()) {
-                return Ok((s.running.peer().clone(), s.id));
+                return Ok((s.running.peer().clone(), s.id, s.watchers.clone()));
             }
         }
         if self.stopped() {
             return Err("the device client has stopped".into());
         }
         tracing::info!("restarting MCP server {}", server.spec.name);
-        self.connect(server).await
-    }
-
-    /// Start the server (unless another caller just did), list its tools, keep the session.
-    async fn connect(&self, server: &Arc<Server>) -> Result<(Peer<RoleClient>, u64), String> {
-        let mut conn = server.conn.lock().await;
-        if let Some(s) = conn.as_ref().filter(|s| s.alive()) {
-            return Ok((s.running.peer().clone(), s.id));
-        }
-        *conn = None;
-        if self.stopped() {
-            return Err("the device client has stopped".into());
-        }
-        let spec = &server.spec;
-        let mut stop = self.stop.subscribe();
-        // Abandoning the start (timeout, or the client stopping) drops the process,
-        // which kills it.
-        let starting = tokio::time::timeout(spec.startup_timeout, async {
-            let running = launch(spec, server.stderr.clone()).await?;
-            let tools = running.peer().list_all_tools().await.map_err(|e| format!("tools/list: {e}"))?;
-            Ok::<_, String>((running, tools))
-        });
-        let started = tokio::select! {
-            r = starting => r.unwrap_or_else(|_| Err(format!("not ready within {} s", spec.startup_timeout.as_secs()))),
-            _ = stop.wait_for(|s| *s) => Err("the device client has stopped".into()),
-        };
-        let (running, tools) = started.map_err(|e| {
-            let tail: Vec<String> = server.stderr.lock().unwrap().iter().cloned().collect();
-            if tail.is_empty() { e } else { format!("{e}; stderr: {}", tail.join(" | ")) }
-        })?;
-        let defs: Vec<(ToolDef, String)> = tools
-            .iter()
-            .filter_map(|t| {
-                let mut def = tool_from_mcp(t);
-                let own = std::mem::take(&mut def.name);
-                def.name = format!("{}{MCP_SEPARATOR}{own}", spec.name);
-                if valid_tool_name(&def.name) {
-                    Some((def, own))
-                } else {
-                    tracing::warn!("MCP server {}: skipping tool {own:?} (name not usable)", spec.name);
-                    None
-                }
-            })
-            .collect();
-        tracing::info!("MCP server {} ready with {} tools", spec.name, defs.len());
-        let peer = running.peer().clone();
-        let id = server.sessions.fetch_add(1, Ordering::Relaxed) + 1;
-        *conn = Some(Session { id, running });
-        drop(conn);
-        let changed = {
-            let mut tools = server.tools.lock().unwrap();
-            let changed = *tools != defs;
-            *tools = defs;
-            changed
-        };
-        if changed {
-            self.changed.send_modify(|n| *n += 1);
-        }
-        Ok((peer, id))
+        connect_server(server, &self.changed, &self.stop.subscribe()).await
     }
 
     /// Stop every server. Later calls fail instead of restarting them.
@@ -558,21 +694,178 @@ impl McpHost {
         for server in &self.servers {
             let session = server.conn.lock().await.take();
             if let Some(mut s) = session {
+                s.refresh_task.abort();
                 let _ = s.running.close_with_timeout(Duration::from_secs(5)).await;
             }
         }
     }
 }
 
+fn map_tools(server_name: &str, tools: &[McpTool]) -> Vec<(ToolDef, String)> {
+    tools
+        .iter()
+        .filter_map(|t| {
+            let mut def = tool_from_mcp(t);
+            let own = std::mem::take(&mut def.name);
+            def.name = format!("{server_name}{MCP_SEPARATOR}{own}");
+            if valid_tool_name(&def.name) {
+                Some((def, own))
+            } else {
+                tracing::warn!("MCP server {server_name}: skipping tool {own:?} (name not usable)");
+                None
+            }
+        })
+        .collect()
+}
+
+fn update_tools(server: &Server, changed: &watch::Sender<u64>, defs: Vec<(ToolDef, String)>) {
+    let did_change = {
+        let mut tools = server.tools.lock().unwrap();
+        let did_change = *tools != defs;
+        *tools = defs;
+        did_change
+    };
+    if did_change {
+        changed.send_modify(|n| *n += 1);
+    }
+}
+
+async fn discard_session(server: &Server, generation: u64) {
+    let mut conn = server.conn.lock().await;
+    if conn.as_ref().is_some_and(|s| s.id == generation) {
+        conn.take();
+    }
+}
+
+async fn restart_session(
+    server: &Arc<Server>,
+    generation: u64,
+    changed: &Arc<watch::Sender<u64>>,
+    stop: &watch::Receiver<bool>,
+) {
+    {
+        let mut conn = server.conn.lock().await;
+        if !conn.as_ref().is_some_and(|s| s.id == generation) {
+            return;
+        }
+        if let Some(mut old) = conn.take() {
+            old.refresh_task.abort();
+            let _ = old.running.close_with_timeout(Duration::from_secs(2)).await;
+        }
+    }
+    if *stop.borrow() {
+        return;
+    }
+    if let Err(e) = connect_server(server, changed, stop).await {
+        tracing::warn!("MCP server {} failed to restart after cancellation: {e}", server.spec.name);
+    }
+}
+
+/// Start the server (unless another caller just did), list its tools, keep the session.
+async fn connect_server(
+    server: &Arc<Server>,
+    changed: &Arc<watch::Sender<u64>>,
+    stop_rx: &watch::Receiver<bool>,
+) -> Result<(Peer<RoleClient>, u64, ResponseWatchers), String> {
+    let mut conn = server.conn.lock().await;
+    if let Some(s) = conn.as_ref().filter(|s| s.alive()) {
+        return Ok((s.running.peer().clone(), s.id, s.watchers.clone()));
+    }
+    *conn = None;
+    if *stop_rx.borrow() {
+        return Err("the device client has stopped".into());
+    }
+    let spec = &server.spec;
+    let mut stop = stop_rx.clone();
+    let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
+    let watchers: ResponseWatchers = Arc::new(Mutex::new(HashMap::new()));
+    // Abandoning the start (timeout, or the client stopping) drops the process,
+    // which kills it.
+    let starting = tokio::time::timeout(spec.startup_timeout, async {
+        let running = launch(spec, server.stderr.clone(), HostClient { refresh: refresh_tx }, watchers.clone()).await?;
+        while refresh_rx.try_recv().is_ok() {}
+        let tools = running.peer().list_all_tools().await.map_err(|e| format!("tools/list: {e}"))?;
+        Ok::<_, String>((running, tools))
+    });
+    let started = tokio::select! {
+        r = starting => r.unwrap_or_else(|_| Err(format!("not ready within {} s", spec.startup_timeout.as_secs()))),
+        _ = stop.wait_for(|s| *s) => Err("the device client has stopped".into()),
+    };
+    let (running, tools) = started.map_err(|e| {
+        let tail: Vec<String> = server.stderr.lock().unwrap().iter().cloned().collect();
+        if tail.is_empty() { e } else { format!("{e}; stderr: {}", tail.join(" | ")) }
+    })?;
+    let defs = map_tools(&spec.name, &tools);
+    tracing::info!("MCP server {} ready with {} tools", spec.name, defs.len());
+    let peer = running.peer().clone();
+    let id = server.sessions.fetch_add(1, Ordering::Relaxed) + 1;
+    let refresh_task = tokio::spawn({
+        let server = server.clone();
+        let changed = changed.clone();
+        let mut stop = stop_rx.clone();
+        let peer = peer.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    msg = refresh_rx.recv() => {
+                        if msg.is_none() {
+                            break;
+                        }
+                    }
+                    _ = stop.wait_for(|s| *s) => break,
+                }
+                while refresh_rx.try_recv().is_ok() {}
+                let tools = match tokio::time::timeout(server.spec.startup_timeout, peer.list_all_tools()).await {
+                    Ok(Ok(tools)) => tools,
+                    Ok(Err(e)) => {
+                        tracing::warn!("MCP server {} tools/list after list_changed failed: {e}", server.spec.name);
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::warn!("MCP server {} tools/list after list_changed timed out", server.spec.name);
+                        continue;
+                    }
+                };
+                if server.sessions.load(Ordering::Relaxed) != id {
+                    break;
+                }
+                let defs = map_tools(&server.spec.name, &tools);
+                tracing::info!("MCP server {} updated with {} tools", server.spec.name, defs.len());
+                update_tools(&server, &changed, defs);
+            }
+        }
+    });
+    *conn = Some(Session { id, running, watchers: watchers.clone(), refresh_task });
+    drop(conn);
+    update_tools(server, changed, defs);
+    Ok((peer, id, watchers))
+}
+
 /// Spawn the server and initialize an MCP session with it.
-async fn launch(spec: &ServerSpec, stderr_tail: Arc<Mutex<VecDeque<String>>>) -> Result<RunningService<RoleClient, ()>, String> {
+async fn launch(
+    spec: &ServerSpec,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    client: HostClient,
+    watchers: ResponseWatchers,
+) -> Result<RunningService<RoleClient, HostClient>, String> {
     let mut cmd = tokio::process::Command::new(&spec.command);
     cmd.args(&spec.args);
     for key in core_agent::tools::secret_env_keys() {
         cmd.env_remove(key);
     }
     cmd.envs(&spec.env);
-    if let Some(cwd) = &spec.cwd {
+    let cwd = match &spec.cwd {
+        Some(dir) => Some(dir.clone()),
+        None => match default_cwd(&spec.name) {
+            Some(dir) => {
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("can't create working folder {}: {e}", dir.display()))?;
+                Some(dir)
+            }
+            None => None,
+        },
+    };
+    if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
     let mut wrapped = process_wrap::tokio::CommandWrap::from(cmd);
@@ -602,7 +895,7 @@ async fn launch(spec: &ServerSpec, stderr_tail: Arc<Mutex<VecDeque<String>>>) ->
             }
         });
     }
-    ().serve(transport).await.map_err(|e| format!("initialize: {e}"))
+    client.serve(ObservingTransport { inner: transport, watchers }).await.map_err(|e| format!("initialize: {e}"))
 }
 
 /// One of the host's tools, offered to a thread.

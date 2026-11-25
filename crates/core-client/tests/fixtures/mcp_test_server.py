@@ -1,7 +1,9 @@
 """A tiny stdio MCP server for tests (standard library only).
 
-Tools: echo, env (is GROUPER_TOKEN visible?), crash (exits mid-call), sleep (honours
-notifications/cancelled) and cancelled (ids of cancelled requests so far).
+Tools: echo, env (is GROUPER_TOKEN visible?), cwd, crash (exits mid-call), sleep (honours
+notifications/cancelled), stubborn (ignores notifications/cancelled), cancelled (ids of
+cancelled requests so far), and set_tools (adds/removes dynamic tools and sends
+notifications/tools/list_changed).
 """
 
 import json
@@ -13,6 +15,7 @@ import time
 lock = threading.Lock()
 cancelled = []
 events = {}
+extra_tools = []
 
 
 def send(msg):
@@ -30,13 +33,22 @@ def tool(name, props=None):
             "inputSchema": {"type": "object", "properties": props or {}}}
 
 
-TOOLS = [
+BASE_TOOLS = [
     tool("echo", {"text": {"type": "string"}}),
     tool("env"),
+    tool("cwd"),
     tool("crash"),
     tool("sleep", {"seconds": {"type": "number"}}),
+    tool("stubborn", {"seconds": {"type": "number"}}),
     tool("cancelled"),
+    tool("set_tools", {"extra": {"type": "array", "items": {"type": "string"}}}),
 ]
+
+
+def current_tools():
+    with lock:
+        extras = [tool(n, {"text": {"type": "string"}}) for n in extra_tools]
+    return BASE_TOOLS + extras
 
 
 def call(req_id, name, args):
@@ -45,6 +57,8 @@ def call(req_id, name, args):
     if name == "env":
         return text("GROUPER_TOKEN=" + ("present" if "GROUPER_TOKEN" in os.environ else "absent")
                     + " pid=" + str(os.getpid()))
+    if name == "cwd":
+        return text(os.getcwd())
     if name == "crash":
         os._exit(3)
     if name == "sleep":
@@ -52,8 +66,21 @@ def call(req_id, name, args):
         events[req_id] = ev
         ev.wait(float(args.get("seconds", 1)))
         return text("cancelled" if req_id in cancelled else "slept")
+    if name == "stubborn":
+        time.sleep(float(args.get("seconds", 30)))
+        return text("finished")
     if name == "cancelled":
         return text(json.dumps(cancelled))
+    if name == "set_tools":
+        names = [str(n) for n in (args.get("extra") or [])]
+        with lock:
+            extra_tools[:] = names
+        send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        return text(json.dumps(names))
+    with lock:
+        is_extra = name in extra_tools
+    if is_extra:
+        return text(args.get("text", name))
     return text("unknown tool " + name, True)
 
 
@@ -71,10 +98,10 @@ for line in sys.stdin:
     if method == "initialize":
         send({"jsonrpc": "2.0", "id": req_id, "result": {
             "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": "grouper-test", "version": "1"}}})
     elif method == "tools/list":
-        send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
+        send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": current_tools()}})
     elif method == "tools/call":
         threading.Thread(target=handle_call, args=(req_id, msg.get("params") or {}), daemon=True).start()
     elif method == "notifications/cancelled":

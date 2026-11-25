@@ -222,6 +222,9 @@ enum ToolsCmd {
     List {
         #[arg(long)]
         device: Option<String>,
+        /// Include tools a device no longer offers (their saved permissions are kept).
+        #[arg(long)]
+        all: bool,
     },
     /// Set a tool's permission: manual, auto or bypass.
     Set { device: String, tool: String, permission: String },
@@ -771,11 +774,32 @@ async fn main() -> Result<()> {
             .await?;
             println!("saved {provider}; every connected device has it now");
         }
-        Cmd::Tools(ToolsCmd::List { device }) => {
-            let q = device.map(|d| format!("?device={d}")).unwrap_or_default();
-            for t in api.get::<Vec<ToolInfo>>(&format!("/v1/tools{q}")).await? {
+        Cmd::Tools(ToolsCmd::List { device, all }) => {
+            let mut params: Vec<(&str, &str)> = Vec::new();
+            if let Some(d) = device.as_deref() {
+                params.push(("device", d));
+            }
+            if all {
+                params.push(("all", "true"));
+            }
+            let url = reqwest::Url::parse_with_params("http://hub/v1/tools", &params)?;
+            let path = match url.query().filter(|q| !q.is_empty()) {
+                Some(q) => format!("/v1/tools?{q}"),
+                None => "/v1/tools".into(),
+            };
+            let dim = std::io::stdout().is_terminal();
+            for t in api.get::<Vec<ToolInfo>>(&path).await? {
                 let about = t.description.lines().next().unwrap_or_default();
-                println!("{:<12} {:<34} {:<7} {}", t.device_id, t.name, t.permission.as_str(), about);
+                let line = if t.available {
+                    format!("{:<12} {:<34} {:<7} {}", t.device_id, t.name, t.permission.as_str(), about)
+                } else {
+                    format!("{:<12} {:<34} {:<7} [unavailable] {}", t.device_id, t.name, t.permission.as_str(), about)
+                };
+                if !t.available && dim {
+                    println!("\x1b[2m{line}\x1b[0m");
+                } else {
+                    println!("{line}");
+                }
             }
         }
         Cmd::Tools(ToolsCmd::Set { device, tool, permission }) => {

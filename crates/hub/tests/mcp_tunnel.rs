@@ -40,6 +40,7 @@ async fn device_tools_reach_the_registry_and_run_over_mcp() {
     let dir = temp("hub");
     let db = Db::open(&dir.join("data")).unwrap();
     let (device, token) = db.add_device("Laptop", "windows", false).unwrap();
+    let http_token = token.clone();
     let hub = Hub::new(db, dir.join("data"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -50,9 +51,12 @@ async fn device_tools_reach_the_registry_and_run_over_mcp() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../core-client/tests/fixtures/mcp_test_server.py");
     let python = if cfg!(windows) { "python" } else { "python3" };
     let mcp_config = dir.join("mcp.json");
+    let py_cwd = dir.join("py-cwd");
+    std::fs::create_dir_all(&py_cwd).unwrap();
     std::fs::write(
         &mcp_config,
-        json!({"includeSubagentChat": false, "mcpServers": {"py": {"command": python, "args": [script]}}}).to_string(),
+        json!({"includeSubagentChat": false, "mcpServers": {"py": {"command": python, "args": [script], "cwd": py_cwd}}})
+            .to_string(),
     )
     .unwrap();
 
@@ -94,13 +98,35 @@ async fn device_tools_reach_the_registry_and_run_over_mcp() {
     assert_eq!(perms["read_file"], Permission::Auto);
     assert_eq!(perms["py__echo"], Permission::Manual);
 
-    // Presence shows the tools, with their schemas.
+    // Presence carries tool names + descriptions only (no input schemas).
     let devices = hub.devices().await;
     let me = devices.iter().find(|d| d.id == device.id).unwrap();
     assert!(me.online);
     let echo = me.capabilities.iter().find(|c| c.name == "echo").unwrap();
-    assert_eq!(echo.input_schema["additionalProperties"], true);
+    assert_eq!(echo.description, "Returns its arguments");
     assert!(me.capabilities.iter().any(|c| c.name == "py__echo"));
+    let presence_json = serde_json::to_value(core_client::core_protocol::HubMessage::Presence { devices }).unwrap();
+    let me_json = presence_json["devices"].as_array().unwrap().iter().find(|d| d["id"] == device.id).unwrap();
+    for cap in me_json["capabilities"].as_array().unwrap() {
+        assert!(cap.get("input_schema").is_none(), "presence must not include schemas: {cap}");
+    }
+
+    // Schemas are available via GET /v1/tools.
+    let http = reqwest::Client::new();
+    let api_tools: Vec<core_client::core_protocol::ToolInfo> = http
+        .get(format!("http://{addr}/v1/tools?device={}", device.id))
+        .bearer_auth(&http_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let echo_info = api_tools.iter().find(|t| t.name == "echo").unwrap();
+    assert!(echo_info.available);
+    assert_eq!(echo_info.input_schema["additionalProperties"], true);
+    let py_echo_info = api_tools.iter().find(|t| t.name == "py__echo").unwrap();
+    assert_eq!(py_echo_info.input_schema["properties"]["text"]["type"], "string");
 
     // Direct calls go through MCP tools/call.
     let r = hub.call_tool(&device.id, "echo", json!({"a": 1})).await.unwrap();
@@ -115,6 +141,76 @@ async fn device_tools_reach_the_registry_and_run_over_mcp() {
     assert_eq!(hub.call_tool(&device.id, "nope", json!({})).await.unwrap_err(), CallError::UnknownTool);
     assert_eq!(hub.call_tool(&device.id, "echo", json!([1])).await.unwrap_err(), CallError::BadArguments);
     assert_eq!(hub.call_tool("someone-else", "echo", json!({})).await.unwrap_err(), CallError::Offline);
+
+    // Local server notifications/tools/list_changed propagates host -> device -> hub,
+    // and removed tools are marked unavailable while keeping their permission level.
+    let r = hub.call_tool(&device.id, "py__set_tools", json!({"extra": ["dynamic"]})).await.unwrap();
+    assert!(r.ok, "{}", r.output);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if hub.db.tools(Some(&device.id)).iter().any(|t| t.name == "py__dynamic") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("dynamic tool reached the hub registry via list_changed");
+    let r = hub.call_tool(&device.id, "py__dynamic", json!({"text": "live"})).await.unwrap();
+    assert_eq!((r.ok, r.output.as_str()), (true, "live"));
+
+    hub.db.set_permission(&device.id, "py__dynamic", Permission::Bypass).unwrap();
+    let r = hub.call_tool(&device.id, "py__set_tools", json!({"extra": []})).await.unwrap();
+    assert!(r.ok, "{}", r.output);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !hub.db.tools(Some(&device.id)).iter().any(|t| t.name == "py__dynamic") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("removed dynamic tool pruned from available hub tools");
+
+    assert!(!hub.db.permissions(&device.id).contains_key("py__dynamic"));
+    let available_api: Vec<core_client::core_protocol::ToolInfo> = http
+        .get(format!("http://{addr}/v1/tools?device={}", device.id))
+        .bearer_auth(&http_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!available_api.iter().any(|t| t.name == "py__dynamic"));
+    let all_api: Vec<core_client::core_protocol::ToolInfo> = http
+        .get(format!("http://{addr}/v1/tools?device={}&all=true", device.id))
+        .bearer_auth(&http_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pruned = all_api.iter().find(|t| t.name == "py__dynamic").unwrap();
+    assert!(!pruned.available);
+    assert_eq!(pruned.permission, Permission::Bypass);
+
+    // When the tool comes back, it is available again and keeps its Bypass permission.
+    let r = hub.call_tool(&device.id, "py__set_tools", json!({"extra": ["dynamic"]})).await.unwrap();
+    assert!(r.ok, "{}", r.output);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if hub.db.tools(Some(&device.id)).iter().any(|t| t.name == "py__dynamic") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("returning dynamic tool became available again");
+    assert_eq!(hub.db.permissions(&device.id).get("py__dynamic"), Some(&Permission::Bypass));
 
     stop.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(15), client).await.expect("client stopped").unwrap();

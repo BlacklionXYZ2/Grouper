@@ -14,8 +14,8 @@ use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use core_agent::thread::ThreadControl;
 use core_protocol::{
-    Capability, ChatRequest, ChatResponse, DeviceInfo, Event, EventBody, HubMessage, IDLE_TIMEOUT_SECS, ModelEntry,
-    NodeMessage, PROTOCOL_VERSION, Permission, ProviderConfig, ProviderInfo, ToolCallRequest, ToolDef,
+    ChatRequest, ChatResponse, DeviceInfo, Event, EventBody, HubMessage, IDLE_TIMEOUT_SECS, ModelEntry,
+    NodeMessage, PROTOCOL_VERSION, Permission, ProviderConfig, ProviderInfo, ToolCallRequest, ToolDef, ToolSummary,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -116,10 +116,9 @@ impl Hub {
                     .map(|l| {
                         l.tools
                             .iter()
-                            .map(|t| Capability {
+                            .map(|t| ToolSummary {
                                 name: t.name.clone(),
                                 description: t.description.clone(),
-                                input_schema: t.input_schema.clone(),
                             })
                             .collect()
                     })
@@ -307,13 +306,16 @@ async fn call_device(
 }
 
 #[derive(Deserialize)]
-struct DeviceFilter {
+struct ToolsFilter {
     device: Option<String>,
+    #[serde(default)]
+    all: bool,
 }
 
-async fn list_tools(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q): Query<DeviceFilter>) -> Response {
+async fn list_tools(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q): Query<ToolsFilter>) -> Response {
     authed!(hub, headers);
-    Json(hub.db.tools(q.device.as_deref())).into_response()
+    let tools = if q.all { hub.db.all_tools(q.device.as_deref()) } else { hub.db.tools(q.device.as_deref()) };
+    Json(tools).into_response()
 }
 
 #[derive(Deserialize)]

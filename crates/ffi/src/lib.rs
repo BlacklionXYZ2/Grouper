@@ -47,8 +47,8 @@ impl Capability {
         Ok(core_protocol::Capability { name: self.name.clone(), description: self.description.clone(), input_schema })
     }
 
-    fn from_core(c: core_protocol::Capability) -> Self {
-        Self { name: c.name, description: c.description, input_schema_json: Some(c.input_schema.to_string()) }
+    fn from_core(c: core_protocol::ToolSummary) -> Self {
+        Self { name: c.name, description: c.description, input_schema_json: None }
     }
 }
 

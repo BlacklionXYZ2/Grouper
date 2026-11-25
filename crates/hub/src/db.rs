@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS devices (
   admin INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS tools (
   device_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, permission TEXT NOT NULL,
+  available INTEGER NOT NULL DEFAULT 1, input_schema TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (device_id, name));
 CREATE TABLE IF NOT EXISTS providers (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}');
@@ -213,6 +214,8 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     }
     ensure_column(&conn, "models", "modalities", "ALTER TABLE models ADD COLUMN modalities TEXT NOT NULL DEFAULT ''")?;
     ensure_column(&conn, "conversations", "model", "ALTER TABLE conversations ADD COLUMN model TEXT")?;
+    ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
     Ok(conn)
 }
 
@@ -364,39 +367,72 @@ impl Db {
 
     // ---- tool registry
 
-    /// Record the tools a device offers. New tools get their default permission;
-    /// existing ones keep whatever the user set.
+    /// Record the tools a device currently offers. Rows for this device not in `defs`
+    /// are marked unavailable (keeping their saved permission level so returning tools
+    /// keep it); listed tools are marked available and get their default permission if new.
     pub fn upsert_tools(&self, device_id: &str, defs: &[ToolDef]) {
-        let c = self.c();
+        let mut c = self.c();
+        let Ok(tx) = c.transaction() else { return };
+        let _ = tx.execute("UPDATE tools SET available = 0 WHERE device_id = ?1", [device_id]);
         for d in defs {
-            let _ = c.execute(
-                "INSERT INTO tools (device_id, name, description, permission) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (device_id, name) DO UPDATE SET description = excluded.description",
-                params![device_id, d.name, d.description, Permission::default_for(&d.name).as_str()],
+            let schema = if d.input_schema.is_object() {
+                d.input_schema.to_string()
+            } else {
+                core_protocol::default_input_schema().to_string()
+            };
+            let _ = tx.execute(
+                "INSERT INTO tools (device_id, name, description, permission, available, input_schema)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5)
+                 ON CONFLICT (device_id, name) DO UPDATE SET
+                   description = excluded.description,
+                   available = 1,
+                   input_schema = excluded.input_schema",
+                params![device_id, d.name, d.description, Permission::default_for(&d.name).as_str(), schema],
             );
         }
+        let _ = tx.commit();
     }
 
-    pub fn tools(&self, device_id: Option<&str>) -> Vec<ToolInfo> {
+    fn query_tools(&self, device_id: Option<&str>, include_unavailable: bool) -> Vec<ToolInfo> {
         let c = self.c();
-        let mut st = c
-            .prepare(
-                "SELECT device_id, name, description, permission FROM tools
-                 WHERE ?1 IS NULL OR device_id = ?1 ORDER BY device_id, name",
-            )
-            .unwrap();
+        let sql = if include_unavailable {
+            "SELECT device_id, name, description, permission, available, input_schema FROM tools
+             WHERE ?1 IS NULL OR device_id = ?1 ORDER BY device_id, name"
+        } else {
+            "SELECT device_id, name, description, permission, available, input_schema FROM tools
+             WHERE available != 0 AND (?1 IS NULL OR device_id = ?1) ORDER BY device_id, name"
+        };
+        let mut st = c.prepare(sql).unwrap();
         st.query_map([device_id], |r| {
             let p: String = r.get(3)?;
+            let available: i64 = r.get(4)?;
+            let schema_str: String = r.get(5)?;
+            let input_schema = serde_json::from_str::<Value>(&schema_str)
+                .ok()
+                .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+                .unwrap_or_else(core_protocol::default_input_schema);
             Ok(ToolInfo {
                 device_id: r.get(0)?,
                 name: r.get(1)?,
                 description: r.get(2)?,
                 permission: Permission::parse(&p).unwrap_or(Permission::Manual),
+                available: available != 0,
+                input_schema,
             })
         })
         .unwrap()
         .filter_map(Result::ok)
         .collect()
+    }
+
+    /// Currently available tools (offered in each device's latest `tools/list`).
+    pub fn tools(&self, device_id: Option<&str>) -> Vec<ToolInfo> {
+        self.query_tools(device_id, false)
+    }
+
+    /// Every tool in the registry, including ones a device no longer offers (`available = false`).
+    pub fn all_tools(&self, device_id: Option<&str>) -> Vec<ToolInfo> {
+        self.query_tools(device_id, true)
     }
 
     pub fn set_permission(&self, device_id: &str, tool: &str, p: Permission) -> Result<()> {
@@ -410,6 +446,7 @@ impl Db {
         Ok(())
     }
 
+    /// Permission levels of a device's currently available tools.
     pub fn permissions(&self, device_id: &str) -> HashMap<String, Permission> {
         self.tools(Some(device_id)).into_iter().map(|t| (t.name, t.permission)).collect()
     }
@@ -858,13 +895,69 @@ mod tests {
         let dir = tmp();
         let db = Db::open(&dir).unwrap();
         let def = |n: &str| ToolDef { name: n.into(), description: "d".into(), input_schema: Value::Null };
-        db.upsert_tools("dev", &[def("read_file"), def("run_shell")]);
+        let with_schema = |n: &str, schema: Value| ToolDef { name: n.into(), description: "d".into(), input_schema: schema };
+        db.upsert_tools(
+            "dev",
+            &[
+                def("read_file"),
+                with_schema("run_shell", serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string"}}})),
+            ],
+        );
+        db.upsert_tools("other", &[def("echo")]);
         let p = db.permissions("dev");
         assert_eq!(p["read_file"], Permission::Auto);
         assert_eq!(p["run_shell"], Permission::Manual);
         db.set_permission("dev", "run_shell", Permission::Bypass).unwrap();
+
+        // Removing `read_file` marks it unavailable without touching `other` or losing permissions.
         db.upsert_tools("dev", &[def("run_shell")]);
+        assert_eq!(db.permissions("dev").get("run_shell"), Some(&Permission::Bypass));
+        assert!(!db.permissions("dev").contains_key("read_file"));
+        assert_eq!(db.tools(Some("dev")).len(), 1);
+        assert_eq!(db.tools(Some("other")).len(), 1);
+        let all = db.all_tools(Some("dev"));
+        assert_eq!(all.len(), 2);
+        let gone = all.iter().find(|t| t.name == "read_file").unwrap();
+        assert!(!gone.available);
+        assert_eq!(gone.permission, Permission::Auto);
+
+        // Removing `run_shell` keeps its Bypass permission; returning restores it as available.
+        db.upsert_tools("dev", &[def("read_file")]);
+        assert!(!db.permissions("dev").contains_key("run_shell"));
+        let gone_shell = db.all_tools(Some("dev")).into_iter().find(|t| t.name == "run_shell").unwrap();
+        assert!(!gone_shell.available);
+        assert_eq!(gone_shell.permission, Permission::Bypass);
+
+        let schema = serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string"}}});
+        db.upsert_tools("dev", &[def("read_file"), with_schema("run_shell", schema.clone())]);
         assert_eq!(db.permissions("dev")["run_shell"], Permission::Bypass);
+        let back = db.tools(Some("dev")).into_iter().find(|t| t.name == "run_shell").unwrap();
+        assert!(back.available);
+        assert_eq!(back.input_schema, schema);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn old_tools_table_gets_available_and_schema_columns_idempotently() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("grouper.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tools (
+               device_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, permission TEXT NOT NULL,
+               PRIMARY KEY (device_id, name));
+             INSERT INTO tools (device_id, name, description, permission) VALUES ('dev', 'echo', 'd', 'bypass');",
+        )
+        .unwrap();
+        drop(conn);
+        drop(Db::open(&dir).unwrap());
+        let db = Db::open(&dir).unwrap();
+        let tools = db.tools(Some("dev"));
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].available);
+        assert_eq!(tools[0].permission, Permission::Bypass);
+        assert_eq!(tools[0].input_schema, core_protocol::default_input_schema());
+        drop(db);
         std::fs::remove_dir_all(dir).ok();
     }
 

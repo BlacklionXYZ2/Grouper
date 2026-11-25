@@ -54,6 +54,15 @@ pub fn valid_tool_name(name: &str) -> bool {
     (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// A tool's name and description as carried in [`DeviceInfo`] (presence and
+/// `GET /v1/devices`). Input schemas are omitted to keep presence small; fetch
+/// `GET /v1/tools` ([`ToolInfo`]) when schemas are needed.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ToolSummary {
+    pub name: String,
+    pub description: String,
+}
+
 /// A registered device as the hub sees it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DeviceInfo {
@@ -62,8 +71,8 @@ pub struct DeviceInfo {
     /// `macos`, `ios`, `windows`, `linux`, …
     pub platform: String,
     pub online: bool,
-    /// Capabilities reported on the device's latest connection.
-    pub capabilities: Vec<Capability>,
+    /// Capabilities reported on the device's latest connection (names and descriptions only).
+    pub capabilities: Vec<ToolSummary>,
     /// Unix seconds when the device was last heard from, if ever.
     pub last_seen: Option<u64>,
 }
@@ -326,6 +335,10 @@ pub struct ThreadInfo {
     pub finished: Option<u64>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// A row of the tool registry.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ToolInfo {
@@ -333,6 +346,12 @@ pub struct ToolInfo {
     pub name: String,
     pub description: String,
     pub permission: Permission,
+    /// Whether the device offered this tool in its latest `tools/list`.
+    #[serde(default = "default_true")]
+    pub available: bool,
+    /// JSON Schema for the tool's arguments (an object schema).
+    #[serde(default = "default_input_schema")]
+    pub input_schema: Value,
 }
 
 /// A row of the model registry.
@@ -736,5 +755,35 @@ mod tests {
         assert_eq!(split_token("abc.def"), Some(("abc", "def")));
         assert_eq!(split_token("abc"), None);
         assert_eq!(split_token(".def"), None);
+    }
+
+    #[test]
+    fn presence_omits_input_schemas() {
+        let msg = HubMessage::Presence {
+            devices: vec![DeviceInfo {
+                id: "dev1".into(),
+                name: "Laptop".into(),
+                platform: "windows".into(),
+                online: true,
+                capabilities: vec![ToolSummary {
+                    name: "codex__codex_chat".into(),
+                    description: "Chat with Codex".into(),
+                }],
+                last_seen: Some(123),
+            }],
+        };
+        let value = serde_json::to_value(&msg).unwrap();
+        let cap = &value["devices"][0]["capabilities"][0];
+        assert_eq!(cap["name"], "codex__codex_chat");
+        assert_eq!(cap["description"], "Chat with Codex");
+        assert!(cap.get("input_schema").is_none(), "presence must not carry input schemas: {cap}");
+        assert_eq!(serde_json::from_value::<HubMessage>(value).unwrap(), msg);
+
+        let info: ToolInfo = serde_json::from_str(
+            r#"{"device_id":"dev1","name":"echo","description":"d","permission":"manual"}"#,
+        )
+        .unwrap();
+        assert!(info.available);
+        assert_eq!(info.input_schema, default_input_schema());
     }
 }
