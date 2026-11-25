@@ -143,6 +143,7 @@ async fn start_thread_without_a_device_picks_from_needs_and_past_results() {
                 allow_shell: true,
                 mcp_config: Some(dir.join("mcp.json")),
                 folders,
+                usage_probes: false,
             };
             let (stop, stopped) = watch::channel(false);
             Client {

@@ -11,7 +11,7 @@
 //! | Token | A device satisfies it when |
 //! |---|---|
 //! | `shell` | it offers `run_shell`. The hub never does: file tools only |
-//! | `gpu` | an available tool's name contains `gpu` (a platform tool such as `gpu`) |
+//! | `gpu` | the device hosts a model provider (`via_device`, e.g. LM Studio on its GPU), or an available tool's name contains `gpu` |
 //! | `xcode` | its platform is macOS (`macos`, `mac`, `darwin`, `osx`), or a tool's name contains `xcode`. Not the hub |
 //! | `folder:<name>` | it reported a scoped folder of that name (`folder:projects` is `@projects`) |
 //! | `agent:<server>` | it offers an MCP tool from that server (`agent:codex` is `codex__codex_chat`) |
@@ -114,6 +114,8 @@ pub(crate) struct DeviceProfile {
     pub hub: bool,
     pub tools: Vec<String>,
     pub folders: Vec<String>,
+    /// The device serves a model provider (`options.via_device`): it has a local model, so a GPU.
+    pub hosts_models: bool,
 }
 
 /// Proven (enough finished threads, success rate at least 50%), not enough record, or a poor record.
@@ -195,7 +197,7 @@ fn satisfies(profile: &DeviceProfile, need: &Need) -> bool {
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case("run_shell"))
         }
-        Need::Gpu => !profile.hub && tool_has(profile, "gpu"),
+        Need::Gpu => !profile.hub && (profile.hosts_models || tool_has(profile, "gpu")),
         Need::Xcode => !profile.hub && (is_mac(&profile.platform) || tool_has(profile, "xcode")),
         Need::Folder(name) => {
             !profile.hub
@@ -256,7 +258,7 @@ fn explains(need: &Need) -> String {
     match need {
         Need::Files => "file tools".into(),
         Need::Shell => "the run_shell tool".into(),
-        Need::Gpu => "a tool whose name contains \"gpu\"".into(),
+        Need::Gpu => "a hosted local model or a tool whose name contains \"gpu\"".into(),
         Need::Xcode => "macOS, or a tool whose name contains \"xcode\"".into(),
         Need::Folder(name) => format!("scoped folder @{name}"),
         Need::Agent(name) => format!("an MCP tool from server {name} ({name}__...)"),
@@ -597,6 +599,13 @@ pub(crate) fn suggest(
 
 impl Hub {
     pub(crate) async fn device_profiles(&self) -> Vec<DeviceProfile> {
+        let hosts: Vec<String> = self
+            .db
+            .providers()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| p.via_device().map(str::to_ascii_lowercase))
+            .collect();
         let mut out = Vec::new();
         for device in self.devices().await {
             let hub = device.id == HUB_DEVICE;
@@ -609,7 +618,10 @@ impl Hub {
                     .map(|tool| tool.name)
                     .collect()
             };
+            let hosts_models = !hub
+                && hosts.iter().any(|h| *h == device.id.to_ascii_lowercase() || *h == device.name.to_ascii_lowercase());
             out.push(DeviceProfile {
+                hosts_models,
                 id: device.id,
                 name: device.name,
                 platform: device.platform,
@@ -756,6 +768,7 @@ mod tests {
             hub: false,
             tools: tools.iter().map(|tool| (*tool).to_string()).collect(),
             folders: folders.iter().map(|folder| (*folder).to_string()).collect(),
+            hosts_models: false,
         }
     }
 
@@ -768,7 +781,20 @@ mod tests {
             hub: true,
             tools: FILE_TOOLS.iter().map(|name| (*name).to_string()).collect(),
             folders: vec![],
+            hosts_models: false,
         }
+    }
+
+    #[test]
+    fn hosting_a_model_satisfies_gpu() {
+        let needs = parse_needs(&["gpu".into()]).unwrap();
+        let mut pc = profile("pc", "Gaming PC", "windows", true, &["run_shell"], &[]);
+        assert!(!needs.iter().all(|n| satisfies(&pc, n)), "no model, no gpu tool");
+        pc.hosts_models = true;
+        assert!(needs.iter().all(|n| satisfies(&pc, n)));
+        let mut hub = hub_profile();
+        hub.hosts_models = true;
+        assert!(!needs.iter().all(|n| satisfies(&hub, n)), "the hub never counts as a gpu device");
     }
 
     fn code_stats(
@@ -792,6 +818,8 @@ mod tests {
             mean_cost: None,
             mean_grade: grade,
             net_rating: 0,
+            source: "thread".into(),
+            mean_tokens: None,
         }
     }
 
@@ -956,7 +984,7 @@ mod tests {
         let missing = missing_needs(mac, &needs);
         assert_eq!(
             lack_error(&mac.name, &missing, &needs, &profiles, &mac.id),
-            "MacBook lacks gpu (a tool whose name contains \"gpu\"). Devices that have all of them: Gaming PC (online). \
+            "MacBook lacks gpu (a hosted local model or a tool whose name contains \"gpu\"). Devices that have all of them: Gaming PC (online). \
              Name one that has every need, or leave device out."
         );
         let offline = vec![
@@ -1206,7 +1234,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
-            "MacBook lacks gpu (a tool whose name contains \"gpu\"). Devices that have it: Gaming PC (offline). \
+            "MacBook lacks gpu (a hosted local model or a tool whose name contains \"gpu\"). Devices that have it: Gaming PC (offline). \
              Name one that has every need, or leave device out."
         );
         assert!(
