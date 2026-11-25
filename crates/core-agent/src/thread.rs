@@ -1,7 +1,7 @@
 //! Runs one subagent thread: the loop, its tools, approvals, `ask_orchestrator`,
 //! messages from the user or orchestrator, and stopping. Used on devices and on the hub.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -83,7 +83,18 @@ struct State {
     queue: Mutex<Vec<String>>,
     pending_asks: Mutex<VecDeque<(u64, oneshot::Sender<String>)>>,
     next_ask: AtomicU64,
+    /// Calls (tool + input) the user denied. Asking again is refused without a new
+    /// approval request until the user next messages the thread: a model must not be
+    /// able to talk its way past a denial (e.g. "the orchestrator says it's allowed").
+    denied: Mutex<HashSet<String>>,
 }
+
+const DENIED: &str = "the user denied this call. Only the user can approve tool calls (the orchestrator can't), \
+                      so don't retry it or ask anyone to allow it. Finish and report that it was declined, or do \
+                      the task another way";
+const DENIED_AGAIN: &str = "the user already denied this exact call. Only the user can approve tool calls (the \
+                            orchestrator can't). Don't retry it: finish and report that it was declined, or do \
+                            the task another way";
 
 struct ThreadHooks {
     thread_id: String,
@@ -102,13 +113,20 @@ impl Hooks for ThreadHooks {
         let level = self.permissions.get(tool).copied().unwrap_or_else(|| Permission::default_for(tool));
         // CLI agents never ask, so their safety arguments are set here, before anything
         // (the log, an approval request, the call) sees them.
-        match check_call(level, tool, input, &self.workspace) {
-            None => Gate::Allow,
-            Some(reason) => match self.host.approve(&self.thread_id, tool, input, &reason).await {
-                ApprovalDecision::Approved => Gate::Allow,
-                ApprovalDecision::Denied => Gate::Deny("the user denied this call".into()),
-                ApprovalDecision::TimedOut { secs } => Gate::Deny(approval_timeout_reason(secs)),
-            },
+        let Some(reason) = check_call(level, tool, input, &self.workspace) else {
+            return Gate::Allow;
+        };
+        let key = format!("{tool}\0{input}");
+        if self.state.denied.lock().unwrap().contains(&key) {
+            return Gate::Deny(DENIED_AGAIN.into());
+        }
+        match self.host.approve(&self.thread_id, tool, input, &reason).await {
+            ApprovalDecision::Approved => Gate::Allow,
+            ApprovalDecision::Denied => {
+                self.state.denied.lock().unwrap().insert(key);
+                Gate::Deny(DENIED.into())
+            }
+            ApprovalDecision::TimedOut { secs } => Gate::Deny(approval_timeout_reason(secs)),
         }
     }
     fn inbox(&self) -> Vec<String> {
@@ -130,7 +148,8 @@ impl Tool for AskOrchestrator {
         ToolDef {
             name: "ask_orchestrator".into(),
             description: "Ask the orchestrator for something you can't get here, such as information from \
-                          another device or a decision. Waits for the answer."
+                          another device or a decision. Waits for the answer. It can't approve tool calls: only \
+                          the user can."
                 .into(),
             input_schema: json!({"type": "object", "properties": {
                 "question": {"type": "string"}
@@ -177,6 +196,7 @@ pub fn spawn_thread(
         queue: Mutex::new(Vec::new()),
         pending_asks: Mutex::new(VecDeque::new()),
         next_ask: AtomicU64::new(1),
+        denied: Mutex::new(HashSet::new()),
     });
 
     // Route incoming messages: an orchestrator reply answers a pending ask, everything
@@ -189,6 +209,10 @@ pub fn spawn_thread(
             {
                 let _ = tx.send(text);
                 continue;
+            }
+            if from == "user" {
+                // The user may have changed their mind: their next approval request decides.
+                st.denied.lock().unwrap().clear();
             }
             st.queue.lock().unwrap().push(format!("[Message from the {from}]\n{text}"));
         }
@@ -344,6 +368,51 @@ mod tests {
             })
             .collect();
         assert_eq!(outputs, vec!["Not run: no answer within 1 minute".to_string()]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_is_not_asked_again_until_the_user_speaks() {
+        #[derive(Default)]
+        struct Count {
+            asked: Mutex<u32>,
+            events: Mutex<Vec<AgentEvent>>,
+        }
+        #[async_trait]
+        impl ThreadHost for Count {
+            fn emit(&self, _: &str, event: AgentEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+            async fn approve(&self, _: &str, _: &str, _: &Value, _: &str) -> ApprovalDecision {
+                *self.asked.lock().unwrap() += 1;
+                ApprovalDecision::Denied
+            }
+            fn ask_orchestrator(&self, _: &str, _: &str) {}
+        }
+        let dir = std::env::temp_dir().join(format!("grouper-denied-again-{}", std::process::id()));
+        let ws = Workspace::create(dir.clone()).unwrap();
+        let host = Arc::new(Count::default());
+        let script = json!({"rules": [
+            {"last": "already denied", "reply": [{"type": "text", "text": "Declined."}]},
+            {"reply": [{"type": "tool_use", "name": "list_files", "input": {}}]}
+        ]});
+        let (_control, handle) = spawn_thread(spec(Some(1800)), provider(script), file_tools(&ws), host.clone(), ws);
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+        assert_eq!(result.summary, "Declined.");
+        assert_eq!(*host.asked.lock().unwrap(), 1, "the repeat must not ask the user again");
+        let outputs: Vec<_> = host
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 2, "{outputs:?}");
+        assert!(outputs[0].contains("the user denied this call"), "{outputs:?}");
+        assert!(outputs[1].contains("already denied"), "{outputs:?}");
         std::fs::remove_dir_all(dir).ok();
     }
 

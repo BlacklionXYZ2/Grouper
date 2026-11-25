@@ -2,11 +2,13 @@
 # Exercises the real `grouper-hub` and `grouper` binaries against free OpenRouter models
 # across 8 realistic scenarios, verifying outcomes from hub events, threads, and files.
 #
-# Requires an OpenRouter API key via $env:OPENROUTER_API_KEY or -KeyFile / --key-file <path>
-# (where the key is the last non-empty line of the file, trimmed).
+# Requires an API key for the target via -KeyFile / --key-file <path> (the key is the last
+# non-empty line of the file, trimmed) or the target's environment variable:
+#   --target openrouter (default): free OpenRouter models, $env:OPENROUTER_API_KEY
+#   --target radium: Radium's Tycho (the test dummy; a custom OpenAI-compatible endpoint), $env:RADIUM_API_KEY
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File scripts/eval.ps1 [--key-file path] [--no-build] [--keep] [--timeout 300] [--report path.json] [--cases a,b,...]
+#   powershell -ExecutionPolicy Bypass -File scripts/eval.ps1 [--target openrouter|radium] [--key-file path] [--no-build] [--keep] [--timeout 300] [--report path.json] [--cases a,b,...]
 
 param(
     [switch]$NoBuild,
@@ -15,6 +17,7 @@ param(
     [string]$ReportPath = '',
     [string]$KeyFile = '',
     [string]$Cases = '',
+    [string]$Target = 'openrouter',
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs
 )
@@ -36,11 +39,13 @@ $EvalModels = @(
 )
 
 $UsageText = @'
-Usage: scripts/eval.ps1 [--key-file <path>] [--no-build] [--keep] [--timeout <sec>] [--report <path>] [--cases a,b,...]
+Usage: scripts/eval.ps1 [--target openrouter|radium] [--key-file <path>] [--no-build] [--keep] [--timeout <sec>] [--report <path>] [--cases a,b,...]
 
 Options:
-  --key-file, -KeyFile <path>  File whose last non-empty line is the OpenRouter API key
-                               (falls back to $env:OPENROUTER_API_KEY if omitted).
+  --target, -Target <name>     openrouter (default; free models, with swapping) or radium
+                               (Tycho only: a paid custom endpoint, for testing).
+  --key-file, -KeyFile <path>  File whose last non-empty line is the target's API key
+                               (falls back to $env:OPENROUTER_API_KEY / $env:RADIUM_API_KEY).
   --no-build, -NoBuild         Skip `cargo build --workspace`.
   --keep, -Keep                Keep the temporary hub/workspace/log directory after exit.
   --timeout, -TimeoutSec <sec> Per-case timeout in seconds (default: 300).
@@ -72,6 +77,11 @@ if ($ExtraArgs) {
                 if ($i -ge $ExtraArgs.Count) { throw '--key-file requires a file path' }
                 $KeyFile = $ExtraArgs[$i]
             }
+            '--target'   {
+                $i++
+                if ($i -ge $ExtraArgs.Count) { throw '--target requires openrouter or radium' }
+                $Target = $ExtraArgs[$i]
+            }
             '--cases'    {
                 $i++
                 if ($i -ge $ExtraArgs.Count) { throw '--cases requires a comma-separated list' }
@@ -84,6 +94,23 @@ if ($ExtraArgs) {
     }
 }
 
+$Target = $Target.ToLowerInvariant()
+switch ($Target) {
+    'openrouter' {
+        $ProviderId = 'openrouter'; $ProviderBaseUrl = $OpenRouterBaseUrl; $KeyEnvVar = 'OPENROUTER_API_KEY'
+        $FreeModels = $true; $ProviderLabel = 'openrouter (free models)'
+    }
+    'radium' {
+        # Tycho, Radium's cheapest model, is the test dummy. One paid model: no swapping.
+        $ProviderId = 'radium'; $ProviderBaseUrl = 'https://api.radium.cloud/v1'; $KeyEnvVar = 'RADIUM_API_KEY'
+        $FreeModels = $false; $ProviderLabel = 'radium (Tycho, custom endpoint)'
+        $EvalModels = @(
+            [PSCustomObject]@{ Id = 'radium-tycho'; Model = 'tycho-1.0'; Roles = 'orchestrator,standard,thread' }
+        )
+    }
+    default { throw "Unknown --target '$Target' (use openrouter or radium)" }
+}
+
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 try { [Console]::OutputEncoding = $Utf8NoBom } catch {}
 
@@ -92,25 +119,25 @@ try { [Console]::OutputEncoding = $Utf8NoBom } catch {}
 $openRouterKey = ''
 if (-not [string]::IsNullOrWhiteSpace($KeyFile)) {
     if (-not (Test-Path -LiteralPath $KeyFile -PathType Leaf)) {
-        [Console]::Error.WriteLine("Error: OpenRouter key file not found: $KeyFile")
+        [Console]::Error.WriteLine("Error: key file not found: $KeyFile")
         exit 1
     }
     $resolvedKeyFile = (Resolve-Path -LiteralPath $KeyFile).Path
     $nonEmptyLines = @([System.IO.File]::ReadAllLines($resolvedKeyFile) | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
     if ($nonEmptyLines.Count -eq 0) {
-        [Console]::Error.WriteLine("Error: OpenRouter key file contains no non-empty lines: $KeyFile")
+        [Console]::Error.WriteLine("Error: key file contains no non-empty lines: $KeyFile")
         exit 1
     }
     $openRouterKey = $nonEmptyLines[$nonEmptyLines.Count - 1]
 } else {
-    $envKey = [Environment]::GetEnvironmentVariable('OPENROUTER_API_KEY', 'Process')
+    $envKey = [Environment]::GetEnvironmentVariable($KeyEnvVar, 'Process')
     if (-not [string]::IsNullOrWhiteSpace($envKey)) {
         $openRouterKey = $envKey.Trim()
     }
 }
 
 if ([string]::IsNullOrWhiteSpace($openRouterKey)) {
-    [Console]::Error.WriteLine('Error: OpenRouter API key is required. Set $env:OPENROUTER_API_KEY or pass -KeyFile / --key-file <path>.')
+    [Console]::Error.WriteLine("Error: an API key for $Target is required. Set `$env:$KeyEnvVar or pass -KeyFile / --key-file <path>.")
     exit 1
 }
 
@@ -633,7 +660,7 @@ $EnvKeysToIsolate = @(
     'GROUPER_HUB', 'GROUPER_TOKEN', 'GROUPER_DATA', 'GROUPER_BIND',
     'GROUPER_MASTER_KEY', 'GROUPER_MASTER_KEY_FILE', 'GROUPER_PROVIDER_KEY',
     'GROUPER_WORKSPACE', 'GROUPER_MCP_CONFIG', 'GROUPER_FOLDERS_CONFIG',
-    'GROUPER_CACHE', 'GROUPER_USAGE_PROBES', 'OPENROUTER_API_KEY'
+    'GROUPER_CACHE', 'GROUPER_USAGE_PROBES', 'OPENROUTER_API_KEY', 'RADIUM_API_KEY'
 )
 
 $script:SetupFailed = $false
@@ -725,24 +752,24 @@ Checklist:
     try {
         $r = Invoke-CommandWithTimeout -FilePath $HubExe -ArgumentList @(
             '--data', $script:DataDir,
-            'provider', 'openrouter',
+            'provider', $ProviderId,
             '--kind', 'openai',
-            '--base-url', $OpenRouterBaseUrl
+            '--base-url', $ProviderBaseUrl
         ) -Env @{ 'GROUPER_PROVIDER_KEY' = $openRouterKey } -Redact @($openRouterKey)
     } finally {
         [Environment]::SetEnvironmentVariable('GROUPER_PROVIDER_KEY', $null, 'Process')
         $openRouterKey = $null
     }
-    if ($r.ExitCode -ne 0) { throw "Failed to configure openrouter provider: $($r.Combined)" }
+    if ($r.ExitCode -ne 0) { throw "Failed to configure $ProviderId provider: $($r.Combined)" }
 
     foreach ($m in $EvalModels) {
         $modelArgs = @(
             '--data', $script:DataDir,
             'model', $m.Id,
-            '--provider', 'openrouter',
-            '--model', $m.Model,
-            '--free'
+            '--provider', $ProviderId,
+            '--model', $m.Model
         )
+        if ($FreeModels) { $modelArgs += '--free' }
         if (-not [string]::IsNullOrWhiteSpace($m.Roles)) {
             $modelArgs += @('--roles', $m.Roles)
         }
@@ -1155,13 +1182,13 @@ $reportModels = @($EvalModels | ForEach-Object {
         id    = $_.Id
         model = $_.Model
         roles = if ([string]::IsNullOrWhiteSpace($_.Roles)) { @() } else { @($_.Roles -split ',') }
-        free  = $true
+        free  = $FreeModels
     }
 })
 
 $reportObj = [PSCustomObject]@{
     timestamp_utc     = (Get-Date).ToUniversalTime().ToString('o')
-    provider          = 'openrouter'
+    provider          = $ProviderId
     models            = $reportModels
     model_swaps       = $script:ModelSwaps
     setup_failed      = $script:SetupFailed
@@ -1183,7 +1210,7 @@ try {
 
 Write-Host ''
 Write-Host '========================= Real-Model Eval Summary ========================='
-Write-Host 'Provider: openrouter (free models)'
+Write-Host "Provider: $ProviderLabel"
 foreach ($m in $EvalModels) {
     $roleLabel = if ([string]::IsNullOrWhiteSpace($m.Roles)) { 'fallback' } else { $m.Roles }
     Write-Host ("  - {0} -> {1} [{2}]" -f $m.Id, $m.Model, $roleLabel)
