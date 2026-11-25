@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-enum GrouperSecret: String {
+enum GrouperSecret: String, Sendable {
     case admin = "grouper.admin"
     case device = "grouper.device"
 }
@@ -34,6 +34,8 @@ enum KeychainStore {
         if status == errSecItemNotFound {
             var create = base
             create[kSecValueData as String] = data
+            // VERIFY ON MAC: Confirm SecItemAdd with kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            // behaves as expected on unsigned/non-sandboxed macOS 26 (legacy vs Data Protection Keychain).
             create[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             let created = SecItemAdd(create as CFDictionary, nil)
             guard created == errSecSuccess else { throw KeychainError.status(created) }
@@ -43,7 +45,7 @@ enum KeychainStore {
     }
 
     static func delete(_ secret: GrouperSecret) {
-        SecItemDelete([
+        _ = SecItemDelete([
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: secret.rawValue,
             kSecAttrAccount as String: account,
@@ -51,4 +53,18 @@ enum KeychainStore {
     }
 }
 
-enum KeychainError: Error { case status(OSStatus) }
+enum KeychainError: Error, LocalizedError, Sendable {
+    case status(OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .status(let code):
+            #if os(macOS)
+            if let message = SecCopyErrorMessageString(code, nil) as String? {
+                return "Keychain error: \(message) (\(code))"
+            }
+            #endif
+            return "Keychain error (OSStatus \(code))."
+        }
+    }
+}

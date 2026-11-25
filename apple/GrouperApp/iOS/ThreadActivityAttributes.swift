@@ -1,8 +1,8 @@
 import ActivityKit
 import Foundation
 
-struct ThreadActivityAttributes: ActivityAttributes {
-    struct ContentState: Codable, Hashable {
+struct ThreadActivityAttributes: ActivityAttributes, Sendable {
+    struct ContentState: Codable, Hashable, Sendable {
         var status: String
         var phase: String
         var streamedLine: String?

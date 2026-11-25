@@ -8,7 +8,8 @@ import UserNotifications
 struct AskGrouperIntent: AppIntent {
     static let title: LocalizedStringResource = "Ask Grouper"
     static let description = IntentDescription("Open the pinned project chat with an optional message.")
-    static let openAppWhenRun = true
+    // VERIFY ON MAC: Confirm IntentModes.foreground compiles in Xcode 26 AppIntents SDK (replacing deprecated openAppWhenRun = true).
+    static let supportedModes: IntentModes = .foreground
 
     @Parameter(title: "Message") var text: String?
 
@@ -17,14 +18,17 @@ struct AskGrouperIntent: AppIntent {
         components.scheme = "grouper"
         components.host = "ask"
         if let text, !text.isEmpty { components.queryItems = [URLQueryItem(name: "text", value: text)] }
-        return .result(opensIntent: OpenURLIntent(components.url!))
+        let url = components.url ?? URL(string: "grouper://ask")!
+        // VERIFY ON MAC: Confirm OpenURLIntent accepts custom URL scheme "grouper://" on iOS 26.
+        return .result(opensIntent: OpenURLIntent(url))
     }
 }
 
 struct OpenApprovalsIntent: AppIntent {
     static let title: LocalizedStringResource = "Open Grouper Approvals"
-    static let openAppWhenRun = true
+    static let supportedModes: IntentModes = .foreground
     func perform() async throws -> some IntentResult & OpensIntent {
+        // VERIFY ON MAC: Confirm OpenURLIntent accepts custom URL scheme "grouper://" on iOS 26.
         .result(opensIntent: OpenURLIntent(URL(string: "grouper://approvals")!))
     }
 }
@@ -39,10 +43,15 @@ struct GrouperShortcuts: AppShortcutsProvider {
 @MainActor
 enum LiveActivityCoordinator {
     static func start(threadId: String, title: String, device: String, status: String, phase: String) async throws {
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
         guard !Activity<ThreadActivityAttributes>.activities.contains(where: { $0.attributes.threadId == threadId }) else { return }
         let attributes = ThreadActivityAttributes(threadId: threadId, title: title, device: device)
         let state = ThreadActivityAttributes.ContentState(status: status, phase: phase, streamedLine: nil)
-        _ = try Activity.request(attributes: attributes, content: ActivityContent(state: state, staleDate: nil))
+        _ = try Activity<ThreadActivityAttributes>.request(
+            attributes: attributes,
+            content: ActivityContent(state: state, staleDate: nil),
+            pushType: nil
+        )
     }
 
     static func update(threadId: String, status: String, phase: String, streamedLine: String?) async {
@@ -54,7 +63,7 @@ enum LiveActivityCoordinator {
     static func end(threadId: String, status: String) async {
         let content = ActivityContent(state: ThreadActivityAttributes.ContentState(status: status, phase: status.capitalized, streamedLine: nil), staleDate: nil)
         for activity in Activity<ThreadActivityAttributes>.activities where activity.attributes.threadId == threadId {
-            await activity.end(content, dismissalPolicy: .after(.now + 60))
+            await activity.end(content, dismissalPolicy: .after(Date.now.addingTimeInterval(60)))
         }
     }
 }
@@ -69,6 +78,7 @@ enum ApprovalNotificationCoordinator {
         content.subtitle = "\(threadTitle) · \(deviceName)"
         content.body = request.reason
         content.categoryIdentifier = "grouper.approval"
+        // VERIFY ON MAC: Time-sensitive Focus breakthrough requires the com.apple.developer.usernotifications.time-sensitive entitlement when signing for device.
         content.interruptionLevel = .timeSensitive
         content.userInfo = ["approval_id": request.approvalId]
         try? await center.add(UNNotificationRequest(identifier: "approval-\(request.approvalId)", content: content, trigger: nil))
@@ -93,28 +103,30 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         return true
     }
 
-    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        let actionIdentifier = response.actionIdentifier
         guard let approvalId = response.notification.request.content.userInfo["approval_id"] as? String else { return }
-        if response.actionIdentifier == "GROUPER_EDIT" {
+        if actionIdentifier == "GROUPER_EDIT" || actionIdentifier == UNNotificationDefaultActionIdentifier {
             await MainActor.run { NotificationCenter.default.post(name: .grouperOpenApproval, object: approvalId) }
             return
         }
-        guard ["GROUPER_APPROVE", "GROUPER_DENY"].contains(response.actionIdentifier),
+        guard ["GROUPER_APPROVE", "GROUPER_DENY"].contains(actionIdentifier),
               let hub = UserDefaults.standard.string(forKey: "grouper.hubURL"),
               let token = KeychainStore.read(.admin) else { return }
         do {
             let client = try HubClient(baseURL: hub, token: token)
-            _ = try await client.resolveApproval(id: approvalId, approve: response.actionIdentifier == "GROUPER_APPROVE")
+            _ = try await client.resolveApproval(id: approvalId, approve: actionIdentifier == "GROUPER_APPROVE")
         } catch {
             // A 404 means another device answered first; the notification can disappear quietly.
         }
     }
 
-    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         [.banner, .list, .sound]
     }
 }
 
 extension Notification.Name {
     static let grouperOpenApproval = Notification.Name("grouper.openApproval")
+    static let grouperOpenTab = Notification.Name("grouper.openTab")
 }

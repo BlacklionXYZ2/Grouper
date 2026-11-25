@@ -6,7 +6,6 @@ struct ChatView: View {
     @State private var message = ""
     @State private var selectedModel: String?
     @State private var sending = false
-    @State private var announcement = ""
     @State private var lastAnnouncement = Date.distantPast
 
     var body: some View {
@@ -27,18 +26,15 @@ struct ChatView: View {
                 .padding()
             }
             .onChange(of: model.transcript.count) { _, _ in withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end") } }
-            .safeAreaInset(edge: .bottom) { composer }
+            // VERIFY ON MAC: Confirm safeAreaBar(edge: .bottom) scroll-edge blur and Reduce Transparency
+            // with GlassSurface + .glassProminent Send button on both iOS 26 and macOS 26.
+            .safeAreaBar(edge: .bottom) { composer }
         }
         .navigationTitle(model.selectedConversation?.title ?? "New chat")
         .toolbar { chatMenu }
         .modifier(ThreadPresentation())
         .sheet(item: Binding(get: { model.selectedApproval }, set: { if $0 == nil { model.selectedApprovalId = nil } })) { approval in
             ApprovalSheet(approval: approval)
-        }
-        .overlay(alignment: .top) {
-            if !announcement.isEmpty {
-                Text(announcement).frame(width: 1, height: 1).opacity(0.01).accessibilityLiveRegion(.polite)
-            }
         }
     }
 
@@ -49,7 +45,7 @@ struct ChatView: View {
     private var offlineBanner: some View {
         Label("Offline. This is the last stored copy; live controls are disabled.", systemImage: "wifi.slash")
             .font(.callout).padding().frame(maxWidth: .infinity, alignment: .leading)
-            .background(.orange.opacity(0.12), in: .rect(cornerRadius: 12))
+            .background(Color.orange.opacity(0.12), in: .rect(cornerRadius: 12))
     }
 
     private var newConversationIntro: some View {
@@ -74,14 +70,16 @@ struct ChatView: View {
             }.buttonStyle(.plain)
         case .error(_, _, let message): ErrorBanner(message: message)
         case .budgetWarning(_, _, let warning):
-            Label("Estimated \(warning.scope) spend is $\(warning.spent, format: .number.precision(.fractionLength(2))) of $\(warning.limit, format: .number.precision(.fractionLength(2))).", systemImage: "dollarsign.circle")
+            let spent = warning.spent.formatted(.number.precision(.fractionLength(2)))
+            let limit = warning.limit.formatted(.number.precision(.fractionLength(2)))
+            Label("Estimated \(warning.scope) spend is $\(spent) of $\(limit).", systemImage: "dollarsign.circle")
                 .font(.callout).foregroundStyle(.orange)
         }
     }
 
     private func assistantMessage(_ text: String, streaming: Bool) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(.init(text)).textSelection(.enabled)
+            Text(LocalizedStringKey(text)).textSelection(.enabled)
             if streaming { Label("Replying", systemImage: "ellipsis").font(.caption).foregroundStyle(.teal) }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -99,7 +97,7 @@ struct ChatView: View {
                     Text(approval.reason).font(.callout).foregroundStyle(.secondary).lineLimit(2)
                 }
                 Spacer(); Image(systemName: "chevron.right")
-            }.padding().background(.orange.opacity(0.1), in: .rect(cornerRadius: 14))
+            }.padding().background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 14))
         }.buttonStyle(.plain)
     }
 
@@ -109,8 +107,10 @@ struct ChatView: View {
                 TextField("Message", text: $message, axis: .vertical)
                     .lineLimit(1...4).textFieldStyle(.plain).padding(.horizontal, 8).grouperMinimumControlSize()
                 Menu {
-                    Button("Default") { selectedModel = nil }
-                    ForEach(availableModels) { entry in Button(entry.free ? "\(entry.id) · Free" : entry.id) { selectedModel = entry.id } }
+                    Button("Default") { chooseModel(nil) }
+                    ForEach(availableModels) { entry in
+                        Button(entry.free ? "\(entry.id) · Free" : entry.id) { chooseModel(entry.id) }
+                    }
                 } label: { Image(systemName: "cpu").grouperMinimumControlSize().accessibilityLabel("Choose model") }
                 Button { send() } label: {
                     if sending { ProgressView().frame(width: 22, height: 22) } else { Image(systemName: "arrow.up") }
@@ -140,6 +140,13 @@ struct ChatView: View {
         }
     }
 
+    private func chooseModel(_ modelId: String?) {
+        selectedModel = modelId
+        if model.selectedConversationId != nil {
+            Task { await model.setConversationModel(modelId) }
+        }
+    }
+
     private func send() {
         let text = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -153,7 +160,7 @@ struct ChatView: View {
     private func announceIfNeeded(_ text: String) {
         let sentenceEnded = text.last.map { ".!?\n".contains($0) } ?? false
         guard sentenceEnded || Date().timeIntervalSince(lastAnnouncement) >= 8 else { return }
-        announcement = text
+        AccessibilityNotification.Announcement(text).post()
         lastAnnouncement = Date()
     }
 

@@ -9,8 +9,8 @@ struct SignInView: View {
             Form {
                 Section("Hub") {
                     TextField("https://grouper.example", text: $model.hubURL)
-                        .textContentType(.URL)
                         #if os(iOS)
+                        .textContentType(.URL)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
                         #endif
@@ -38,6 +38,9 @@ struct SignInView: View {
                     .controlSize(.large)
                 }
             }
+            #if os(macOS)
+            .formStyle(.grouped)
+            #endif
             .navigationTitle("Connect to Grouper")
         }
     }

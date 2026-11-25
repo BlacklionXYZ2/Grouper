@@ -1,5 +1,10 @@
 import SwiftUI
 import GrouperAPI
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 extension Color {
     static var grouperSecondaryBackground: Color {
@@ -13,7 +18,7 @@ extension Color {
 
 struct GlassSurface<Content: View>: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @ViewBuilder let content: Content
+    let content: Content
 
     init(@ViewBuilder content: () -> Content) { self.content = content() }
 
@@ -32,7 +37,7 @@ struct ErrorBanner: View {
         Label(message, systemImage: "exclamationmark.triangle.fill")
             .font(.callout).foregroundStyle(.red).padding()
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.red.opacity(0.08), in: .rect(cornerRadius: 12))
+            .background(Color.red.opacity(0.08), in: .rect(cornerRadius: 12))
             .accessibilityElement(children: .combine)
     }
 }
@@ -65,7 +70,7 @@ struct ThreadChip: View {
     let deviceName: String
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(card.title.isEmpty ? "Thread" : card.title).font(.headline).lineLimit(2)
+            Text(displayTitle).font(.headline).lineLimit(2)
             HStack { StatusLabel(status: card.status); Text(deviceName).font(.caption).foregroundStyle(.secondary) }
             if let preview = card.liveDraft.isEmpty ? card.latestText : card.liveDraft, !preview.isEmpty {
                 Text(preview).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -79,13 +84,16 @@ struct ThreadChip: View {
         .padding(12).frame(minWidth: 170, maxWidth: 240, alignment: .leading)
         .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 14))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(card.title), \(card.status), on \(deviceName)")
+        .accessibilityLabel("\(displayTitle), \(spokenStatus), on \(deviceName)")
         .accessibilityValue(card.liveDraft.isEmpty ? card.latestText ?? "" : card.liveDraft)
     }
+
+    private var displayTitle: String { card.title.isEmpty ? "Thread" : card.title }
+    private var spokenStatus: String { card.status == "waiting_device" ? "Waiting" : card.status }
 }
 
 extension View {
-    @ViewBuilder func grouperMinimumControlSize() -> some View {
+    func grouperMinimumControlSize() -> some View {
         self.frame(minWidth: 44, minHeight: 44)
     }
 }

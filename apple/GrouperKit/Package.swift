@@ -42,7 +42,7 @@ targets += [
 
 let package = Package(
     name: "GrouperKit",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v14), .iOS(.v16)],
     products: products,
     targets: targets
 )

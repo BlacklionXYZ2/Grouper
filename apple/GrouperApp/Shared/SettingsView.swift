@@ -2,6 +2,11 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
+    #if os(macOS)
+    @EnvironmentObject private var node: MacNodeController
+    @State private var savingDeviceToken = false
+    #endif
+
     var body: some View {
         Form {
             Section("Connection") {
@@ -12,14 +17,36 @@ struct SettingsView: View {
             #if os(macOS)
             Section("This Mac") {
                 SecureField("Device token", text: $model.deviceToken)
-                Button("Save device token") { if !model.deviceToken.isEmpty { try? KeychainStore.save(model.deviceToken, as: .device) } }
-                Button("Forget device token", role: .destructive) { model.forgetDeviceToken() }
+                    .textContentType(.password)
+                Button(savingDeviceToken ? "Verifying…" : "Save device token") {
+                    savingDeviceToken = true
+                    Task {
+                        let saved = await model.saveDeviceToken()
+                        savingDeviceToken = false
+                        if saved {
+                            node.stop()
+                            node.start(hubURL: model.hubURL, token: model.deviceToken)
+                        }
+                    }
+                }
+                .disabled(savingDeviceToken || model.deviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Forget device token", role: .destructive) {
+                    node.stop()
+                    model.forgetDeviceToken()
+                }
+                if let error = model.errorMessage {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
                 Text("Forgetting removes the token from this Mac. The hub continues to accept it until that device is revoked there.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             #endif
             Section { Button("Sign out on this device", role: .destructive) { model.signOut() } }
-        }.navigationTitle("Settings")
+        }
+        #if os(macOS)
+        .formStyle(.grouped)
+        #endif
+        .navigationTitle("Settings")
     }
 }
 

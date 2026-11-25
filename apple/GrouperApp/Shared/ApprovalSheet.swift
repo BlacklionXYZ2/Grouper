@@ -22,7 +22,7 @@ struct ApprovalSheet: View {
                             .font(.body.weight(.medium)).fixedSize(horizontal: false, vertical: true)
                     }
                     .padding().frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.orange.opacity(0.12), in: .rect(cornerRadius: 14))
+                    .background(Color.orange.opacity(0.12), in: .rect(cornerRadius: 14))
 
                     VStack(alignment: .leading, spacing: 8) {
                         Text("What will run").font(.headline)
@@ -48,11 +48,13 @@ struct ApprovalSheet: View {
 
     private var actions: some View {
         VStack(spacing: 10) {
-            HStack(spacing: 12) {
-                Button { answer(false) } label: { Label("Deny", systemImage: "xmark") }.buttonStyle(.glass).grouperMinimumControlSize()
-                    .accessibilityLabel("Deny \(approval.tool) on \(deviceName)")
-                Button { answer(true) } label: { Label("Approve", systemImage: "checkmark") }.buttonStyle(.glassProminent).grouperMinimumControlSize()
-                    .accessibilityLabel("Approve \(approval.tool) on \(deviceName)")
+            GlassEffectContainer(spacing: 12) {
+                HStack(spacing: 12) {
+                    Button { answer(false) } label: { Label("Deny", systemImage: "xmark") }.buttonStyle(.glass).grouperMinimumControlSize()
+                        .accessibilityLabel("Deny \(approval.tool) on \(deviceName)")
+                    Button { answer(true) } label: { Label("Approve", systemImage: "checkmark") }.buttonStyle(.glassProminent).grouperMinimumControlSize()
+                        .accessibilityLabel("Approve \(approval.tool) on \(deviceName)")
+                }
             }
             Button("Change it: deny and tell the thread what to do instead") { changeIt() }.font(.callout)
         }
@@ -66,18 +68,24 @@ struct ApprovalSheet: View {
 
     private func answer(_ approve: Bool) {
         busy = true
-        Task { await model.resolveApproval(approval.id, approve: approve); busy = false; dismiss() }
+        Task {
+            let resolved = await model.resolveApproval(approval.id, approve: approve)
+            busy = false
+            if resolved { dismiss() }
+        }
     }
 
     private func changeIt() {
         guard let threadId = approval.threadId else { answer(false); return }
         busy = true
         Task {
-            await model.resolveApproval(approval.id, approve: false)
-            model.threadMessageDrafts[threadId] = "Don’t run that. Instead: "
-            model.selectedThreadId = threadId
+            let resolved = await model.resolveApproval(approval.id, approve: false)
             busy = false
-            dismiss()
+            if resolved {
+                model.threadMessageDrafts[threadId] = "Don’t run that. Instead: "
+                model.selectedThreadId = threadId
+                dismiss()
+            }
         }
     }
 }

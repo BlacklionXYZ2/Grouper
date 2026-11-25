@@ -2,6 +2,24 @@ import Foundation
 import SwiftUI
 import GrouperAPI
 
+private final class TaskBox {
+    var task: Task<Void, Never>?
+
+    func replace(with newTask: Task<Void, Never>?) {
+        task?.cancel()
+        task = newTask
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+
+    deinit {
+        task?.cancel()
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var hubURL = ""
@@ -26,18 +44,16 @@ final class AppModel: ObservableObject {
     @Published var threadMessageDrafts: [String: String] = [:]
     @Published var newChatMode = "project"
 
-    private var streamTask: Task<Void, Never>?
+    private let streamTask = TaskBox()
 
     init() {
         hubURL = UserDefaults.standard.string(forKey: "grouper.hubURL") ?? ""
         adminToken = KeychainStore.read(.admin) ?? ""
         deviceToken = KeychainStore.read(.device) ?? ""
         if !hubURL.isEmpty, !adminToken.isEmpty {
-            Task { await connect(save: false) }
+            Task { [weak self] in await self?.connect(save: false) }
         }
     }
-
-    deinit { streamTask?.cancel() }
 
     var selectedConversation: ConversationInfo? {
         conversations.first { $0.id == selectedConversationId }
@@ -68,28 +84,28 @@ final class AppModel: ObservableObject {
 
     func connect(save: Bool = true) async {
         errorMessage = nil
+        let trimmedHub = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAdmin = adminToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedDevice = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            let api = try HubClient(baseURL: hubURL, token: adminToken)
+            let api = try HubClient(baseURL: trimmedHub, token: trimmedAdmin)
             try await api.health()
             _ = try await api.providers() // proves this is the admin token, not merely a valid device token
             #if os(macOS)
-            if !deviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let deviceAPI = try HubClient(baseURL: hubURL, token: deviceToken)
-                do {
-                    _ = try await deviceAPI.providers()
-                    throw HubClientError.badRequest("The device field contains an admin token. Use a separate non-admin device token for the Mac node.")
-                } catch HubClientError.forbidden {
-                    // Expected: a device token can read, but cannot access providers.
-                }
+            if !trimmedDevice.isEmpty {
+                try await verifyDeviceToken(trimmedDevice, hubURL: trimmedHub)
             }
             #endif
+            hubURL = trimmedHub
+            adminToken = trimmedAdmin
+            deviceToken = trimmedDevice
             client = api
             signedIn = true
             online = true
             if save {
-                UserDefaults.standard.set(hubURL, forKey: "grouper.hubURL")
-                try KeychainStore.save(adminToken, as: .admin)
-                if !deviceToken.isEmpty { try KeychainStore.save(deviceToken, as: .device) }
+                UserDefaults.standard.set(trimmedHub, forKey: "grouper.hubURL")
+                try KeychainStore.save(trimmedAdmin, as: .admin)
+                if !trimmedDevice.isEmpty { try KeychainStore.save(trimmedDevice, as: .device) }
             }
             await loadInitial()
         } catch {
@@ -99,12 +115,47 @@ final class AppModel: ObservableObject {
         }
     }
 
+    #if os(macOS)
+    func saveDeviceToken() async -> Bool {
+        errorMessage = nil
+        let trimmedDevice = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedDevice.isEmpty else { return false }
+        do {
+            try await verifyDeviceToken(trimmedDevice, hubURL: hubURL)
+            deviceToken = trimmedDevice
+            try KeychainStore.save(trimmedDevice, as: .device)
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    private func verifyDeviceToken(_ token: String, hubURL: String) async throws {
+        let deviceAPI = try HubClient(baseURL: hubURL, token: token)
+        do {
+            _ = try await deviceAPI.providers()
+            throw HubClientError.badRequest("The device field contains an admin token. Use a separate non-admin device token for the Mac node.")
+        } catch HubClientError.forbidden(_) {
+            // Expected: a device token can read, but cannot access providers.
+        }
+    }
+    #endif
+
     func signOut() {
-        streamTask?.cancel()
+        streamTask.cancel()
         client = nil
         signedIn = false
         online = false
+        adminToken = ""
+        errorMessage = nil
+        conversations.removeAll()
+        threads.removeAll()
         folders.removeAll()
+        selectedConversationId = nil
+        selectedThreadId = nil
+        selectedApprovalId = nil
+        streamState = .disconnected
         KeychainStore.delete(.admin)
     }
 
@@ -136,17 +187,20 @@ final class AppModel: ObservableObject {
     func selectConversation(_ id: String) async {
         guard let client else { return }
         selectedConversationId = id
-        streamTask?.cancel()
+        streamTask.cancel()
         do {
             async let events = client.events(conversationId: id)
             async let scopedThreads = client.threads(conversationId: id)
-            folders[id] = TranscriptFolder(conversationId: id, events: try await events)
+            let fetchedEvents = try await events
             let scoped = try await scopedThreads
+            guard selectedConversationId == id else { return }
+            folders[id] = TranscriptFolder(conversationId: id, events: fetchedEvents)
             threads.removeAll { $0.conversationId == id }
             threads.append(contentsOf: scoped)
             online = true
             followEvents(conversationId: id)
         } catch {
+            guard selectedConversationId == id else { return }
             online = false
             errorMessage = error.localizedDescription
         }
@@ -172,6 +226,18 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func setConversationModel(_ modelId: String?) async {
+        guard let client, let conversationId = selectedConversationId else { return }
+        do {
+            let updated = try await client.setConversationModel(modelId, conversationId: conversationId)
+            if let index = conversations.firstIndex(where: { $0.id == updated.id }) {
+                conversations[index] = updated
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func refreshConversations() async {
         guard let client else { return }
         do { conversations = try await client.conversations().sorted { $0.created > $1.created } }
@@ -179,7 +245,7 @@ final class AppModel: ObservableObject {
     }
 
     func beginNewChat(mode: String) {
-        streamTask?.cancel()
+        streamTask.cancel()
         selectedConversationId = nil
         selectedThreadId = nil
         newChatMode = mode
@@ -203,15 +269,21 @@ final class AppModel: ObservableObject {
         catch { errorMessage = error.localizedDescription }
     }
 
-    func resolveApproval(_ id: String, approve: Bool) async {
-        guard let client else { return }
+    @discardableResult
+    func resolveApproval(_ id: String, approve: Bool) async -> Bool {
+        guard let client else { return false }
         do {
             _ = try await client.resolveApproval(id: id, approve: approve)
             selectedApprovalId = nil
-        } catch HubClientError.notFound {
+            return true
+        } catch HubClientError.notFound(_) {
             selectedApprovalId = nil
             errorMessage = "Answered on another device."
-        } catch { errorMessage = error.localizedDescription }
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     func refreshDevices() async {
@@ -242,7 +314,7 @@ final class AppModel: ObservableObject {
     private func followEvents(conversationId: String) {
         guard let client else { return }
         let last = folders[conversationId]?.storedEvents.last?.seq ?? 0
-        streamTask = Task { [weak self] in
+        streamTask.replace(with: Task { [weak self] in
             do {
                 for try await update in client.eventStream(conversationId: conversationId).updates(after: last) {
                     guard let self, !Task.isCancelled else { return }
@@ -252,10 +324,11 @@ final class AppModel: ObservableObject {
                     }
                 }
             } catch {
+                guard !Task.isCancelled else { return }
                 self?.online = false
                 self?.errorMessage = error.localizedDescription
             }
-        }
+        })
     }
 
     private func ingest(_ event: Event) {
@@ -266,17 +339,32 @@ final class AppModel: ObservableObject {
         #if os(iOS)
         switch event.body {
         case .threadStarted(let started):
-            Task { try? await LiveActivityCoordinator.start(threadId: event.threadId ?? "", title: started.title, device: deviceName(started.deviceId), status: "running", phase: "Running on \(deviceName(started.deviceId))") }
+            if let threadId = event.threadId, !threadId.isEmpty {
+                let device = deviceName(started.deviceId)
+                Task { try? await LiveActivityCoordinator.start(threadId: threadId, title: started.title, device: device, status: "running", phase: "Running on \(device)") }
+            }
         case .threadWaiting(let waiting):
-            Task { await LiveActivityCoordinator.update(threadId: event.threadId ?? "", status: "waiting_device", phase: "Waiting for \(deviceName(waiting.deviceId))", streamedLine: nil) }
+            if let threadId = event.threadId, !threadId.isEmpty {
+                let device = deviceName(waiting.deviceId)
+                Task { await LiveActivityCoordinator.update(threadId: threadId, status: "waiting_device", phase: "Waiting for \(device)", streamedLine: nil) }
+            }
         case .threadCheckpoint:
-            Task { await LiveActivityCoordinator.update(threadId: event.threadId ?? "", status: "waiting_device", phase: "Checkpoint on the hub", streamedLine: nil) }
+            if let threadId = event.threadId, !threadId.isEmpty {
+                Task { await LiveActivityCoordinator.update(threadId: threadId, status: "waiting_device", phase: "Checkpoint on the hub", streamedLine: nil) }
+            }
         case .threadHandedOver(let handover):
-            Task { await LiveActivityCoordinator.update(threadId: event.threadId ?? "", status: "running", phase: "Running on \(deviceName(handover.deviceId))", streamedLine: nil) }
+            if let threadId = event.threadId, !threadId.isEmpty {
+                let device = deviceName(handover.deviceId)
+                Task { await LiveActivityCoordinator.update(threadId: threadId, status: "running", phase: "Running on \(device)", streamedLine: nil) }
+            }
         case .threadFinished(let status, _):
-            Task { await LiveActivityCoordinator.end(threadId: event.threadId ?? "", status: status) }
+            if let threadId = event.threadId, !threadId.isEmpty {
+                Task { await LiveActivityCoordinator.end(threadId: threadId, status: status) }
+            }
         case .approvalRequested(let request):
-            Task { await ApprovalNotificationCoordinator.post(request, threadTitle: threads.first { $0.id == event.threadId }?.title ?? "Thread", deviceName: deviceName(request.deviceId)) }
+            let threadTitle = threads.first { $0.id == event.threadId }?.title ?? "Thread"
+            let device = deviceName(request.deviceId)
+            Task { await ApprovalNotificationCoordinator.post(request, threadTitle: threadTitle, deviceName: device) }
         case .approvalResolved(let approvalId, _):
             ApprovalNotificationCoordinator.remove(approvalId: approvalId)
         default: break

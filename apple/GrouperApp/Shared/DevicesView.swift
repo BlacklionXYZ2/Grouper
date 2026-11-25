@@ -9,7 +9,7 @@ struct DevicesView: View {
             List(model.devices) { device in
                 NavigationLink(value: device.id) {
                     VStack(alignment: .leading, spacing: 5) {
-                        HStack { Circle().fill(device.online ? .green : .secondary).frame(width: 8, height: 8); Text(device.name).font(.headline) }
+                        HStack { Circle().fill(device.online ? Color.green : Color.secondary).frame(width: 8, height: 8); Text(device.name).font(.headline) }
                         Text(device.online ? "Online · \(device.platform)" : offlineText(device)).font(.caption).foregroundStyle(.secondary)
                         Text(device.id == "hub" ? "Hub threads have file tools only." : "\(device.capabilities.count) tools")
                             .font(.caption).foregroundStyle(.secondary)
@@ -83,7 +83,7 @@ struct DeviceDetailView: View {
                     if !tool.available { Text("Unavailable").font(.caption).foregroundStyle(.secondary) }
                     if tool.permission == .bypass { Label("Bypass", systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.red) }
                 }
-                if !tool.description.isEmpty { Text(.init(tool.description)).font(.callout).foregroundStyle(.secondary) }
+                if !tool.description.isEmpty { Text(LocalizedStringKey(tool.description)).font(.callout).foregroundStyle(.secondary) }
                 Picker("Permission for \(tool.name)", selection: Binding(
                     get: { tool.permission },
                     set: { permission in
@@ -98,7 +98,7 @@ struct DeviceDetailView: View {
                 .pickerStyle(.segmented).disabled(!tool.available || !model.online)
                 .accessibilityHint(policy(tool: tool, permission: tool.permission))
                 Text(policy(tool: tool, permission: tool.permission)).font(.caption)
-                    .foregroundStyle(tool.permission == .bypass ? .red : isUnconfined(tool) ? .orange : .secondary)
+                    .foregroundStyle(tool.permission == .bypass ? Color.red : isUnconfined(tool) ? Color.orange : Color.secondary)
             }.padding(.vertical, 6)
         }
     }

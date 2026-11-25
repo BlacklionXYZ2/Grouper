@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -9,7 +10,7 @@ struct GrouperMacApp: App {
         WindowGroup("Grouper", id: "main") {
             Group { if model.signedIn { MacRootView() } else { SignInView() } }
                 .environmentObject(model).environmentObject(node).tint(.teal)
-                .onChange(of: model.signedIn) { _, signedIn in
+                .onChange(of: model.signedIn, initial: true) { _, signedIn in
                     if signedIn, !model.deviceToken.isEmpty { node.start(hubURL: model.hubURL, token: model.deviceToken) }
                     else if !signedIn { node.stop() }
                 }
@@ -31,7 +32,7 @@ private enum MacSection: Hashable { case chat, threads, devices, settings }
 
 struct MacRootView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var section: MacSection = .chat
+    @State private var section: MacSection? = .chat
 
     var body: some View {
         NavigationSplitView {
@@ -55,8 +56,8 @@ struct MacRootView: View {
             }
             .navigationSplitViewColumnWidth(min: 210, ideal: 260)
         } content: {
-            switch section {
-            case .chat: ChatView()
+            switch section ?? .chat {
+            case .chat: NavigationStack { ChatView() }
             case .threads: ThreadsView()
             case .devices: DevicesView()
             case .settings: NavigationStack { SettingsView() }
@@ -75,16 +76,18 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack { Circle().fill(model.online ? .green : .red).frame(width: 8, height: 8); Text(model.online ? "Hub connected" : "Hub offline"); Spacer(); Text(node.statusText).foregroundStyle(.secondary) }
+            HStack { Circle().fill(model.online ? Color.green : Color.red).frame(width: 8, height: 8); Text(model.online ? "Hub connected" : "Hub offline"); Spacer(); Text(node.statusText).foregroundStyle(.secondary) }
             if !model.pendingApprovals.isEmpty {
                 Divider()
                 ForEach(model.pendingApprovals.prefix(3)) { approval in
                     VStack(alignment: .leading, spacing: 6) {
                         Text("\(approval.tool) · \(approval.reason)").lineLimit(2)
-                        HStack {
-                            Button("Approve") { Task { await model.resolveApproval(approval.id, approve: true) } }
-                            Button("Deny") { Task { await model.resolveApproval(approval.id, approve: false) } }
-                        }.buttonStyle(.glass)
+                        GlassEffectContainer(spacing: 8) {
+                            HStack {
+                                Button("Approve") { Task { await model.resolveApproval(approval.id, approve: true) } }
+                                Button("Deny") { Task { await model.resolveApproval(approval.id, approve: false) } }
+                            }.buttonStyle(.glass)
+                        }
                     }
                 }
             }
@@ -95,7 +98,11 @@ struct MenuBarView: View {
             }
             Divider()
             HStack {
-                Button("Open Chat") { openWindow(id: "main") }
+                Button("Open Chat") {
+                    openWindow(id: "main")
+                    NSApplication.shared.activate()
+                }
+                SettingsLink { Text("Settings") }
                 Spacer()
                 Button(node.running ? "Pause this Mac" : "Resume this Mac") {
                     if node.running { node.stop() } else { node.start(hubURL: model.hubURL, token: model.deviceToken) }
