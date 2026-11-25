@@ -33,6 +33,16 @@ swift build --target GrouperAPI
 swift test --filter GrouperAPITests
 ```
 
+## CI
+
+`.github/workflows/apple.yml` runs on a `macos-26` runner with Xcode 26. It
+builds the host Mac library with `scripts/build-apple.sh`, runs `swift build`
+and `swift test` in `apple/GrouperKit` (live hub tests skip), then builds
+`Grouper-macOS` and the iOS Simulator `Grouper-iOS` without code signing.
+xcodebuild logs are kept when that build fails. CI does not build an iOS
+XCFramework: the script has no iOS slice, and the iPhone target links
+`GrouperAPI` only.
+
 ## Real-hub API test on Windows
 
 `GrouperAPILiveTests` is skipped unless `GROUPER_LIVE_HUB` and
