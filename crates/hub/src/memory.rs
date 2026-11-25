@@ -545,7 +545,12 @@ mod tests {
     async fn turn(hub: &Arc<Hub>, conversation: Option<String>, mode: &str, text: &str) -> (String, String) {
         let before = conversation.as_ref().map(|c| hub.db.events(c, 0, None).len()).unwrap_or(0);
         let id = hub
-            .chat(core_protocol::ChatRequest { conversation_id: conversation, mode: Some(mode.into()), text: text.into() })
+            .chat(core_protocol::ChatRequest {
+                conversation_id: conversation,
+                mode: Some(mode.into()),
+                text: text.into(),
+                model: None,
+            })
             .await
             .unwrap();
         for _ in 0..200 {
@@ -606,6 +611,7 @@ mod tests {
             free: true,
             roles: vec!["orchestrator".into(), "standard".into()],
             local: false,
+            modalities: vec![],
         })
         .unwrap();
         let cat = db.add_memory("Oscar's cat is called Miso.", &[], None).unwrap();

@@ -287,6 +287,11 @@ pub struct ChatRequest {
     #[serde(default)]
     pub mode: Option<String>,
     pub text: String,
+    /// Registry id for this conversation's orchestrator or standard model.
+    /// Applied on the conversation's first message. Change it later with
+    /// `POST /v1/conversations/{id}/model`.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -300,6 +305,9 @@ pub struct ConversationInfo {
     pub mode: String,
     pub title: String,
     pub created: u64,
+    /// Registry id used instead of the role default, when this conversation has one.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -360,6 +368,36 @@ pub struct ModelEntry {
     /// local even without this flag.
     #[serde(default)]
     pub local: bool,
+    /// Input modalities from the provider's model card, e.g. `text`, `image`.
+    /// Empty until a catalog import sets them.
+    #[serde(default)]
+    pub modalities: Vec<String>,
+}
+
+/// `POST /v1/models/import`. Pull one model from the provider's catalog.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ModelImportRequest {
+    pub provider: String,
+    /// The provider's model name, e.g. `anthropic/claude-sonnet-4`.
+    pub model: String,
+    /// Registry id. Derived from `model` when omitted.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Roles this model becomes the default for. Omitted keeps the current roles
+    /// (none, on a new row).
+    #[serde(default)]
+    pub roles: Option<Vec<String>>,
+    /// When omitted, a new row is not local and an existing row keeps its flag.
+    #[serde(default)]
+    pub local: Option<bool>,
+}
+
+/// Saved registry row plus the use-case proposal waiting for confirmation, if one was drafted.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ModelImportResult {
+    pub model: ModelEntry,
+    #[serde(default)]
+    pub proposal_id: Option<i64>,
 }
 
 /// Aggregated metered usage returned by `GET /v1/usage`.
@@ -521,7 +559,7 @@ pub struct RegistryProposal {
     pub reason: String,
     /// `pending`, `accepted` or `rejected`.
     pub status: String,
-    /// `stats` (the hub's automatic check) or `orchestrator`.
+    /// `stats` (the hub's automatic check), `orchestrator`, or `catalog` (drafted from a model card).
     pub source: String,
     pub created: u64,
     pub decided: Option<u64>,

@@ -229,6 +229,9 @@ pub async fn refresh(hub: &Hub) -> RefreshResult {
 }
 
 pub async fn collector_loop(hub: Arc<Hub>) {
+    // Usage is collected every hour. OpenRouter model prices are refreshed on the
+    // first pass and then once a day; a failed refresh is tried again next hour.
+    let mut hours_until_prices = 0u32;
     loop {
         let result = refresh(&hub).await;
         tracing::debug!(
@@ -236,6 +239,16 @@ pub async fn collector_loop(hub: Arc<Hub>) {
             snapshots = result.snapshots_stored,
             "usage refresh complete"
         );
+        if hours_until_prices == 0 {
+            let prices = crate::catalog::refresh_openrouter_prices(&hub).await;
+            tracing::debug!(models = prices.updated, failed = prices.failed, "model price refresh complete");
+            if !prices.failed {
+                hours_until_prices = 24;
+            }
+        }
+        if hours_until_prices > 0 {
+            hours_until_prices = hours_until_prices.saturating_sub(1);
+        }
         tokio::time::sleep(COLLECT_INTERVAL).await;
     }
 }
@@ -413,6 +426,7 @@ mod tests {
             free: false,
             roles: vec![],
             local: false,
+            modalities: vec![],
         })
         .unwrap();
         let conversation = db.create_conversation("project", "test").unwrap();

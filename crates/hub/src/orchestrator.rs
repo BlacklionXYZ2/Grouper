@@ -177,7 +177,16 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     };
 
     let role = if project { "orchestrator" } else { "standard" };
-    let Some(model) = hub.db.default_model(role) else {
+    let chosen = match hub.db.conversation_model(conversation_id) {
+        Ok(model) => model,
+        Err(e) => {
+            finish(hub, &history);
+            hub.emit(conversation_id, None, EventBody::Error { message: e.to_string() });
+            hub.emit(conversation_id, None, EventBody::TurnFinished { running_threads: 0 });
+            return;
+        }
+    };
+    let Some(model) = chosen.or_else(|| hub.db.default_model(role)) else {
         finish(hub, &history);
         hub.emit(
             conversation_id,

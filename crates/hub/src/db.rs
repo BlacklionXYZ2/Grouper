@@ -81,9 +81,10 @@ CREATE TABLE IF NOT EXISTS models (
   id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, input_price REAL NOT NULL DEFAULT 0,
   output_price REAL NOT NULL DEFAULT 0, cache_read_price REAL, cache_write_price REAL,
   context_window INTEGER NOT NULL DEFAULT 0,
-  use_cases TEXT NOT NULL DEFAULT '', free INTEGER NOT NULL DEFAULT 0, roles TEXT NOT NULL DEFAULT '');
+  use_cases TEXT NOT NULL DEFAULT '', free INTEGER NOT NULL DEFAULT 0, roles TEXT NOT NULL DEFAULT '',
+  modalities TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS conversations (
-  id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created INTEGER NOT NULL);
+  id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created INTEGER NOT NULL, model TEXT);
 CREATE TABLE IF NOT EXISTS history (
   conversation_id TEXT NOT NULL, idx INTEGER NOT NULL, message TEXT NOT NULL,
   PRIMARY KEY (conversation_id, idx));
@@ -123,8 +124,13 @@ fn thread_row(r: &rusqlite::Row) -> rusqlite::Result<ThreadInfo> {
 }
 const THREAD_COLS: &str = "id, conversation_id, title, device_id, model, status, reason, summary, created, finished";
 
+fn csv_list(value: String) -> Vec<String> {
+    value.split(',').filter(|s| !s.is_empty()).map(String::from).collect()
+}
+
 fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
     let roles: String = r.get(10)?;
+    let modalities: String = r.get(12)?;
     Ok(ModelEntry {
         id: r.get(0)?,
         provider_id: r.get(1)?,
@@ -136,11 +142,24 @@ fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
         context_window: r.get::<_, i64>(7)? as u64,
         use_cases: r.get(8)?,
         free: r.get::<_, i64>(9)? != 0,
-        roles: roles.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
+        roles: csv_list(roles),
         local: r.get::<_, i64>(11)? != 0,
+        modalities: csv_list(modalities),
     })
 }
-const MODEL_COLS: &str = "id, provider_id, model, input_price, output_price, cache_read_price, cache_write_price,                           context_window, use_cases, free, roles, local";
+const MODEL_COLS: &str = "id, provider_id, model, input_price, output_price, cache_read_price, cache_write_price, \
+                           context_window, use_cases, free, roles, local, modalities";
+
+fn conversation_row(r: &rusqlite::Row) -> rusqlite::Result<ConversationInfo> {
+    Ok(ConversationInfo {
+        id: r.get(0)?,
+        mode: r.get(1)?,
+        title: r.get(2)?,
+        created: r.get::<_, i64>(3)? as u64,
+        model: r.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+    })
+}
+const CONVERSATION_COLS: &str = "id, mode, title, created, model";
 
 fn migrate_provider_secrets(conn: &mut Connection, secrets: &Secrets) -> Result<()> {
     let tx = conn.transaction()?;
@@ -192,6 +211,8 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
             conn.execute(&format!("ALTER TABLE models ADD COLUMN {column} REAL"), [])?;
         }
     }
+    ensure_column(&conn, "models", "modalities", "ALTER TABLE models ADD COLUMN modalities TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&conn, "conversations", "model", "ALTER TABLE conversations ADD COLUMN model TEXT")?;
     Ok(conn)
 }
 
@@ -203,6 +224,17 @@ fn migrate_dotted_tool_names(conn: &Connection) -> Result<()> {
         "UPDATE OR IGNORE tools SET name = replace(name, '.', '_') WHERE instr(name, '.') > 0;
          DELETE FROM tools WHERE instr(name, '.') > 0;",
     )?;
+    Ok(())
+}
+
+/// `ALTER TABLE` only when the column is missing, so opening an existing database is safe to repeat.
+fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) -> Result<()> {
+    let exists = conn
+        .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
+        .exists([column])?;
+    if !exists {
+        conn.execute(alter_sql, [])?;
+    }
     Ok(())
 }
 
@@ -441,8 +473,8 @@ impl Db {
         }
         self.c().execute(
             "INSERT OR REPLACE INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
-               cache_write_price, context_window, use_cases, free, roles, local)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+               cache_write_price, context_window, use_cases, free, roles, local, modalities)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 m.id,
                 m.provider_id,
@@ -455,7 +487,8 @@ impl Db {
                 m.use_cases,
                 m.free,
                 m.roles.join(","),
-                m.local
+                m.local,
+                m.modalities.join(",")
             ],
         )?;
         Ok(())
@@ -507,9 +540,7 @@ impl Db {
 
     pub fn conversation(&self, id: &str) -> Option<ConversationInfo> {
         self.c()
-            .query_row("SELECT id, mode, title, created FROM conversations WHERE id = ?1", [id], |r| {
-                Ok(ConversationInfo { id: r.get(0)?, mode: r.get(1)?, title: r.get(2)?, created: r.get::<_, i64>(3)? as u64 })
-            })
+            .query_row(&format!("SELECT {CONVERSATION_COLS} FROM conversations WHERE id = ?1"), [id], conversation_row)
             .optional()
             .ok()
             .flatten()
@@ -517,13 +548,35 @@ impl Db {
 
     pub fn conversations(&self) -> Vec<ConversationInfo> {
         let c = self.c();
-        let mut st = c.prepare("SELECT id, mode, title, created FROM conversations ORDER BY created DESC").unwrap();
-        st.query_map([], |r| {
-            Ok(ConversationInfo { id: r.get(0)?, mode: r.get(1)?, title: r.get(2)?, created: r.get::<_, i64>(3)? as u64 })
+        let mut st = c.prepare(&format!("SELECT {CONVERSATION_COLS} FROM conversations ORDER BY created DESC")).unwrap();
+        st.query_map([], conversation_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Registry id this conversation uses instead of the role default, resolved to a model.
+    /// `Ok(None)` means it uses the role default. An error means the stored id is no longer registered.
+    pub fn conversation_model(&self, conversation_id: &str) -> Result<Option<ModelEntry>> {
+        let Some(info) = self.conversation(conversation_id) else { bail!("no such conversation") };
+        let Some(key) = info.model else { return Ok(None) };
+        self.find_model(&key).map(Some).with_context(|| {
+            format!("conversation {conversation_id} is set to model {key}, which is not in the registry")
         })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect()
+    }
+
+    /// Set or clear the conversation's model. `model` is a registry id (or the provider's model
+    /// name); null uses the role default again. The stored value is the registry id.
+    pub fn set_conversation_model(&self, id: &str, model: Option<&str>) -> Result<ConversationInfo> {
+        if self.conversation(id).is_none() {
+            bail!("no such conversation");
+        }
+        let stored = match model.map(str::trim).filter(|s| !s.is_empty()) {
+            None => None,
+            Some(key) => {
+                let Some(found) = self.find_model(key) else { bail!("no model {key:?} in the registry") };
+                Some(found.id)
+            }
+        };
+        self.c().execute("UPDATE conversations SET model = ?1 WHERE id = ?2", params![stored, id])?;
+        Ok(self.conversation(id).expect("conversation exists"))
     }
 
     pub fn history(&self, conversation_id: &str) -> Vec<Message> {
@@ -786,13 +839,14 @@ mod tests {
         drop(conn);
         drop(Db::open(&dir).unwrap());
         let db = Db::open(&dir).unwrap();
-        for column in ["cache_read_price", "cache_write_price"] {
+        for column in ["cache_read_price", "cache_write_price", "modalities"] {
             assert!(
                 db.c()
                     .prepare("SELECT 1 FROM pragma_table_info('models') WHERE name = ?1")
                     .unwrap()
                     .exists([column])
-                    .unwrap()
+                    .unwrap(),
+                "missing column {column}"
             );
         }
         drop(db);
@@ -871,6 +925,7 @@ mod tests {
             free,
             roles: roles.iter().map(|s| s.to_string()).collect(),
             local: false,
+            modalities: vec![],
         };
         db.upsert_model(&m("big", false, &["orchestrator"])).unwrap();
         db.upsert_model(&m("free", true, &[])).unwrap();
@@ -925,6 +980,7 @@ mod tests {
                 free: false,
                 roles: vec![],
                 local: false,
+                modalities: vec![],
             })
             .unwrap();
         }
@@ -1028,6 +1084,71 @@ mod tests {
         let c2_after_2: Vec<i64> = db.events_since(e2.seq, Some("c2")).into_iter().map(|e| e.seq).collect();
         assert!(c2_after_2.is_empty());
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn conversation_model_override_is_stored_and_cleared() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "p".into(),
+            kind: "openai".into(),
+            base_url: None,
+            api_key: None,
+            options: Value::Null,
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "picked".into(),
+            provider_id: "p".into(),
+            model: "picked-model".into(),
+            input_price: 1.0,
+            output_price: 2.0,
+            cache_read_price: None,
+            cache_write_price: None,
+            context_window: 0,
+            use_cases: String::new(),
+            free: false,
+            roles: vec![],
+            local: false,
+            modalities: vec!["text".into()],
+        })
+        .unwrap();
+        let id = db.create_conversation("project", "notes").unwrap();
+        assert_eq!(db.conversation(&id).unwrap().model, None);
+        assert!(db.conversation_model(&id).unwrap().is_none());
+        let info = db.set_conversation_model(&id, Some("picked-model")).unwrap();
+        assert_eq!(info.model.as_deref(), Some("picked"));
+        assert_eq!(db.conversation_model(&id).unwrap().unwrap().id, "picked");
+        assert_eq!(db.conversations()[0].model.as_deref(), Some("picked"));
+        assert!(db.set_conversation_model(&id, Some("missing")).is_err());
+        assert_eq!(db.conversation(&id).unwrap().model.as_deref(), Some("picked"));
+        let cleared = db.set_conversation_model(&id, None).unwrap();
+        assert_eq!(cleared.model, None);
+        assert!(db.set_conversation_model("nope", None).is_err());
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn old_conversations_gain_a_nullable_model_column() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("grouper.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+               id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created INTEGER NOT NULL);
+             INSERT INTO conversations (id, mode, title, created) VALUES ('c1', 'standard', 'old', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.conversation("c1").unwrap().model, None);
+        drop(db);
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.conversation("c1").unwrap().model, None);
+        drop(db);
         std::fs::remove_dir_all(dir).ok();
     }
 }

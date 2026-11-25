@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use core_client::core_protocol::{
     AgentEvent, Capability, ChatRequest, ChatResponse, ConversationInfo, DeviceInfo, Event, EventBody, ModelEntry,
-    ProviderConfig, ProviderInfo, ThreadInfo, ToolCallRequest, ToolCallResponse, ToolInfo, default_input_schema,
+    ModelImportRequest, ModelImportResult, ProviderConfig, ProviderInfo, ThreadInfo, ToolCallRequest, ToolCallResponse,
+    ToolInfo, default_input_schema,
 };
 use core_client::{Events, Status, ToolHandler};
 use futures_util::StreamExt;
@@ -60,14 +61,20 @@ enum Cmd {
         /// One model, no subagents (defaults to a free model).
         #[arg(long)]
         standard: bool,
+        /// Registry id for this conversation's model (first message, or a new conversation).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Print live events (all conversations, or one).
     Watch {
         #[arg(long, short)]
         conversation: Option<String>,
     },
-    /// List conversations.
-    Conversations,
+    /// List conversations, or set the model one of them uses.
+    Conversations {
+        #[command(subcommand)]
+        cmd: Option<ConversationsCmd>,
+    },
     /// Print a conversation's events so far.
     Log {
         conversation: String,
@@ -256,6 +263,21 @@ enum ModelsCmd {
         #[arg(long)]
         local: bool,
     },
+    /// Pull a model from the provider's catalog (OpenRouter) and draft its use cases.
+    Import {
+        provider: String,
+        /// The provider's model name, e.g. anthropic/claude-sonnet-4
+        model: String,
+        /// Registry id. Derived from the model name when omitted.
+        #[arg(long)]
+        id: Option<String>,
+        /// Comma-separated defaults: orchestrator, standard, thread
+        #[arg(long, default_value = "")]
+        roles: String,
+        /// Runs on your own hardware (for "sensitive → local" priority rules)
+        #[arg(long)]
+        local: bool,
+    },
     Remove { id: String },
     /// How threads went per model and device, by task type.
     Stats,
@@ -268,6 +290,16 @@ enum ModelsCmd {
     /// Accept a proposal: the model's use cases become the proposed text.
     Accept { id: i64 },
     Reject { id: i64 },
+}
+
+#[derive(Subcommand)]
+enum ConversationsCmd {
+    /// Set the model for a conversation: `grouper conversations model <id> <model|default>`.
+    Model {
+        id: String,
+        /// A registry id, or `default` to use the role default again.
+        model: String,
+    },
 }
 
 struct CliTools;
@@ -622,7 +654,7 @@ async fn main() -> Result<()> {
             });
             core_client::run(config, Arc::new(CliTools), Arc::new(PrintEvents), rx).await;
         }
-        Cmd::Chat { text, conversation, standard } => {
+        Cmd::Chat { text, conversation, standard, model } => {
             // Subscribe first so nothing is missed, then send.
             let mut events = Box::pin(api.events(conversation.as_deref()).await?);
             let resp: ChatResponse = serde_json::from_value(
@@ -632,12 +664,16 @@ async fn main() -> Result<()> {
                         conversation_id: conversation,
                         mode: Some(if standard { "standard" } else { "project" }.into()),
                         text,
+                        model: model.clone(),
                     },
                 )
                 .await?,
             )?;
             let id = resp.conversation_id;
             println!("conversation {id}");
+            if let Some(model) = model {
+                println!("model: {model}");
+            }
             let mut printer = Printer::default();
             while let Some(e) = events.next().await {
                 if e.conversation_id != id || matches!(e.body, EventBody::UserMessage { .. }) {
@@ -661,11 +697,20 @@ async fn main() -> Result<()> {
                 printer.event(&e);
             }
         }
-        Cmd::Conversations => {
-            for c in api.get::<Vec<ConversationInfo>>("/v1/conversations").await? {
-                println!("{}  {:<8} {}", c.id, c.mode, c.title);
+        Cmd::Conversations { cmd } => match cmd {
+            None => {
+                for c in api.get::<Vec<ConversationInfo>>("/v1/conversations").await? {
+                    let model = c.model.as_deref().unwrap_or("default");
+                    println!("{}  {:<8} {:<16} {}", c.id, c.mode, model, c.title);
+                }
             }
-        }
+            Some(ConversationsCmd::Model { id, model }) => {
+                let body = if model == "default" { json!({"model": null}) } else { json!({"model": model}) };
+                let info: ConversationInfo =
+                    serde_json::from_value(api.post(&format!("/v1/conversations/{id}/model"), &body).await?)?;
+                println!("{id} model: {}", info.model.as_deref().unwrap_or("default"));
+            }
+        },
         Cmd::Log { conversation, thread } => {
             let q = thread.map(|t| format!("?thread={t}")).unwrap_or_default();
             for e in api.get::<Vec<Event>>(&format!("/v1/conversations/{conversation}/events{q}")).await? {
@@ -753,6 +798,45 @@ async fn main() -> Result<()> {
                 if !m.use_cases.is_empty() {
                     println!("{:<16} use cases: {}", "", m.use_cases);
                 }
+                if !m.modalities.is_empty() {
+                    println!("{:<16} modalities: {}", "", m.modalities.join(", "));
+                }
+            }
+        }
+        Cmd::Models(ModelsCmd::Import { provider, model, id, roles, local }) => {
+            let roles: Vec<String> =
+                roles.split(',').map(str::trim).filter(|role| !role.is_empty()).map(String::from).collect();
+            let result: ModelImportResult = serde_json::from_value(
+                api.post(
+                    "/v1/models/import",
+                    &ModelImportRequest {
+                        provider,
+                        model,
+                        id,
+                        roles: (!roles.is_empty()).then_some(roles),
+                        local: local.then_some(true),
+                    },
+                )
+                .await?,
+            )?;
+            let m = &result.model;
+            println!(
+                "{:<16} {:<12} {:<28} ${}/${} ctx {} {}{}{}",
+                m.id,
+                m.provider_id,
+                m.model,
+                m.input_price,
+                m.output_price,
+                m.context_window,
+                if m.free { "free " } else { "" },
+                if m.local { "local " } else { "" },
+                m.roles.join(",")
+            );
+            if !m.modalities.is_empty() {
+                println!("{:<16} modalities: {}", "", m.modalities.join(", "));
+            }
+            if let Some(n) = result.proposal_id {
+                println!("use cases drafted: accept with `grouper models accept {n}`");
             }
         }
         Cmd::Models(ModelsCmd::Add {
@@ -782,6 +866,7 @@ async fn main() -> Result<()> {
                 free,
                 roles: roles.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
                 local,
+                modalities: vec![],
             };
             api.put(&format!("/v1/models/{id}"), &entry).await?;
             println!("saved model {id}");

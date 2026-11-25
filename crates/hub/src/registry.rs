@@ -1013,6 +1013,7 @@ mod tests {
             free: false,
             roles: roles.iter().map(|s| s.to_string()).collect(),
             local: false,
+            modalities: vec![],
         }
     }
 
@@ -1319,7 +1320,12 @@ mod tests {
         let hub = Hub::new(db, dir.clone());
 
         let conv = hub
-            .chat(core_protocol::ChatRequest { conversation_id: None, mode: Some("project".into()), text: "please summarise my private notes".into() })
+            .chat(core_protocol::ChatRequest {
+                conversation_id: None,
+                mode: Some("project".into()),
+                text: "please summarise my private notes".into(),
+                model: None,
+            })
             .await
             .unwrap();
         wait_for(&hub, &conv, |e| replies(e, "Graded and saved.") == 1).await;
@@ -1361,6 +1367,7 @@ mod tests {
             conversation_id: Some(conv.clone()),
             mode: None,
             text: "please summarise my private notes again".into(),
+            model: None,
         })
         .await
         .unwrap();
@@ -1376,6 +1383,7 @@ mod tests {
             conversation_id: Some(conv.clone()),
             mode: None,
             text: "please summarise my private notes once more".into(),
+            model: None,
         })
         .await
         .unwrap();
@@ -1401,7 +1409,9 @@ mod tests {
         .unwrap();
         drop(conn);
         let db = Db::open(&dir).unwrap();
-        assert!(!db.find_model("old").unwrap().local);
+        let old = db.find_model("old").unwrap();
+        assert!(!old.local);
+        assert!(old.modalities.is_empty());
         drop(db);
         Db::open(&dir).unwrap();
         std::fs::remove_dir_all(dir).ok();

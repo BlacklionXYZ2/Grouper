@@ -165,10 +165,19 @@ impl Hub {
     pub async fn chat(self: &Arc<Self>, req: ChatRequest) -> anyhow::Result<String> {
         let text = req.text.trim().to_string();
         anyhow::ensure!(!text.is_empty(), "message is empty");
-        let id = match req.conversation_id {
+        let requested = req.model.as_deref().map(str::trim).filter(|model| !model.is_empty()).map(str::to_string);
+        if let Some(model) = &requested {
+            anyhow::ensure!(self.db.find_model(model).is_some(), "no model {model:?} in the registry");
+        }
+        let id = match &req.conversation_id {
             Some(id) => {
-                anyhow::ensure!(self.db.conversation(&id).is_some(), "no such conversation");
-                id
+                anyhow::ensure!(self.db.conversation(id).is_some(), "no such conversation");
+                if requested.is_some() && !self.db.history(id).is_empty() {
+                    anyhow::bail!(
+                        "model can be set on the first message; use POST /v1/conversations/{id}/model to change it"
+                    );
+                }
+                id.clone()
             }
             None => {
                 let mode = req.mode.as_deref().unwrap_or("project");
@@ -177,6 +186,9 @@ impl Hub {
                 self.db.create_conversation(mode, &title)?
             }
         };
+        if let Some(model) = &requested {
+            self.db.set_conversation_model(&id, Some(model))?;
+        }
         self.emit(&id, None, EventBody::UserMessage { text: text.clone() });
         self.wake(&id, Wake::User(text)).await;
         Ok(id)
@@ -230,6 +242,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/usage/refresh", post(refresh_usage))
         .route("/v1/chat", post(chat))
         .route("/v1/conversations", get(list_conversations))
+        .route("/v1/conversations/{id}/model", post(set_conversation_model))
         .route("/v1/conversations/{id}/events", get(conversation_events))
         .route("/v1/threads", get(list_threads))
         .route("/v1/threads/{id}", get(get_thread))
@@ -239,6 +252,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/{id}", put(update_memory).delete(delete_memory))
         .merge(crate::registry::routes())
+        .merge(crate::catalog::routes())
         .merge(crate::skills::routes())
         .with_state(hub)
 }
@@ -438,6 +452,34 @@ async fn chat(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(req): Json<C
 async fn list_conversations(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     authed!(hub, headers);
     Json(hub.db.conversations()).into_response()
+}
+
+#[derive(Deserialize)]
+struct ConversationModelBody {
+    /// Registry id, or null to use the role default again.
+    model: Option<String>,
+}
+
+/// Set or clear the model this conversation's orchestrator or standard chat uses.
+async fn set_conversation_model(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ConversationModelBody>,
+) -> Response {
+    admin!(hub, headers);
+    let model = body.model.as_deref().map(str::trim).filter(|model| !model.is_empty());
+    match hub.db.set_conversation_model(&id, model) {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => {
+            let status = if error.to_string().contains("no such conversation") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            err(status, error)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -803,12 +845,13 @@ mod tests {
             free: true,
             roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
             local: false,
+            modalities: vec![],
         })
         .unwrap();
         let hub = Hub::new(db, dir.clone());
         let mut rx = hub.events.subscribe();
         let conv = hub
-            .chat(ChatRequest { conversation_id: None, mode: Some("project".into()), text: "go now".into() })
+            .chat(ChatRequest { conversation_id: None, mode: Some("project".into()), text: "go now".into(), model: None })
             .await
             .unwrap();
 
@@ -868,6 +911,192 @@ mod tests {
             texts,
             vec![json!("Starting a thread for that."), json!(["thread", "thread result here"]), json!("All finished.")]
         );
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A conversation can pin its orchestrator or standard model. Threads in it still
+    /// go through routing unless the orchestrator names one.
+    #[tokio::test]
+    async fn conversation_model_overrides_the_orchestrator_not_thread_routing() {
+        let dir = std::env::temp_dir().join(format!("grouper-model-override-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "s".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"inline": {"rules": [
+                {"system": "orchestrator of Grouper", "last": "go now", "reply": [
+                    {"type": "text", "text": "Starting a thread for that."},
+                    {"type": "tool_use", "name": "start_thread", "input": {"title": "T", "device": "hub", "goal": "write"}}
+                ]},
+                {"system": "You are a subagent", "reply": [{"type": "text", "text": "thread result here"}]},
+                {"system": "orchestrator of Grouper", "last": "done]", "reply": [{"type": "text", "text": "All finished."}]},
+                {"system": "orchestrator of Grouper", "last": "use the default", "reply": [{"type": "text", "text": "Default model speaking."}]},
+                {"system": "You are Grouper", "last": "standard hello", "reply": [{"type": "text", "text": "Standard reply."}]}
+            ], "default": [{"type": "text", "text": "OK"}]}}),
+        })
+        .unwrap();
+        let entry = |id: &str, name: &str, roles: &[&str]| ModelEntry {
+            id: id.into(),
+            provider_id: "s".into(),
+            model: name.into(),
+            input_price: if id == "big" { 3.0 } else { 1.0 },
+            output_price: 1.0,
+            cache_read_price: None,
+            cache_write_price: None,
+            context_window: 0,
+            use_cases: String::new(),
+            free: false,
+            roles: roles.iter().map(|role| (*role).to_string()).collect(),
+            local: false,
+            modalities: vec![],
+        };
+        db.upsert_model(&entry("big", "big-model", &["orchestrator", "standard", "thread"])).unwrap();
+        db.upsert_model(&entry("picked", "picked-model", &[])).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let mut rx = hub.events.subscribe();
+
+        async fn until(rx: &mut tokio::sync::broadcast::Receiver<core_protocol::Event>, pred: impl Fn(&core_protocol::Event) -> bool) {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let event = rx.recv().await.expect("event stream closed");
+                    if pred(&event) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for an event");
+        }
+
+        let usage = |hub: &Hub, conversation: &str| -> Vec<(Option<String>, String)> {
+            let connection = hub.db.c();
+            let mut statement = connection
+                .prepare("SELECT thread_id, model FROM usage WHERE conversation_id = ?1 ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([conversation], |row| Ok((row.get::<_, Option<String>>(0)?, row.get(1)?)))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+
+        let conv = hub
+            .chat(ChatRequest {
+                conversation_id: None,
+                mode: Some("project".into()),
+                text: "go now".into(),
+                model: Some("picked".into()),
+            })
+            .await
+            .unwrap();
+        until(&mut rx, |event| {
+            matches!(&event.body, EventBody::AssistantMessage { text } if text == "All finished.")
+        })
+        .await;
+        assert_eq!(hub.db.conversation(&conv).unwrap().model.as_deref(), Some("picked"));
+        let threads = hub.db.threads(Some(&conv));
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].model, "big", "threads keep using routing, not the conversation override");
+        let rows = usage(&hub, &conv);
+        assert!(rows.iter().any(|(thread, model)| thread.is_none() && model == "picked-model"), "{rows:?}");
+        assert!(rows.iter().any(|(thread, model)| thread.is_some() && model == "big-model"), "{rows:?}");
+        assert!(
+            rows.iter().all(|(thread, model)| {
+                if thread.is_none() { model == "picked-model" } else { model == "big-model" }
+            }),
+            "{rows:?}"
+        );
+
+        let error = hub
+            .chat(ChatRequest {
+                conversation_id: Some(conv.clone()),
+                mode: None,
+                text: "go now again".into(),
+                model: Some("big".into()),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("first message"), "{error}");
+
+        assert!(hub.db.set_conversation_model(&conv, None).unwrap().model.is_none());
+        hub.chat(ChatRequest {
+            conversation_id: Some(conv.clone()),
+            mode: None,
+            text: "use the default".into(),
+            model: None,
+        })
+        .await
+        .unwrap();
+        until(&mut rx, |event| {
+            matches!(&event.body, EventBody::AssistantMessage { text } if text == "Default model speaking.")
+        })
+        .await;
+        assert_eq!(usage(&hub, &conv).last().map(|row| row.1.as_str()), Some("big-model"));
+
+        let standard = hub
+            .chat(ChatRequest {
+                conversation_id: None,
+                mode: Some("standard".into()),
+                text: "standard hello".into(),
+                model: None,
+            })
+            .await
+            .unwrap();
+        until(&mut rx, |event| {
+            event.conversation_id == standard
+                && matches!(&event.body, EventBody::AssistantMessage { text } if text == "Standard reply.")
+        })
+        .await;
+        assert!(hub.db.conversation(&standard).unwrap().model.is_none());
+        assert_eq!(usage(&hub, &standard)[0].1, "big-model");
+
+        let overridden = hub
+            .chat(ChatRequest {
+                conversation_id: None,
+                mode: Some("standard".into()),
+                text: "standard hello".into(),
+                model: Some("picked".into()),
+            })
+            .await
+            .unwrap();
+        until(&mut rx, |event| {
+            event.conversation_id == overridden
+                && matches!(&event.body, EventBody::AssistantMessage { text } if text == "Standard reply.")
+        })
+        .await;
+        assert_eq!(hub.db.conversation(&overridden).unwrap().model.as_deref(), Some("picked"));
+        assert_eq!(usage(&hub, &overridden)[0].1, "picked-model");
+        let error = hub
+            .chat(ChatRequest {
+                conversation_id: Some(overridden),
+                mode: None,
+                text: "standard hello again".into(),
+                model: Some("big".into()),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("first message"), "{error}");
+
+        hub.db.set_conversation_model(&conv, Some("picked")).unwrap();
+        hub.db.delete_model("picked").unwrap();
+        hub.chat(ChatRequest {
+            conversation_id: Some(conv.clone()),
+            mode: None,
+            text: "after the model was removed".into(),
+            model: None,
+        })
+        .await
+        .unwrap();
+        until(&mut rx, |event| {
+            matches!(&event.body, EventBody::Error { message } if message.contains("not in the registry"))
+        })
+        .await;
+
         drop(hub);
         std::fs::remove_dir_all(dir).ok();
     }
