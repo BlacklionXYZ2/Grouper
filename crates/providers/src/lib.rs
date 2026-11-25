@@ -130,7 +130,8 @@ pub enum ProviderError {
 impl ProviderError {
     fn retryable(&self) -> bool {
         match self {
-            ProviderError::Http { status, .. } => *status == 429 || *status == 408 || *status >= 500,
+            ProviderError::Http { status: 429, body, .. } => !fallback::account_wide_limit(body),
+            ProviderError::Http { status, .. } => *status == 408 || *status >= 500,
             ProviderError::Network { .. } => true,
             _ => false,
         }

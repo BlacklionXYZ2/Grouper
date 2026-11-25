@@ -39,8 +39,18 @@ fn cool(provider: &str, model: &str) {
 
 /// Whether this error means "this model, right now", so another model may work.
 /// Key, quota-wide and request errors (400, 401, 402, 403) are not: every model would fail.
+/// An account-wide limit (OpenRouter's daily free-model allowance) also answers 429, but
+/// every model on the key would fail the same way, so it doesn't swap either.
 fn model_unavailable(e: &ProviderError) -> bool {
-    matches!(e, ProviderError::Http { status: 429 | 404 | 502 | 503, .. })
+    match e {
+        ProviderError::Http { status: 429, body, .. } => !account_wide_limit(body),
+        ProviderError::Http { status: 404 | 502 | 503, .. } => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn account_wide_limit(body: &str) -> bool {
+    body.contains("free-models-per-day") || body.contains("openrouter_free_tier_daily")
 }
 
 /// Tries the request's model, then `alternates` in order, skipping models on cooldown.
@@ -168,6 +178,22 @@ mod tests {
         // Everything is cooling: only the requested model is tried, once.
         let _ = fb.complete(&req("x")).await;
         assert_eq!(*inner.calls.lock().unwrap(), vec!["x", "y", "x"]);
+    }
+
+    #[test]
+    fn the_daily_free_allowance_does_not_swap() {
+        let daily = ProviderError::Http {
+            provider: "openrouter".into(),
+            status: 429,
+            body: r#"{"error":{"message":"Rate limit exceeded: free-models-per-day.","code":429,"metadata":{"limit_source":"openrouter_free_tier_daily"}}}"#.into(),
+        };
+        assert!(!model_unavailable(&daily));
+        let upstream = ProviderError::Http {
+            provider: "openrouter".into(),
+            status: 429,
+            body: r#"{"error":{"message":"Provider returned error","code":429}}"#.into(),
+        };
+        assert!(model_unavailable(&upstream));
     }
 
     #[tokio::test]
