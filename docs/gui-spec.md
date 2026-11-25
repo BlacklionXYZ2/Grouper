@@ -2,6 +2,17 @@
 
 Status: design target, 25 November 2026. This is a build specification, not a description of the current client. The web app exists and supplies most of the behaviours and routes below; the target reorganizes its navigation and makes the provider/key hierarchy and usage accounting first-class. Apple apps are planned SwiftUI clients and should preserve the same information architecture.
 
+## Owner decisions (25 November 2026)
+
+These override anything below that disagrees.
+
+- **Usage tracks two separate things:** API costs per provider key, and subscription usage/quota (plan windows such as Claude's or ChatGPT's, read on devices). They are separate sections and are never added together.
+- **One key per provider.** A provider *is* a connection: "Fable through OpenRouter is different to Fable through Claude". Models are grouped by provider only; there is no per-key level beneath it, and no connection nicknames.
+- **The model picker is a covering panel** (full-height sheet on phone, large overlay panel on desktop) with search and provider groups, because there are many candidates. Not a small popover.
+- **A thread opens as a chat-style view:** the same transcript layout as a chat, with the model fixed to the one the orchestrator chose (shown in the header, not changeable), so the owner can see which model is doing what.
+- **Thread rows in the threads panel** show the title, time elapsed (live while running, total once finished) and the model, with a colour accent by model family.
+- **Navigation:** no Threads tab. Phone tab design is being brainstormed separately (`docs/gui-nav-ideas.md`).
+
 ## Scope and reading guide
 
 - Grouper is a single-owner, multi-device AI orchestrator. The hub owns account state; devices run threads and expose tools; the owner chats with an orchestrator in project chats or directly with one model in standard chats.
@@ -279,7 +290,7 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 
 1. Panel title: “Threads in {chat title}”; close/back button; total and needs-you count.
 2. “Needs you”: pending approvals first, followed by `waiting_device`; each item includes thread title and reason/status, device and age.
-3. “Running”: newest activity first; each row includes title, device, model and a short live preview/tool name.
+3. “Running”: newest activity first; each row includes title, time elapsed (live), model with a model-family colour accent, device, and a short live preview/tool name. Finished rows show total duration instead of a live timer. The colour is a supplement: the model name is always shown as text.
 4. “Finished”: recent done/failed/stopped entries, summary preview; collapsed or limited to recent 20 with “Show all”.
 5. Empty state explains threads appear when the orchestrator delegates work; Standard mode explicitly says no threads.
 
@@ -303,6 +314,7 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 **Purpose**
 
 - Reveal exactly what one delegated task is doing, where it runs, what it touched, and how to steer or stop it.
+- **Presentation (owner decision):** the same chat-style transcript as a chat. The brief is the first “user” message, the thread's text is the assistant's, tool calls are compact collapsible rows inline, and owner/orchestrator messages appear as messages. The composer at the bottom messages the thread. The header shows the model the orchestrator chose, fixed (with its family colour); there is no model picker here.
 
 **Content hierarchy**
 
@@ -372,10 +384,9 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 
 **Grouping rule**
 
-- Primary group is provider identity/type (Anthropic, OpenAI-compatible, scripted/test). Within each provider show configured connection/API-key identities (provider ID and optional owner-chosen display label; never reveal secret). Then list models for that connection.
-- If two keys exist for the same provider, they are separate labeled connection groups. If current data only has provider `id`, show that ID as the connection label; do not fabricate key names. Mask any accidental credential-like text.
-- Each group header shows kind, key status (“Stored”/“Not set”), base URL/endpoint (if configured), hosted-via device and online/offline state, and expand/collapse. Do not show a key fingerprint unless a deliberate, non-secret fingerprint is designed.
-- Sort providers in stable explicit order: configured favorites/default-use first, then provider display name; connections by owner label/ID; models by role then name. No unstable random order.
+- One group per provider. A provider is one connection with one key (owner decision): OpenRouter, Anthropic, Radium, a local LM Studio, the scripted test provider. The same model reached through two providers appears under each, as two entries.
+- Each group header shows the provider id, kind, key status (“Key set”/“No key”), base URL host (if configured), hosted-via device and its online/offline state, model count, and expand/collapse. Never reveal or fingerprint the key.
+- Sort providers by id; models by role, then name. No unstable random order.
 
 **Content hierarchy**
 
@@ -388,8 +399,8 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 
 **Model picker inside chat**
 
-- Compact searchable popover/sheet attached to composer. Header shows role (“Orchestrator model” or “Standard model”) and current pinned/default choice.
-- Rows nested under provider > configured key/connection, with availability and device-host status. Mark “Free”, “Paid”, “Local”, “Default for this role”, and stale/disabled model accurately.
+- A covering panel opened from the composer's model button (owner decision): full-height sheet on phone, large overlay panel on desktop (about 640 px wide, most of the viewport tall) with a scrim. Search field focused on open. Header shows role (“Orchestrator model” or “Standard model”) and current pinned/default choice.
+- Rows grouped under provider headers, with availability and device-host status. Mark “Free”, “Paid”, “Local”, “Default for this role”, and stale/disabled model accurately.
 - Show estimated price per 1M input/output and context for each model in detail/secondary text; do not overload the closed picker.
 - Project chats filter for orchestrator role; standard chats filter for standard. Allow compatible models with explicit role warning/confirmation only if supported by registry. Default selection is always present.
 - A selected model pinned to a conversation appears in header. If unavailable/offline, keep selection visible and explain; do not silently fall back without a system event/message.
@@ -444,6 +455,7 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 
 **Purpose**
 
+- **Two tracks, kept apart (owner decision):** (1) **API costs** per provider key: Grouper's metered estimate, provider-reported spend/balance, free allowances such as OpenRouter's daily requests; (2) **Subscription usage/quota**: plan windows (e.g. Claude, ChatGPT/Codex) read on devices, shown as used/remaining per window with reset time. The page leads with both, side by side on desktop, stacked on phone.
 - Answer at a glance: “What did Grouper spend, where did it go, what is left in provider allowances, and what limit will stop or warn me next?” Clearly distinguish metered Grouper calls, provider-reported billing/balances, and unofficial subscription snapshots.
 
 **Top-level dashboard hierarchy**
@@ -699,10 +711,10 @@ Use semantic tokens and verify WCAG 2.2 AA contrast: body text at least 4.5:1; l
 ## 9. Open questions for the owner
 
 1. What concept art/brand direction should replace the provisional warm-neutral/teal visual tokens, and should Grouper use a mascot/illustration at all?
-2. Should the phone primary tabs be Chat / Needs you / Devices / More as specified, or should Devices move under More to give Chat more prominence?
-3. What owner-facing labels should distinguish multiple API keys/connections for one provider? Current data appears to expose provider IDs rather than a safe key label; should the registry gain an explicit connection nickname?
+2. Should the phone primary tabs be Chat / Needs you / Devices / More as specified, or should Devices move under More to give Chat more prominence? *(Being brainstormed: `docs/gui-nav-ideas.md`.)*
+3. ~~Labels for multiple keys per provider~~ *Answered: one key per provider; a provider is a connection.*
 4. Should a user be able to create multiple project chats and standard chats freely, and should chats be renameable/archivable/searchable beyond current behavior?
-5. Which usage sources should be enabled in the first UI release: Grouper metering only, official provider billing/balance APIs, and/or device-local subscription snapshots? Which unofficial probes are acceptable to display?
+5. *Partly answered: two tracks, API costs per key and subscription usage/quota.* Which usage sources should be enabled in the first UI release: Grouper metering only, official provider billing/balance APIs, and/or device-local subscription snapshots? Which unofficial probes are acceptable to display?
 6. What budget values and warning threshold should be the initial suggested setup? All current hub limits are off by default; UI must not imply a cap is active.
 7. Should offline chat sends remain disabled, queue for later, or be answered locally and reconciled? Until chosen, preserve a draft and never pretend it was sent.
 8. Should usage dashboard show UTC day only or offer local-day as an alternate view? Backend limit semantics are UTC; display must avoid a mismatch.
