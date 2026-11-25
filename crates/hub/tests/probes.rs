@@ -248,6 +248,7 @@ async fn probes_work_through_a_device_hosted_provider_and_report_offline() {
             allow_shell: false,
             mcp_config: Some(mcp_config),
             folders: Vec::new(),
+            usage_probes: false,
         },
         Arc::new(NoTools),
         Arc::new(Quiet),
