@@ -58,3 +58,26 @@ curl https://grouper.clockmillbarn.uk/healthz   # prints "ok"
 ```
 
 Clients then use `--hub https://grouper.clockmillbarn.uk` (or `GROUPER_HUB`).
+
+## 4. Models: local Gemma on the PC, through the PC's own connection
+
+The online hub is set up with `gemma-local` (Gemma 4 12B in LM Studio on the PC's GPU) as
+its default model for every role. The provider is hosted by the device "Gaming PC": the hub
+sends model calls over that device's outbound connection and the PC calls LM Studio on
+`127.0.0.1`, so LM Studio is never exposed to the network. To use it, on the PC:
+
+```powershell
+lms server start --port 45123
+```
+
+```powershell
+lms load "hauhaucs/gemma-4-12b-qat-uncensored-hauhaucs-balanced-q4_k_m-gguf/gemma-4-12b-qat-uncensored-hauhaucs-balanced-q4_k_m.gguf" --identifier grouper-gemma --context-length 32768 --gpu max -y
+```
+
+```powershell
+grouper connect --hub https://grouper.clockmillbarn.uk
+```
+
+(Port 45123 because Hyper-V reserves 1228–1327, including LM Studio's default 1234.)
+While the PC or LM Studio is off, chats say the model's device is offline. To add a hosted
+model alongside it: `grouper keys set <provider>` then `grouper models add …`.
