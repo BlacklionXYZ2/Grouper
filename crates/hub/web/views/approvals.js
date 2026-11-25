@@ -21,9 +21,13 @@ function isManualReason(reason) {
   return !reason || / is set to Manual$/.test(reason);
 }
 
-export function openApproval(approvalId) {
+export function openApproval(approvalId, { conversationId } = {}) {
   const a = store.approvals.get(approvalId);
   if (!a || openId) return;
+  if (conversationId && a.conversation_id && a.conversation_id !== conversationId) {
+    navigate(`#/chat/${enc(a.conversation_id)}`);
+    return;
+  }
   openId = approvalId;
   const thread = store.threads.get(a.thread_id);
   const device = deviceName(a.device_id);

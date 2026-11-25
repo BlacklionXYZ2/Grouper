@@ -377,6 +377,22 @@ a {
   flex: none;
 }
 
+.side-icon.accent {
+  color: var(--accent);
+}
+
+.side-icon.warn {
+  color: var(--warn);
+}
+
+.side-icon.danger {
+  color: var(--danger);
+}
+
+.side-icon.muted {
+  color: var(--text-3);
+}
+
 .side-item {
   display: flex;
   align-items: center;

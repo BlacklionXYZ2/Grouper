@@ -244,18 +244,18 @@ function applyDerived(e) {
       break;
     }
     case 'thread_waiting':
-      upsertThread(tid, { status: 'waiting_device', checkpoint: false });
+      upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: 'waiting_device', checkpoint: false });
       refreshDevicesSoon();
       break;
     case 'thread_checkpoint':
-      upsertThread(tid, { status: 'waiting_device', checkpoint: true });
+      upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: 'waiting_device', checkpoint: true });
       break;
     case 'thread_handed_over':
-      upsertThread(tid, { status: 'running' });
+      upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: 'running' });
       refreshDevicesSoon();
       break;
     case 'thread_finished':
-      upsertThread(tid, { status: e.status, summary: e.summary, finished: e.ts });
+      upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: e.status, summary: e.summary, finished: e.ts });
       for (const [id, a] of store.approvals) if (a.thread_id === tid) store.approvals.delete(id);
       liveOf(tid).tool = null;
       liveOf(tid).draft = '';
@@ -372,6 +372,7 @@ export async function loadThreads() {
     next.set(t.id, { ...t, checkpoint: t.status === 'waiting_device' ? Boolean(old?.checkpoint) : false });
   }
   store.threads = next;
+  store.threadsLoaded = true;
   emit('threads');
 }
 
@@ -464,8 +465,14 @@ export async function scanApprovals({ strict = false } = {}) {
           open.delete(e.approval_id);
           store.answered.add(e.approval_id);
         }
-        if (e.kind === 'thread_checkpoint') store.threads.get(t.id).checkpoint = true;
-        if (e.kind === 'thread_handed_over') store.threads.get(t.id).checkpoint = false;
+        if (e.kind === 'thread_checkpoint') {
+          const th = store.threads.get(t.id);
+          if (th) th.checkpoint = true;
+        }
+        if (e.kind === 'thread_handed_over') {
+          const th = store.threads.get(t.id);
+          if (th) th.checkpoint = false;
+        }
         if (e.kind === 'thread_activity' && e.event.type === 'text') liveOf(t.id).lastText = e.event.text;
       }
       for (const e of open.values()) {

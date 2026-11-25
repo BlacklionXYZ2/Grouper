@@ -7,7 +7,7 @@
 import { h, icon, setChildren, throttle } from '../lib/dom.js';
 import { post, describe } from '../lib/api.js';
 import { renderMarkdown } from '../lib/md.js';
-import { store, on, conv, liveOf, deviceName, deviceOnline, threadsIn, approvalsFor, pendingApprovals, isAdmin } from '../lib/store.js';
+import { store, on, conv, liveOf, deviceName, deviceOnline, threadsIn, approvalsFor, approvalsIn, isAdmin } from '../lib/store.js';
 import { loadConversation, loadConversations } from '../lib/live.js';
 import { bar, navigate, statusPill, skeleton, toast, announce, sentenceSpeaker, autoGrow, toastError } from '../lib/ui.js';
 import { isActive, usd } from '../lib/format.js';
@@ -106,17 +106,20 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   }
 
   function renderApprovalBanner() {
-    const all = pendingApprovals();
-    if (!all.length) {
+    if (isNew) {
       approvalSlot.hidden = true;
       return;
     }
-    const here = all.filter((a) => a.conversation_id === cid);
-    const first = here[0] || all[0];
+    const here = approvalsIn(cid);
+    if (!here.length) {
+      approvalSlot.hidden = true;
+      return;
+    }
+    const first = here[0];
     const text =
-      all.length === 1
+      here.length === 1
         ? `${first.tool} on ${deviceName(first.device_id)} is waiting for your approval.`
-        : `${all.length} tool calls are waiting for your approval.`;
+        : `${here.length} tool calls in this chat are waiting for your approval.`;
     approvalSlot.hidden = false;
     setChildren(
       approvalSlot,
@@ -125,7 +128,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         { class: 'banner warn', role: 'status' },
         icon('shield'),
         h('div', { class: 'grow' }, text),
-        h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => openApproval(first.approval_id) }, 'Review'),
+        h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => openApproval(first.approval_id, { conversationId: cid }) }, 'Review'),
       ),
     );
   }
@@ -185,7 +188,8 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   }
 
   function openThreadSheet(tid) {
-    navigate(`#/chat/${encodeURIComponent(cid)}/thread/${encodeURIComponent(tid)}`);
+    const targetCid = store.threads.get(tid)?.conversation_id || cid;
+    navigate(`#/chat/${encodeURIComponent(targetCid)}/thread/${encodeURIComponent(tid)}`);
   }
 
   function chipLine(tid) {
@@ -526,6 +530,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     }),
     on('conversations', () => {
       renderBar();
+      renderStrip();
       composer.renderModels();
       if (!isNew && rendered && !info()) missing();
     }),

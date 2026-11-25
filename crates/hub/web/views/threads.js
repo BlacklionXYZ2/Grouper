@@ -1,28 +1,59 @@
-// Threads across conversations: what needs you (approvals, threads waiting for a
-// device), then running, then finished.
+// Threads for the open conversation (needs you, then running, then finished).
+// When no conversation is open, shows only the chats that have active threads
+// or pending approvals (chat title + counts only, no thread titles or contents).
 
-import { h, icon, setChildren, keepFocus } from '../lib/dom.js';
-import { store, on, deviceName, approvalsFor, pendingApprovals } from '../lib/store.js';
+import { h, icon, setChildren, setText, setAttr, keepFocus } from '../lib/dom.js';
+import { enc } from '../lib/api.js';
+import { store, on, deviceName, threadsIn, approvalsFor, approvalsIn, pendingApprovals } from '../lib/store.js';
 import { loadThreads, scanApprovals } from '../lib/live.js';
 import { bar, statusPill, skeletonBlocks, errorBanner } from '../lib/ui.js';
-import { ago } from '../lib/format.js';
+import { ago, isActive, plural } from '../lib/format.js';
 import { openApproval } from './approvals.js';
 
-export function renderThreads(container) {
+export function renderThreads(container, { conversation: cid = null } = {}) {
+  const chat = () => (cid ? store.conversations.find((c) => c.id === cid) : null);
+
+  const chatLink = h('a', { class: 'btn btn-sm', href: cid ? `#/chat/${enc(cid)}` : '#/chat', hidden: !cid }, icon('chat'), 'Chat');
+  const refreshBtn = h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Refresh', onclick: () => refresh() }, icon('refresh'));
+  const barEl = bar({
+    title: cid ? chat()?.title || 'Conversation' : 'Threads',
+    caption: ' ',
+    actions: [chatLink, refreshBtn],
+  });
+  const titleEl = barEl.querySelector('h1');
+  const captionEl = barEl.querySelector('.caption');
+
   const body = h('div', { class: 'view-body narrow' });
-  const view = h(
-    'section',
-    { class: 'view' },
-    bar({
-      title: 'Threads',
-      caption: 'Needs you, then running, then finished',
-      actions: [h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Refresh', onclick: () => refresh() }, icon('refresh'))],
-    }),
-    body,
-  );
+  const view = h('section', { class: 'view' }, barEl, body);
   container.append(view);
-  let loaded = store.threads.size > 0;
+  let loaded = store.threadsLoaded || store.threads.size > 0;
   let error = null;
+
+  function renderHeader() {
+    if (cid) {
+      const c = chat();
+      const name = c?.title || 'Conversation';
+      const ts = threadsIn(cid);
+      const running = ts.filter((t) => t.status === 'running').length;
+      const waiting = ts.filter((t) => t.status === 'waiting_device').length;
+      const apprs = approvalsIn(cid).length;
+      const parts = [];
+      if (apprs) parts.push(plural(apprs, 'approval'));
+      if (running) parts.push(`${running} running`);
+      if (waiting) parts.push(`${waiting} waiting`);
+      const caption = parts.length ? `Threads · ${parts.join(' · ')}` : 'Threads · Needs you, then running, then finished';
+      setText(titleEl, name);
+      setText(captionEl, caption);
+      chatLink.hidden = false;
+      setAttr(chatLink, 'href', `#/chat/${enc(cid)}`);
+      document.title = `${name} · Threads · Grouper`;
+    } else {
+      setText(titleEl, 'Threads');
+      setText(captionEl, 'Chats with active threads or pending approvals');
+      chatLink.hidden = true;
+      document.title = 'Threads · Grouper';
+    }
+  }
 
   function row(t) {
     const approvals = approvalsFor(t.id);
@@ -31,13 +62,13 @@ export function renderThreads(container) {
       null,
       h(
         'a',
-        { class: 'list-row', href: `#/chat/${encodeURIComponent(t.conversation_id)}/thread/${encodeURIComponent(t.id)}` },
+        { class: 'list-row', href: `#/chat/${enc(cid)}/thread/${enc(t.id)}` },
         h(
           'div',
           { class: 'grow' },
           h('div', { class: 'row-title' }, t.title),
           h('div', { class: 'meta' }, h('span', null, deviceName(t.device_id)), h('span', { class: 'mono' }, t.model), h('span', null, ago(t.finished || t.created))),
-          t.summary && !['running', 'waiting_device'].includes(t.status) ? h('div', { class: 'row-sub' }, clip(t.summary)) : null,
+          t.summary && !isActive(t.status) ? h('div', { class: 'row-sub' }, clip(t.summary)) : null,
         ),
         statusPill(t.status, { checkpoint: t.checkpoint, approval: approvals.length > 0 }),
       ),
@@ -51,7 +82,7 @@ export function renderThreads(container) {
       null,
       h(
         'button',
-        { class: 'list-row', type: 'button', id: `approval-row-${a.approval_id}`, onclick: () => openApproval(a.approval_id) },
+        { class: 'list-row', type: 'button', id: `approval-row-${a.approval_id}`, onclick: () => openApproval(a.approval_id, { conversationId: cid }) },
         icon('shield'),
         h(
           'div',
@@ -65,6 +96,25 @@ export function renderThreads(container) {
     );
   }
 
+  function chatSummaryRow(item) {
+    const counts = [];
+    if (item.running) counts.push(h('span', null, `${item.running} running`));
+    if (item.waiting) counts.push(h('span', null, `${item.waiting} waiting`));
+    if (item.approvals) counts.push(h('span', null, plural(item.approvals, 'approval')));
+    return h(
+      'li',
+      null,
+      h(
+        'a',
+        { class: 'list-row', href: `#/chat/${enc(item.id)}` },
+        icon('chat'),
+        h('div', { class: 'grow' }, h('div', { class: 'row-title' }, item.title), h('div', { class: 'meta' }, counts)),
+        item.approvals ? h('span', { class: 'count', 'aria-label': `${plural(item.approvals, 'approval')} waiting` }, String(item.approvals)) : null,
+        icon('chevron'),
+      ),
+    );
+  }
+
   function section(title, items, empty) {
     return h(
       'section',
@@ -74,7 +124,58 @@ export function renderThreads(container) {
     );
   }
 
+  function renderChatsOverview() {
+    const convIds = new Set();
+    for (const t of store.threads.values()) {
+      if (isActive(t.status) && t.conversation_id) convIds.add(t.conversation_id);
+    }
+    for (const a of pendingApprovals()) {
+      if (a.conversation_id) convIds.add(a.conversation_id);
+    }
+    const chats = [...convIds]
+      .map((id) => {
+        const c = store.conversations.find((x) => x.id === id);
+        const ts = threadsIn(id);
+        const apprs = approvalsIn(id);
+        const running = ts.filter((t) => t.status === 'running').length;
+        const waiting = ts.filter((t) => t.status === 'waiting_device').length;
+        const latest = Math.max(0, ...ts.filter((t) => isActive(t.status)).map((t) => t.created || 0), ...apprs.map((a) => a.ts || 0));
+        return {
+          id,
+          title: c?.title || 'Untitled conversation',
+          running,
+          waiting,
+          approvals: apprs.length,
+          latest,
+        };
+      })
+      .sort((a, b) => Number(b.approvals > 0) - Number(a.approvals > 0) || Number(b.waiting > 0) - Number(a.waiting > 0) || b.running - a.running || b.latest - a.latest);
+
+    if (!chats.length) {
+      setChildren(
+        body,
+        h(
+          'div',
+          { class: 'empty' },
+          h('h2', null, 'No active threads'),
+          h('p', null, 'Open a chat to see its threads, or start a new project chat.'),
+          h('p', null, h('a', { href: '#/chat/new' }, 'Start a project chat')),
+        ),
+      );
+      return;
+    }
+
+    keepFocus(body, () =>
+      setChildren(
+        body,
+        h('p', { class: 'section-note' }, 'Threads belong to their chat. Select a chat to see its threads and approvals.'),
+        h('ul', { class: 'list card' }, chats.map(chatSummaryRow)),
+      ),
+    );
+  }
+
   function render() {
+    renderHeader();
     if (error) {
       setChildren(body, errorBanner(error, refresh));
       return;
@@ -83,16 +184,34 @@ export function renderThreads(container) {
       setChildren(body, skeletonBlocks(4));
       return;
     }
-    const all = [...store.threads.values()];
-    const approvals = pendingApprovals();
+    if (!cid) {
+      renderChatsOverview();
+      return;
+    }
+
+    const all = threadsIn(cid);
+    const approvals = approvalsIn(cid);
     const withApproval = new Set(approvals.map((a) => a.thread_id));
     const waiting = all.filter((t) => t.status === 'waiting_device' && !withApproval.has(t.id));
     const running = all.filter((t) => t.status === 'running' && !withApproval.has(t.id)).sort((a, b) => b.created - a.created);
-    const finished = all.filter((t) => !['running', 'waiting_device'].includes(t.status)).sort((a, b) => (b.finished || b.created) - (a.finished || a.created));
-    if (!all.length) {
+    const finished = all.filter((t) => !isActive(t.status)).sort((a, b) => (b.finished || b.created) - (a.finished || a.created));
+    if (!all.length && !approvals.length) {
+      const standard = chat()?.mode === 'standard';
       setChildren(
         body,
-        h('div', { class: 'empty' }, h('h2', null, 'No threads yet'), h('p', null, 'Threads appear when a project chat hands work to one of your devices or the hub.'), h('p', null, h('a', { href: '#/chat/new' }, 'Start a project chat'))),
+        h(
+          'div',
+          { class: 'empty' },
+          h('h2', null, standard ? 'Standard chat' : 'No threads in this chat yet'),
+          h(
+            'p',
+            null,
+            standard
+              ? 'Standard chats use one model and do not start threads.'
+              : 'Threads appear here when this chat hands work to one of your devices or the hub.',
+          ),
+          h('p', null, h('a', { href: `#/chat/${enc(cid)}` }, 'Back to chat')),
+        ),
       );
       return;
     }
@@ -119,7 +238,7 @@ export function renderThreads(container) {
     render();
   }
 
-  const offs = [on('threads', render), on('approvals', render), on('devices', render)];
+  const offs = [on('threads', render), on('approvals', render), on('devices', render), on('conversations', render)];
   render();
   refresh();
   return () => offs.forEach((off) => off());

@@ -9,7 +9,9 @@ export const store = {
   devices: [],
   devicesAt: 0,
   conversations: [],
+  currentConversation: null, // id of the conversation currently open, or null
   threads: new Map(), // id -> ThreadInfo (+ checkpoint flag)
+  threadsLoaded: false,
   models: [],
   convs: new Map(), // conversation id -> {events, lastSeq, loaded, catching, queue}
   drafts: new Map(), // conversation id -> streamed assistant text
@@ -30,6 +32,8 @@ export function resetStore() {
     devices: [],
     devicesAt: 0,
     conversations: [],
+    currentConversation: null,
+    threadsLoaded: false,
     models: [],
     pendingProposals: 0,
   });
@@ -78,6 +82,7 @@ export function deviceOnline(id) {
 }
 
 export function threadsIn(conversationId) {
+  if (!conversationId) return [];
   return [...store.threads.values()].filter((t) => t.conversation_id === conversationId);
 }
 
@@ -85,7 +90,13 @@ export function approvalsFor(threadId) {
   return [...store.approvals.values()].filter((a) => a.thread_id === threadId);
 }
 
-/** Pending approvals, oldest first. */
+/** Pending approvals in one conversation, oldest first. */
+export function approvalsIn(conversationId) {
+  if (!conversationId) return [];
+  return [...store.approvals.values()].filter((a) => a.conversation_id === conversationId).sort((a, b) => a.ts - b.ts);
+}
+
+/** Pending approvals across all conversations, oldest first. */
 export function pendingApprovals() {
   return [...store.approvals.values()].sort((a, b) => a.ts - b.ts);
 }

@@ -5,18 +5,21 @@
 //   #/chat/new             a new conversation
 //   #/chat/<id>            a conversation
 //   #/chat/<id>/thread/<t> a conversation with a thread open in the inspector
-//   #/threads #/devices #/devices/<id> #/models #/usage #/memory #/skills #/settings #/more
+//   #/chat/<id>/threads    a conversation's threads
+//   #/threads              current conversation's threads, or active chats if none open
+//   #/threads/<t>          resolves thread's conversation and opens it there
+//   #/devices #/devices/<id> #/models #/usage #/memory #/skills #/settings #/more
 //
 // The shell (sidebar, tab bar) is built once per sign-in and updated in place, so
 // focus and scroll survive the live updates. Everything it subscribes to is torn
 // down on sign-out.
 
 import { h, icon, setChildren, syncList, setText, setAttr } from './lib/dom.js';
-import { get, onApiError } from './lib/api.js';
-import { store, on, emit, pendingApprovals, resetStore } from './lib/store.js';
+import { get, enc, isAbort, onApiError } from './lib/api.js';
+import { store, on, emit, threadsIn, approvalsIn, pendingApprovals, resetStore } from './lib/store.js';
 import { startLive, stopLive, loadConversations, loadThreads, loadDevices, loadModels, scanApprovals } from './lib/live.js';
-import { closeDrawer, navigate, syncInert } from './lib/ui.js';
-import { ago, isActive } from './lib/format.js';
+import { closeDrawer, navigate, syncInert, bar, skeletonBlocks, errorBanner } from './lib/ui.js';
+import { ago, isActive, threadStatus } from './lib/format.js';
 import { renderLogin } from './views/login.js';
 import { renderChat } from './views/chat.js';
 import { renderThread } from './views/thread.js';
@@ -171,7 +174,7 @@ function buildShell() {
   els = { shell, sidebar, main, inspector, inspectorScrim, tabbar, offline };
   buildNav();
 
-  const subs = ['conversations', 'threads', 'approvals', 'online', 'route'].map((topic) => on(topic, scheduleNav));
+  const subs = ['conversations', 'threads', 'approvals', 'online'].map((topic) => on(topic, scheduleNav));
   subs.push(
     on('online', (online) => {
       if (els) els.offline.hidden = online || !store.everOnline;
@@ -202,7 +205,7 @@ function focusMain() {
 
 function closeInspector() {
   const r = parseRoute();
-  if (r.view === 'chat' && r.thread) navigate(`#/chat/${encodeURIComponent(r.conversation)}`);
+  if (r.view === 'chat' && r.conversation && r.thread) navigate(`#/chat/${enc(r.conversation)}`);
 }
 
 function currentHash() {
@@ -210,7 +213,8 @@ function currentHash() {
 }
 
 function needsYouCount() {
-  const waiting = [...store.threads.values()].filter((t) => t.status === 'waiting_device').length;
+  const approvalThreads = new Set([...store.approvals.values()].map((a) => a.thread_id));
+  const waiting = [...store.threads.values()].filter((t) => t.status === 'waiting_device' && !approvalThreads.has(t.id)).length;
   return store.approvals.size + waiting;
 }
 
@@ -244,15 +248,30 @@ function buildNav() {
   };
   const approvalsBtn = h(
     'button',
-    { class: 'banner warn', type: 'button', hidden: true, onclick: () => openApproval(pendingApprovals()[0]?.approval_id) },
+    {
+      class: 'banner warn',
+      type: 'button',
+      hidden: true,
+      onclick: () => {
+        const currentCid = store.currentConversation;
+        const here = currentCid ? approvalsIn(currentCid) : [];
+        if (here.length) {
+          openApproval(here[0].approval_id, { conversationId: currentCid });
+          return;
+        }
+        const first = pendingApprovals()[0];
+        if (first?.conversation_id) navigate(`#/chat/${enc(first.conversation_id)}`);
+      },
+    },
     icon('shield'),
     h('span', { class: 'grow' }),
     icon('chevron'),
   );
   const chatList = h('ul', { class: 'side-list' });
   const chatEmpty = h('p', { class: 'side-empty' }, 'No conversations yet.');
+  const threadsAllLink = h('a', { href: '#/threads' }, 'All');
   const threadList = h('ul', { class: 'side-list' });
-  const threadEmpty = h('p', { class: 'side-empty' }, 'Nothing running.');
+  const threadEmpty = h('p', { class: 'side-empty' }, 'Open a chat to see its threads.');
   const foot = [
     footLink('#/devices', 'Devices', 'devices', ['devices']),
     footLink('#/models', 'Models', 'models', ['models'], 'waiting'),
@@ -278,7 +297,7 @@ function buildNav() {
       h(
         'section',
         { class: 'side-section', 'aria-labelledby': 'side-threads' },
-        h('h2', { class: 'side-title', id: 'side-threads' }, 'Threads', h('a', { href: '#/threads' }, 'All')),
+        h('h2', { class: 'side-title', id: 'side-threads' }, 'Threads', threadsAllLink),
         threadList,
         threadEmpty,
       ),
@@ -298,7 +317,7 @@ function buildNav() {
     tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings'], 'pending'),
   ];
   setChildren(els.tabbar, tabs.map((t) => t.a));
-  nav = { approvalsBtn, chatList, chatEmpty, threadList, threadEmpty, foot, conn, tabs };
+  nav = { approvalsBtn, chatList, chatEmpty, threadsAllLink, threadList, threadEmpty, foot, conn, tabs };
 }
 
 function sideItem() {
@@ -308,35 +327,57 @@ function sideItem() {
   return h('li', null, a);
 }
 
+function chatSideItem() {
+  const li = sideItem();
+  li.firstChild.append(countBadge('approvals waiting'));
+  return li;
+}
+
+function threadRecency(t) {
+  return isActive(t.status) ? t.created || 0 : t.finished || t.created || 0;
+}
+
 function renderNav() {
   if (!els || !nav) return;
   const r = parseRoute();
+  const currentCid = store.currentConversation;
 
-  // Chats, newest first.
+  // Chats, newest first, with per-chat running/waiting lines and approval badges.
   syncList(
     nav.chatList,
     store.conversations.slice(0, 50),
     (c) => c.id,
-    sideItem,
+    chatSideItem,
     (li, c) => {
       const a = li.firstChild;
-      setAttr(a, 'href', `#/chat/${encodeURIComponent(c.id)}`);
+      setAttr(a, 'href', `#/chat/${enc(c.id)}`);
       setAttr(a, 'aria-current', r.view === 'chat' && r.conversation === c.id ? 'page' : null);
       setText(a.querySelector('.title'), c.title || 'Untitled');
-      setText(a.querySelector('.sub'), `${c.mode === 'standard' ? 'Standard' : 'Project'} · ${ago(c.created)}`);
+      const chatThreads = threadsIn(c.id);
+      const running = chatThreads.filter((t) => t.status === 'running').length;
+      const waiting = chatThreads.filter((t) => t.status === 'waiting_device').length;
+      const subParts = [c.mode === 'standard' ? 'Standard' : 'Project'];
+      if (running) subParts.push(`${running} running`);
+      if (waiting) subParts.push(`${waiting} waiting`);
+      if (!running && !waiting) subParts.push(ago(c.created));
+      setText(a.querySelector('.sub'), subParts.join(' · '));
+      setBadge(a.querySelector('.count'), approvalsIn(c.id).length);
     },
   );
   nav.chatEmpty.hidden = store.conversations.length > 0;
 
-  // Threads that need you, then running.
-  const approvalsByThread = new Set(pendingApprovals().map((a) => a.thread_id));
-  const active = [...store.threads.values()]
-    .filter((t) => isActive(t.status) || approvalsByThread.has(t.id))
-    .sort((a, b) => rank(a, approvalsByThread) - rank(b, approvalsByThread) || b.created - a.created)
-    .slice(0, 6);
+  // Current conversation's threads only: needs approval / waiting / running first,
+  // then recent finished. Empty with a short hint when no conversation is open.
+  const currentApprovals = currentCid ? approvalsIn(currentCid) : [];
+  const approvalsByThread = new Set(currentApprovals.map((a) => a.thread_id));
+  const scopedThreads = currentCid
+    ? threadsIn(currentCid)
+        .sort((a, b) => rank(a, approvalsByThread) - rank(b, approvalsByThread) || threadRecency(b) - threadRecency(a))
+        .slice(0, 8)
+    : [];
   syncList(
     nav.threadList,
-    active,
+    scopedThreads,
     (t) => t.id,
     () => {
       const li = sideItem();
@@ -346,23 +387,54 @@ function renderNav() {
     (li, t) => {
       const a = li.firstChild;
       const needs = approvalsByThread.has(t.id);
-      const kind = needs ? 'shield' : t.status === 'waiting_device' ? 'offline' : 'threads';
+      const st = threadStatus(t.status, { checkpoint: t.checkpoint, approval: needs });
+      const kind = needs ? 'shield' : t.status === 'running' ? 'threads' : st.icon;
       const slot = a.querySelector('.side-icon');
+      slot.className = `side-icon ${st.tone}`;
       if (slot.dataset.icon !== kind) {
         slot.dataset.icon = kind;
         slot.replaceChildren(icon(kind));
       }
-      setAttr(a, 'href', `#/chat/${encodeURIComponent(t.conversation_id)}/thread/${encodeURIComponent(t.id)}`);
-      setAttr(a, 'aria-current', r.thread === t.id ? 'page' : null);
+      setAttr(a, 'href', `#/chat/${enc(currentCid)}/thread/${enc(t.id)}`);
+      setAttr(a, 'aria-current', r.view === 'chat' && r.conversation === currentCid && r.thread === t.id ? 'page' : null);
       setText(a.querySelector('.title'), t.title);
-      setText(a.querySelector('.sub'), needs ? 'Needs approval' : t.status === 'waiting_device' ? 'Waiting for device' : 'Running');
+      const subText = needs
+        ? 'Needs approval'
+        : t.status === 'waiting_device'
+          ? t.checkpoint
+            ? 'Checkpoint'
+            : 'Waiting for device'
+          : t.status === 'running'
+            ? 'Running'
+            : `${st.word} · ${ago(t.finished || t.created)}`;
+      setText(a.querySelector('.sub'), subText);
     },
   );
-  nav.threadEmpty.hidden = active.length > 0;
+  const currentChat = currentCid ? store.conversations.find((c) => c.id === currentCid) : null;
+  setAttr(nav.threadsAllLink, 'href', currentCid ? `#/chat/${enc(currentCid)}/threads` : '#/threads');
+  setAttr(nav.threadsAllLink, 'aria-current', r.view === 'threads' ? 'page' : null);
+  nav.threadEmpty.hidden = scopedThreads.length > 0;
+  setText(
+    nav.threadEmpty,
+    !currentCid
+      ? 'Open a chat to see its threads.'
+      : currentChat?.mode === 'standard'
+        ? 'Standard chats have no threads.'
+        : 'No threads in this chat yet.',
+  );
 
+  // Global sidebar approval indicator so nothing in other chats is missed.
   const approvals = pendingApprovals();
   nav.approvalsBtn.hidden = !approvals.length;
-  setText(nav.approvalsBtn.querySelector('.grow'), approvals.length === 1 ? '1 approval waiting' : `${approvals.length} approvals waiting`);
+  const approvalText =
+    currentCid && !currentApprovals.length && approvals.length
+      ? approvals.length === 1
+        ? '1 approval in another chat'
+        : `${approvals.length} approvals in other chats`
+      : approvals.length === 1
+        ? '1 approval waiting'
+        : `${approvals.length} approvals waiting`;
+  setText(nav.approvalsBtn.querySelector('.grow'), approvalText);
 
   for (const f of nav.foot) {
     setAttr(f.a, 'aria-current', f.view.includes(r.view) ? 'page' : null);
@@ -374,6 +446,7 @@ function renderNav() {
   const needs = needsYouCount();
   for (const t of nav.tabs) {
     setAttr(t.a, 'aria-current', t.view.includes(r.view) ? 'page' : null);
+    if (t.view[0] === 'threads') setAttr(t.a, 'href', currentCid ? `#/chat/${enc(currentCid)}/threads` : '#/threads');
     if (t.badge) setBadge(t.badge, t.view[0] === 'threads' ? needs : store.pendingProposals);
   }
 }
@@ -401,15 +474,76 @@ export function parseRoute() {
     });
   const [view = 'chat', a, b, c] = parts;
   if (view === 'chat') {
+    if (a && a !== 'new' && b === 'threads') {
+      return { view: 'threads', conversation: a };
+    }
+    if (a === 'new' && b === 'thread' && c) {
+      return { view: 'thread-redirect', thread: c };
+    }
     return { view, conversation: a && a !== 'new' ? a : a === 'new' ? null : undefined, thread: b === 'thread' ? c : undefined };
   }
+  if ((view === 'threads' || view === 'thread') && a) {
+    return { view: 'thread-redirect', thread: a };
+  }
   return { view, id: a };
+}
+
+function renderThreadRedirect(container, { thread: threadId }) {
+  const body = h('div', { class: 'view-body narrow' }, skeletonBlocks(2));
+  container.append(h('section', { class: 'view' }, bar({ title: 'Opening thread…' }), body));
+  const aborter = new AbortController();
+
+  async function resolve() {
+    setChildren(body, skeletonBlocks(2));
+    try {
+      const thread = await get(`/v1/threads/${enc(threadId)}`, { signal: aborter.signal });
+      if (aborter.signal.aborted) return;
+      if (thread?.conversation_id) {
+        const known = store.threads.get(threadId);
+        store.threads.set(threadId, { ...known, ...thread, checkpoint: known?.checkpoint });
+        emit('threads');
+        location.replace(`#/chat/${enc(thread.conversation_id)}/thread/${enc(threadId)}`);
+        return;
+      }
+      showMissing();
+    } catch (err) {
+      if (isAbort(err) || aborter.signal.aborted) return;
+      if (err.status === 404) showMissing();
+      else setChildren(body, errorBanner(err, resolve));
+    }
+  }
+
+  function showMissing() {
+    setChildren(
+      body,
+      h(
+        'div',
+        { class: 'empty' },
+        h('h2', null, 'Thread not found'),
+        h('p', null, "It isn't on this hub."),
+        h('p', null, h('a', { href: '#/threads' }, 'View threads'), ' · ', h('a', { href: '#/chat' }, 'Back to chat')),
+      ),
+    );
+  }
+
+  resolve();
+  return () => aborter.abort();
 }
 
 function route() {
   if (!els || !store.me) return;
   closeDrawer();
   const r = parseRoute();
+
+  // Deep links like #/threads/<id>: resolve the thread's conversation and open it there.
+  if (r.view === 'thread-redirect' && r.thread) {
+    const known = store.threads.get(r.thread);
+    if (known?.conversation_id) {
+      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}`);
+      return;
+    }
+  }
+
   if (r.view === 'chat' && r.conversation === undefined) {
     let last = null;
     try {
@@ -418,31 +552,65 @@ function route() {
       /* storage unavailable */
     }
     if (last) {
-      location.replace(`#/chat/${encodeURIComponent(last)}`);
+      location.replace(`#/chat/${enc(last)}`);
       return;
     }
     r.conversation = null;
   }
-  if (r.view === 'chat' && r.conversation) {
+
+  // Never open a thread inside the wrong conversation: switch to its conversation first.
+  if (r.view === 'chat' && r.conversation && r.thread) {
+    const known = store.threads.get(r.thread);
+    if (known?.conversation_id && known.conversation_id !== r.conversation) {
+      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}`);
+      return;
+    }
+  }
+
+  // Track which conversation is currently open (null when none is open).
+  if (r.view === 'chat') {
+    store.currentConversation = r.conversation || null;
+  } else if (r.view === 'threads') {
+    if (r.conversation) store.currentConversation = r.conversation;
+    // Plain #/threads keeps the open conversation if one was open; otherwise null.
+  } else {
+    store.currentConversation = null;
+  }
+
+  if (store.currentConversation && (r.view === 'chat' || (r.view === 'threads' && r.conversation))) {
     try {
-      localStorage.setItem(LAST_CONV, r.conversation);
+      localStorage.setItem(LAST_CONV, store.currentConversation);
     } catch {
       /* storage unavailable */
     }
   }
 
+  const scopedThreadsCid = r.view === 'threads' ? r.conversation || store.currentConversation || null : null;
+
   let mainChanged = false;
-  const key = r.view === 'chat' ? `chat:${r.conversation || 'new'}` : `${r.view}:${r.id || ''}`;
+  const key =
+    r.view === 'chat'
+      ? `chat:${r.conversation || 'new'}`
+      : r.view === 'threads'
+        ? `threads:${scopedThreadsCid || 'all'}`
+        : r.view === 'thread-redirect'
+          ? `thread-redirect:${r.thread || ''}`
+          : `${r.view}:${r.id || ''}`;
   if (key !== mainKey) {
     mainChanged = true;
     mainKey = key;
     mainCleanup?.();
     mainCleanup = null;
     els.main.replaceChildren();
-    const params = { ...r, onMissing: () => forgetConversation(r.conversation) };
+    const params = {
+      ...r,
+      ...(r.view === 'threads' ? { conversation: scopedThreadsCid } : null),
+      onMissing: () => forgetConversation(r.conversation),
+    };
     const renderers = {
       chat: renderChat,
       threads: renderThreads,
+      'thread-redirect': renderThreadRedirect,
       devices: renderDevices,
       models: renderModels,
       usage: renderUsage,
@@ -452,12 +620,15 @@ function route() {
       more: renderMore,
     };
     const render = renderers[r.view] || renderChat;
+    document.title = 'Grouper';
     mainCleanup = render(els.main, params) || null;
     els.main.querySelector('h1')?.setAttribute('tabindex', '-1');
-    document.title = `${els.main.querySelector('h1')?.textContent || 'Grouper'} · Grouper`;
+    if (document.title === 'Grouper') {
+      document.title = `${els.main.querySelector('h1')?.textContent || 'Grouper'} · Grouper`;
+    }
   }
 
-  const tKey = r.view === 'chat' && r.thread ? r.thread : null;
+  const tKey = r.view === 'chat' && r.conversation && r.thread ? `${r.conversation}:${r.thread}` : null;
   let inspectorClosed = false;
   if (tKey !== inspectorKey) {
     const active = document.activeElement;
@@ -470,10 +641,23 @@ function route() {
     els.inspector.hidden = !tKey;
     els.inspectorScrim.hidden = !tKey;
     if (tKey) {
-      inspectorCleanup = renderThread(els.inspector, { threadId: tKey, conversationId: r.conversation, onClose: closeInspector }) || null;
+      inspectorCleanup =
+        renderThread(els.inspector, {
+          threadId: r.thread,
+          conversationId: r.conversation,
+          onClose: closeInspector,
+          onWrongConversation: (targetCid) => {
+            location.replace(`#/chat/${enc(targetCid)}/thread/${enc(r.thread)}`);
+          },
+        }) || null;
     }
   }
   syncInert();
+  if (navFrame) {
+    cancelAnimationFrame(navFrame);
+    navFrame = 0;
+  }
+  renderNav();
   emit('route', r);
 
   // Move focus where the person's attention goes: back to what opened a closed
@@ -497,6 +681,10 @@ function route() {
 }
 
 function forgetConversation(id) {
+  if (store.currentConversation === id) {
+    store.currentConversation = null;
+    scheduleNav();
+  }
   try {
     if (localStorage.getItem(LAST_CONV) === id) localStorage.removeItem(LAST_CONV);
   } catch {

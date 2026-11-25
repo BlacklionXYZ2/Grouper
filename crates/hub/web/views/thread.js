@@ -38,10 +38,12 @@ export async function stopThread(threadId) {
   return true;
 }
 
-export function renderThread(container, { threadId, conversationId, onClose }) {
+export function renderThread(container, { threadId, conversationId, onClose, onWrongConversation }) {
   const subs = [];
   const aborter = new AbortController();
-  let info = store.threads.get(threadId) || null;
+  const initial = store.threads.get(threadId) || null;
+  let verified = !conversationId || Boolean(initial?.conversation_id && initial.conversation_id === conversationId);
+  let info = verified ? initial : null;
   let cid = conversationId || info?.conversation_id;
   let events = [];
   let lastSeq = 0;
@@ -129,25 +131,46 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
   foot.append(stepError, stepRow, stopRow, footNote);
 
   function t() {
+    if (!verified) return {};
     return store.threads.get(threadId) || info || {};
+  }
+
+  function redirectIfWrong(thread) {
+    if (!conversationId || !thread?.conversation_id || thread.conversation_id === conversationId) return false;
+    aborter.abort();
+    onWrongConversation?.(thread.conversation_id);
+    return true;
   }
 
   async function load() {
     const { signal } = aborter;
+    const pre = store.threads.get(threadId);
+    if (redirectIfWrong(pre)) return;
     try {
-      // The thread's own record says which conversation holds its events; read it
-      // first only when the route didn't say.
+      // Only fetch events in parallel once we know the thread belongs to this
+      // conversation; otherwise verify the thread's conversation first so a
+      // thread from another chat is never shown here.
       let thread;
       let evs;
-      if (cid) {
+      if (verified && cid) {
         [thread, evs] = await Promise.all([get(`/v1/threads/${enc(threadId)}`, { signal }), get(`/v1/conversations/${enc(cid)}/events${qs({ thread: threadId })}`, { signal })]);
+        if (signal.aborted) return;
+        const known = store.threads.get(threadId);
+        store.threads.set(threadId, { ...known, ...thread, checkpoint: known?.checkpoint });
+        if (redirectIfWrong(thread)) return;
       } else {
         thread = await get(`/v1/threads/${enc(threadId)}`, { signal });
-        evs = await get(`/v1/conversations/${enc(thread.conversation_id)}/events${qs({ thread: threadId })}`, { signal });
+        if (signal.aborted) return;
+        const known = store.threads.get(threadId);
+        store.threads.set(threadId, { ...known, ...thread, checkpoint: known?.checkpoint });
+        if (redirectIfWrong(thread)) return;
+        verified = true;
+        cid = thread.conversation_id;
+        evs = await get(`/v1/conversations/${enc(cid)}/events${qs({ thread: threadId })}`, { signal });
+        if (signal.aborted) return;
       }
       info = thread;
-      const known = store.threads.get(threadId);
-      store.threads.set(threadId, { ...known, ...thread, checkpoint: known?.checkpoint });
+      verified = true;
       cid = thread.conversation_id;
       // Keep events that arrived on the socket while loading.
       const fetched = evs || [];
@@ -202,6 +225,12 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
   }
 
   function renderHead(th) {
+    if (!verified) {
+      setText(titleEl, 'Thread');
+      metaEl.replaceChildren();
+      reasonEl.hidden = true;
+      return;
+    }
     const approval = approvalsFor(threadId).length > 0;
     const started = events.find((e) => e.kind === 'thread_started');
     const reason = th.reason || started?.reason;
@@ -228,7 +257,7 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
           { class: 'banner warn' },
           icon('shield'),
           h('div', { class: 'grow' }, h('strong', null, a.tool), ` on ${deviceName(a.device_id)} is waiting for your approval.`),
-          h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => openApproval(a.approval_id) }, 'Review'),
+          h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => openApproval(a.approval_id, { conversationId: cid }) }, 'Review'),
         ),
       ),
     );
@@ -564,6 +593,7 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
   subs.push(
     on('event', (e) => {
       if (e.thread_id !== threadId) return;
+      if (conversationId && e.conversation_id && e.conversation_id !== conversationId) return;
       if (e.seq > 0) {
         if (e.seq <= lastSeq) return;
         events.push(e);
@@ -586,18 +616,33 @@ export function renderThread(container, { threadId, conversationId, onClose }) {
         else renderEmpty(t());
         if (atEnd) body.scrollTop = body.scrollHeight;
       } else if (e.kind === 'thread_activity' && e.event.type === 'text_delta') {
+        if (!verified) return;
         scheduleDraft();
         speaker.speak(liveOf(threadId).draft);
       }
     }),
-    on('threads', scheduleAll),
+    on('threads', () => {
+      const th = store.threads.get(threadId);
+      if (redirectIfWrong(th)) return;
+      if (!verified && th?.conversation_id === conversationId) {
+        verified = true;
+        info = th;
+      }
+      scheduleAll();
+    }),
     on('approvals', scheduleAll),
     on('devices', scheduleAll),
     on('online', scheduleAll),
   );
 
   renderAll();
-  load();
+  if (initial && conversationId && initial.conversation_id && initial.conversation_id !== conversationId) {
+    queueMicrotask(() => {
+      if (!aborter.signal.aborted) redirectIfWrong(initial);
+    });
+  } else {
+    load();
+  }
   requestAnimationFrame(() => titleEl.focus());
 
   return () => {
