@@ -39,6 +39,8 @@ Docker volume, so rebuilding keeps it.
 
 ## 3. The tunnel (`grouper.clockmillbarn.uk`)
 
+Full step-by-step guide: [cloudflare-tunnel.md](cloudflare-tunnel.md).
+
 In the Cloudflare dashboard (done once, by you):
 
 1. **Zero Trust → Networks → Tunnels → Create a tunnel**, type **Cloudflared**, name it `grouper-hub`.
