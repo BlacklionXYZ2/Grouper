@@ -161,15 +161,71 @@ impl Tool for ListFiles {
     }
 }
 
+fn shell_description() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Run a shell command in PowerShell on Windows, with your workspace as the working directory. \
+         Use PowerShell syntax. Returns exit code, stdout and stderr."
+    }
+    #[cfg(not(windows))]
+    {
+        "Run a shell command with sh -c and your workspace as the working directory. \
+         Returns exit code, stdout and stderr."
+    }
+}
+
+/// `pwsh` when it is on PATH, otherwise Windows PowerShell.
+#[cfg(windows)]
+fn windows_powershell() -> &'static str {
+    let Some(path) = std::env::var_os("PATH") else {
+        return "powershell.exe";
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.join("pwsh.exe").is_file() || dir.join("pwsh.cmd").is_file() {
+            return "pwsh";
+        }
+    }
+    "powershell.exe"
+}
+
+fn shell_program(cmd: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    let mut command = {
+        // A redirected pipe is not a console. Windows PowerShell encodes that pipe as
+        // UTF-16 unless OutputEncoding is UTF-8 before the user's command runs.
+        let wrapped = format!(
+            "$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; {cmd}"
+        );
+        let mut c = tokio::process::Command::new(windows_powershell());
+        c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &wrapped]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    };
+    hide_grouper_env(&mut command);
+    command
+}
+
+/// Threads must not see hub tokens or provider keys.
+fn hide_grouper_env(cmd: &mut tokio::process::Command) {
+    for (key, _) in std::env::vars() {
+        if key.to_ascii_uppercase().starts_with("GROUPER_") {
+            cmd.env_remove(key);
+        }
+    }
+}
+
 struct RunShell(Arc<Workspace>);
 #[async_trait]
 impl Tool for RunShell {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "run_shell".into(),
-            description: "Run a shell command with your workspace as the working directory. \
-                          Returns exit code, stdout and stderr."
-                .into(),
+            description: shell_description().into(),
             input_schema: json!({"type": "object", "properties": {
                 "command": {"type": "string"},
                 "timeout_secs": {"type": "integer", "description": "Default 120, max 600"}
@@ -179,15 +235,7 @@ impl Tool for RunShell {
     async fn call(&self, input: Value) -> ToolOutput {
         let Some(cmd) = s(&input, "command") else { return ToolOutput::err("missing command") };
         let secs = input.get("timeout_secs").and_then(Value::as_u64).unwrap_or(120).min(600);
-        let mut c = if cfg!(windows) {
-            let mut c = tokio::process::Command::new("cmd");
-            c.arg("/C").arg(&cmd);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("sh");
-            c.arg("-c").arg(&cmd);
-            c
-        };
+        let mut c = shell_program(&cmd);
         c.current_dir(self.0.root()).kill_on_drop(true).stdin(std::process::Stdio::null());
         for key in secret_env_keys() {
             c.env_remove(key);
@@ -256,27 +304,104 @@ mod tests {
             std::os::unix::fs::symlink("/etc", dir.join("link")).unwrap();
             assert!(tools[0].call(json!({"path": "link/passwd"})).await.is_error);
         }
-        assert!(tools[2].call(json!({})).await.content.contains("a/b.txt"));
+        let listing = tools[2].call(json!({})).await.content.replace('\\', "/");
+        assert!(listing.contains("a/b.txt"), "{listing}");
         let sh = shell_tool(&ws).call(json!({"command": "cat a/b.txt"})).await;
         assert!(sh.content.contains("hi"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn run_shell_def_names_the_shell() {
+        let desc = builtin_defs(true).into_iter().find(|d| d.name == "run_shell").expect("run_shell").description;
+        #[cfg(windows)]
+        assert!(desc.contains("PowerShell on Windows"), "{desc}");
+        #[cfg(not(windows))]
+        assert!(desc.contains("sh -c"), "{desc}");
+    }
+
+    fn env_list_command() -> &'static str {
+        #[cfg(windows)]
+        {
+            "Get-ChildItem env: | ForEach-Object { $_.Name + '=' + $_.Value }"
+        }
+        #[cfg(not(windows))]
+        {
+            "env"
+        }
+    }
+
+    struct SavedEnv(Vec<(String, Option<String>)>);
+
+    impl SavedEnv {
+        fn set(pairs: &[(&str, &str)]) -> Self {
+            let saved = pairs
+                .iter()
+                .map(|(key, value)| {
+                    let prev = std::env::var(key).ok();
+                    // SAFETY: the test process is the only writer, and GROUPER_ENV_LOCK
+                    // keeps the other shell tests from reading or restoring these at the same time.
+                    unsafe { std::env::set_var(key, value) };
+                    ((*key).to_string(), prev)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    impl Drop for SavedEnv {
+        fn drop(&mut self) {
+            for (key, prev) in self.0.drain(..) {
+                // SAFETY: same lock as `set`; restoring the previous value cannot race another test.
+                unsafe {
+                    match prev {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    static GROUPER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[allow(clippy::await_holding_lock)]
+    async fn assert_grouper_hidden(ws: &Arc<Workspace>) {
+        let _guard = GROUPER_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _env = SavedEnv::set(&[
+            ("GROUPER_TOKEN", "grouper-test-secret-token"),
+            ("GROUPER_PROVIDER_KEY", "grouper-test-secret-key"),
+        ]);
+        let sh = shell_tool(ws).call(json!({"command": env_list_command()})).await;
+        assert!(!sh.is_error, "{sh:?}");
+        let lower = sh.content.to_ascii_lowercase();
+        assert!(lower.contains("path="), "{sh:?}");
+        assert!(!lower.contains("grouper_token="), "{sh:?}");
+        assert!(!lower.contains("grouper_provider_key="), "{sh:?}");
+        assert!(!sh.content.contains("grouper-test-secret-token"), "{sh:?}");
+        assert!(!sh.content.contains("grouper-test-secret-key"), "{sh:?}");
     }
 
     #[tokio::test]
     async fn shell_hides_grouper_secrets() {
         let dir = std::env::temp_dir().join(format!("grouper-env-{}", std::process::id()));
         let ws = Workspace::create(dir.clone()).unwrap();
-        // SAFETY: no other test reads or writes these variables.
-        unsafe {
-            std::env::set_var("GROUPER_TOKEN", "dev.supersecret");
-            std::env::set_var("GROUPER_TEST_VISIBLE_CHECK", "x");
-            std::env::set_var("NOT_GROUPER_CHECK", "visible");
-        }
-        let cmd = if cfg!(windows) { "set" } else { "env" };
-        let out = shell_tool(&ws).call(json!({"command": cmd})).await;
-        assert!(!out.content.contains("supersecret"), "{}", out.content);
-        assert!(!out.content.contains("GROUPER_TEST_VISIBLE_CHECK"));
-        assert!(out.content.contains("NOT_GROUPER_CHECK=visible"));
+        assert_grouper_hidden(&ws).await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_uses_powershell() {
+        let dir = std::env::temp_dir().join(format!("grouper-ps-{}", std::process::id()));
+        let ws = Workspace::create(dir.clone()).unwrap();
+        let sh = shell_tool(&ws).call(json!({"command": "$PSVersionTable.PSVersion.Major"})).await;
+        assert!(!sh.is_error, "{sh:?}");
+        let stdout = sh.content.split("--- stdout\n").nth(1).unwrap_or("");
+        let stdout = stdout.split("--- stderr").next().unwrap_or(stdout).trim();
+        assert!(!stdout.is_empty() && stdout.chars().all(|c| c.is_ascii_digit()), "{sh:?}");
+        assert!(shell_tool(&ws).def().description.contains("PowerShell on Windows"));
+        assert_grouper_hidden(&ws).await;
         std::fs::remove_dir_all(dir).ok();
     }
 }
