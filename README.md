@@ -44,6 +44,7 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 | `crates/core-protocol` | Wire protocol and shared types (frames, events, registry rows) |
 | `crates/providers` | Model adapters: Anthropic, OpenAI-compatible, scripted |
 | `crates/core-agent` | The loop engine, workspace and shell tools, permission rules, thread runner |
+| `crates/core-sync` | Local SQLite cache of conversations, threads and events, kept in sync with the hub; offline reads |
 | `crates/core-client` | Device side: connection, presence, running threads, approvals |
 | `crates/hub` | `grouper-hub`: storage, orchestrator, threads, HTTP and WebSocket API |
 | `crates/ffi` | UniFFI bindings exposing `core-client` to Swift |
@@ -119,6 +120,7 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 | `grouper skills list\|show\|forget` | Saved skills |
 | `grouper usage [--by day\|provider\|model\|conversation]`, `grouper usage balances` | Tokens, cost and provider balances |
 | `grouper limits`, `grouper limits set <key> <value\|off>` | Thread caps, budgets, approval and ask timeouts (all off by default) |
+| `grouper sync` | Refresh the local cache; `log`, `conversations` and `threads` read it when the hub is unreachable |
 | `grouper devices`, `grouper call <device> <tool>` | Presence and direct device tools |
 
 ## Swift demo node

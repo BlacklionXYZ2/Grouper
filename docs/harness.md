@@ -176,6 +176,14 @@ All off until you set them (`grouper limits set <key> <value|off>`): running thr
 `ask_orchestrator` waits (30 minutes by default). Spend is estimated from the registry's
 prices.
 
+## Clients offline
+
+`core-sync` keeps a local copy of conversations, threads, events and memories in SQLite:
+it catches up by `seq`, follows the live stream, fills gaps and survives reconnects. The
+CLI reads it when the hub is unreachable (`grouper sync` refreshes it); the apps get it
+through UniFFI (`SyncStore`). Only reading works offline: sending messages while offline
+needs a decision on how they merge back (open question below).
+
 ## Known gaps
 
 - Auto's shell rules are a blocklist: they ask more than needed for ordinary words, and
@@ -185,4 +193,7 @@ prices.
 ## Open questions
 
 - Should a web client come first, to design the screens before the native apps?
+- Offline writes: queue messages typed offline and send them on reconnect, or answer them
+  on the device with an API model and merge the reply into the hub's log? How do they
+  order against events that happened meanwhile, and who wins on memory edits?
 - What values do you want for limits, budgets and timeouts? (Mechanisms exist; all off.)
