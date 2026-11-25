@@ -10,25 +10,38 @@ import Foundation
 
 let libDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("lib").path
 
+var products: [Product] = [
+    .library(name: "GrouperAPI", targets: ["GrouperAPI"]),
+]
+var targets: [Target] = [
+    .target(name: "GrouperAPI"),
+    .testTarget(name: "GrouperAPITests", dependencies: ["GrouperAPI"]),
+]
+
+#if !os(Windows)
+products += [
+    .library(name: "GrouperKit", targets: ["GrouperKit"]),
+    .executable(name: "grouper-mac", targets: ["grouper-mac"]),
+]
+targets += [
+    .target(
+        name: "grouper_ffiFFI",
+        path: "Sources/grouper_ffiFFI",
+        linkerSettings: [
+            .unsafeFlags(["-L\(libDir)", "-lgrouper_ffi"]),
+            .linkedFramework("Security"),
+            .linkedFramework("SystemConfiguration"),
+            .linkedFramework("CoreFoundation"),
+        ]
+    ),
+    .target(name: "GrouperKit", dependencies: ["grouper_ffiFFI"]),
+    .executableTarget(name: "grouper-mac", dependencies: ["GrouperKit"]),
+]
+#endif
+
 let package = Package(
     name: "GrouperKit",
     platforms: [.macOS(.v14)],
-    products: [
-        .library(name: "GrouperKit", targets: ["GrouperKit"]),
-        .executable(name: "grouper-mac", targets: ["grouper-mac"]),
-    ],
-    targets: [
-        .target(
-            name: "grouper_ffiFFI",
-            path: "Sources/grouper_ffiFFI",
-            linkerSettings: [
-                .unsafeFlags(["-L\(libDir)", "-lgrouper_ffi"]),
-                .linkedFramework("Security"),
-                .linkedFramework("SystemConfiguration"),
-                .linkedFramework("CoreFoundation"),
-            ]
-        ),
-        .target(name: "GrouperKit", dependencies: ["grouper_ffiFFI"]),
-        .executableTarget(name: "grouper-mac", dependencies: ["GrouperKit"]),
-    ]
+    products: products,
+    targets: targets
 )

@@ -1,0 +1,64 @@
+name: Grouper
+options:
+  bundleIdPrefix: uk.clockmillbarn.grouper
+  deploymentTarget:
+    iOS: "26.0"
+    macOS: "26.0"
+  xcodeVersion: "26.0"
+packages:
+  GrouperKit:
+    path: ../GrouperKit
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    DEVELOPMENT_TEAM: ""
+targets:
+  Grouper-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - Shared
+      - iOS
+    dependencies:
+      - package: GrouperKit
+        product: GrouperAPI
+      - target: GrouperWidgets
+        embed: true
+    info:
+      path: iOS/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.ios
+        SUPPORTS_MACCATALYST: NO
+        TARGETED_DEVICE_FAMILY: "1"
+  GrouperWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - iOSWidgets
+      - path: iOS/ThreadActivityAttributes.swift
+      - path: iOS/StopThreadIntent.swift
+    info:
+      path: iOSWidgets/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.ios.widgets
+        SKIP_INSTALL: YES
+        TARGETED_DEVICE_FAMILY: "1"
+  Grouper-macOS:
+    type: application
+    platform: macOS
+    sources:
+      - Shared
+      - macOS
+    dependencies:
+      - package: GrouperKit
+        product: GrouperAPI
+      - package: GrouperKit
+        product: GrouperKit
+    info:
+      path: macOS/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.macos
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
