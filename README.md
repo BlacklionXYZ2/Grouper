@@ -54,6 +54,7 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 | `crates/hub` | `grouper-hub`: storage, orchestrator, threads, HTTP and WebSocket API |
 | `crates/ffi` | UniFFI bindings exposing `core-client` to Swift |
 | `crates/cli` | `grouper`: connect a device, chat, watch threads, approve, manage keys/tools/models |
+| `apple/GrouperApp` | SwiftUI apps for iPhone and Mac (first draft, not yet built: see its README; needs Xcode 26) |
 | `apple/GrouperKit` | Swift package wrapping the Rust core, plus the `grouper-mac` demo node |
 | `examples/scripted-demo.json` | Script for the fake model, to try everything without API keys |
 | `Dockerfile`, `deploy/` | Hub container for the Linux VM on the PC (later a VPS) |
