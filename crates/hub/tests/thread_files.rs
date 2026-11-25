@@ -232,7 +232,15 @@ async fn scoped_folders_and_thread_files() {
         .is_some()
     })
     .await;
-    let history = serde_json::to_string(&hub.db.history(&conv)).unwrap();
+    // History is saved when the turn ends, just after its reply is streamed, so wait for it.
+    let mut history = String::new();
+    for _ in 0..100 {
+        history = serde_json::to_string(&hub.db.history(&conv)).unwrap();
+        if history.contains("Quoted the thread's result.") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(history.contains("read_thread_file") && history.contains("result body from thread"), "{history}");
 
     // A hub thread's files are read from the hub's own workspace.

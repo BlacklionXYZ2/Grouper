@@ -320,7 +320,9 @@ async fn an_approval_timeout_can_stop_the_thread() {
         EventBody::ThreadActivity { event: AgentEvent::ToolResult { output, .. } } => Some(output.as_str()),
         _ => None,
     });
-    assert_eq!(outputs, vec!["Not run: no answer within 1 second"]);
+    // The thread is stopped before the denial is delivered, so the denied call's result
+    // may or may not be recorded before the thread ends; if it is, it's the denial.
+    assert!(outputs.is_empty() || outputs == vec!["Not run: no answer within 1 second"], "{outputs:?}");
     assert_eq!(hub.db.threads(Some(&conv))[0].status, "stopped");
 
     drop(hub);

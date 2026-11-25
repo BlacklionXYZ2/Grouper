@@ -218,14 +218,26 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     };
     let Some(model) = model else {
         finish(hub, &history);
-        hub.emit(
-            conversation_id,
-            None,
-            EventBody::Error {
-                message: "No models registered. Add a provider key (`grouper keys set`) and a model (`grouper models add`)."
-                    .into(),
-            },
-        );
+        // Models may exist but all live on devices that are offline; say which.
+        let message = match hub.db.default_model(role) {
+            Some(m) => {
+                let host = hub
+                    .db
+                    .provider(&m.provider_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.via_device().map(String::from))
+                    .unwrap_or_else(|| "a device".into());
+                format!(
+                    "Every model for this chat runs on a device that's offline ({} runs on {host}). Bring it back \
+                     online, or add a model that doesn't depend on it (`grouper models add`).",
+                    m.id
+                )
+            }
+            None => "No models registered. Add a provider key (`grouper keys set`) and a model (`grouper models add`)."
+                .into(),
+        };
+        hub.emit(conversation_id, None, EventBody::Error { message });
         hub.emit(conversation_id, None, EventBody::TurnFinished { running_threads: 0 });
         return;
     };
