@@ -5,14 +5,17 @@
 //! - A looping hub thread is stopped at its budget and the orchestrator is told.
 //! - A second thread is refused at `max_running_threads = 1`.
 //! - A spent daily budget refuses the next orchestrator turn until it's raised.
+//! - A hub thread's Manual call is denied when its approval times out, and the thread continues.
+//! - The same timeout with action `stop` stops the thread.
+//! - With no approval timeout (the default), a pending approval stays pending.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use core_protocol::{ChatRequest, Event, EventBody, Limits, ModelEntry, ProviderConfig};
+use core_protocol::{AgentEvent, ChatRequest, Event, EventBody, Limits, ModelEntry, Permission, ProviderConfig, ToolDef};
 use hub::db::Db;
-use hub::server::Hub;
+use hub::server::{Hub, HUB_DEVICE};
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(60);
@@ -205,6 +208,150 @@ async fn a_spent_daily_budget_refuses_turns_until_it_is_raised() {
     let history = serde_json::to_string(&hub.db.history(&conv)).unwrap();
     assert!(history.contains("hello again") && history.contains("third"), "{history}");
 
+    drop(hub);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// `list_files` is Auto for file tools unless the registry says otherwise, and a thread
+/// snapshots permissions when it starts.
+fn manual_list_files(hub: &Hub) {
+    hub.db.upsert_tools(
+        HUB_DEVICE,
+        &[ToolDef {
+            name: "list_files".into(),
+            description: "List the workspace.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        }],
+    );
+    hub.db.set_permission(HUB_DEVICE, "list_files", Permission::Manual).unwrap();
+}
+
+fn texts_of<'a>(events: &'a [Event], pick: impl Fn(&'a EventBody) -> Option<&'a str> + 'a) -> Vec<&'a str> {
+    events.iter().filter_map(|e| pick(&e.body)).collect()
+}
+
+/// A hub thread calls Manual `list_files`. `action` is `deny` or `stop`.
+fn approval_script(delay_ms: u64) -> Value {
+    json!({"delay_ms": delay_ms, "rules": [
+        {"system": ORCH, "last": "please", "reply": [{"type": "tool_use", "name": "start_thread",
+            "input": {"title": "Look", "device": "hub", "goal": "List the workspace."}}]},
+        {"system": THREAD, "last": "Not run:", "reply": [{"type": "text", "text": "Continued."}]},
+        {"system": THREAD, "reply": [{"type": "tool_use", "name": "list_files", "input": {}}]}
+    ], "default": [{"type": "text", "text": "Noted."}]})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_timeout_denies_the_call_and_the_hub_thread_continues() {
+    let (dir, hub) = setup(
+        "approval-deny",
+        approval_script(0),
+        Limits { approval_timeout_secs: Some(1), ..Default::default() },
+    );
+    manual_list_files(&hub);
+    let conv = chat(&hub, None, "please").await;
+    until_event(&hub, &conv, "the thread finished after the denial", |e| {
+        matches!(&e.body, EventBody::ThreadFinished { status, summary }
+            if status == "done" && summary == "Continued.")
+    })
+    .await;
+
+    let events = hub.db.events(&conv, 0, None);
+    let resolved = texts_of(&events, |b| match b {
+        EventBody::ApprovalResolved { approval_id, approved: false } => Some(approval_id.as_str()),
+        _ => None,
+    });
+    assert_eq!(resolved.len(), 1, "one denial, not a second resolution: {events:?}");
+    let notices = texts_of(&events, |b| match b {
+        EventBody::ThreadActivity { event: AgentEvent::Notice { text } } => Some(text.as_str()),
+        _ => None,
+    });
+    assert_eq!(notices, vec!["No answer within 1 second; the call was denied."]);
+    let outputs = texts_of(&events, |b| match b {
+        EventBody::ThreadActivity { event: AgentEvent::ToolResult { output, .. } } => Some(output.as_str()),
+        _ => None,
+    });
+    assert_eq!(outputs, vec!["Not run: no answer within 1 second"]);
+    let threads = hub.db.threads(Some(&conv));
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].status, "done");
+    // Already resolved: answering it now does nothing.
+    assert!(!hub.resolve_approval(resolved[0], true).await);
+    assert_eq!(
+        hub.db.events(&conv, 0, None).iter().filter(|e| matches!(e.body, EventBody::ApprovalResolved { .. })).count(),
+        1
+    );
+
+    drop(hub);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_timeout_can_stop_the_thread() {
+    // The next model call is asleep when the stop lands, so the thread records the
+    // denial and then stops, rather than finishing the turn.
+    let (dir, hub) = setup(
+        "approval-stop",
+        approval_script(250),
+        Limits {
+            approval_timeout_secs: Some(1),
+            approval_timeout_action: core_protocol::ApprovalTimeoutAction::Stop,
+            ..Default::default()
+        },
+    );
+    manual_list_files(&hub);
+    let conv = chat(&hub, None, "please").await;
+    until_event(&hub, &conv, "the thread stopped on the approval timeout", |e| {
+        matches!(&e.body, EventBody::ThreadFinished { status, summary }
+            if status == "stopped" && summary == "Stopped: no answer to an approval within 1 second.")
+    })
+    .await;
+
+    let events = hub.db.events(&conv, 0, None);
+    let notices = texts_of(&events, |b| match b {
+        EventBody::ThreadActivity { event: AgentEvent::Notice { text } } => Some(text.as_str()),
+        _ => None,
+    });
+    assert_eq!(notices, vec!["No answer within 1 second; stopping the thread."]);
+    assert_eq!(
+        events.iter().filter(|e| matches!(e.body, EventBody::ApprovalResolved { approved: false, .. })).count(),
+        1
+    );
+    let outputs = texts_of(&events, |b| match b {
+        EventBody::ThreadActivity { event: AgentEvent::ToolResult { output, .. } } => Some(output.as_str()),
+        _ => None,
+    });
+    assert_eq!(outputs, vec!["Not run: no answer within 1 second"]);
+    assert_eq!(hub.db.threads(Some(&conv))[0].status, "stopped");
+
+    drop(hub);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_waits_forever_unless_a_timeout_is_set() {
+    let (dir, hub) = setup("approval-off", approval_script(0), Limits::default());
+    manual_list_files(&hub);
+    let conv = chat(&hub, None, "please").await;
+    until_event(&hub, &conv, "the call is waiting for approval", |e| {
+        matches!(e.body, EventBody::ApprovalRequested { .. })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let events = hub.db.events(&conv, 0, None);
+    assert!(
+        events.iter().all(|e| !matches!(e.body, EventBody::ApprovalResolved { .. })),
+        "no timeout by default: {events:?}"
+    );
+    assert!(
+        events.iter().all(|e| !matches!(e.body, EventBody::ThreadActivity { event: AgentEvent::ToolResult { .. } })),
+        "the call has not been answered"
+    );
+    let threads = hub.db.threads(Some(&conv));
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].status, "running");
+
+    hub.stop_thread(&threads[0].id, "user").await.unwrap();
     drop(hub);
     std::fs::remove_dir_all(dir).ok();
 }

@@ -78,13 +78,22 @@ pub(crate) struct HandoverAckRoute {
     pub(crate) tx: mpsc::Sender<(String, bool, Option<String>)>,
 }
 
+/// What the hub tells whoever is waiting on an approval.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ApprovalAnswer {
+    Allow,
+    Deny,
+    /// Nobody answered within `secs`.
+    TimedOut { secs: u64 },
+}
+
 /// Where to send the answer to an approval request.
 pub(crate) struct ApprovalRoute {
     pub(crate) device_id: String,
     pub(crate) conversation_id: String,
     pub(crate) thread_id: String,
-    /// Set for threads running on the hub itself.
-    pub(crate) local: Option<oneshot::Sender<bool>>,
+    /// Set for threads running on the hub itself (and for the hub's hand-over copy).
+    pub(crate) local: Option<oneshot::Sender<ApprovalAnswer>>,
 }
 
 pub struct Hub {
@@ -320,11 +329,14 @@ impl Hub {
         let Some(route) = self.approvals.lock().await.remove(approval_id) else { return false };
         match route.local {
             Some(tx) => {
-                let _ = tx.send(approved);
+                let _ = tx.send(if approved { ApprovalAnswer::Allow } else { ApprovalAnswer::Deny });
             }
             None => {
-                self.send_to(&route.device_id, HubMessage::ApprovalResult { approval_id: approval_id.into(), approved })
-                    .await;
+                self.send_to(
+                    &route.device_id,
+                    HubMessage::ApprovalResult { approval_id: approval_id.into(), approved, timeout_secs: None },
+                )
+                .await;
             }
         }
         self.emit(

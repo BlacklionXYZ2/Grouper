@@ -4,15 +4,17 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
-use core_agent::thread::{ThreadHost, spawn_thread};
+use core_agent::thread::{ApprovalDecision, ThreadHost, approval_timeout_phrase, spawn_thread};
 use core_agent::tools::{Workspace, file_tools};
-use core_protocol::{AgentEvent, EventBody, FolderInfo, FolderMode, HubMessage, ThreadInfo, ThreadSpec};
+use core_protocol::{
+    AgentEvent, ApprovalTimeoutAction, EventBody, FolderInfo, FolderMode, HubMessage, ThreadInfo, ThreadSpec,
+};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::offline::WAITING_DEVICE;
 use crate::orchestrator::Wake;
-use crate::server::{ApprovalRoute, HUB_DEVICE, Hub};
+use crate::server::{ApprovalAnswer, ApprovalRoute, HUB_DEVICE, Hub};
 
 /// What the orchestrator asks for when it starts a thread.
 #[derive(Debug, Default)]
@@ -151,6 +153,7 @@ impl Hub {
             permissions: self.db.permissions(&device_id),
             max_turns: MAX_THREAD_TURNS,
             device_name: device_name.clone(),
+            ask_timeout_secs: self.db.limits().ask_timeout_secs,
         };
 
         if on_hub {
@@ -251,14 +254,14 @@ impl Hub {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_approval(
-        &self,
+        self: &Arc<Self>,
         device_id: &str,
         thread_id: &str,
         approval_id: &str,
         tool: &str,
         input: Value,
         reason: &str,
-        local: Option<oneshot::Sender<bool>>,
+        local: Option<oneshot::Sender<ApprovalAnswer>>,
     ) {
         let Some(t) = self.db.thread(thread_id) else { return };
         self.approvals.lock().await.insert(
@@ -281,6 +284,73 @@ impl Hub {
                 reason: reason.into(),
             },
         );
+        // The limit at request time. Turning it off before the timer fires leaves
+        // the approval pending (`approval_timed_out` checks again).
+        if let Some(secs) = self.db.limits().approval_timeout_secs {
+            let hub = Arc::clone(self);
+            let approval_id = approval_id.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                hub.approval_timed_out(approval_id, secs).await;
+            });
+        }
+    }
+
+    /// The timer for one approval. Does nothing if that approval was already resolved
+    /// or cleared, or if the timeout has since been turned off.
+    pub(crate) async fn approval_timed_out(self: &Arc<Self>, approval_id: String, secs: u64) {
+        if self.db.limits().approval_timeout_secs.is_none() {
+            return;
+        }
+        let Some(route) = self.approvals.lock().await.remove(&approval_id) else { return };
+        let action = self.db.limits().approval_timeout_action;
+        let phrase = approval_timeout_phrase(secs);
+        tracing::info!(approval_id, thread = %route.thread_id, secs, action = action.as_str(), "approval timed out");
+        match route.local {
+            Some(tx) => {
+                let _ = tx.send(ApprovalAnswer::TimedOut { secs });
+            }
+            None => {
+                self.send_to(
+                    &route.device_id,
+                    HubMessage::ApprovalResult {
+                        approval_id: approval_id.clone(),
+                        approved: false,
+                        timeout_secs: Some(secs),
+                    },
+                )
+                .await;
+            }
+        }
+        self.emit(
+            &route.conversation_id,
+            Some(&route.thread_id),
+            EventBody::ApprovalResolved { approval_id: approval_id.clone(), approved: false },
+        );
+        let text = if action == ApprovalTimeoutAction::Stop {
+            format!("No answer within {phrase}; stopping the thread.")
+        } else {
+            format!("No answer within {phrase}; the call was denied.")
+        };
+        self.emit(
+            &route.conversation_id,
+            Some(&route.thread_id),
+            EventBody::ThreadActivity { event: AgentEvent::Notice { text } },
+        );
+        if action == ApprovalTimeoutAction::Stop {
+            let summary = format!("Stopped: no answer to an approval within {phrase}.");
+            let id = route.thread_id.clone();
+            if self.stop_thread_as(&id, "approval", &summary).await.is_err() {
+                return;
+            }
+            if let Some(t) = self.db.thread(&id) {
+                self.wake(
+                    &t.conversation_id,
+                    Wake::ThreadDone { thread_id: t.id, title: t.title, status: "stopped".into(), summary },
+                )
+                .await;
+            }
+        }
     }
 
     pub(crate) async fn thread_ask(self: &Arc<Self>, thread_id: &str, question: &str) {
@@ -341,7 +411,8 @@ impl Hub {
         self.stop_thread_as(thread_id, by, &format!("Stopped by the {by}.")).await
     }
 
-    /// Stop with the given summary; `by` is `user`, `orchestrator` or `budget` (`limits.rs`).
+    /// Stop with the given summary; `by` is `user`, `orchestrator`, `budget` (`limits.rs`)
+    /// or `approval` (an approval timeout whose action is stop).
     pub(crate) async fn stop_thread_as(self: &Arc<Self>, thread_id: &str, by: &str, summary: &str) -> Result<(), String> {
         let t = self.db.thread(thread_id).ok_or("no such thread")?;
         let summary = summary.to_string();
@@ -407,13 +478,17 @@ impl ThreadHost for HubHost {
         }
     }
 
-    async fn approve(&self, thread_id: &str, tool: &str, input: &Value, reason: &str) -> bool {
-        let Some(hub) = self.hub.upgrade() else { return false };
+    async fn approve(&self, thread_id: &str, tool: &str, input: &Value, reason: &str) -> ApprovalDecision {
+        let Some(hub) = self.hub.upgrade() else { return ApprovalDecision::Denied };
         let approval_id = format!("a{}", hub.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         hub.request_approval(HUB_DEVICE, thread_id, &approval_id, tool, input.clone(), reason, Some(tx)).await;
         drop(hub);
-        rx.await.unwrap_or(false)
+        match rx.await {
+            Ok(ApprovalAnswer::Allow) => ApprovalDecision::Approved,
+            Ok(ApprovalAnswer::TimedOut { secs }) => ApprovalDecision::TimedOut { secs },
+            _ => ApprovalDecision::Denied,
+        }
     }
 
     fn ask_orchestrator(&self, thread_id: &str, question: &str) {

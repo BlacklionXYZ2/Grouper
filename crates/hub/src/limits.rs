@@ -18,6 +18,11 @@
 //!   UTC day; again if the limit changes).
 //! - **Routing**: a thread with a budget prefers cheaper models among otherwise equal
 //!   ones when the orchestrator doesn't name a model (`Db::route_model_with`).
+//! - **Approval timeout**: `approval_timeout_secs` (off until set; a pending approval
+//!   then resolves as denied) and `approval_timeout_action` (`deny`, the default, or
+//!   `stop`). See `threads.rs`.
+//! - **Ask timeout**: `ask_timeout_secs` (default 1800; off waits forever), passed to
+//!   each thread on its [`core_protocol::ThreadSpec`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,7 +32,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use core_protocol::{DEFAULT_WARN_AT_FRACTION, EventBody, LIMIT_KEYS, Limits, LimitsReport, ThreadInfo};
+use core_protocol::{
+    ApprovalTimeoutAction, DEFAULT_WARN_AT_FRACTION, EventBody, LIMIT_KEYS, Limits, LimitsReport, ThreadInfo,
+};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
@@ -104,10 +111,33 @@ pub fn effective_thread_budget(asked: Option<f64>, account: Option<f64>) -> Opti
     }
 }
 
+/// Stored for `ask_timeout_secs` when the user turns it off (wait forever).
+const ASK_FOREVER: f64 = -1.0;
+/// Stored for `approval_timeout_action` = stop. No row means deny.
+const ACTION_STOP: f64 = 1.0;
+
+fn whole_secs(key: &str, n: f64) -> Result<u64, String> {
+    if n >= 1.0 && n.fract() == 0.0 && n <= f64::from(u32::MAX) {
+        Ok(n as u64)
+    } else {
+        Err(format!("{key} must be a whole number of seconds, 1 or more (or off)"))
+    }
+}
+
 /// Apply `PUT /v1/limits` changes (key → number, or null to turn it off) to `current`.
 pub fn apply_changes(current: &Limits, changes: &Map<String, Value>) -> Result<Limits, String> {
     let mut l = current.clone();
     for (key, value) in changes {
+        if key == "approval_timeout_action" {
+            l.approval_timeout_action = match value {
+                Value::Null => ApprovalTimeoutAction::Deny,
+                Value::String(s) => ApprovalTimeoutAction::parse(s).ok_or_else(|| {
+                    "approval_timeout_action must be deny or stop (or off)".to_string()
+                })?,
+                _ => return Err("approval_timeout_action must be deny or stop (or off)".into()),
+            };
+            continue;
+        }
         let n = match value {
             Value::Null => None,
             v => Some(v.as_f64().ok_or_else(|| format!("{key} must be a number, or null to turn it off"))?),
@@ -156,6 +186,8 @@ pub fn apply_changes(current: &Limits, changes: &Map<String, Value>) -> Result<L
                     })
                     .transpose()?;
             }
+            "approval_timeout_secs" => l.approval_timeout_secs = n.map(|n| whole_secs(key, n)).transpose()?,
+            "ask_timeout_secs" => l.ask_timeout_secs = n.map(|n| whole_secs(key, n)).transpose()?,
             _ => return Err(format!("unknown limit {key:?}; the limits are {}", LIMIT_KEYS.join(", "))),
         }
     }
@@ -251,6 +283,15 @@ impl Db {
                 "conversation_budget_usd" => l.conversation_budget_usd = Some(value),
                 "daily_budget_usd" => l.daily_budget_usd = Some(value),
                 "warn_at_fraction" => l.warn_at_fraction = Some(value),
+                "approval_timeout_secs" if value >= 1.0 && value.fract() == 0.0 => {
+                    l.approval_timeout_secs = Some(value as u64);
+                }
+                "approval_timeout_action" if value == ACTION_STOP => {
+                    l.approval_timeout_action = ApprovalTimeoutAction::Stop;
+                }
+                // -1 is "off": wait forever. Anything else invalid keeps the default.
+                "ask_timeout_secs" if value < 0.0 => l.ask_timeout_secs = None,
+                "ask_timeout_secs" if value >= 1.0 && value.fract() == 0.0 => l.ask_timeout_secs = Some(value as u64),
                 _ => {}
             }
         }
@@ -266,6 +307,18 @@ impl Db {
             ("conversation_budget_usd", l.conversation_budget_usd),
             ("daily_budget_usd", l.daily_budget_usd),
             ("warn_at_fraction", l.warn_at_fraction),
+            ("approval_timeout_secs", l.approval_timeout_secs.map(|n| n as f64)),
+            (
+                "approval_timeout_action",
+                (l.approval_timeout_action == ApprovalTimeoutAction::Stop).then_some(ACTION_STOP),
+            ),
+            (
+                "ask_timeout_secs",
+                Some(match l.ask_timeout_secs {
+                    Some(n) => n as f64,
+                    None => ASK_FOREVER,
+                }),
+            ),
         ];
         let mut c = self.c();
         let tx = c.transaction()?;
@@ -691,6 +744,22 @@ mod tests {
         let l = apply_changes(&l, &changes(json!({"thread_budget_usd": null, "warn_at_fraction": null}))).unwrap();
         assert_eq!((l.thread_budget_usd, l.max_running_threads), (None, Some(3)));
         assert_eq!(warn_fraction(&l), DEFAULT_WARN_AT_FRACTION);
+        let l = apply_changes(
+            &Limits::default(),
+            &changes(json!({"approval_timeout_secs": 60, "approval_timeout_action": "stop", "ask_timeout_secs": 12})),
+        )
+        .unwrap();
+        assert_eq!(l.approval_timeout_secs, Some(60));
+        assert_eq!(l.approval_timeout_action, core_protocol::ApprovalTimeoutAction::Stop);
+        assert_eq!(l.ask_timeout_secs, Some(12));
+        let l = apply_changes(
+            &l,
+            &changes(json!({"approval_timeout_secs": null, "approval_timeout_action": "Deny", "ask_timeout_secs": null})),
+        )
+        .unwrap();
+        assert_eq!(l.approval_timeout_secs, None);
+        assert_eq!(l.approval_timeout_action, core_protocol::ApprovalTimeoutAction::Deny);
+        assert_eq!(l.ask_timeout_secs, None, "off waits forever, it does not restore 1800");
         for bad in [
             json!({"max_running_threads": 0}),
             json!({"max_running_threads": 1.5}),
@@ -700,6 +769,11 @@ mod tests {
             json!({"warn_at_fraction": 1.5}),
             json!({"warn_at_fraction": 0}),
             json!({"monthly_budget_usd": 5}),
+            json!({"approval_timeout_secs": 0}),
+            json!({"approval_timeout_secs": 1.5}),
+            json!({"ask_timeout_secs": -5}),
+            json!({"approval_timeout_action": "allow"}),
+            json!({"approval_timeout_action": 1}),
         ] {
             assert!(apply_changes(&Limits::default(), &changes(bad.clone())).is_err(), "{bad}");
         }
@@ -789,6 +863,9 @@ mod tests {
             conversation_budget_usd: Some(2.0),
             daily_budget_usd: Some(10.0),
             warn_at_fraction: Some(0.5),
+            approval_timeout_secs: Some(120),
+            approval_timeout_action: core_protocol::ApprovalTimeoutAction::Stop,
+            ask_timeout_secs: None,
         };
         db.set_limits(&l).unwrap();
         assert_eq!(db.limits(), l);
@@ -825,6 +902,192 @@ mod tests {
         db.set_limits(&Limits::default()).unwrap();
         assert_eq!(db.limits(), Limits::default());
         drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn scripted_hub(tag: &str) -> (std::path::PathBuf, std::sync::Arc<crate::server::Hub>) {
+        use core_protocol::{ModelEntry, ProviderConfig};
+        let dir = std::env::temp_dir().join(format!("grouper-limits-{tag}-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "p".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"inline": {"default": [{"type": "text", "text": "OK"}]}}),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "m".into(),
+            provider_id: "p".into(),
+            model: "fake".into(),
+            input_price: 0.0,
+            output_price: 0.0,
+            cache_read_price: None,
+            cache_write_price: None,
+            context_window: 0,
+            use_cases: String::new(),
+            free: true,
+            roles: vec!["orchestrator".into(), "thread".into()],
+            local: false,
+            modalities: vec![],
+        })
+        .unwrap();
+        let hub = crate::server::Hub::new(db, dir.clone());
+        (dir, hub)
+    }
+
+    #[tokio::test]
+    async fn ask_timeout_is_passed_on_the_thread_spec() {
+        use core_protocol::{HubMessage, DEFAULT_ASK_TIMEOUT_SECS};
+        use crate::server::{CloseHandle, Live};
+        use crate::threads::ThreadRequest;
+
+        let (dir, hub) = scripted_hub("ask-spec");
+        let (device, _) = hub.db.add_device("Mac", "macos", false).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (close, _close_rx) = CloseHandle::new();
+        let (_closed_tx, closed) = tokio::sync::watch::channel(false);
+        hub.live.lock().await.insert(
+            device.id.clone(),
+            Live { conn_id: 1, tx, tools: vec![], mcp: None, close, closed },
+        );
+        let conv = hub.db.create_conversation("project", "ask").unwrap();
+        let start = |hub: std::sync::Arc<crate::server::Hub>, conv: String, device: String| async move {
+            hub.start_thread(
+                &conv,
+                ThreadRequest { title: "T".into(), device, goal: "Look it up.".into(), ..Default::default() },
+            )
+            .await
+            .unwrap()
+        };
+        start(hub.clone(), conv.clone(), device.id.clone()).await;
+        match rx.recv().await.unwrap() {
+            HubMessage::StartThread { spec } => assert_eq!(spec.ask_timeout_secs, Some(DEFAULT_ASK_TIMEOUT_SECS)),
+            other => panic!("expected StartThread, got {other:?}"),
+        }
+
+        let mut limits = hub.db.limits();
+        limits.ask_timeout_secs = Some(12);
+        hub.db.set_limits(&limits).unwrap();
+        start(hub.clone(), conv.clone(), device.id.clone()).await;
+        match rx.recv().await.unwrap() {
+            HubMessage::StartThread { spec } => assert_eq!(spec.ask_timeout_secs, Some(12)),
+            other => panic!("expected StartThread, got {other:?}"),
+        }
+
+        limits.ask_timeout_secs = None;
+        hub.db.set_limits(&limits).unwrap();
+        start(hub.clone(), conv, device.id).await;
+        match rx.recv().await.unwrap() {
+            HubMessage::StartThread { spec } => assert_eq!(spec.ask_timeout_secs, None),
+            other => panic!("expected StartThread, got {other:?}"),
+        }
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_approval_timeout_is_single_use_for_hub_and_device_threads() {
+        use core_protocol::{EventBody, HubMessage};
+        use crate::server::{ApprovalAnswer, ApprovalRoute, CloseHandle, HUB_DEVICE, Live};
+
+        let (dir, hub) = scripted_hub("approval-once");
+        let (device, _) = hub.db.add_device("Mac", "macos", false).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (close, _close_rx) = CloseHandle::new();
+        let (_closed_tx, closed) = tokio::sync::watch::channel(false);
+        hub.live.lock().await.insert(
+            device.id.clone(),
+            Live { conn_id: 1, tx, tools: vec![], mcp: None, close, closed },
+        );
+        let conv = hub.db.create_conversation("project", "approvals").unwrap();
+        let on_device = hub.db.create_thread(&conv, "D", &device.id, "m", None, "brief").unwrap();
+        let on_hub = hub.db.create_thread(&conv, "H", HUB_DEVICE, "m", None, "brief").unwrap();
+
+        let resolved = || {
+            hub.db.events(&conv, 0, None).iter().filter(|e| matches!(e.body, EventBody::ApprovalResolved { .. })).count()
+        };
+        let insert = |id: &str, thread: &str, device_id: &str, local| {
+            let id = id.to_string();
+            let route = ApprovalRoute {
+                device_id: device_id.to_string(),
+                conversation_id: conv.clone(),
+                thread_id: thread.to_string(),
+                local,
+            };
+            let hub = hub.clone();
+            let id2 = id.clone();
+            async move {
+                hub.approvals.lock().await.insert(id2, route);
+            }
+        };
+
+        // Off: a stale timer must not resolve it.
+        insert("a-off", &on_device.id, &device.id, None).await;
+        hub.approval_timed_out("a-off".into(), 30).await;
+        assert!(hub.approvals.lock().await.contains_key("a-off"));
+        assert_eq!(resolved(), 0);
+        assert!(rx.try_recv().is_err());
+
+        let mut limits = hub.db.limits();
+        limits.approval_timeout_secs = Some(30);
+        hub.db.set_limits(&limits).unwrap();
+        hub.approval_timed_out("a-off".into(), 30).await;
+        match rx.try_recv().unwrap() {
+            HubMessage::ApprovalResult { approval_id, approved, timeout_secs } => {
+                assert_eq!((approval_id.as_str(), approved, timeout_secs), ("a-off", false, Some(30)));
+            }
+            other => panic!("expected ApprovalResult, got {other:?}"),
+        }
+        assert_eq!(resolved(), 1);
+        let notices: Vec<_> = hub
+            .db
+            .events(&conv, 0, None)
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ThreadActivity { event: core_protocol::AgentEvent::Notice { text } } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices, vec!["No answer within 30 seconds; the call was denied.".to_string()]);
+        // Already resolved: a second pass does not send again.
+        hub.approval_timed_out("a-off".into(), 30).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(resolved(), 1);
+        assert!(!hub.resolve_approval("a-off", true).await);
+
+        // Answered by the user first.
+        insert("a-user", &on_device.id, &device.id, None).await;
+        assert!(hub.resolve_approval("a-user", true).await);
+        match rx.try_recv().unwrap() {
+            HubMessage::ApprovalResult { approval_id, approved, timeout_secs } => {
+                assert_eq!((approval_id.as_str(), approved, timeout_secs), ("a-user", true, None));
+            }
+            other => panic!("expected ApprovalResult, got {other:?}"),
+        }
+        hub.approval_timed_out("a-user".into(), 30).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(resolved(), 2);
+
+        // Cleared because the thread was stopped.
+        let stopped = hub.db.create_thread(&conv, "S", &device.id, "m", None, "brief").unwrap();
+        insert("a-cleared", &stopped.id, &device.id, None).await;
+        hub.stop_thread(&stopped.id, "user").await.unwrap();
+        assert!(rx.try_recv().is_ok(), "StopThread");
+        hub.approval_timed_out("a-cleared".into(), 30).await;
+        assert!(rx.try_recv().is_err(), "a cleared approval is not resolved");
+        assert_eq!(resolved(), 2);
+
+        // Hub thread: the waiter hears the timeout, once.
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+        insert("a-hub", &on_hub.id, HUB_DEVICE, Some(answer_tx)).await;
+        hub.approval_timed_out("a-hub".into(), 30).await;
+        assert_eq!(answer_rx.await.unwrap(), ApprovalAnswer::TimedOut { secs: 30 });
+        hub.approval_timed_out("a-hub".into(), 30).await;
+        assert_eq!(resolved(), 3);
+
+        drop(hub);
         std::fs::remove_dir_all(dir).ok();
     }
 }

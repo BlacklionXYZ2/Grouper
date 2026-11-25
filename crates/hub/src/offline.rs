@@ -42,7 +42,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::db::{Db, now};
 use crate::orchestrator::Wake;
-use crate::server::{HUB_DEVICE, HandoverAckRoute, Hub};
+use crate::server::{ApprovalAnswer, HUB_DEVICE, HandoverAckRoute, Hub};
 use crate::threads::{HubHost, MAX_THREAD_TURNS, thread_system};
 
 /// Thread status while its device is offline.
@@ -442,6 +442,7 @@ impl Hub {
             permissions: self.db.permissions(HUB_DEVICE),
             max_turns: MAX_THREAD_TURNS,
             device_name: "Hub".into(),
+            ask_timeout_secs: self.db.limits().ask_timeout_secs,
         };
         let host = Arc::new(HubHost { hub: Arc::downgrade(self) });
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());
@@ -544,7 +545,7 @@ impl Hub {
             let reason = format!("copy {} file(s) the hub prepared into this thread's workspace on {device}", files.len());
             let input = json!({"files": names, "bytes": total});
             self.request_approval(&t.device_id, thread_id, &approval_id, "write_file", input, &reason, Some(tx)).await;
-            if !rx.await.unwrap_or(false) {
+            if !matches!(rx.await, Ok(ApprovalAnswer::Allow)) {
                 if !self.is_online(&t.device_id).await {
                     return Err("the device went offline during the approval".into());
                 }
@@ -656,6 +657,7 @@ impl Hub {
             permissions: self.db.permissions(&t.device_id),
             max_turns: MAX_THREAD_TURNS,
             device_name: device.clone(),
+            ask_timeout_secs: self.db.limits().ask_timeout_secs,
         };
         if !self.send_to_conn(&t.device_id, conn_id, HubMessage::StartThread { spec }).await {
             self.wait_for_device(thread_id, "the device went offline during the hand-over", true).await;

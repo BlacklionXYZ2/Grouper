@@ -140,7 +140,8 @@ enum Cmd {
     /// Saved skills: procedures that worked, reused for similar tasks.
     #[command(subcommand)]
     Skills(SkillsCmd),
-    /// Limits on running threads and on (estimated) spending. All off unless you set them.
+    /// Limits on running threads, estimated spending, and how long an approval or
+    /// ask_orchestrator waits. Spending and approval limits are off unless you set them.
     Limits {
         #[command(subcommand)]
         cmd: Option<LimitsCmd>,
@@ -149,9 +150,12 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum LimitsCmd {
-    /// grouper limits set <key> <value|off>, e.g. `daily_budget_usd 5`, `max_running_threads 3`.
+    /// grouper limits set <key> <value|off>, e.g. `daily_budget_usd 5`, `max_running_threads 3`,
+    /// `approval_timeout_secs 600`, `approval_timeout_action stop`, `ask_timeout_secs off`.
     /// Keys: max_running_threads, max_running_threads_per_device, thread_budget_usd,
-    /// conversation_budget_usd, daily_budget_usd, warn_at_fraction (default 0.8).
+    /// conversation_budget_usd, daily_budget_usd, warn_at_fraction (default 0.8),
+    /// approval_timeout_secs (off waits forever), approval_timeout_action (deny or stop),
+    /// ask_timeout_secs (default 1800 seconds; off waits forever).
     Set { key: String, value: String },
 }
 
@@ -1039,16 +1043,26 @@ async fn main() -> Result<()> {
 }
 
 async fn limits_cmd(api: &Api, cmd: Option<LimitsCmd>) -> Result<()> {
-    use core_client::core_protocol::{LIMIT_KEYS, LimitsReport};
+    use core_client::core_protocol::{
+        ApprovalTimeoutAction, DEFAULT_ASK_TIMEOUT_SECS, LIMIT_KEYS, LimitsReport,
+    };
     let report: LimitsReport = match cmd {
         None => api.get("/v1/limits").await?,
         Some(LimitsCmd::Set { key, value }) => {
             if !LIMIT_KEYS.contains(&key.as_str()) {
                 bail!("unknown limit {key:?}; the limits are {}", LIMIT_KEYS.join(", "));
             }
-            let value = match value.trim().trim_start_matches('$') {
-                "off" | "none" | "null" => Value::Null,
-                v => json!(v.parse::<f64>().with_context(|| format!("{key} takes a number or off"))?),
+            let raw = value.trim();
+            let value = if key == "approval_timeout_action" {
+                match raw {
+                    "off" | "none" | "null" => Value::Null,
+                    v => Value::String(v.to_string()),
+                }
+            } else {
+                match raw.trim_start_matches('$') {
+                    "off" | "none" | "null" => Value::Null,
+                    v => json!(v.parse::<f64>().with_context(|| format!("{key} takes a number or off"))?),
+                }
             };
             serde_json::from_value(api.put("/v1/limits", &serde_json::Map::from_iter([(key, value)])).await?)?
         }
@@ -1064,6 +1078,19 @@ async fn limits_cmd(api: &Api, cmd: Option<LimitsCmd>) -> Result<()> {
     println!("daily_budget_usd                {}", money(l.daily_budget_usd));
     let default = if l.warn_at_fraction.is_none() { " (default)" } else { "" };
     println!("warn_at_fraction                {}{default}", report.warn_at_fraction);
+    println!(
+        "{:<31}  {}",
+        "approval_timeout_secs",
+        l.approval_timeout_secs.map(|n| n.to_string()).unwrap_or_else(off)
+    );
+    let action_note = if l.approval_timeout_action == ApprovalTimeoutAction::Deny { " (default)" } else { "" };
+    println!("{:<31}  {}{action_note}", "approval_timeout_action", l.approval_timeout_action.as_str());
+    let ask = match l.ask_timeout_secs {
+        Some(n) if n == DEFAULT_ASK_TIMEOUT_SECS => format!("{n} (default)"),
+        Some(n) => n.to_string(),
+        None => off(),
+    };
+    println!("{:<31}  {ask}", "ask_timeout_secs");
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let left = report.day_resets_at.saturating_sub(now);
     println!(

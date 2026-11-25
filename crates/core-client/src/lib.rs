@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use core_agent::folders::{FolderSpec, Folders};
-use core_agent::thread::{ThreadControl, ThreadHost, spawn_thread};
+use core_agent::thread::{ApprovalDecision, ThreadControl, ThreadHost, spawn_thread};
 use core_agent::tools::{Workspace, file_tools, shell_tool};
 use core_agent::{Tool, ToolOutput};
 use core_protocol::{
@@ -150,7 +150,7 @@ struct Threads {
     out: mpsc::Sender<NodeMessage>,
     on_overflow: Arc<dyn Fn() + Send + Sync>,
     controls: Mutex<HashMap<String, ThreadControl>>,
-    approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    approvals: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
     providers: Mutex<Vec<ProviderConfig>>,
     next: AtomicU64,
     /// Set once the connection is gone: no new threads or approvals.
@@ -204,13 +204,13 @@ impl ThreadHost for Threads {
     fn emit(&self, thread_id: &str, event: AgentEvent) {
         self.send(NodeMessage::ThreadEvent { thread_id: thread_id.into(), event });
     }
-    async fn approve(&self, thread_id: &str, tool: &str, input: &Value, reason: &str) -> bool {
+    async fn approve(&self, thread_id: &str, tool: &str, input: &Value, reason: &str) -> ApprovalDecision {
         let approval_id = format!("{thread_id}-a{}", self.next.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         {
             let mut approvals = self.approvals.lock().unwrap();
             if self.closed.load(Ordering::SeqCst) {
-                return false;
+                return ApprovalDecision::Denied;
             }
             approvals.insert(approval_id.clone(), tx);
         }
@@ -221,7 +221,7 @@ impl ThreadHost for Threads {
             input: input.clone(),
             reason: reason.into(),
         });
-        rx.await.unwrap_or(false)
+        rx.await.unwrap_or(ApprovalDecision::Denied)
     }
     fn ask_orchestrator(&self, thread_id: &str, question: &str) {
         self.send(NodeMessage::AskOrchestrator { thread_id: thread_id.into(), question: question.into() });
@@ -429,9 +429,16 @@ async fn connect_once(
                         let prefix = format!("{thread_id}-a");
                         threads.approvals.lock().unwrap().retain(|id, _| !id.starts_with(&prefix));
                     }
-                    Ok(HubMessage::ApprovalResult { approval_id, approved }) => {
+                    Ok(HubMessage::ApprovalResult { approval_id, approved, timeout_secs }) => {
                         if let Some(tx) = threads.approvals.lock().unwrap().remove(&approval_id) {
-                            let _ = tx.send(approved);
+                            let decision = if approved {
+                                ApprovalDecision::Approved
+                            } else if let Some(secs) = timeout_secs {
+                                ApprovalDecision::TimedOut { secs }
+                            } else {
+                                ApprovalDecision::Denied
+                            };
+                            let _ = tx.send(decision);
                         }
                     }
                     // Written before the thread's StartThread, which follows on this connection.
@@ -501,6 +508,7 @@ mod tests {
             permissions: HashMap::from([("list_files".to_string(), Permission::Manual)]),
             max_turns: 5,
             device_name: "Laptop".into(),
+            ask_timeout_secs: Some(core_protocol::DEFAULT_ASK_TIMEOUT_SECS),
         };
         let host: Arc<dyn ThreadHost> = threads.clone();
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());
@@ -524,7 +532,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(Arc::strong_count(&threads), 1);
         // A late approval request is denied at once.
-        assert!(!threads.approve("t1", "list_files", &json!({}), "late").await);
+        assert_eq!(threads.approve("t1", "list_files", &json!({}), "late").await, ApprovalDecision::Denied);
         std::fs::remove_dir_all(dir).ok();
     }
 }

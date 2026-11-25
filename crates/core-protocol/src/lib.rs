@@ -202,7 +202,14 @@ pub enum HubMessage {
     /// A message for a running thread, from the orchestrator or the user.
     ThreadInput { thread_id: String, from: String, text: String },
     StopThread { thread_id: String },
-    ApprovalResult { approval_id: String, approved: bool },
+    ApprovalResult {
+        approval_id: String,
+        approved: bool,
+        /// Set when the hub denied the call because nobody answered in time.
+        /// Older devices ignore the field and treat it as an ordinary denial.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
     /// Offline hand-over: a file the hub prepared for a thread while this device was
     /// away. Write it into that thread's workspace (`path` is workspace-relative, with
     /// `/`) before the thread's `StartThread`, which follows on the same connection.
@@ -318,6 +325,18 @@ pub struct ThreadSpec {
     /// The device's name as the hub knows it, for approval reasons (`writes to @docs on Laptop`).
     #[serde(default)]
     pub device_name: String,
+    /// How long `ask_orchestrator` waits, in seconds. Missing on a spec from an older
+    /// hub means [`DEFAULT_ASK_TIMEOUT_SECS`], so those devices keep today's 30 minutes.
+    /// `null` waits forever.
+    #[serde(default = "default_ask_timeout_secs")]
+    pub ask_timeout_secs: Option<u64>,
+}
+
+/// How long `ask_orchestrator` waits when the account hasn't changed it.
+pub const DEFAULT_ASK_TIMEOUT_SECS: u64 = 30 * 60;
+
+fn default_ask_timeout_secs() -> Option<u64> {
+    Some(DEFAULT_ASK_TIMEOUT_SECS)
 }
 
 /// What an agent loop did, reported as it happens.
@@ -565,10 +584,40 @@ pub struct UsageSnapshot {
     pub fetched_at: u64,
 }
 
-/// Account limits on running threads and estimated spending (`GET`/`PUT /v1/limits`).
-/// Every field is optional and `None` means no limit, which is the default. `PUT`
-/// takes a JSON object with only the keys to change; `null` turns one off.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+/// What the hub does when [`Limits::approval_timeout_secs`] elapses.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalTimeoutAction {
+    /// Resolve the approval as denied. The thread keeps going.
+    #[default]
+    Deny,
+    /// Resolve the approval as denied and stop the thread.
+    Stop,
+}
+
+impl ApprovalTimeoutAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Stop => "stop",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "deny" => Some(Self::Deny),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// Account limits (`GET`/`PUT /v1/limits`). `PUT` takes a JSON object with only the
+/// keys to change; `null` turns one off.
+///
+/// Spending caps, running-thread caps and `approval_timeout_secs` are off (`None`)
+/// until set. `ask_timeout_secs` defaults to [`DEFAULT_ASK_TIMEOUT_SECS`]; `None`
+/// waits forever. `approval_timeout_action` defaults to deny.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Threads running at once across the account (hub parts of threads waiting for
@@ -590,6 +639,34 @@ pub struct Limits {
     /// Warn when spend reaches this fraction of a budget. `None` means [`DEFAULT_WARN_AT_FRACTION`].
     #[serde(default)]
     pub warn_at_fraction: Option<f64>,
+    /// How long a pending approval waits, in seconds. `None` (the default) waits until
+    /// the user answers or the thread stops.
+    #[serde(default)]
+    pub approval_timeout_secs: Option<u64>,
+    /// What happens when [`Self::approval_timeout_secs`] elapses. `deny` (the default)
+    /// leaves the thread running; `stop` stops it.
+    #[serde(default)]
+    pub approval_timeout_action: ApprovalTimeoutAction,
+    /// How long `ask_orchestrator` waits, in seconds. `None` waits forever. Absent
+    /// means [`DEFAULT_ASK_TIMEOUT_SECS`].
+    #[serde(default = "default_ask_timeout_secs")]
+    pub ask_timeout_secs: Option<u64>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_running_threads: None,
+            max_running_threads_per_device: None,
+            thread_budget_usd: None,
+            conversation_budget_usd: None,
+            daily_budget_usd: None,
+            warn_at_fraction: None,
+            approval_timeout_secs: None,
+            approval_timeout_action: ApprovalTimeoutAction::Deny,
+            ask_timeout_secs: default_ask_timeout_secs(),
+        }
+    }
 }
 
 pub const DEFAULT_WARN_AT_FRACTION: f64 = 0.8;
@@ -602,6 +679,9 @@ pub const LIMIT_KEYS: &[&str] = &[
     "conversation_budget_usd",
     "daily_budget_usd",
     "warn_at_fraction",
+    "approval_timeout_secs",
+    "approval_timeout_action",
+    "ask_timeout_secs",
 ];
 
 /// Response of `GET`/`PUT /v1/limits`: the settings and where things stand.
@@ -944,6 +1024,52 @@ mod tests {
         assert_eq!(split_token("abc.def"), Some(("abc", "def")));
         assert_eq!(split_token("abc"), None);
         assert_eq!(split_token(".def"), None);
+    }
+
+    #[test]
+    fn ask_timeout_defaults_when_an_older_spec_omits_it() {
+        let raw = r#"{"thread_id":"t","conversation_id":"c","title":"T","provider_id":"p","model":"m","system":"","brief":"b","permissions":{},"max_turns":4}"#;
+        let spec: ThreadSpec = serde_json::from_str(raw).unwrap();
+        assert_eq!(spec.ask_timeout_secs, Some(DEFAULT_ASK_TIMEOUT_SECS));
+        let forever = serde_json::json!({
+            "thread_id": "t", "conversation_id": "c", "title": "T", "provider_id": "p", "model": "m",
+            "system": "", "brief": "b", "permissions": {}, "max_turns": 4, "ask_timeout_secs": null
+        });
+        assert_eq!(serde_json::from_value::<ThreadSpec>(forever).unwrap().ask_timeout_secs, None);
+        let custom = serde_json::json!({
+            "thread_id": "t", "conversation_id": "c", "title": "T", "provider_id": "p", "model": "m",
+            "system": "", "brief": "b", "permissions": {}, "max_turns": 4, "ask_timeout_secs": 12
+        });
+        assert_eq!(serde_json::from_value::<ThreadSpec>(custom).unwrap().ask_timeout_secs, Some(12));
+
+        let old = r#"{"type":"approval_result","approval_id":"a","approved":false}"#;
+        assert_eq!(
+            serde_json::from_str::<HubMessage>(old).unwrap(),
+            HubMessage::ApprovalResult { approval_id: "a".into(), approved: false, timeout_secs: None }
+        );
+        let timed =
+            HubMessage::ApprovalResult { approval_id: "a".into(), approved: false, timeout_secs: Some(60) };
+        let s = serde_json::to_string(&timed).unwrap();
+        assert!(s.contains(r#""timeout_secs":60"#), "{s}");
+        assert_eq!(serde_json::from_str::<HubMessage>(&s).unwrap(), timed);
+        let plain = HubMessage::ApprovalResult { approval_id: "a".into(), approved: true, timeout_secs: None };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("timeout_secs"));
+    }
+
+    #[test]
+    fn limit_defaults_keep_today_ask_wait_and_no_approval_timeout() {
+        let l: Limits = serde_json::from_str("{}").unwrap();
+        assert_eq!(l, Limits::default());
+        assert_eq!(l.ask_timeout_secs, Some(DEFAULT_ASK_TIMEOUT_SECS));
+        assert_eq!(l.approval_timeout_secs, None);
+        assert_eq!(l.approval_timeout_action, ApprovalTimeoutAction::Deny);
+        let set: Limits = serde_json::from_str(
+            r#"{"ask_timeout_secs":null,"approval_timeout_secs":30,"approval_timeout_action":"stop"}"#,
+        )
+        .unwrap();
+        assert_eq!(set.ask_timeout_secs, None);
+        assert_eq!(set.approval_timeout_secs, Some(30));
+        assert_eq!(set.approval_timeout_action, ApprovalTimeoutAction::Stop);
     }
 
     #[test]
