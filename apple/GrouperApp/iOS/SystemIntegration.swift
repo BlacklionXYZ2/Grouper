@@ -82,7 +82,8 @@ enum ApprovalNotificationCoordinator {
 
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        let approve = UNNotificationAction(identifier: "GROUPER_APPROVE", title: "Approve")
+        // Approving runs a tool on one of your devices: never from a locked phone.
+        let approve = UNNotificationAction(identifier: "GROUPER_APPROVE", title: "Approve", options: .authenticationRequired)
         let deny = UNNotificationAction(identifier: "GROUPER_DENY", title: "Deny", options: .destructive)
         let edit = UNNotificationAction(identifier: "GROUPER_EDIT", title: "Edit", options: .foreground)
         let category = UNNotificationCategory(identifier: "grouper.approval", actions: [approve, deny, edit], intentIdentifiers: [])
