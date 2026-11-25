@@ -1,6 +1,7 @@
 mod credentials;
 
-use std::io::IsTerminal;
+use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -314,12 +315,15 @@ fn print_event(e: &Event) {
     match &e.body {
         EventBody::UserMessage { text } => println!("\nyou: {text}"),
         EventBody::AssistantMessage { text } => println!("\ngrouper: {text}"),
+        // Streamed pieces; `Printer` handles these when they arrive live.
+        EventBody::AssistantDelta { text } => print!("{text}"),
         EventBody::ThreadStarted { title, device_id, model, reason, .. } => {
             let why = reason.as_ref().map(|r| format!(" ({r})")).unwrap_or_default();
             println!("  ▶ thread {t} \"{title}\" started on {device_id} with {model}{why}");
         }
         EventBody::ThreadActivity { event } => match event {
             AgentEvent::Text { text } => println!("    [{t}] {}", short(&json!(text), 200)),
+            AgentEvent::TextDelta { text } => print!("{text}"),
             AgentEvent::ToolCall { name, input, .. } => println!("    [{t}] → {name} {}", short(input, 120)),
             AgentEvent::ToolResult { name, ok, output, .. } => {
                 println!("    [{t}] {} {name}: {}", if *ok { "✓" } else { "✗" }, short(&json!(output), 120))
@@ -346,6 +350,112 @@ fn print_event(e: &Event) {
             }
         }
         EventBody::Error { message } => println!("  ⚠ {message}"),
+    }
+}
+
+/// Prints live events, showing streamed text as it arrives: the orchestrator's reply
+/// inline after `grouper: `, and thread text a whole line at a time behind the
+/// thread id, so threads streaming at once stay readable. The full message that
+/// follows streamed text isn't printed again.
+#[derive(Default)]
+struct Printer {
+    /// Put the conversation id in front (`grouper watch` across conversations).
+    show_conversation: bool,
+    /// The conversation whose reply is streaming on the current, unfinished line.
+    open: Option<String>,
+    /// `c:<conversation>` / `t:<thread>` whose current message was streamed.
+    streamed: HashSet<String>,
+    /// Thread text after its last newline, waiting for the rest of the line.
+    partial: HashMap<String, String>,
+}
+
+impl Printer {
+    fn prefix(&self, e: &Event) -> String {
+        if self.show_conversation { format!("[{}] ", e.conversation_id) } else { String::new() }
+    }
+
+    /// Finish a streaming line so other output starts on a line of its own.
+    fn close_line(&mut self) {
+        if self.open.take().is_some() {
+            println!();
+        }
+    }
+
+    fn thread_line(&mut self, e: &Event, t: &str, line: &str) {
+        self.close_line();
+        println!("{}    [{t}] {line}", self.prefix(e));
+    }
+
+    fn flush_thread(&mut self, e: &Event, t: &str) {
+        if let Some(rest) = self.partial.remove(t).filter(|r| !r.is_empty()) {
+            self.thread_line(e, t, &rest);
+        }
+    }
+
+    fn event(&mut self, e: &Event) {
+        let conv = &e.conversation_id;
+        let t = e.thread_id.clone().unwrap_or_default();
+        let (ckey, tkey) = (format!("c:{conv}"), format!("t:{t}"));
+        match &e.body {
+            EventBody::AssistantDelta { text } => {
+                if self.open.as_ref() != Some(conv) {
+                    self.close_line();
+                    if self.streamed.contains(&ckey) {
+                        // Resuming after other output (thread lines): indent under the reply.
+                        print!("{}         ", self.prefix(e));
+                    } else {
+                        print!("\n{}grouper: ", self.prefix(e));
+                    }
+                    self.open = Some(conv.clone());
+                }
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+                self.streamed.insert(ckey);
+                return;
+            }
+            EventBody::AssistantMessage { .. } if self.streamed.remove(&ckey) => {
+                if self.open.as_ref() == Some(conv) {
+                    self.close_line();
+                }
+                return;
+            }
+            EventBody::ThreadActivity { event: AgentEvent::TextDelta { text } } => {
+                self.streamed.insert(tkey);
+                let mut buf = self.partial.remove(&t).unwrap_or_default();
+                buf.push_str(text);
+                while let Some(i) = buf.find('\n') {
+                    let line: String = buf.drain(..=i).collect();
+                    self.thread_line(e, &t, line.trim_end_matches(['\n', '\r']));
+                }
+                self.partial.insert(t, buf);
+                return;
+            }
+            EventBody::ThreadActivity { event: AgentEvent::Text { .. } } if self.streamed.remove(&tkey) => {
+                self.flush_thread(e, &t);
+                return;
+            }
+            EventBody::ThreadFinished { .. } => {
+                // A stream cut short leaves a partial line and no full message.
+                self.streamed.remove(&tkey);
+                self.flush_thread(e, &t);
+            }
+            EventBody::TurnFinished { .. } | EventBody::Error { .. } if e.thread_id.is_none() => {
+                self.streamed.remove(&ckey);
+            }
+            _ => {}
+        }
+        self.close_line();
+        let p = self.prefix(e);
+        match &e.body {
+            // Keep the conversation prefix on the message's own line.
+            EventBody::UserMessage { text } => println!("\n{p}you: {text}"),
+            EventBody::AssistantMessage { text } => println!("\n{p}grouper: {text}"),
+            EventBody::TurnFinished { running_threads: 0 } => {}
+            _ => {
+                print!("{p}");
+                print_event(e);
+            }
+        }
     }
 }
 
@@ -453,11 +563,12 @@ async fn main() -> Result<()> {
             )?;
             let id = resp.conversation_id;
             println!("conversation {id}");
+            let mut printer = Printer::default();
             while let Some(e) = events.next().await {
                 if e.conversation_id != id || matches!(e.body, EventBody::UserMessage { .. }) {
                     continue;
                 }
-                print_event(&e);
+                printer.event(&e);
                 if let EventBody::TurnFinished { running_threads: 0 } = e.body {
                     let threads: Vec<ThreadInfo> = api.get(&format!("/v1/threads?conversation={id}")).await?;
                     if threads.iter().all(|t| t.status != "running") {
@@ -470,11 +581,9 @@ async fn main() -> Result<()> {
         }
         Cmd::Watch { conversation } => {
             let mut events = Box::pin(api.events(conversation.as_deref()).await?);
+            let mut printer = Printer { show_conversation: conversation.is_none(), ..Default::default() };
             while let Some(e) = events.next().await {
-                if conversation.is_none() {
-                    print!("[{}] ", e.conversation_id);
-                }
-                print_event(&e);
+                printer.event(&e);
             }
         }
         Cmd::Conversations => {

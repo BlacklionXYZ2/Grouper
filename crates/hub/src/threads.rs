@@ -165,6 +165,11 @@ impl Hub {
 
     pub(crate) fn thread_event(&self, thread_id: &str, event: AgentEvent) {
         let Some(t) = self.db.thread(thread_id) else { return };
+        if matches!(event, AgentEvent::TextDelta { .. }) {
+            // Streamed text is shown live; the full message arrives as Text and is stored.
+            self.emit_live(&t.conversation_id, Some(thread_id), EventBody::ThreadActivity { event });
+            return;
+        }
         if let AgentEvent::Usage { provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens } =
             &event
         {

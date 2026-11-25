@@ -70,7 +70,8 @@ impl Hub {
             approvals: Mutex::new(HashMap::new()),
             hub_threads: Mutex::new(HashMap::new()),
             orchestrators: Mutex::new(HashMap::new()),
-            events: broadcast::channel(1024).0,
+            // Roomy: streamed text sends many small events.
+            events: broadcast::channel(8192).0,
             next_id: AtomicU64::new(1),
         })
     }
@@ -80,6 +81,18 @@ impl Hub {
         let e = self.db.add_event(conversation_id, thread_id, body);
         let _ = self.events.send(e.clone());
         e
+    }
+
+    /// Send an event to everyone watching without storing it: streamed text, whose
+    /// full message is stored separately once complete. Live-only events have seq 0.
+    pub fn emit_live(&self, conversation_id: &str, thread_id: Option<&str>, body: EventBody) {
+        let _ = self.events.send(Event {
+            seq: 0,
+            conversation_id: conversation_id.into(),
+            thread_id: thread_id.map(String::from),
+            ts: crate::db::now(),
+            body,
+        });
     }
 
     pub async fn devices(&self) -> Vec<DeviceInfo> {
@@ -686,5 +699,112 @@ async fn delete_memory(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id)
         Ok(true) => Json(json!({"deleted": id})).into_response(),
         Ok(false) => err(StatusCode::NOT_FOUND, format!("no memory #{id}")),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_protocol::AgentEvent;
+    use serde_json::Value;
+
+    /// Streamed text reaches subscribers live, for the orchestrator and for a hub
+    /// thread, but only the full messages are stored.
+    #[tokio::test]
+    async fn deltas_are_live_only() {
+        let dir = std::env::temp_dir().join(format!("grouper-stream-test-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "s".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"inline": {"rules": [
+                {"system": "orchestrator of Grouper", "last": "go now", "reply": [
+                    {"type": "text", "text": "Starting a thread for that."},
+                    {"type": "tool_use", "name": "start_thread", "input": {"title": "T", "device": "hub", "goal": "write"}}
+                ]},
+                {"system": "You are a subagent", "reply": [{"type": "text", "text": "thread result here"}]},
+                {"system": "orchestrator of Grouper", "last": "done]", "reply": [{"type": "text", "text": "All finished."}]}
+            ], "default": []}}),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "fake".into(),
+            provider_id: "s".into(),
+            model: "fake-1".into(),
+            input_price: 0.0,
+            output_price: 0.0,
+            context_window: 0,
+            use_cases: String::new(),
+            free: true,
+            roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
+        })
+        .unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let mut rx = hub.events.subscribe();
+        let conv = hub
+            .chat(ChatRequest { conversation_id: None, mode: Some("project".into()), text: "go now".into() })
+            .await
+            .unwrap();
+
+        let mut live = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let e = rx.recv().await.unwrap();
+                let done = matches!(&e.body, EventBody::AssistantMessage { text } if text == "All finished.");
+                live.push(e);
+                if done {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("conversation finished");
+
+        let orch_deltas: String = live
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::AssistantDelta { text } => {
+                    assert_eq!((e.seq, e.thread_id.as_deref()), (0, None));
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(orch_deltas, "Starting a thread for that.All finished.");
+        let thread_deltas: String = live
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ThreadActivity { event: AgentEvent::TextDelta { text } } => {
+                    assert_eq!(e.seq, 0);
+                    assert!(e.thread_id.is_some());
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thread_deltas, "thread result here");
+
+        let stored = hub.db.events(&conv, 0, None);
+        assert!(stored.iter().all(|e| e.seq > 0));
+        assert!(!stored.iter().any(|e| matches!(
+            e.body,
+            EventBody::AssistantDelta { .. } | EventBody::ThreadActivity { event: AgentEvent::TextDelta { .. } }
+        )));
+        let texts: Vec<Value> = stored
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::AssistantMessage { text } => Some(json!(text)),
+                EventBody::ThreadActivity { event: AgentEvent::Text { text } } => Some(json!(["thread", text])),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![json!("Starting a thread for that."), json!(["thread", "thread result here"]), json!("All finished.")]
+        );
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

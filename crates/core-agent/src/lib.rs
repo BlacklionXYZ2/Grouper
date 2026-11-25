@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use core_protocol::AgentEvent;
-use providers::{Block, Message, Provider, Request, Role, StopReason, ToolDef, Usage};
+use providers::{Block, Delta, Message, Provider, Request, Role, StopReason, ToolDef, Usage};
 use serde_json::Value;
 
 pub mod permission;
@@ -132,7 +132,13 @@ pub async fn run_loop(
             tools: defs.clone(),
             max_tokens: cfg.max_tokens,
         };
-        let resp = match provider.complete(&req).await {
+        // Text reaches clients as it is generated; the full message follows as Text.
+        let on_delta = |d: Delta| {
+            if let Delta::Text(text) = d {
+                hooks.event(AgentEvent::TextDelta { text });
+            }
+        };
+        let resp = match provider.complete_stream(&req, &on_delta).await {
             Ok(r) => r,
             Err(e) => return LoopOutcome { final_text: last_text, usage, ending: Ending::Error(e.to_string()) },
         };
@@ -249,5 +255,17 @@ mod tests {
         assert_eq!(history.len(), 4);
         let results = &history[2].content;
         assert_eq!(results.len(), 2);
+
+        // The answer streamed in pieces, then arrived whole.
+        let events = rec.0.lock().unwrap();
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| if let AgentEvent::TextDelta { text } = e { Some(text.as_str()) } else { None })
+            .collect();
+        assert!(deltas.len() > 1);
+        assert_eq!(deltas.concat(), "all done");
+        let last_delta = events.iter().rposition(|e| matches!(e, AgentEvent::TextDelta { .. })).unwrap();
+        let text = events.iter().position(|e| matches!(e, AgentEvent::Text { .. })).unwrap();
+        assert!(last_delta < text);
     }
 }

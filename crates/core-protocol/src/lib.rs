@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Bumped on any breaking change to the frames below.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// WebSocket endpoint for devices, relative to the hub's base URL.
 pub const CONNECT_PATH: &str = "/v1/connect";
@@ -190,7 +190,11 @@ pub struct ThreadSpec {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// The model's full text for one turn, once the turn is complete.
     Text { text: String },
+    /// A piece of text as the model generates it. The same text arrives again in
+    /// the turn's [`AgentEvent::Text`], so a client that missed deltas loses nothing.
+    TextDelta { text: String },
     ToolCall { call_id: String, name: String, input: Value },
     ToolResult { call_id: String, name: String, ok: bool, output: String },
     Usage {
@@ -205,8 +209,13 @@ pub enum AgentEvent {
 }
 
 /// One entry in a conversation's event log.
+///
+/// Streamed text ([`EventBody::AssistantDelta`], and [`EventBody::ThreadActivity`]
+/// carrying [`AgentEvent::TextDelta`]) is live-only: it reaches clients on the event
+/// stream but is never stored, so it has `seq` 0 and doesn't appear in history.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Event {
+    /// Position in the conversation's log; 0 for live-only events.
     pub seq: i64,
     pub conversation_id: String,
     pub thread_id: Option<String>,
@@ -220,6 +229,9 @@ pub struct Event {
 pub enum EventBody {
     UserMessage { text: String },
     AssistantMessage { text: String },
+    /// Part of an assistant message as it streams (live only, never stored). The
+    /// complete text follows as an [`EventBody::AssistantMessage`].
+    AssistantDelta { text: String },
     ThreadStarted { title: String, device_id: String, model: String, reason: Option<String>, brief: String },
     ThreadActivity { event: AgentEvent },
     ThreadInput { from: String, text: String },
@@ -417,6 +429,17 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""kind":"assistant_message""#));
         assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+
+        let d = Event {
+            seq: 0,
+            conversation_id: "c".into(),
+            thread_id: Some("t1".into()),
+            ts: 0,
+            body: EventBody::ThreadActivity { event: AgentEvent::TextDelta { text: "par".into() } },
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains(r#""kind":"thread_activity","event":{"type":"text_delta","text":"par"}"#), "{s}");
+        assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), d);
     }
 
     #[test]

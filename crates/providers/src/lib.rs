@@ -14,6 +14,7 @@ use serde_json::Value;
 mod anthropic;
 mod openai;
 mod scripted;
+mod sse;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -131,9 +132,34 @@ impl ProviderError {
     }
 }
 
+/// A piece of a response as the model generates it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delta {
+    /// Visible text. Concatenated, a response's text deltas equal [`Message::text`]
+    /// of the final message (separate text blocks are joined with `\n`).
+    Text(String),
+    /// Reasoning text, when the provider shows it.
+    Thinking(String),
+}
+
+/// Receives [`Delta`]s while a response streams.
+pub type OnDelta<'a> = &'a (dyn Fn(Delta) + Send + Sync);
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn complete(&self, req: &Request) -> Result<Response, ProviderError>;
+
+    /// Like [`complete`](Provider::complete), calling `on_delta` as text arrives. The
+    /// returned [`Response`] is the same as `complete` would give. The default makes
+    /// one non-streaming call and emits the whole text once.
+    async fn complete_stream(&self, req: &Request, on_delta: OnDelta<'_>) -> Result<Response, ProviderError> {
+        let resp = self.complete(req).await?;
+        let text = resp.message.text();
+        if !text.is_empty() {
+            on_delta(Delta::Text(text));
+        }
+        Ok(resp)
+    }
 }
 
 pub fn build(cfg: &ProviderConfig) -> Result<Arc<dyn Provider>, ProviderError> {
@@ -157,6 +183,29 @@ impl Provider for Retrying {
         loop {
             match self.0.complete(req).await {
                 Err(e) if e.retryable() && attempt < 3 => {
+                    attempt += 1;
+                    tracing::warn!("provider error, retry {attempt}/3 in {delay:?}: {e}");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Retries only failures before the first delta: once text has reached the
+    /// caller, a retry would repeat it.
+    async fn complete_stream(&self, req: &Request, on_delta: OnDelta<'_>) -> Result<Response, ProviderError> {
+        let mut delay = std::time::Duration::from_secs(1);
+        let mut attempt = 0;
+        loop {
+            let emitted = std::sync::atomic::AtomicBool::new(false);
+            let forward = |d: Delta| {
+                emitted.store(true, std::sync::atomic::Ordering::Relaxed);
+                on_delta(d);
+            };
+            match self.0.complete_stream(req, &forward).await {
+                Err(e) if e.retryable() && attempt < 3 && !emitted.load(std::sync::atomic::Ordering::Relaxed) => {
                     attempt += 1;
                     tracing::warn!("provider error, retry {attempt}/3 in {delay:?}: {e}");
                     tokio::time::sleep(delay).await;
@@ -205,4 +254,58 @@ pub(crate) fn opt_bool(options: &Value, key: &str, default: bool) -> bool {
 
 pub(crate) fn opt_str<'a>(options: &'a Value, key: &str) -> Option<&'a str> {
     options.get(key).and_then(Value::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Fails with a 503 on every call; emits `before_failing` deltas first.
+    struct Flaky {
+        calls: AtomicU32,
+        before_failing: usize,
+    }
+
+    #[async_trait]
+    impl Provider for Flaky {
+        async fn complete(&self, _req: &Request) -> Result<Response, ProviderError> {
+            unreachable!()
+        }
+        async fn complete_stream(&self, _req: &Request, on_delta: OnDelta<'_>) -> Result<Response, ProviderError> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            for _ in 0..self.before_failing {
+                on_delta(Delta::Text(format!("call {n} ")));
+            }
+            Err(ProviderError::Http { provider: "p".into(), status: 503, body: String::new() })
+        }
+    }
+
+    fn req() -> Request {
+        Request { model: "m".into(), system: String::new(), messages: vec![], tools: vec![], max_tokens: 1 }
+    }
+
+    #[tokio::test]
+    async fn no_retry_after_a_delta() {
+        let inner = Arc::new(Flaky { calls: AtomicU32::new(0), before_failing: 1 });
+        let seen = Mutex::new(Vec::new());
+        let r = Retrying(inner.clone()).complete_stream(&req(), &|d| seen.lock().unwrap().push(d)).await;
+        assert!(matches!(r, Err(ProviderError::Http { status: 503, .. })));
+        assert_eq!(inner.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(seen.into_inner().unwrap(), vec![Delta::Text("call 0 ".into())]);
+    }
+
+    #[tokio::test]
+    async fn retries_before_the_first_delta() {
+        let inner = Arc::new(Flaky { calls: AtomicU32::new(0), before_failing: 0 });
+        // Three retries with 1 s, 2 s, 4 s backoff would make this test slow; stop after the first.
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            Retrying(inner.clone()).complete_stream(&req(), &|_| {}),
+        )
+        .await;
+        assert!(r.is_err(), "still retrying");
+        assert_eq!(inner.calls.load(Ordering::Relaxed), 2);
+    }
 }

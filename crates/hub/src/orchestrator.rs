@@ -229,6 +229,9 @@ impl Hooks for ConversationHooks {
             AgentEvent::Text { text } => {
                 self.hub.emit(&self.conversation_id, None, EventBody::AssistantMessage { text });
             }
+            AgentEvent::TextDelta { text } => {
+                self.hub.emit_live(&self.conversation_id, None, EventBody::AssistantDelta { text });
+            }
             AgentEvent::Usage { provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens } => {
                 self.hub.db.record_usage(
                     Some(&self.conversation_id),
