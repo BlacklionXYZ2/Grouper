@@ -10,7 +10,8 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 - **Harness**: project chat (an orchestrator that starts subagent **threads** on your
   devices or on the hub and is woken when they finish or ask something) and standard
   chat (one model). Threads run in parallel, can ask the orchestrator questions, and you
-  can message or stop any thread.
+  can message or stop any thread. A thread for an offline device works to a checkpoint
+  on the hub and continues on the device when it reconnects.
 - **MCP**: each device is an MCP server to the hub over its WebSocket, and hosts local MCP
   servers. Your subagent-chat plugin is found automatically, so threads can hand work to
   Claude Code, Codex, Antigravity, Hermes, Grok, pi, opencode and Cursor
@@ -108,6 +109,8 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 | `grouper tools list`, `grouper tools set <device> <tool> manual\|auto\|bypass` | Tool registry |
 | `grouper keys list`, `grouper keys set <provider>` | Account provider keys |
 | `grouper models list`, `grouper models add …` | Model registry |
+| `grouper models import <provider> <model>` | Add a model from the provider's catalog (OpenRouter): prices, context, modalities, drafted use cases |
+| `grouper chat --model <id>`, `grouper conversations model <id> <model\|default>` | Pin a conversation to a model |
 | `grouper models stats`, `models proposals`, `models accept\|reject <id>` | What the registry learned, and its proposals |
 | `grouper rules list\|add\|remove` | Priority rules for choosing models |
 | `grouper rate <thread> up\|down` | Rate a thread's result |

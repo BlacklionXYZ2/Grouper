@@ -55,8 +55,14 @@ The orchestrator starts a thread with a **brief**, not a transcript:
 - **Wake-ups:** your message, a thread finishing or failing, a thread asking it a
   question, or you stepping into a thread.
 - **Where:** on the device named in the brief. The hub is also a device (`hub`).
-  When a thread runs on the hub instead of its natural device (for example because
-  the device is offline), the reason is recorded on the thread.
+  When a thread runs on the hub instead of its natural device, the reason is recorded.
+- **Device offline:** the thread waits for the device (`waiting_device`). Meanwhile the hub
+  is told: "the target device is disconnected; define the next checkpoint, implement it
+  here, then stop and wait". It works to that checkpoint in a hub workspace (file tools
+  only) and writes a checkpoint report. When the device reconnects, the hub copies the
+  workspace files over (approval first if `write_file` is Manual) and the same thread
+  continues on the device from the checkpoint. A device that drops mid-thread goes the same
+  way, with its progress so far added to the brief.
 - **Workspace:** each thread gets its own folder on the device it runs on.
 - **Needs another device?** A thread calls `ask_orchestrator`. The orchestrator
   either answers itself (for example by checking `list_devices`) or starts another
@@ -151,12 +157,15 @@ the OS (`grouper login`); memory, skills, registry learning and priority rules; 
 cost reporting; MCP between devices and the hub and on each device, with the
 subagent-chat CLI agents as default device tools ([mcp.md](mcp.md)).
 
-Later: the offline-device checkpoint flow, limits on threads and spending,
+The offline-device checkpoint flow. Model rows can be imported from OpenRouter's catalog
+(prices, context, modalities; use cases drafted for you to accept), and a conversation
+can be pinned to a model.
+
+Later: limits on threads and spending,
 sandboxing hub threads (file tools only until then), the Swift apps, and a web client.
 
 ## Known gaps
 
-- A thread on a device that disconnects is marked failed; it isn't resumed.
 - Approvals have no timeout; a thread waits until you answer or stop it.
 - No limit yet on how many threads run at once, or on spending.
 - Auto's shell rules are a blocklist: they ask more than needed for ordinary words, and
