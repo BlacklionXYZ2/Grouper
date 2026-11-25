@@ -11,8 +11,13 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
   devices or on the hub and is woken when they finish or ask something) and standard
   chat (one model). Threads run in parallel, can ask the orchestrator questions, and you
   can message or stop any thread.
-- **Tools and permissions**: threads get workspace files, the shell, and the device's own
-  tools. Each device's tools are in a registry with Manual / Auto / Bypass levels that only
+- **MCP**: each device is an MCP server to the hub over its WebSocket, and hosts local MCP
+  servers. Your subagent-chat plugin is found automatically, so threads can hand work to
+  Claude Code, Codex, Antigravity, Hermes, Grok, pi, opencode and Cursor
+  (`codex__codex_chat` and so on). Add other servers in `<config dir>/grouper/mcp.json`
+  (Claude-style `mcpServers`). See [docs/mcp.md](docs/mcp.md).
+- **Tools and permissions**: threads get workspace files, the shell, the device's own
+  tools and its MCP tools. Each device's tools are in a registry with Manual / Auto / Bypass levels that only
   you can change; approvals reach every client.
 - **Streaming**: replies and thread text reach every client token by token; only full
   messages are stored.
@@ -94,7 +99,7 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 | Command | Does |
 |---|---|
 | `grouper login --hub <url>`, `grouper logout` | Store this device's token (DPAPI / Keychain), so `GROUPER_TOKEN` isn't needed |
-| `grouper connect` | Be a device: stay online, run threads here (`--workspace`, `--no-shell`) |
+| `grouper connect` | Be a device: stay online, run threads here (`--workspace`, `--no-shell`, `--mcp-config`) |
 | `grouper chat "…"` (`-c <id>`, `--standard`) | Talk to Grouper; prints replies and thread activity |
 | `grouper watch` | Live events from every conversation |
 | `grouper threads`, `grouper log <conversation>` | Threads and history |
@@ -122,6 +127,16 @@ cd apple/GrouperKit && GROUPER_TOKEN=<token> swift run grouper-mac
 
 See [deploy/README.md](deploy/README.md): a Hyper-V VM made by script, the hub in
 Docker, and a Cloudflare Tunnel to `https://grouper.clockmillbarn.uk`.
+
+## Permissions for CLI agents
+
+Agent tools (`codex__codex_chat`, `claude-code__claude_code_chat`, …) start on **Auto**:
+Grouper sets each agent's own safety option (Codex `workspace-write`, Claude Code
+`acceptEdits`, Antigravity accept-edits without all tools, Cursor sandbox on) and runs it in
+the thread's workspace. A call asks you first when it would leave the workspace, asks for
+a bypass mode, or contains clearly destructive instructions. Set the tool to **Bypass** and
+the agent runs in its own bypass mode too. Hermes, Grok and opencode have no safety option,
+so they run unconfined even on Auto.
 
 ## Notes
 

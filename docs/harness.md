@@ -148,10 +148,10 @@ project chat with asynchronous threads; standard chat; threads on devices and th
 and shell tools (PowerShell on Windows); the tool registry with Manual/Auto/Bypass and
 approvals; account keys encrypted at rest and synced to devices; device tokens stored with
 the OS (`grouper login`); memory, skills, registry learning and priority rules; usage and
-cost reporting.
+cost reporting; MCP between devices and the hub and on each device, with the
+subagent-chat CLI agents as default device tools ([mcp.md](mcp.md)).
 
-Next: MCP everywhere ([mcp.md](mcp.md)), with the subagent-chat CLI agents as default
-device tools. Later: the offline-device checkpoint flow, limits on threads and spending,
+Later: the offline-device checkpoint flow, limits on threads and spending,
 sandboxing hub threads (file tools only until then), the Swift apps, and a web client.
 
 ## Known gaps
