@@ -339,7 +339,12 @@ async fn list_providers(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Resp
     };
     let list: Vec<ProviderInfo> = providers
         .into_iter()
-        .map(|p| ProviderInfo { id: p.id, kind: p.kind, base_url: p.base_url, has_key: p.api_key.is_some() })
+        .map(|p| ProviderInfo {
+            id: p.id,
+            kind: p.kind,
+            base_url: p.base_url,
+            has_key: p.api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        })
         .collect();
     Json(list).into_response()
 }
@@ -491,6 +496,7 @@ async fn events_ws(
     ws: WebSocketUpgrade,
 ) -> Response {
     authed!(hub, headers);
+    let mut last_seq = hub.db.last_event_seq();
     let mut rx = hub.events.subscribe();
     ws.on_upgrade(move |mut socket| async move {
         loop {
@@ -500,13 +506,33 @@ async fn events_ws(
                         if q.conversation.as_ref().is_some_and(|c| *c != e.conversation_id) {
                             continue;
                         }
+                        if e.seq > 0 && e.seq <= last_seq {
+                            continue;
+                        }
                         let text = serde_json::to_string(&e).unwrap();
                         if socket.send(Message::Text(text.into())).await.is_err() {
                             break;
                         }
+                        if e.seq > 0 {
+                            last_seq = e.seq;
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("event subscriber lagged by {n}");
+                        let mut failed = false;
+                        for e in hub.db.events_since(last_seq, q.conversation.as_deref()) {
+                            let text = serde_json::to_string(&e).unwrap();
+                            if socket.send(Message::Text(text.into())).await.is_err() {
+                                failed = true;
+                                break;
+                            }
+                            if e.seq > 0 {
+                                last_seq = e.seq;
+                            }
+                        }
+                        if failed {
+                            break;
+                        }
                     }
                     Err(_) => break,
                 },

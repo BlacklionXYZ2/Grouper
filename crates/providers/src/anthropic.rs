@@ -7,6 +7,7 @@ use crate::*;
 
 const API_VERSION: &str = "2026-10-21";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+const MAX_CONTENT_BLOCKS: usize = 1024;
 
 pub struct Anthropic {
     id: String,
@@ -162,15 +163,24 @@ fn stream_error(provider: &str, err: &Value) -> ProviderError {
     ProviderError::Http { provider: provider.into(), status, body: err.to_string() }
 }
 
+fn block_index(provider: &str, v: &Value, context: &str) -> Result<usize, ProviderError> {
+    let bad = |m: String| ProviderError::BadResponse { provider: provider.into(), message: m };
+    let raw = v.get("index").and_then(Value::as_u64).ok_or_else(|| bad(format!("{context} without index: {v}")))?;
+    let i = usize::try_from(raw).map_err(|_| bad(format!("{context} index {raw} out of range")))?;
+    if i >= MAX_CONTENT_BLOCKS {
+        return Err(bad(format!("{context} index {i} exceeds maximum of {MAX_CONTENT_BLOCKS} blocks")));
+    }
+    Ok(i)
+}
+
 impl StreamAssembler {
     /// Handle one event's data. Returns true at `message_stop`.
     fn handle(&mut self, provider: &str, v: &Value, on_delta: OnDelta<'_>) -> Result<bool, ProviderError> {
         let bad = |m: String| ProviderError::BadResponse { provider: provider.into(), message: m };
-        let index = v.get("index").and_then(Value::as_u64).map(|i| i as usize);
         match v.get("type").and_then(Value::as_str).unwrap_or("") {
             "message_start" => self.message = v.get("message").cloned().unwrap_or(json!({})),
             "content_block_start" => {
-                let i = index.ok_or_else(|| bad(format!("block start without index: {v}")))?;
+                let i = block_index(provider, v, "block start")?;
                 let block = v.get("content_block").cloned().unwrap_or(json!({}));
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => {
@@ -196,7 +206,7 @@ impl StreamAssembler {
                 self.blocks[i] = block;
             }
             "content_block_delta" => {
-                let i = index.ok_or_else(|| bad(format!("delta without index: {v}")))?;
+                let i = block_index(provider, v, "delta")?;
                 let block = self
                     .blocks
                     .get_mut(i)
@@ -233,7 +243,7 @@ impl StreamAssembler {
                 }
             }
             "content_block_stop" => {
-                let i = index.ok_or_else(|| bad(format!("block stop without index: {v}")))?;
+                let i = block_index(provider, v, "block stop")?;
                 if let (Some(json), Some(block)) = (self.partial_json.remove(&i), self.blocks.get_mut(i)) {
                     block["input"] = if json.trim().is_empty() {
                         json!({})
@@ -460,6 +470,30 @@ mod tests {
         let cut = RECORDED.find("event: message_delta").unwrap();
         let (v, _) = assemble(&[&RECORDED.as_bytes()[..cut]]);
         assert!(matches!(v, Err(ProviderError::Network { .. })));
+    }
+
+    #[test]
+    fn rejects_out_of_range_block_index() {
+        for bad_index in [json!(MAX_CONTENT_BLOCKS), json!(u64::MAX), json!(-1)] {
+            let ev = json!({
+                "type": "content_block_start",
+                "index": bad_index,
+                "content_block": {"type": "text", "text": "x"}
+            });
+            let mut asm = StreamAssembler::default();
+            let err = asm.handle("anthropic", &ev, &|_| {}).unwrap_err();
+            assert!(matches!(err, ProviderError::BadResponse { .. }), "index {bad_index}: {err:?}");
+        }
+
+        // The maximum allowed index (1023 for 1024 blocks) is accepted.
+        let ok_ev = json!({
+            "type": "content_block_start",
+            "index": MAX_CONTENT_BLOCKS - 1,
+            "content_block": {"type": "text", "text": "ok"}
+        });
+        let mut asm = StreamAssembler::default();
+        assert!(!asm.handle("anthropic", &ok_ev, &|_| {}).unwrap());
+        assert_eq!(asm.blocks.len(), MAX_CONTENT_BLOCKS);
     }
 
     /// Serve one HTTP response on a local port: `head` then `body` in small, delayed writes.

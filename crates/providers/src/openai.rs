@@ -112,7 +112,7 @@ impl OpenAi {
 /// A chat completion body (or a streamed one, reassembled) as a [`Response`].
 fn parse_completion(provider: &str, v: &Value) -> Result<Response, ProviderError> {
     let bad = |m: String| ProviderError::BadResponse { provider: provider.into(), message: m };
-    if let Some(err) = v.get("error") {
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         return Err(bad(err.to_string()));
     }
     let choice = v.pointer("/choices/0").ok_or_else(|| bad(format!("no choices: {v}")))?;
@@ -124,8 +124,12 @@ fn parse_completion(provider: &str, v: &Value) -> Result<Response, ProviderError
     }
     for (i, call) in msg.get("tool_calls").and_then(Value::as_array).into_iter().flatten().enumerate() {
         let name = call.pointer("/function/name").and_then(Value::as_str).unwrap_or_default().to_string();
-        let args = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}");
-        let input = serde_json::from_str(args).unwrap_or_else(|_| json!({ "_unparsed_arguments": args }));
+        let args = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("");
+        let input = if args.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(args).unwrap_or_else(|_| json!({ "_unparsed_arguments": args }))
+        };
         let id = call.get("id").and_then(Value::as_str).map(String::from).unwrap_or_else(|| format!("call_{i}"));
         content.push(Block::ToolUse { id, name, input });
     }
@@ -165,6 +169,7 @@ struct ChunkAssembler {
     content: String,
     /// Tool calls by their `index`, which is what ties fragments together.
     calls: std::collections::BTreeMap<u64, PartialCall>,
+    current_call: Option<u64>,
     finish_reason: Option<String>,
     usage: Option<Value>,
     done: bool,
@@ -179,7 +184,7 @@ impl ChunkAssembler {
             return Ok(true);
         }
         let v: Value = serde_json::from_str(data).map_err(|e| bad(format!("bad stream chunk: {e}")))?;
-        if let Some(err) = v.get("error") {
+        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
             return Err(bad(err.to_string()));
         }
         // With include_usage, the last chunk has usage and no choices. Some servers
@@ -197,16 +202,35 @@ impl ChunkAssembler {
             self.content.push_str(t);
             on_delta(Delta::Text(t.into()));
         }
-        // DeepSeek and OpenRouter stream reasoning separately.
-        for key in ["reasoning_content", "reasoning"] {
-            if let Some(t) = delta.get(key).and_then(Value::as_str).filter(|t| !t.is_empty()) {
-                on_delta(Delta::Thinking(t.into()));
-            }
+        // DeepSeek and OpenRouter stream reasoning separately (some send both fields).
+        if let Some(t) = ["reasoning_content", "reasoning"]
+            .into_iter()
+            .find_map(|key| delta.get(key).and_then(Value::as_str).filter(|t| !t.is_empty()))
+        {
+            on_delta(Delta::Thinking(t.into()));
         }
         for (pos, tc) in delta.get("tool_calls").and_then(Value::as_array).into_iter().flatten().enumerate() {
-            let index = tc.get("index").and_then(Value::as_u64).unwrap_or(pos as u64);
+            let id = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+            let index = match tc.get("index").and_then(Value::as_u64) {
+                Some(i) => i,
+                None => {
+                    let cur = self.current_call.unwrap_or(pos as u64);
+                    let id_differs = id.is_some_and(|new_id| {
+                        self.calls
+                            .get(&cur)
+                            .and_then(|c| c.id.as_deref())
+                            .is_some_and(|old_id| old_id != new_id)
+                    });
+                    if id_differs || (pos > 0 && self.calls.contains_key(&cur)) {
+                        self.calls.keys().next_back().map_or(0, |k| k + 1)
+                    } else {
+                        cur
+                    }
+                }
+            };
+            self.current_call = Some(index);
             let call = self.calls.entry(index).or_default();
-            if let Some(id) = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            if let Some(id) = id {
                 call.id = Some(id.to_string());
             }
             if let Some(n) = tc.pointer("/function/name").and_then(Value::as_str) {
@@ -216,7 +240,7 @@ impl ChunkAssembler {
                 call.arguments.push_str(a);
             }
         }
-        if let Some(f) = choice.get("finish_reason").and_then(Value::as_str) {
+        if let Some(f) = choice.get("finish_reason").and_then(Value::as_str).filter(|f| !f.is_empty()) {
             self.finish_reason = Some(f.to_string());
         }
         Ok(false)
@@ -240,7 +264,8 @@ impl ChunkAssembler {
                 .calls
                 .into_values()
                 .map(|c| {
-                    let mut call = json!({"type": "function", "function": {"name": c.name, "arguments": c.arguments}});
+                    let arguments = if c.arguments.trim().is_empty() { "{}".to_string() } else { c.arguments };
+                    let mut call = json!({"type": "function", "function": {"name": c.name, "arguments": arguments}});
                     if let Some(id) = c.id {
                         call["id"] = json!(id);
                     }
@@ -388,5 +413,103 @@ mod tests {
         // An error object in the stream.
         let (v, _) = assemble(&[r#"{"error":{"message":"boom"}}"#]);
         assert!(matches!(v, Err(ProviderError::BadResponse { .. })));
+    }
+
+    #[test]
+    fn empty_tool_arguments_become_empty_object() {
+        // Non-streaming: empty and whitespace arguments both parse as {}.
+        let body = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "a", "arguments": ""}},
+                        {"id": "c2", "type": "function", "function": {"name": "b", "arguments": "  \n\t "}}
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let resp = parse_completion("openai", &body).unwrap();
+        assert_eq!(
+            resp.message.content,
+            vec![
+                Block::ToolUse { id: "c1".into(), name: "a".into(), input: json!({}) },
+                Block::ToolUse { id: "c2".into(), name: "b".into(), input: json!({}) },
+            ]
+        );
+
+        // Streaming: empty and whitespace arguments become {}.
+        let events = [
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"a","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"b","arguments":"   "}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let (v, _) = assemble(&events);
+        let resp = parse_completion("openai", &v.unwrap()).unwrap();
+        assert_eq!(
+            resp.message.content,
+            vec![
+                Block::ToolUse { id: "c1".into(), name: "a".into(), input: json!({}) },
+                Block::ToolUse { id: "c2".into(), name: "b".into(), input: json!({}) },
+            ]
+        );
+    }
+
+    #[test]
+    fn null_error_and_empty_finish_reason() {
+        // Non-streaming "error": null is not an error.
+        let body = json!({
+            "error": null,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        });
+        assert_eq!(parse_completion("openai", &body).unwrap().message.text(), "ok");
+
+        // Streaming "error": null is not an error, and empty finish_reason does not end the stream.
+        let truncated = [
+            r#"{"error":null,"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":""}]}"#,
+        ];
+        let (v, _) = assemble(&truncated);
+        assert!(matches!(v, Err(ProviderError::Network { .. })));
+
+        let complete = [
+            r#"{"error":null,"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":""}]}"#,
+            r#"{"error":null,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ];
+        let (v, _) = assemble(&complete);
+        assert_eq!(parse_completion("openai", &v.unwrap()).unwrap().message.text(), "hi");
+    }
+
+    #[test]
+    fn tool_calls_without_index_split_on_new_id() {
+        let events = [
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","function":{"name":"first","arguments":"{\"a\":"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_2","function":{"name":"second","arguments":"{\"b\":"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"2}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let (v, _) = assemble(&events);
+        let resp = parse_completion("openai", &v.unwrap()).unwrap();
+        assert_eq!(
+            resp.message.content,
+            vec![
+                Block::ToolUse { id: "call_1".into(), name: "first".into(), input: json!({"a": 1}) },
+                Block::ToolUse { id: "call_2".into(), name: "second".into(), input: json!({"b": 2}) },
+            ]
+        );
+    }
+
+    #[test]
+    fn dual_reasoning_fields_emit_thinking_once() {
+        let events = [
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"step 1","reasoning":"step 1"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"step 2"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ];
+        let (v, deltas) = assemble(&events);
+        assert!(v.is_ok());
+        assert_eq!(deltas, vec![Delta::Thinking("step 1".into()), Delta::Thinking("step 2".into())]);
     }
 }

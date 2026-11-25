@@ -240,6 +240,7 @@ impl Tool for RunShell {
         for key in secret_env_keys() {
             c.env_remove(key);
         }
+        c.env("GROUPER_THREAD_SHELL", "1");
         match tokio::time::timeout(Duration::from_secs(secs), c.output()).await {
             Err(_) => ToolOutput::err(format!("timed out after {secs}s")),
             Ok(Err(e)) => ToolOutput::err(e.to_string()),
@@ -378,6 +379,9 @@ mod tests {
         assert!(lower.contains("path="), "{sh:?}");
         assert!(!lower.contains("grouper_token="), "{sh:?}");
         assert!(!lower.contains("grouper_provider_key="), "{sh:?}");
+        // The only GROUPER_ variable a thread shell sees is the marker that stops the
+        // CLI from using stored credentials inside it.
+        assert!(lower.contains("grouper_thread_shell=1"), "{sh:?}");
         assert!(!sh.content.contains("grouper-test-secret-token"), "{sh:?}");
         assert!(!sh.content.contains("grouper-test-secret-key"), "{sh:?}");
     }

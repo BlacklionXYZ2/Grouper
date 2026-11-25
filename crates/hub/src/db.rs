@@ -152,26 +152,44 @@ fn migrate_provider_secrets(conn: &mut Connection, secrets: &Secrets) -> Result<
     Ok(())
 }
 
+fn has_sealed_provider_keys(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .prepare("SELECT 1 FROM providers WHERE api_key LIKE 'enc:v1:%' LIMIT 1")?
+        .exists([])?)
+}
+
+fn open_connection(data_dir: &Path) -> Result<Connection> {
+    std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+    let conn = Connection::open(data_dir.join("grouper.db"))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(crate::memory::SCHEMA)?;
+    // Databases made before admin tokens: every existing token becomes a plain
+    // device token; grant admin with `grouper-hub device admin <id>`.
+    let has_admin: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('devices') WHERE name = 'admin'")?
+        .exists([])?;
+    if !has_admin {
+        conn.execute_batch("ALTER TABLE devices ADD COLUMN admin INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    Ok(conn)
+}
+
 impl Db {
     pub fn open(data_dir: &Path) -> Result<Self> {
-        let secrets = Secrets::load(data_dir)?;
-        Self::open_with_secrets(data_dir, secrets)
+        let conn = open_connection(data_dir)?;
+        let has_sealed = has_sealed_provider_keys(&conn)?;
+        let secrets = Secrets::load_with_create(data_dir, !has_sealed)?;
+        Self::finish_open(data_dir, conn, secrets)
     }
 
+    #[cfg(test)]
     fn open_with_secrets(data_dir: &Path, secrets: Secrets) -> Result<Self> {
-        std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
-        let mut conn = Connection::open(data_dir.join("grouper.db"))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(crate::memory::SCHEMA)?;
-        // Databases made before admin tokens: every existing token becomes a plain
-        // device token; grant admin with `grouper-hub device admin <id>`.
-        let has_admin: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('devices') WHERE name = 'admin'")?
-            .exists([])?;
-        if !has_admin {
-            conn.execute_batch("ALTER TABLE devices ADD COLUMN admin INTEGER NOT NULL DEFAULT 0;")?;
-        }
+        let conn = open_connection(data_dir)?;
+        Self::finish_open(data_dir, conn, secrets)
+    }
+
+    fn finish_open(data_dir: &Path, mut conn: Connection, secrets: Secrets) -> Result<Self> {
         migrate_provider_secrets(&mut conn, &secrets)?;
         let db = Self { connection: Mutex::new(conn), secrets };
         db.import_devices_json(data_dir)?;
@@ -339,7 +357,12 @@ impl Db {
             bail!("kind must be anthropic, openai or scripted");
         }
         let options = if p.options.is_null() { "{}".to_string() } else { p.options.to_string() };
-        let api_key = p.api_key.as_deref().map(|key| self.secrets.seal(key)).transpose()?;
+        let api_key = p
+            .api_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .map(|key| self.secrets.seal(key))
+            .transpose()?;
         self.c().execute(
             "INSERT INTO providers (id, kind, base_url, api_key, options) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, base_url = excluded.base_url,
@@ -583,6 +606,32 @@ impl Db {
         .collect()
     }
 
+    pub fn last_event_seq(&self) -> i64 {
+        self.c()
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    pub fn events_since(&self, after: i64, conversation: Option<&str>) -> Vec<Event> {
+        let c = self.c();
+        let mut st = c
+            .prepare(
+                "SELECT seq, conversation_id, thread_id, ts, body FROM events
+                 WHERE seq > ?1 AND (?2 IS NULL OR conversation_id = ?2) ORDER BY seq",
+            )
+            .unwrap();
+        st.query_map(params![after, conversation], |r| {
+            let body: String = r.get(4)?;
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as u64, body))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|(seq, conversation_id, thread_id, ts, body)| {
+            Some(Event { seq, conversation_id, thread_id, ts, body: serde_json::from_str(&body).ok()? })
+        })
+        .collect()
+    }
+
     /// Record token usage; returns the estimated cost in USD.
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage(
@@ -720,12 +769,21 @@ mod tests {
         assert_eq!(db.default_model("orchestrator").unwrap().id, "big");
         assert_eq!(db.default_model("standard").unwrap().id, "free");
         assert_eq!(db.default_model("thread").unwrap().id, "big");
-        // keys are kept when an update omits them
+        // keys are kept when an update omits them or passes an empty string
         db.upsert_provider(&ProviderConfig {
             id: "or".into(),
             kind: "openai".into(),
             base_url: None,
             api_key: None,
+            options: Value::Null,
+        })
+        .unwrap();
+        assert_eq!(db.provider("or").unwrap().unwrap().api_key.as_deref(), Some("k"));
+        db.upsert_provider(&ProviderConfig {
+            id: "or".into(),
+            kind: "openai".into(),
+            base_url: None,
+            api_key: Some(String::new()),
             options: Value::Null,
         })
         .unwrap();
@@ -775,6 +833,56 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("decrypting provider secret for secured"));
         assert!(message.contains("master key is wrong"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn missing_master_key_is_not_autogenerated_when_sealed_rows_exist() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "secured".into(),
+            kind: "openai".into(),
+            base_url: None,
+            api_key: Some("secret".into()),
+            options: Value::Null,
+        })
+        .unwrap();
+        drop(db);
+
+        let key_path = dir.join("master.key");
+        std::fs::remove_file(&key_path).unwrap();
+
+        let error = Db::open(&dir).err().unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("master key missing"), "{message}");
+        assert!(message.contains("GROUPER_MASTER_KEY"), "{message}");
+        assert!(!key_path.exists(), "must not auto-generate a new master key");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn events_since_filters_by_seq_and_conversation() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.last_event_seq(), 0);
+        let e1 = db.add_event("c1", None, EventBody::UserMessage { text: "a".into() });
+        let e2 = db.add_event("c2", None, EventBody::UserMessage { text: "b".into() });
+        let e3 = db.add_event("c1", None, EventBody::AssistantMessage { text: "c".into() });
+        assert_eq!(db.last_event_seq(), e3.seq);
+
+        let all_after_0: Vec<i64> = db.events_since(0, None).into_iter().map(|e| e.seq).collect();
+        assert_eq!(all_after_0, vec![e1.seq, e2.seq, e3.seq]);
+
+        let all_after_1: Vec<i64> = db.events_since(e1.seq, None).into_iter().map(|e| e.seq).collect();
+        assert_eq!(all_after_1, vec![e2.seq, e3.seq]);
+
+        let c1_after_1: Vec<i64> = db.events_since(e1.seq, Some("c1")).into_iter().map(|e| e.seq).collect();
+        assert_eq!(c1_after_1, vec![e3.seq]);
+
+        let c2_after_2: Vec<i64> = db.events_since(e2.seq, Some("c2")).into_iter().map(|e| e.seq).collect();
+        assert!(c2_after_2.is_empty());
+
         std::fs::remove_dir_all(dir).ok();
     }
 }

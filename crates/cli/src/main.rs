@@ -463,11 +463,13 @@ fn read_key() -> Result<String> {
     if let Ok(k) = std::env::var("GROUPER_PROVIDER_KEY") {
         return Ok(k);
     }
-    if std::io::stdin().is_terminal() {
-        eprint!("API key (input shown): ");
-    }
-    let mut k = String::new();
-    std::io::stdin().read_line(&mut k)?;
+    let k = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("API key: ")?
+    } else {
+        let mut k = String::new();
+        std::io::stdin().read_line(&mut k)?;
+        k
+    };
     Ok(k.trim().to_string())
 }
 
@@ -508,26 +510,14 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    let saved = if cli.hub.is_none() || cli.token.is_none() {
-        credentials::load(cli.token.is_none())?
-    } else {
-        None
-    };
-    let hub = cli
-        .hub
-        .or_else(|| saved.as_ref().map(|credentials| credentials.hub.clone()))
-        .unwrap_or_else(|| DEFAULT_HUB.to_string());
-    let token = cli
-        .token
-        .or_else(|| saved.and_then(|credentials| credentials.token))
-        .context("no token: pass --token, set GROUPER_TOKEN, or run `grouper login --hub <url>`")?;
+    let (hub, token) = credentials::resolve(cli.hub, cli.token, DEFAULT_HUB)?;
     let api = Api { base: hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
 
     match cli.cmd {
         Cmd::Login | Cmd::Logout => unreachable!(),
         Cmd::Connect { workspace, no_shell } => {
             let workspace = workspace.unwrap_or_else(|| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("Grouper").join("workspaces")
+                dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Grouper").join("workspaces")
             });
             println!("thread workspaces: {}", workspace.display());
             let config = core_client::Config {

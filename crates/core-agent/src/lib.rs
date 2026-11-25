@@ -142,6 +142,11 @@ pub async fn run_loop(
             Ok(r) => r,
             Err(e) => return LoopOutcome { final_text: last_text, usage, ending: Ending::Error(e.to_string()) },
         };
+        let text = resp.message.text();
+        if !text.is_empty() {
+            hooks.event(AgentEvent::Text { text: text.clone() });
+            last_text = text;
+        }
         usage.add(&resp.usage);
         hooks.event(AgentEvent::Usage {
             provider_id: cfg.provider_id.clone(),
@@ -151,11 +156,6 @@ pub async fn run_loop(
             cache_read_tokens: resp.usage.cache_read_tokens,
             cache_write_tokens: resp.usage.cache_write_tokens,
         });
-        let text = resp.message.text();
-        if !text.is_empty() {
-            hooks.event(AgentEvent::Text { text: text.clone() });
-            last_text = text;
-        }
         let calls: Vec<(String, String, Value)> = resp
             .message
             .content
@@ -266,6 +266,8 @@ mod tests {
         assert_eq!(deltas.concat(), "all done");
         let last_delta = events.iter().rposition(|e| matches!(e, AgentEvent::TextDelta { .. })).unwrap();
         let text = events.iter().position(|e| matches!(e, AgentEvent::Text { .. })).unwrap();
+        let last_usage = events.iter().rposition(|e| matches!(e, AgentEvent::Usage { .. })).unwrap();
         assert!(last_delta < text);
+        assert!(text < last_usage);
     }
 }

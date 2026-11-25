@@ -23,6 +23,10 @@ pub struct Secrets {
 
 impl Secrets {
     pub fn load(data_dir: &Path) -> Result<Self> {
+        Self::load_with_create(data_dir, true)
+    }
+
+    pub(crate) fn load_with_create(data_dir: &Path, allow_create: bool) -> Result<Self> {
         if let Some(encoded) = std::env::var_os(ENV_KEY) {
             let encoded = encoded
                 .into_string()
@@ -35,7 +39,12 @@ impl Secrets {
             .unwrap_or_else(|| data_dir.join("master.key"));
         let encoded = match fs::read_to_string(&path) {
             Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_key_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !allow_create {
+                    bail!("master key missing ({}); restore it or set {ENV_KEY}", path.display());
+                }
+                create_key_file(&path)?
+            }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("reading master key file {}", path.display()));
@@ -118,6 +127,14 @@ fn create_key_file(path: &Path) -> Result<String> {
     getrandom::fill(&mut key).context("generating the master key")?;
     let encoded = STANDARD.encode(key);
 
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).context("generating a temporary key filename")?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("master.key");
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}", hex::encode(suffix)));
+
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -125,14 +142,25 @@ fn create_key_file(path: &Path) -> Result<String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    match options.open(path) {
-        Ok(mut file) => {
-            writeln!(file, "{encoded}")
-                .with_context(|| format!("writing master key file {}", path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("syncing master key file {}", path.display()))?;
-            Ok(encoded)
-        }
+    let write_res = (|| -> Result<()> {
+        let mut file = options
+            .open(&tmp_path)
+            .with_context(|| format!("creating temporary master key file {}", tmp_path.display()))?;
+        writeln!(file, "{encoded}")
+            .with_context(|| format!("writing temporary master key file {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing temporary master key file {}", tmp_path.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+
+    let link_res = fs::hard_link(&tmp_path, path);
+    let _ = fs::remove_file(&tmp_path);
+    match link_res {
+        Ok(()) => Ok(encoded),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => fs::read_to_string(path)
             .with_context(|| format!("reading master key file {}", path.display())),
         Err(error) => {
@@ -178,5 +206,20 @@ mod tests {
         *payload.last_mut().unwrap() ^= 1;
         let tampered = format!("{PREFIX}{}", STANDARD.encode(payload));
         assert!(secrets.open(&tampered).is_err());
+    }
+
+    #[test]
+    fn create_key_file_is_atomic_and_does_not_overwrite() {
+        let dir = std::env::temp_dir().join(format!("grouper-secrets-test-{}", crate::db::random_hex(4)));
+        let path = dir.join("master.key");
+        let first = create_key_file(&path).unwrap();
+        let entries: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries.len(), 1);
+
+        // Calling again must keep the existing key and return its contents.
+        let second = create_key_file(&path).unwrap();
+        assert_eq!(second.trim(), first.trim());
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), first.trim());
+        fs::remove_dir_all(dir).ok();
     }
 }

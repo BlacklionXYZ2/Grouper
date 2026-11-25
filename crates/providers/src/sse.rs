@@ -56,16 +56,28 @@ impl SseParser {
         out
     }
 
-    /// The stream ended: flush a final unterminated line and any pending event.
+    /// The stream ended: dispatch a bare-CR-terminated event or a lone `data: [DONE]`,
+    /// but drop any other partial event that never received its terminating blank line.
     pub fn finish(&mut self) -> Option<SseEvent> {
         let mut out = Vec::new();
+        if self.buf == b"\r" {
+            self.buf.clear();
+            self.line("", &mut out);
+            return out.pop();
+        }
         if !self.buf.is_empty() {
             let rest = std::mem::take(&mut self.buf);
             let line = String::from_utf8_lossy(&rest);
             self.line(line.trim_end_matches('\r'), &mut out);
         }
-        self.line("", &mut out);
-        out.pop()
+        if self.has_data && self.event.is_empty() && self.data.trim() == "[DONE]" {
+            self.line("", &mut out);
+            return out.pop();
+        }
+        self.event.clear();
+        self.data.clear();
+        self.has_data = false;
+        None
     }
 
     fn line(&mut self, line: &str, out: &mut Vec<SseEvent>) {
@@ -106,6 +118,11 @@ pub(crate) enum Streamed {
     Events,
 }
 
+fn is_json_content_type(value: &str) -> bool {
+    let media_type = value.split(';').next().unwrap_or("").trim();
+    media_type.eq_ignore_ascii_case("application/json")
+}
+
 /// POST `body` and call `on_event` for each server-sent event until it returns
 /// `Ok(true)` (done) or the stream ends. HTTP errors become [`ProviderError::Http`].
 pub(crate) async fn post_sse(
@@ -126,7 +143,7 @@ pub(crate) async fn post_sse(
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("application/json"));
+        .is_some_and(is_json_content_type);
     if is_json {
         let text = resp.text().await.map_err(net)?;
         return serde_json::from_str(&text)
@@ -166,8 +183,8 @@ mod tests {
 
     #[test]
     fn splits_anywhere() {
-        let whole = b": hello\r\nevent: a\r\ndata: {\"x\":1}\r\n\r\nevent: b\ndata: line1\ndata:line2\n\ndata: tail";
-        let want = vec![ev("a", "{\"x\":1}"), ev("b", "line1\nline2"), ev("", "tail")];
+        let whole = b": hello\r\nevent: a\r\ndata: {\"x\":1}\r\n\r\nevent: b\ndata: line1\ndata:line2\n\ndata: [DONE]";
+        let want = vec![ev("a", "{\"x\":1}"), ev("b", "line1\nline2"), ev("", "[DONE]")];
         assert_eq!(feed(&[whole]), want);
         // Every possible split point, including between \r and \n.
         for cut in 0..whole.len() {
@@ -176,6 +193,27 @@ mod tests {
         // One byte at a time.
         let bytes: Vec<&[u8]> = whole.chunks(1).collect();
         assert_eq!(feed(&bytes), want);
+    }
+
+    #[test]
+    fn truncated_final_event_is_dropped_except_done() {
+        // Mid-line drop or missing terminating blank line is not dispatched.
+        assert_eq!(feed(&[b"data: {\"x\":1}\n\ndata: {\"trunc"]), vec![ev("", "{\"x\":1}")]);
+        assert_eq!(feed(&[b"data: {\"x\":1}\n\ndata: {\"complete\":true}\n"]), vec![ev("", "{\"x\":1}")]);
+        assert_eq!(feed(&[b"event: custom\ndata: [DONE]\n"]), vec![]);
+        // A lone `data: [DONE]` without a trailing blank line is still accepted.
+        assert_eq!(feed(&[b"data: [DONE]"]), vec![ev("", "[DONE]")]);
+        assert_eq!(feed(&[b"data: [DONE]\n"]), vec![ev("", "[DONE]")]);
+        assert_eq!(feed(&[b"data: [DONE]\r\n"]), vec![ev("", "[DONE]")]);
+        assert_eq!(feed(&[b"data: [DONE]\r"]), vec![ev("", "[DONE]")]);
+    }
+
+    #[test]
+    fn json_content_type_is_case_insensitive() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("Application/JSON; charset=utf-8"));
+        assert!(is_json_content_type(" APPLICATION/JSON "));
+        assert!(!is_json_content_type("text/event-stream"));
     }
 
     #[test]

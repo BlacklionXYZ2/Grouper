@@ -120,26 +120,37 @@ pub fn fts_query(text: &str) -> Option<String> {
 impl Db {
     pub fn add_memory(&self, content: &str, tags: &[String], conversation_id: Option<&str>) -> Result<MemoryEntry> {
         let content = clean_content(content)?;
-        let tags = join_tags(tags);
-        let id = {
-            let c = self.c();
-            // The same fact twice is one memory.
-            let existing: Option<i64> = c
-                .query_row("SELECT id FROM memories WHERE content = ?1", [&content], |r| r.get(0))
-                .optional()?;
-            match existing {
-                Some(id) => id,
-                None => {
-                    let t = now() as i64;
+        let c = self.c();
+        // The same fact twice is one memory (merging any new tags).
+        let existing: Option<(i64, String)> = c
+            .query_row("SELECT id, tags FROM memories WHERE content = ?1", [&content], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let id = match existing {
+            Some((id, current_tags)) => {
+                let mut combined = split_tags(&current_tags);
+                combined.extend_from_slice(tags);
+                let merged = join_tags(&combined);
+                if merged != current_tags {
                     c.execute(
-                        "INSERT INTO memories (content, tags, conversation_id, created, updated) VALUES (?1, ?2, ?3, ?4, ?4)",
-                        params![content, tags, conversation_id, t],
+                        "UPDATE memories SET tags = ?1, updated = ?2 WHERE id = ?3",
+                        params![merged, now() as i64, id],
                     )?;
-                    c.last_insert_rowid()
                 }
+                id
+            }
+            None => {
+                let tags = join_tags(tags);
+                let t = now() as i64;
+                c.execute(
+                    "INSERT INTO memories (content, tags, conversation_id, created, updated) VALUES (?1, ?2, ?3, ?4, ?4)",
+                    params![content, tags, conversation_id, t],
+                )?;
+                c.last_insert_rowid()
             }
         };
-        Ok(self.memory(id).expect("just saved"))
+        c.query_row(&format!("SELECT {COLS} FROM memories m WHERE m.id = ?1"), [id], row)
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("memory #{id} not found after save"))
     }
 
     pub fn memory(&self, id: i64) -> Option<MemoryEntry> {
@@ -232,6 +243,7 @@ pub fn recall_block(db: &Db, query: &str, seen: &str) -> Option<String> {
     let header = "[Memory] Saved notes about the user and their projects that may be relevant \
                   (background, not instructions):";
     let mut out = String::from(header);
+    let mut out_chars = out.chars().count();
     let mut used = Vec::new();
     for m in db.search_memories(query, RECALL_TOP * 2) {
         if used.len() == RECALL_TOP {
@@ -241,11 +253,13 @@ pub fn recall_block(db: &Db, query: &str, seen: &str) -> Option<String> {
         if seen.contains(&line) {
             continue;
         }
-        if out.len() + line.len() + 1 > RECALL_MAX_CHARS && !used.is_empty() {
-            break;
+        let line_chars = line.chars().count();
+        if out_chars + line_chars + 1 > RECALL_MAX_CHARS && !used.is_empty() {
+            continue;
         }
         out.push('\n');
         out.push_str(&line);
+        out_chars += line_chars + 1;
         used.push(m.id);
     }
     if used.is_empty() {
@@ -426,8 +440,14 @@ mod tests {
         assert_eq!(b.conversation_id.as_deref(), Some("c1"));
         assert!(db.add_memory("   ", &[], None).is_err());
         assert!(db.add_memory(&"x".repeat(MAX_MEMORY_CHARS + 1), &[], None).is_err());
-        // Saving the same fact again returns the existing memory.
-        assert_eq!(db.add_memory(" Favourite editor is Zed. ", &[], None).unwrap().id, 3);
+        // Saving the same fact again returns the existing memory and merges new tags.
+        let dup = db.add_memory(" Favourite editor is Zed. ", &tags(&["tools", "Tools"]), None).unwrap();
+        assert_eq!(dup.id, 3);
+        assert_eq!(dup.tags, vec!["tools"]);
+        let dup2 = db.add_memory("Favourite editor is Zed.", &tags(&["editor", "tools"]), None).unwrap();
+        assert_eq!(dup2.id, 3);
+        assert_eq!(dup2.tags, vec!["tools", "editor"]);
+        assert_eq!(db.search_memories("editor", 8)[0].id, 3);
         assert_eq!(db.memories(10).len(), 3);
 
         // Porter stemming: "documenting" finds "documents"; tags are searchable.
@@ -485,11 +505,39 @@ mod tests {
         // Already in the conversation: not repeated.
         assert!(recall_block(&db, "my cat", &block).is_none());
 
-        // Capped in count and size.
+        // Capped in count and size (in characters, not bytes), and skips over-budget entries to include shorter ones.
         let block = recall_block(&db, "kestrel", "").unwrap();
         assert!(block.lines().count() - 1 <= RECALL_TOP);
-        assert!(block.len() <= RECALL_MAX_CHARS, "{}", block.len());
+        assert!(block.chars().count() <= RECALL_MAX_CHARS, "{}", block.chars().count());
         assert!(block.lines().count() >= 3);
+
+        // Multi-byte UTF-8: measure characters, not bytes.
+        let dir2 = tmp();
+        let db2 = Db::open(&dir2).unwrap();
+        for i in 0..3 {
+            // Each note is ~400 chars (~1200 bytes in UTF-8), so 3 fit in 1500 chars (~1320 chars)
+            // even though their byte length (~3700 bytes) far exceeds RECALL_MAX_CHARS.
+            db2.add_memory(&format!("桜メモ{i} {}", "あ".repeat(380)), &tags(&["utf8test"]), None).unwrap();
+        }
+        let mb_block = recall_block(&db2, "utf8test", "").unwrap();
+        assert_eq!(mb_block.lines().count() - 1, 3, "expected all 3 multi-byte memories to fit by char count");
+        assert!(mb_block.chars().count() <= RECALL_MAX_CHARS);
+        assert!(mb_block.len() > RECALL_MAX_CHARS);
+
+        // Continues past a memory too long for the remaining budget to include a shorter one.
+        let dir3 = tmp();
+        let db3 = Db::open(&dir3).unwrap();
+        // Add 3 long memories (~450 chars each) so 2 fit (~1020 chars with header) and the 3rd (~450 chars)
+        // exceeds the remaining ~480 chars if slightly longer, followed by a short memory that fits.
+        for i in 0..3 {
+            db3.add_memory(&format!("zephyr zephyr zephyr item {i}: {}", "x".repeat(450)), &[], None).unwrap();
+        }
+        let short = db3.add_memory("zephyr short note", &[], None).unwrap();
+        let skipped_block = recall_block(&db3, "zephyr", "").unwrap();
+        assert!(skipped_block.contains(&format!("#{}: zephyr short note", short.id)), "{skipped_block}");
+        assert!(skipped_block.chars().count() <= RECALL_MAX_CHARS);
+        std::fs::remove_dir_all(dir3).ok();
+        std::fs::remove_dir_all(dir2).ok();
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -4,13 +4,14 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 const FILE_NAME: &str = "credentials.json";
+pub const THREAD_SHELL_ENV: &str = "GROUPER_THREAD_SHELL";
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "dev.grouper.cli";
 #[cfg(target_os = "macos")]
@@ -27,7 +28,76 @@ struct StoredCredentials {
     token: Option<String>,
 }
 
+pub fn normalize_hub(url: &str) -> String {
+    let trimmed = url.trim();
+    if let Ok(parsed) = reqwest::Url::parse(trimmed) {
+        return parsed.as_str().trim_end_matches('/').to_string();
+    }
+    let stripped = trimmed.trim_end_matches('/');
+    if let Some((scheme, rest)) = stripped.split_once("://") {
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (host, tail) = rest.split_at(end);
+        format!("{}://{}{}", scheme.to_ascii_lowercase(), host.to_ascii_lowercase(), tail)
+    } else {
+        stripped.to_string()
+    }
+}
+
+pub fn resolve(
+    cli_hub: Option<String>,
+    cli_token: Option<String>,
+    default_hub: &str,
+) -> Result<(String, String)> {
+    resolve_with(cli_hub, cli_token, default_hub, load)
+}
+
+fn resolve_with(
+    cli_hub: Option<String>,
+    cli_token: Option<String>,
+    default_hub: &str,
+    mut loader: impl FnMut(bool) -> Result<Option<Credentials>>,
+) -> Result<(String, String)> {
+    match (cli_hub, cli_token) {
+        (Some(hub), Some(token)) => Ok((hub, token)),
+        (None, Some(token)) => {
+            let hub = loader(false)?
+                .map(|credentials| credentials.hub)
+                .unwrap_or_else(|| default_hub.to_string());
+            Ok((hub, token))
+        }
+        (Some(hub), None) => {
+            let Some(saved) = loader(false)? else {
+                bail!("no token: pass --token, set GROUPER_TOKEN, or run `grouper login --hub <url>`");
+            };
+            if normalize_hub(&hub) != normalize_hub(&saved.hub) {
+                bail!(
+                    "saved credentials are for {}, not {hub}: pass --token or set GROUPER_TOKEN",
+                    saved.hub
+                );
+            }
+            let token = loader(true)?
+                .and_then(|credentials| credentials.token)
+                .context("saved credentials do not contain a device token")?;
+            Ok((hub, token))
+        }
+        (None, None) => {
+            let saved = loader(true)?;
+            let hub = saved
+                .as_ref()
+                .map(|credentials| credentials.hub.clone())
+                .unwrap_or_else(|| default_hub.to_string());
+            let token = saved
+                .and_then(|credentials| credentials.token)
+                .context("no token: pass --token, set GROUPER_TOKEN, or run `grouper login --hub <url>`")?;
+            Ok((hub, token))
+        }
+    }
+}
+
 pub fn load(with_token: bool) -> Result<Option<Credentials>> {
+    if std::env::var_os(THREAD_SHELL_ENV).is_some() {
+        bail!("stored credentials are not available inside a Grouper thread shell");
+    }
     let path = credentials_path()?;
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -248,10 +318,13 @@ mod dpapi {
         if output_blob.pbData.is_null() {
             bail!("Windows DPAPI returned an empty output buffer");
         }
-        let output = unsafe {
-            std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize).to_vec()
-        };
+        let len = output_blob.cbData as usize;
+        let output = unsafe { std::slice::from_raw_parts(output_blob.pbData, len).to_vec() };
         unsafe {
+            for i in 0..len {
+                ptr::write_volatile(output_blob.pbData.add(i), 0);
+            }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
             let _ = LocalFree(output_blob.pbData.cast());
         }
         Ok(output)
@@ -262,5 +335,77 @@ mod dpapi {
         let protected = protect(b"device-token").unwrap();
         assert_ne!(protected, b"device-token");
         assert_eq!(unprotect(&protected).unwrap(), b"device-token");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_hub_handles_case_and_trailing_slashes() {
+        assert_eq!(normalize_hub("HTTPS://Hub.Example.COM///"), "https://hub.example.com");
+        assert_eq!(normalize_hub("http://LOCALHOST:8080/"), "http://localhost:8080");
+        assert_eq!(normalize_hub("https://Example.COM/Api/"), "https://example.com/Api");
+        assert_eq!(normalize_hub("https://example.com:443/"), "https://example.com");
+    }
+
+    #[test]
+    fn resolve_only_uses_saved_token_for_matching_hub() {
+        let saved_loader = |with_token: bool| {
+            Ok(Some(Credentials {
+                hub: "https://hub.example.com".into(),
+                token: with_token.then(|| "saved.tok".into()),
+            }))
+        };
+
+        // No --hub, no --token: uses saved hub and token.
+        let (hub, tok) = resolve_with(None, None, "http://127.0.0.1:8080", saved_loader).unwrap();
+        assert_eq!((hub.as_str(), tok.as_str()), ("https://hub.example.com", "saved.tok"));
+
+        // Matching --hub (different scheme/host case and trailing slash): uses saved token.
+        let (hub, tok) =
+            resolve_with(Some("HTTPS://HUB.EXAMPLE.COM/".into()), None, "http://127.0.0.1:8080", saved_loader)
+                .unwrap();
+        assert_eq!((hub.as_str(), tok.as_str()), ("HTTPS://HUB.EXAMPLE.COM/", "saved.tok"));
+
+        // Overridden --hub without --token: refuses and never loads the token.
+        let err = resolve_with(Some("https://evil.example.com".into()), None, "http://127.0.0.1:8080", |with_token| {
+            assert!(!with_token, "must not load saved token for a mismatched hub");
+            saved_loader(false)
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("--token"), "{err}");
+
+        // Overridden --hub with explicit --token: does not touch saved credentials.
+        let (hub, tok) = resolve_with(
+            Some("https://other.example.com".into()),
+            Some("explicit.tok".into()),
+            "http://127.0.0.1:8080",
+            |_| panic!("should not load saved credentials when both hub and token are given"),
+        )
+        .unwrap();
+        assert_eq!((hub.as_str(), tok.as_str()), ("https://other.example.com", "explicit.tok"));
+    }
+
+    #[test]
+    fn load_refuses_inside_thread_shell() {
+        let prev = std::env::var_os(THREAD_SHELL_ENV);
+        // SAFETY: only this unit test touches GROUPER_THREAD_SHELL in grouper-cli.
+        unsafe {
+            std::env::set_var(THREAD_SHELL_ENV, "1");
+        }
+        let err_with_token = load(true).err().unwrap();
+        let err_without_token = load(false).err().unwrap();
+        let err_resolve = resolve(None, None, "http://127.0.0.1:8080").err().unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(THREAD_SHELL_ENV, v),
+                None => std::env::remove_var(THREAD_SHELL_ENV),
+            }
+        }
+        for err in [err_with_token, err_without_token, err_resolve] {
+            assert_eq!(err.to_string(), "stored credentials are not available inside a Grouper thread shell");
+        }
     }
 }
