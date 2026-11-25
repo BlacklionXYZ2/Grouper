@@ -603,9 +603,21 @@ impl Db {
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
     }
 
+    /// Provider ids configured to run through a device.
+    fn device_providers(&self) -> std::collections::HashSet<String> {
+        self.providers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|provider| provider.via_device().is_some())
+            .map(|provider| provider.id)
+            .collect()
+    }
+
     /// Whether a model counts as local: flagged, or its provider's URL is local.
     pub fn model_is_local(&self, m: &ModelEntry) -> bool {
-        m.local || self.provider_urls().get(&m.provider_id).cloned().flatten().is_some_and(|u| is_local_url(&u))
+        m.local
+            || self.device_providers().contains(&m.provider_id)
+            || self.provider_urls().get(&m.provider_id).cloned().flatten().is_some_and(|u| is_local_url(&u))
     }
 
     /// Choose the model for a thread (see the module docs), or check the one the
@@ -624,6 +636,20 @@ impl Db {
         tags: &[String],
         prefer_cheaper: bool,
     ) -> Result<Route, String> {
+        self.route_model_available(requested, task_type, tags, prefer_cheaper, &std::collections::HashSet::new())
+    }
+
+    /// Route while excluding unavailable providers from automatic selection.
+    /// An explicitly requested model is still returned so the caller can surface
+    /// its precise availability error instead of silently substituting a model.
+    pub fn route_model_available(
+        &self,
+        requested: Option<&str>,
+        task_type: Option<&str>,
+        tags: &[String],
+        prefer_cheaper: bool,
+        unavailable_providers: &std::collections::HashSet<String>,
+    ) -> Result<Route, String> {
         let models = self.models();
         if models.is_empty() {
             return Err("no models registered".into());
@@ -631,11 +657,12 @@ impl Db {
         let task_type = task_type.map(norm).unwrap_or_default();
         let tags = clean_tags(tags);
         let urls = self.provider_urls();
+        let device_providers = self.device_providers();
         let local: HashMap<String, bool> = models
             .iter()
             .map(|m| {
                 let url_local = urls.get(&m.provider_id).cloned().flatten().is_some_and(|u| is_local_url(&u));
-                (m.id.clone(), m.local || url_local)
+                (m.id.clone(), m.local || device_providers.contains(&m.provider_id) || url_local)
             })
             .collect();
         let rules: Vec<PriorityRule> =
@@ -665,8 +692,15 @@ impl Db {
             return Ok(Route { model: m, reason: None });
         }
 
-        let mut allowed: Vec<ModelEntry> = models.iter().filter(|m| blocked_by(m).is_none()).cloned().collect();
+        let mut allowed: Vec<ModelEntry> = models
+            .iter()
+            .filter(|m| blocked_by(m).is_none() && !unavailable_providers.contains(&m.provider_id))
+            .cloned()
+            .collect();
         if allowed.is_empty() {
+            if models.iter().any(|m| blocked_by(m).is_none() && unavailable_providers.contains(&m.provider_id)) {
+                return Err("No automatically selectable model is currently available; the matching device-hosted model is offline. Connect its hosting device or choose another model.".into());
+            }
             let why: Vec<String> = filters.iter().map(|r| describe_rule(r)).collect();
             return Err(format!(
                 "No registered model satisfies the priority rules for this task ({}). Tell the user: they can add a \
@@ -1209,6 +1243,49 @@ mod tests {
         assert!(db.delete_rule(sensitive.id).unwrap());
         assert!(!db.delete_rule(sensitive.id).unwrap());
         assert_eq!(db.rules().len(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn device_hosted_models_are_local_and_skipped_automatically_when_offline() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        db.add_device("Gaming PC", "windows", false).unwrap();
+        provider(&db, "cloud", Some("https://example.com/v1"));
+        db.upsert_provider(&ProviderConfig {
+            id: "device".into(),
+            kind: "scripted".into(),
+            base_url: Some("http://127.0.0.1:45123/v1".into()),
+            api_key: None,
+            options: json!({
+                "via_device": "Gaming PC",
+                "inline": {"default": [{"type": "text", "text": "OK"}]}
+            }),
+        })
+        .unwrap();
+        db.upsert_model(&model("cloud-model", "cloud", 1.0, &["thread"])).unwrap();
+        db.upsert_model(&model("local-model", "device", 0.0, &["thread"])).unwrap();
+        assert!(db.model_is_local(&db.find_model("local-model").unwrap()));
+
+        db.add_rule(
+            "Private work stays local",
+            &RuleSpec { when_tag: Some("private".into()), require: Some("local".into()), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(db.route_model(None, None, &tags(&["private"])).unwrap().model.id, "local-model");
+
+        let unavailable = std::collections::HashSet::from(["device".to_string()]);
+        assert_eq!(
+            db.route_model_available(None, None, &[], false, &unavailable).unwrap().model.id,
+            "cloud-model"
+        );
+        let error = db.route_model_available(None, None, &tags(&["private"]), false, &unavailable).unwrap_err();
+        assert!(error.contains("device-hosted model is offline"), "{error}");
+        assert_eq!(
+            db.route_model_available(Some("local-model"), None, &[], false, &unavailable).unwrap().model.id,
+            "local-model",
+            "an explicit choice is kept so the provider can report its named host as offline"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

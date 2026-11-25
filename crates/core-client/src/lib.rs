@@ -29,6 +29,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 pub mod folders;
+mod device_provider;
 mod handover;
 pub mod mcp_host;
 mod mcp_server;
@@ -152,6 +153,12 @@ struct Threads {
     controls: Mutex<HashMap<String, ThreadControl>>,
     approvals: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
     providers: Mutex<Vec<ProviderConfig>>,
+    /// This connection's authenticated device id and name, set by Welcome.
+    identity: Mutex<Option<(String, String)>>,
+    /// Calls this device is executing for the hub, keyed by hub call id.
+    model_tasks: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Calls a local thread asked the hub to relay, keyed by device call id.
+    model_waiters: Mutex<HashMap<String, mpsc::UnboundedSender<device_provider::ModelReply>>>,
     /// Random for each connection, so a reconnect cannot reuse an old approval id.
     approval_nonce: u64,
     next: AtomicU64,
@@ -169,6 +176,9 @@ impl Threads {
             controls: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             providers: Mutex::new(Vec::new()),
+            identity: Mutex::new(None),
+            model_tasks: Mutex::new(HashMap::new()),
+            model_waiters: Mutex::new(HashMap::new()),
             approval_nonce: u64::from_le_bytes(nonce),
             next: AtomicU64::new(1),
             closed: AtomicBool::new(false),
@@ -191,6 +201,10 @@ impl Threads {
         }
         // Dropping the senders resolves each waiting `approve` as a denial.
         self.approvals.lock().unwrap().clear();
+        for (_, cancel) in self.model_tasks.lock().unwrap().drain() {
+            let _ = cancel.send(true);
+        }
+        self.model_waiters.lock().unwrap().clear();
     }
 }
 
@@ -285,7 +299,7 @@ fn start_thread(
     let Some(pcfg) = threads.providers.lock().unwrap().iter().find(|p| p.id == spec.provider_id).cloned() else {
         return fail(format!("This device has no provider {:?}.", spec.provider_id));
     };
-    let provider = match providers::build(&pcfg) {
+    let provider = match device_provider::build(&pcfg, threads) {
         Ok(p) => p,
         Err(e) => return fail(e.to_string()),
     };
@@ -413,12 +427,27 @@ async fn connect_once(
                     Some(Ok(_)) => continue,
                 };
                 match serde_json::from_str::<HubMessage>(&text) {
-                    Ok(HubMessage::Welcome { device_id, .. }) => events.status(Status::Connected { device_id }),
+                    Ok(HubMessage::Welcome { device_id, device_name, .. }) => {
+                        *threads.identity.lock().unwrap() = Some((device_id.clone(), device_name));
+                        events.status(Status::Connected { device_id });
+                    }
                     Ok(HubMessage::Presence { devices }) => events.presence(devices),
                     Ok(HubMessage::Mcp { message }) => {
                         if let Err(mpsc::error::TrySendError::Full(_)) = mcp.incoming.try_send(message) {
                             return Outcome::Retry("MCP incoming queue full".into());
                         }
+                    }
+                    Ok(HubMessage::ModelRequest { call_id, provider_id, request }) => {
+                        device_provider::start_host_call(&threads, call_id, provider_id, request);
+                    }
+                    Ok(HubMessage::ModelDelta { call_id, delta }) => {
+                        device_provider::relay_delta(&threads, &call_id, delta);
+                    }
+                    Ok(HubMessage::ModelResponse { call_id, response, error }) => {
+                        device_provider::relay_response(&threads, &call_id, response, error);
+                    }
+                    Ok(HubMessage::ModelCancel { call_id }) => {
+                        device_provider::cancel_host_call(&threads, &call_id);
                     }
                     Ok(HubMessage::Providers { providers }) => {
                         *threads.providers.lock().unwrap() = providers;

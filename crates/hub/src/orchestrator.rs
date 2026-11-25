@@ -212,7 +212,11 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
             None
         }
     };
-    let Some(model) = chosen.or_else(|| hub.db.default_model(role)) else {
+    let model = match chosen {
+        Some(model) => Some(model),
+        None => hub.default_model(role).await,
+    };
+    let Some(model) = model else {
         finish(hub, &history);
         hub.emit(
             conversation_id,
@@ -230,7 +234,7 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         .provider(&model.provider_id)
         .map_err(|e| e.to_string())
         .and_then(|p| p.ok_or_else(|| format!("no provider {}", model.provider_id)))
-        .and_then(|p| providers::build(&p).map_err(|e| e.to_string()))
+        .and_then(|p| hub.build_provider(&p).map_err(|e| e.to_string()))
     {
         Ok(p) => p,
         Err(e) => {

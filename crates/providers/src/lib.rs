@@ -66,7 +66,7 @@ impl Message {
 
 pub use core_protocol::{ProviderConfig, ToolDef};
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Request {
     pub model: String,
     pub system: String,
@@ -92,7 +92,8 @@ impl Usage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
     ToolUse,
@@ -101,7 +102,7 @@ pub enum StopReason {
     Other(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Response {
     pub message: Message,
     pub stop: StopReason,
@@ -120,6 +121,8 @@ pub enum ProviderError {
     BadResponse { provider: String, message: String },
     #[error("bad provider config: {0}")]
     Config(String),
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 impl ProviderError {
@@ -133,7 +136,8 @@ impl ProviderError {
 }
 
 /// A piece of a response as the model generates it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", content = "text", rename_all = "snake_case")]
 pub enum Delta {
     /// Visible text. Concatenated, a response's text deltas equal [`Message::text`]
     /// of the final message (separate text blocks are joined with `\n`).

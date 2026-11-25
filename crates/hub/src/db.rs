@@ -499,6 +499,22 @@ impl Db {
         if !["anthropic", "openai", "scripted"].contains(&p.kind.as_str()) {
             bail!("kind must be anthropic, openai or scripted");
         }
+        if let Some(value) = p.options.get("via_device") {
+            let Some(host) = value.as_str().map(str::trim).filter(|host| !host.is_empty()) else {
+                bail!("options.via_device must be a non-empty device id or name");
+            };
+            let devices: Vec<Device> = self
+                .devices()
+                .into_iter()
+                .filter(|device| !device.revoked && (device.id == host || device.name.eq_ignore_ascii_case(host)))
+                .collect();
+            if devices.is_empty() {
+                bail!("options.via_device names no device {host:?}");
+            }
+            if devices.len() > 1 && !devices.iter().any(|device| device.id == host) {
+                bail!("options.via_device name {host:?} is ambiguous; use a device id");
+            }
+        }
         let options = if p.options.is_null() { "{}".to_string() } else { p.options.to_string() };
         let api_key = p
             .api_key
@@ -596,7 +612,21 @@ impl Db {
 
     /// The model to use for a role. Standard chat prefers a free model.
     pub fn default_model(&self, role: &str) -> Option<ModelEntry> {
-        let models = self.models();
+        self.default_model_available(role, &std::collections::HashSet::new())
+    }
+
+    /// The role default excluding providers that cannot currently serve an
+    /// automatically selected model (for example, an offline device host).
+    pub fn default_model_available(
+        &self,
+        role: &str,
+        unavailable_providers: &std::collections::HashSet<String>,
+    ) -> Option<ModelEntry> {
+        let models: Vec<ModelEntry> = self
+            .models()
+            .into_iter()
+            .filter(|model| !unavailable_providers.contains(&model.provider_id))
+            .collect();
         let by_role = |r: &str| models.iter().find(|m| m.roles.iter().any(|x| x == r)).cloned();
         match role {
             "standard" => by_role("standard").or_else(|| models.iter().find(|m| m.free).cloned()),
@@ -913,6 +943,31 @@ mod tests {
         assert!(db.authenticate(&token).unwrap().admin);
         db.revoke_device(&d.id).unwrap();
         assert!(db.authenticate(&token).is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn device_hosted_provider_requires_a_real_device_id_or_name() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let (device, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+        let provider = |via: Value| ProviderConfig {
+            id: "local".into(),
+            kind: "openai".into(),
+            base_url: Some("http://127.0.0.1:45123/v1".into()),
+            api_key: None,
+            options: serde_json::json!({"via_device": via}),
+        };
+
+        db.upsert_provider(&provider(Value::String("Gaming PC".into()))).unwrap();
+        assert_eq!(db.provider("local").unwrap().unwrap().via_device(), Some("Gaming PC"));
+        db.upsert_provider(&provider(Value::String(device.id.clone()))).unwrap();
+        assert_eq!(db.provider("local").unwrap().unwrap().via_device(), Some(device.id.as_str()));
+
+        for bad in [Value::String(String::new()), Value::String("Missing PC".into()), Value::Bool(true), Value::Null] {
+            let error = db.upsert_provider(&provider(bad)).unwrap_err().to_string();
+            assert!(error.contains("via_device"), "{error}");
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 

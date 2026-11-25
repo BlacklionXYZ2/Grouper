@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod db;
+mod device_provider;
 pub mod files;
 pub mod limits;
 pub mod mcp;

@@ -18,7 +18,7 @@ use serde_json::Value;
 pub mod tunnel;
 
 /// Bumped on any breaking change to the frames below.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// WebSocket endpoint for devices, relative to the hub's base URL.
 pub const CONNECT_PATH: &str = "/v1/connect";
@@ -161,6 +161,21 @@ pub enum NodeMessage {
     Hello { protocol_version: u32, client_version: String },
     /// One MCP JSON-RPC message from the device's MCP server to the hub's client.
     Mcp { message: Value },
+    /// Ask the hub to relay a model call to the device named by the provider's
+    /// `options.via_device`. Used by a thread running on a different device.
+    ModelRequest { call_id: String, provider_id: String, request: Value },
+    /// A streamed model delta from this device when it is hosting the provider.
+    ModelDelta { call_id: String, delta: Value },
+    /// The final model response, or an error, from this provider host.
+    ModelResponse {
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Cancel a relayed model call previously requested by this device.
+    ModelCancel { call_id: String },
     Ping,
     /// Something happened in a thread running on this device.
     ThreadEvent { thread_id: String, event: AgentEvent },
@@ -185,6 +200,7 @@ pub enum NodeMessage {
 pub enum HubMessage {
     Welcome {
         device_id: String,
+        device_name: String,
         hub_version: String,
         protocol_version: u32,
     },
@@ -193,6 +209,22 @@ pub enum HubMessage {
     /// One MCP JSON-RPC message from the hub's MCP client to the device's server
     /// (`initialize`, `tools/list`, `tools/call`, `notifications/cancelled`, …).
     Mcp { message: Value },
+    /// Run a model call on this provider-hosting device. `request` is a serialized
+    /// `providers::Request`; the device streams `ModelDelta` then `ModelResponse`.
+    ModelRequest { call_id: String, provider_id: String, request: Value },
+    /// A streamed delta relayed back to a non-host device thread.
+    ModelDelta { call_id: String, delta: Value },
+    /// The final response (serialized `providers::Response`) or error relayed back
+    /// to a non-host device thread.
+    ModelResponse {
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Stop work on a model call hosted by this device.
+    ModelCancel { call_id: String },
     Pong,
     Error { message: String },
     /// The account's providers and keys, sent on connect and whenever they change.
@@ -236,9 +268,27 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub api_key: Option<String>,
     /// Kind-specific options, e.g. `{"max_tokens_field": "max_completion_tokens"}`,
-    /// `{"script": "/path/to/script.json"}`, `{"fallbacks": false}`.
+    /// `{"script": "/path/to/script.json"}`, or `{"via_device": "Gaming PC"}`.
+    /// With `via_device`, `base_url` is interpreted on that device and all other
+    /// nodes reach it through the device's outbound hub connection.
     #[serde(default)]
     pub options: Value,
+}
+
+impl ProviderConfig {
+    /// Device id or name that hosts this provider, if configured.
+    pub fn via_device(&self) -> Option<&str> {
+        self.options.get("via_device").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    /// A copy suitable for constructing the provider on its hosting device.
+    pub fn without_via_device(&self) -> Self {
+        let mut config = self.clone();
+        if let Some(options) = config.options.as_object_mut() {
+            options.remove("via_device");
+        }
+        config
+    }
 }
 
 /// How a tool call on a device is gated.
@@ -714,6 +764,9 @@ pub struct ProviderInfo {
     pub kind: String,
     pub base_url: Option<String>,
     pub has_key: bool,
+    /// Device id or name that hosts the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_device: Option<String>,
 }
 
 /// Body of `POST /v1/devices/{id}/call`.

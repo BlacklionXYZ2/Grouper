@@ -114,7 +114,7 @@ impl Hub {
         let place = if online { (device_id.as_str(), device_name.as_str()) } else { (HUB_DEVICE, "the hub") };
         let admission = crate::limits::admit(self, conversation_id, place.0, place.1, req.budget_usd).await?;
         let cheaper = req.model.is_none() && admission.budget.is_some();
-        let route = self.db.route_model_with(req.model.as_deref(), req.task_type.as_deref(), &req.tags, cheaper)?;
+        let route = self.route_model(req.model.as_deref(), req.task_type.as_deref(), &req.tags, cheaper).await?;
         let model = route.model;
         let offline = (!online).then(|| format!("{device_name} is offline; the hub prepares a checkpoint"));
         let reason =
@@ -179,7 +179,7 @@ impl Hub {
             Ok(None) => return fail(format!("no provider {}", spec.provider_id)).await,
             Err(error) => return fail(error.to_string()).await,
         };
-        let provider = match providers::build(&pcfg) {
+        let provider = match self.build_provider(&pcfg) {
             Ok(p) => p,
             Err(e) => return fail(e.to_string()).await,
         };

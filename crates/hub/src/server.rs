@@ -24,6 +24,7 @@ use serde_json::json;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 use crate::db::{Auth, Db};
+use crate::device_provider::ModelRoute;
 use crate::mcp::McpSession;
 use crate::orchestrator::Wake;
 
@@ -106,6 +107,8 @@ pub struct Hub {
     pub(crate) live: Mutex<HashMap<String, Live>>,
     pub(crate) approvals: Mutex<HashMap<String, ApprovalRoute>>,
     pub(crate) handover_acks: Mutex<HashMap<String, HandoverAckRoute>>,
+    /// Concurrent model calls currently relayed through hosting devices.
+    pub(crate) model_calls: Mutex<HashMap<String, ModelRoute>>,
     handover_ack_timeout: std::sync::Mutex<Duration>,
     pub(crate) hub_threads: Mutex<HashMap<String, ThreadControl>>,
     pub(crate) orchestrators: Mutex<HashMap<String, mpsc::UnboundedSender<Wake>>>,
@@ -126,6 +129,7 @@ impl Hub {
             live: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             handover_acks: Mutex::new(HashMap::new()),
+            model_calls: Mutex::new(HashMap::new()),
             handover_ack_timeout: std::sync::Mutex::new(crate::offline::HANDOVER_ACK_TIMEOUT),
             hub_threads: Mutex::new(HashMap::new()),
             orchestrators: Mutex::new(HashMap::new()),
@@ -519,6 +523,7 @@ async fn list_providers(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Resp
     let list: Vec<ProviderInfo> = providers
         .into_iter()
         .map(|p| ProviderInfo {
+            via_device: p.via_device().map(String::from),
             id: p.id,
             kind: p.kind,
             base_url: p.base_url,
@@ -954,6 +959,13 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     hub.db.touch(&device_id);
     let _ = tx.try_send(HubMessage::Welcome {
         device_id: device_id.clone(),
+        device_name: hub
+            .db
+            .devices()
+            .into_iter()
+            .find(|device| device.id == device_id)
+            .map(|device| device.name)
+            .unwrap_or_else(|| device_id.clone()),
         hub_version: HUB_VERSION.into(),
         protocol_version: PROTOCOL_VERSION,
     });
@@ -1029,6 +1041,20 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                     break Err("MCP incoming queue full".to_string());
                 }
             }
+            Ok(NodeMessage::ModelRequest { call_id, provider_id, request }) => {
+                if hub.is_live_conn(&device_id, conn_id).await {
+                    hub.relay_model_request(&device_id, conn_id, call_id, provider_id, request).await;
+                }
+            }
+            Ok(NodeMessage::ModelDelta { call_id, delta }) => {
+                hub.model_delta(&device_id, conn_id, &call_id, delta).await;
+            }
+            Ok(NodeMessage::ModelResponse { call_id, response, error }) => {
+                hub.model_response(&device_id, conn_id, &call_id, response, error).await;
+            }
+            Ok(NodeMessage::ModelCancel { call_id }) => {
+                hub.relay_model_cancel(&device_id, conn_id, &call_id).await;
+            }
             Ok(
                 msg @ (NodeMessage::ThreadEvent { .. }
                 | NodeMessage::ThreadFinished { .. }
@@ -1060,6 +1086,8 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
             }
         }
     };
+
+    hub.model_connection_gone(&device_id, conn_id).await;
 
     let call_device_gone = {
         let mut live = hub.live.lock().await;

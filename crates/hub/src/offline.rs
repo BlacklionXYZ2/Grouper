@@ -413,7 +413,7 @@ impl Hub {
             .provider(&model.provider_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("no provider {}", model.provider_id))?;
-        let provider = providers::build(&pcfg).map_err(|e| e.to_string())?;
+        let provider = self.build_provider(&pcfg).map_err(|e| e.to_string())?;
         let ws = Workspace::create(hub_workspace(&self.data_dir, &t.id)).map_err(|e| format!("workspace: {e}"))?;
         let spec = ThreadSpec {
             thread_id: t.id.clone(),

@@ -245,6 +245,9 @@ enum KeysCmd {
         kind: String,
         #[arg(long)]
         base_url: Option<String>,
+        /// Host this provider on a device (id or name); its base URL is local to that device.
+        #[arg(long)]
+        via_device: Option<String>,
         /// JSON options, e.g. '{"script": "/path/script.json"}'
         #[arg(long)]
         options: Option<String>,
@@ -959,15 +962,25 @@ async fn main() -> Result<()> {
         Cmd::Keys(KeysCmd::List) => {
             for p in api.get::<Vec<ProviderInfo>>("/v1/providers").await? {
                 let key = if p.has_key { "key set" } else { "no key" };
-                println!("{:<14} {:<10} {:<8} {}", p.id, p.kind, key, p.base_url.unwrap_or_default());
+                let via = p.via_device.map(|device| format!(" via {device}")).unwrap_or_default();
+                println!("{:<14} {:<10} {:<8} {}{via}", p.id, p.kind, key, p.base_url.unwrap_or_default());
             }
         }
-        Cmd::Keys(KeysCmd::Set { provider, kind, base_url, options, no_key }) => {
+        Cmd::Keys(KeysCmd::Set { provider, kind, base_url, via_device, options, no_key }) => {
             let api_key = if no_key { None } else { Some(read_key()?).filter(|k| !k.is_empty()) };
-            let options = match options {
+            let mut options = match options {
                 Some(o) => serde_json::from_str(&o).context("options must be JSON")?,
                 None => Value::Null,
             };
+            if let Some(device) = via_device {
+                if options.is_null() {
+                    options = json!({});
+                }
+                let Some(object) = options.as_object_mut() else {
+                    bail!("--via-device requires --options to be a JSON object");
+                };
+                object.insert("via_device".into(), Value::String(device));
+            }
             api.put(
                 &format!("/v1/providers/{provider}"),
                 &ProviderConfig { id: provider.clone(), kind, base_url, api_key, options },
@@ -1008,9 +1021,16 @@ async fn main() -> Result<()> {
             println!("{device} {tool}: {permission}");
         }
         Cmd::Models(ModelsCmd::List) => {
+            let hosted: HashMap<String, String> = api
+                .get::<Vec<ProviderInfo>>("/v1/providers")
+                .await?
+                .into_iter()
+                .filter_map(|provider| provider.via_device.map(|device| (provider.id, device)))
+                .collect();
             for m in api.get::<Vec<ModelEntry>>("/v1/models").await? {
+                let via = hosted.get(&m.provider_id).map(|device| format!(" via {device}")).unwrap_or_default();
                 println!(
-                    "{:<16} {:<12} {:<28} ${}/${} {}{}{}",
+                    "{:<16} {:<12} {:<28} ${}/${} {}{}{}{via}",
                     m.id,
                     m.provider_id,
                     m.model,

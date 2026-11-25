@@ -105,6 +105,10 @@ The orchestrator starts a thread with a **brief**, not a transcript:
   `free` flag, and which roles it's the default for (`orchestrator`, `standard`,
   `thread`).
 
+### Models on a device
+
+Set `ProviderConfig.options.via_device` to a device id or name to host a provider there, for example `grouper keys set local --kind openai --base-url http://127.0.0.1:45123/v1 --via-device "Gaming PC" --no-key`. Its `base_url` is interpreted on that device (so a loopback LM Studio URL stays private); hub calls and threads on other devices stream through the host's existing outbound connection, while threads already on the host call it directly. Disconnects and cancellation stop the relayed call, offline hosts are skipped by automatic routing, and an explicitly selected model reports which device is offline.
+
 ## Storage
 
 SQLite on the hub, because tools can fetch just the rows they need, which keeps
@@ -188,7 +192,6 @@ needs a decision on how they merge back (open question below).
 
 - Auto's shell rules are a blocklist: they ask more than needed for ordinary words, and
   obfuscated commands can get past them. Use Manual for shells you don't trust.
-- Model routing judges "local" from the hub's view of a provider URL, not the device's.
 
 ## Open questions
 
