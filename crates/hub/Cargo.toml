@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 core-protocol = { workspace = true, features = ["tunnel"] }
+core-registry.workspace = true
+core-memory.workspace = true
 core-agent.workspace = true
 providers.workspace = true
 async-trait.workspace = true

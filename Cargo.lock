@@ -536,6 +536,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core-protocol",
+ "rusqlite",
+ "tracing",
+]
+
+[[package]]
 name = "core-protocol"
 version = "0.1.0"
 dependencies = [
@@ -543,6 +553,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "core-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core-protocol",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1018,7 +1040,9 @@ dependencies = [
  "clap",
  "core-agent",
  "core-client",
+ "core-memory",
  "core-protocol",
+ "core-registry",
  "futures-util",
  "getrandom 0.4.3",
  "hex",

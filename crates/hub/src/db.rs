@@ -129,13 +129,6 @@ fn csv_list(value: String) -> Vec<String> {
     value.split(',').filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
-fn check_price(field: &str, value: f64) -> Result<()> {
-    if !value.is_finite() || value < 0.0 {
-        bail!("{field} must be a non-negative finite number, got {value}");
-    }
-    Ok(())
-}
-
 fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
     let roles: String = r.get(10)?;
     let modalities: String = r.get(12)?;
@@ -200,9 +193,9 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     let conn = Connection::open(data_dir.join("grouper.db"))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     conn.execute_batch(SCHEMA)?;
-    conn.execute_batch(crate::memory::SCHEMA)?;
-    crate::registry::migrate(&conn)?;
-    conn.execute_batch(crate::skills::SCHEMA)?;
+    core_memory::memory::migrate(&conn)?;
+    core_registry::migrate(&conn)?;
+    core_memory::skills::migrate(&conn)?;
     conn.execute_batch(crate::offline::SCHEMA)?;
     conn.execute_batch(crate::limits::SCHEMA)?;
     conn.execute_batch(crate::session::SCHEMA)?;
@@ -566,13 +559,13 @@ impl Db {
         if self.provider(&m.provider_id)?.is_none() {
             bail!("no provider {}; add it first", m.provider_id);
         }
-        check_price("input_price", m.input_price)?;
-        check_price("output_price", m.output_price)?;
+        core_registry::cost::check_price("input_price", m.input_price)?;
+        core_registry::cost::check_price("output_price", m.output_price)?;
         if let Some(p) = m.cache_read_price {
-            check_price("cache_read_price", p)?;
+            core_registry::cost::check_price("cache_read_price", p)?;
         }
         if let Some(p) = m.cache_write_price {
-            check_price("cache_write_price", p)?;
+            core_registry::cost::check_price("cache_write_price", p)?;
         }
         self.c().execute(
             "INSERT OR REPLACE INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
@@ -622,26 +615,12 @@ impl Db {
         role: &str,
         unavailable_providers: &std::collections::HashSet<String>,
     ) -> Option<ModelEntry> {
-        let models: Vec<ModelEntry> = self
-            .models()
-            .into_iter()
-            .filter(|model| !unavailable_providers.contains(&model.provider_id))
-            .collect();
-        let by_role = |r: &str| models.iter().find(|m| m.roles.iter().any(|x| x == r)).cloned();
-        match role {
-            "standard" => by_role("standard").or_else(|| models.iter().find(|m| m.free).cloned()),
-            "thread" => by_role("thread"),
-            _ => None,
-        }
-        .or_else(|| by_role(role))
-        .or_else(|| by_role("orchestrator"))
-        .or_else(|| models.first().cloned())
+        core_registry::default_model_from(&self.models(), role, unavailable_providers)
     }
 
     /// A model by registry id, or by the provider's model name.
     pub fn find_model(&self, key: &str) -> Option<ModelEntry> {
-        let models = self.models();
-        models.iter().find(|m| m.id == key).or_else(|| models.iter().find(|m| m.model == key)).cloned()
+        core_registry::find_model_in(&self.models(), key)
     }
 
     // ---- conversations and history
@@ -872,18 +851,7 @@ impl Db {
         let price = self.models().into_iter().find(|m| m.provider_id == provider_id && m.model == model);
         let provider_kind = self.provider(provider_id).ok().flatten().map(|p| p.kind);
         let cost = price
-            .map(|m| {
-                let anthropic = provider_kind.as_deref() == Some("anthropic");
-                let cache_read_price =
-                    m.cache_read_price.unwrap_or(m.input_price * if anthropic { 0.1 } else { 0.5 });
-                let cache_write_price =
-                    m.cache_write_price.unwrap_or(m.input_price * if anthropic { 1.25 } else { 1.0 });
-                (m.input_price * input as f64
-                    + m.output_price * output as f64
-                    + cache_read_price * cache_read as f64
-                    + cache_write_price * cache_write as f64)
-                    / 1_000_000.0
-            })
+            .map(|m| core_registry::cost::estimate_cost(&m, provider_kind.as_deref(), input, output, cache_read, cache_write))
             .unwrap_or(0.0);
         let _ = self.c().execute(
             "INSERT INTO usage (conversation_id, thread_id, provider_id, model, input_tokens, output_tokens,
@@ -895,15 +863,7 @@ impl Db {
 
     /// (input tokens, output tokens, cost) for a conversation.
     pub fn usage_total(&self, conversation_id: &str) -> (u64, u64, f64) {
-        self.c()
-            .query_row(
-                "SELECT COALESCE(SUM(input_tokens + cache_read_tokens + cache_write_tokens), 0),
-                        COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cost), 0)
-                 FROM usage WHERE conversation_id = ?1",
-                [conversation_id],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get(2)?)),
-            )
-            .unwrap_or((0, 0, 0.0))
+        core_registry::cost::usage_total(&self.c(), conversation_id)
     }
 }
 

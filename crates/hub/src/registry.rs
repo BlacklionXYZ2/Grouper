@@ -1,22 +1,9 @@
-//! The model registry's learning, per Proposal v3: thread outcomes and the stats
-//! drawn from them (per model and per device, by task type), the orchestrator's
-//! grades and your thumbs up/down, use-case proposals that wait for your approval
-//! so the table doesn't drift, and priority rules ("Sensitive data: local only",
-//! "drafts: cheapest") that choose and restrict the model for each thread.
+//! Model registry hub glue: `Db` wrappers, orchestrator tools (`grade_thread`,
+//! `propose_use_cases`) and HTTP routes (`/v1/registry/*`, `/v1/threads/{id}/rating`).
 //!
-//! Tables: `thread_meta` (task type and tags given at start), `thread_outcomes`
-//! (one row per finished thread), `registry_proposals`, `priority_rules`; and the
-//! `local` column on `models`.
-//!
-//! Routing ([`Db::route_model`]): enabled rules that apply to the task (by tag and
-//! task type) filter the models first (`require` / `forbid`); what's left is
-//! ordered by the rules' `prefer`s, then by the task type's record (models with at
-//! least [`MIN_ROUTING_RUNS`] finished threads and a success rate of 50% or more
-//! first, by success rate, grade, then cost; unproven models next; poor records
-//! last), then by the registry default for threads. A model the orchestrator names
-//! itself must still pass the filters, so privacy rules can't be bypassed.
+//! Schema/migrations, stats, routing, proposals and priority rules live in [`core_registry`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -28,301 +15,27 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_agent::{Tool, ToolOutput};
 use core_protocol::{ModelEntry, OutcomeStats, PriorityRule, RegistryProposal, RegistryStats, RuleInput, RuleSpec, ToolDef};
-use rusqlite::{Connection, OptionalExtension, params};
+pub use core_registry::{
+    By, MIN_ROUTING_RUNS, PROPOSAL_HIGH, PROPOSAL_LOW, PROPOSAL_MIN_RUNS, Route, TASK_TYPES, clean_tags,
+    format_duration_s, is_local_url, probe_overview_line, stats_line, validate_rule,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::db::{Db, now};
+use crate::db::Db;
 use crate::server::{Hub, err};
-
-pub(crate) const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS thread_meta (
-  thread_id TEXT PRIMARY KEY, task_type TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS thread_outcomes (
-  thread_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, model_id TEXT NOT NULL, device_id TEXT NOT NULL,
-  task_type TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, grade INTEGER, grade_note TEXT, user_rating INTEGER,
-  duration_s INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
-  created INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'thread', duration_ms INTEGER);
-CREATE INDEX IF NOT EXISTS thread_outcomes_model ON thread_outcomes (model_id, task_type);
-CREATE TABLE IF NOT EXISTS registry_proposals (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, model_id TEXT NOT NULL, field TEXT NOT NULL, text TEXT NOT NULL,
-  reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', source TEXT NOT NULL, created INTEGER NOT NULL,
-  decided INTEGER);
-CREATE TABLE IF NOT EXISTS priority_rules (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, rule TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
-  created INTEGER NOT NULL);
-";
-
-/// Create this module's tables and add newer columns to older databases.
-pub(crate) fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA)?;
-    for (table, column, sql) in [
-        ("models", "local", "ALTER TABLE models ADD COLUMN local INTEGER NOT NULL DEFAULT 0;"),
-        (
-            "thread_outcomes",
-            "source",
-            "ALTER TABLE thread_outcomes ADD COLUMN source TEXT NOT NULL DEFAULT 'thread';",
-        ),
-        ("thread_outcomes", "duration_ms", "ALTER TABLE thread_outcomes ADD COLUMN duration_ms INTEGER;"),
-    ] {
-        let has: bool =
-            conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?.exists([column])?;
-        if !has {
-            conn.execute_batch(sql)?;
-        }
-    }
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS thread_outcomes_source ON thread_outcomes (source, model_id, task_type);",
-    )?;
-    Ok(())
-}
-
-/// Suggested task types (any short tag works).
-pub const TASK_TYPES: &[&str] = &["code", "research", "writing", "data", "ops"];
-/// Finished threads of a task type before a model's record steers routing.
-pub const MIN_ROUTING_RUNS: u64 = 3;
-/// Finished threads of a task type before the hub proposes a use-case change, and
-/// the success rates that trigger it.
-pub const PROPOSAL_MIN_RUNS: u64 = 5;
-pub const PROPOSAL_HIGH: f64 = 0.8;
-pub const PROPOSAL_LOW: f64 = 0.3;
-const MAX_USE_CASES_CHARS: usize = 500;
-
-/// Rule values for `require` / `forbid`, and for `prefer`.
-const PROPERTIES: &[&str] = &["local", "remote", "free", "paid"];
-const PREFERENCES: &[&str] = &["cheapest", "local", "free"];
-
-fn norm(s: &str) -> String {
-    s.trim().to_lowercase()
-}
-
-/// Lower-cased, trimmed, de-duplicated tags.
-pub fn clean_tags(tags: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for t in tags.iter().flat_map(|t| t.split(',')).map(norm).filter(|t| !t.is_empty()) {
-        if !out.contains(&t) {
-            out.push(t);
-        }
-    }
-    out
-}
-
-/// The host of a URL such as `http://user@[::1]:8080/v1`, lower-cased.
-fn url_host(url: &str) -> Option<String> {
-    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url.trim());
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next()?,
-        None => authority.split(':').next()?,
-    };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
-}
-
-/// Whether a provider URL points at this machine or the local network.
-pub fn is_local_url(url: &str) -> bool {
-    url_host(url).is_some_and(|h| {
-        h == "localhost" || h == "::1" || h.starts_with("127.") || h.ends_with(".local") || h.ends_with(".localhost")
-    })
-}
-
-/// Rough price for comparing models: USD per million input plus output tokens.
-fn price(m: &ModelEntry) -> f64 {
-    if m.free { 0.0 } else { m.input_price + m.output_price }
-}
-
-fn has_property(m: &ModelEntry, local: bool, property: &str) -> bool {
-    match property {
-        "local" => local,
-        "remote" => !local,
-        "free" => m.free,
-        "paid" => !m.free,
-        _ => false,
-    }
-}
-
-/// Check and normalise a rule.
-pub fn validate_rule(rule: &RuleSpec) -> Result<RuleSpec> {
-    let clean = |v: &Option<String>| v.as_deref().map(norm).filter(|s| !s.is_empty());
-    let r = RuleSpec {
-        when_tag: clean(&rule.when_tag),
-        when_task_type: clean(&rule.when_task_type),
-        require: clean(&rule.require),
-        forbid: clean(&rule.forbid),
-        prefer: clean(&rule.prefer),
-    };
-    for v in [&r.require, &r.forbid].into_iter().flatten() {
-        if !PROPERTIES.contains(&v.as_str()) {
-            bail!("require and forbid take one of {}; got {v:?}", PROPERTIES.join(", "));
-        }
-    }
-    if let Some(p) = &r.prefer
-        && !PREFERENCES.contains(&p.as_str())
-    {
-        bail!("prefer takes one of {}; got {p:?}", PREFERENCES.join(", "));
-    }
-    if r.require.is_none() && r.forbid.is_none() && r.prefer.is_none() {
-        bail!("a rule needs require, forbid or prefer");
-    }
-    Ok(r)
-}
-
-fn rule_applies(r: &RuleSpec, task_type: &str, tags: &[String]) -> bool {
-    r.when_tag.as_ref().is_none_or(|t| tags.contains(t)) && r.when_task_type.as_ref().is_none_or(|t| t == task_type)
-}
-
-/// `#1 "Sensitive data: local only" (require local)`
-fn describe_rule(r: &PriorityRule) -> String {
-    let mut effects = Vec::new();
-    for (k, v) in [("require", &r.rule.require), ("forbid", &r.rule.forbid), ("prefer", &r.rule.prefer)] {
-        if let Some(v) = v {
-            effects.push(format!("{k} {v}"));
-        }
-    }
-    format!("#{} \"{}\" ({})", r.id, r.text, effects.join(", "))
-}
-
-/// Which model a thread gets, and why (`None` when the orchestrator named it).
-#[derive(Debug, Clone)]
-pub struct Route {
-    pub model: ModelEntry,
-    pub reason: Option<String>,
-}
-
-/// Group outcome stats by model or by device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum By {
-    Model,
-    Device,
-}
-
-struct OutcomeRow {
-    subject: String,
-    task_type: String,
-    status: String,
-    grade: Option<i64>,
-    rating: Option<i64>,
-    duration_s: i64,
-    duration_ms: Option<i64>,
-    cost: f64,
-    tokens: i64,
-}
-
-fn summarize(subject: &str, task_type: &str, source: &str, rows: &[&OutcomeRow]) -> OutcomeStats {
-    let mut s = OutcomeStats {
-        subject: subject.into(),
-        task_type: task_type.into(),
-        source: source.into(),
-        ..Default::default()
-    };
-    let mut durations = Vec::new();
-    let (mut cost, mut tokens, mut grades, mut graded) = (0.0, 0i64, 0i64, 0u64);
-    for r in rows {
-        match r.status.as_str() {
-            "done" => s.done += 1,
-            "stopped" => s.stopped += 1,
-            _ => s.failed += 1,
-        }
-        if r.status == "done" && !r.grade.is_some_and(|g| g <= 2) && r.rating != Some(-1) {
-            s.successes += 1;
-        }
-        if let Some(g) = r.grade {
-            grades += g;
-            graded += 1;
-        }
-        s.net_rating += r.rating.unwrap_or(0);
-        let dur_s = r.duration_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(r.duration_s as f64);
-        durations.push(dur_s);
-        cost += r.cost;
-        tokens += r.tokens;
-    }
-    let finished = s.done + s.failed;
-    s.success_rate = (finished > 0).then(|| s.successes as f64 / finished as f64);
-    s.mean_grade = (graded > 0).then(|| grades as f64 / graded as f64);
-    if !rows.is_empty() {
-        s.mean_cost = Some(cost / rows.len() as f64);
-        if tokens > 0 || source == "probe" {
-            s.mean_tokens = Some(tokens as f64 / rows.len() as f64);
-        }
-        durations.sort_by(f64::total_cmp);
-        let n = durations.len();
-        s.median_duration_s = Some(if n % 2 == 1 { durations[n / 2] } else { (durations[n / 2 - 1] + durations[n / 2]) / 2.0 });
-    }
-    s
-}
-
-/// Format latency seconds cleanly: `240ms`, `1.4s`, `41s`.
-pub fn format_duration_s(secs: f64) -> String {
-    if secs < 1.0 {
-        format!("{:.0}ms", secs * 1000.0)
-    } else if secs < 10.0 {
-        format!("{secs:.1}s")
-    } else {
-        format!("{secs:.0}s")
-    }
-}
-
-/// `code: 8/9 ok (89%), grade 4.3, $0.0120/thread, 41s median, rating +2`
-pub fn stats_line(s: &OutcomeStats) -> String {
-    let what = if s.task_type.is_empty() { "all" } else { s.task_type.as_str() };
-    let mut out = format!("{what}: {}/{} ok", s.successes, s.done + s.failed);
-    if let Some(r) = s.success_rate {
-        out.push_str(&format!(" ({:.0}%)", r * 100.0));
-    }
-    if s.stopped > 0 {
-        out.push_str(&format!(", {} stopped", s.stopped));
-    }
-    if let Some(g) = s.mean_grade {
-        out.push_str(&format!(", grade {g:.1}"));
-    }
-    if let Some(c) = s.mean_cost {
-        out.push_str(&format!(", ${c:.4}/thread"));
-    }
-    if let Some(d) = s.median_duration_s {
-        out.push_str(&format!(", {d:.0}s median"));
-    }
-    if s.net_rating != 0 {
-        out.push_str(&format!(", rating {:+}", s.net_rating));
-    }
-    out
-}
-
-fn proposal_row(r: &rusqlite::Row) -> rusqlite::Result<RegistryProposal> {
-    Ok(RegistryProposal {
-        id: r.get(0)?,
-        model_id: r.get(1)?,
-        field: r.get(2)?,
-        text: r.get(3)?,
-        reason: r.get(4)?,
-        status: r.get(5)?,
-        source: r.get(6)?,
-        created: r.get::<_, i64>(7)? as u64,
-        decided: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-    })
-}
-const PROPOSAL_COLS: &str = "id, model_id, field, text, reason, status, source, created, decided";
 
 impl Db {
     // ---- thread metadata and outcomes
 
     /// Remember what kind of work a thread is, for its outcome later.
     pub fn set_thread_meta(&self, thread_id: &str, task_type: &str, tags: &[String]) {
-        let _ = self.c().execute(
-            "INSERT OR REPLACE INTO thread_meta (thread_id, task_type, tags) VALUES (?1, ?2, ?3)",
-            params![thread_id, norm(task_type), clean_tags(tags).join(",")],
-        );
+        core_registry::set_thread_meta(&self.c(), thread_id, task_type, tags);
     }
 
     /// (task type, tags) given when the thread started.
     pub fn thread_meta(&self, thread_id: &str) -> Option<(String, Vec<String>)> {
-        self.c()
-            .query_row("SELECT task_type, tags FROM thread_meta WHERE thread_id = ?1", [thread_id], |r| {
-                let tags: String = r.get(1)?;
-                Ok((r.get(0)?, tags.split(',').filter(|t| !t.is_empty()).map(String::from).collect()))
-            })
-            .optional()
-            .ok()
-            .flatten()
+        core_registry::thread_meta(&self.c(), thread_id)
     }
 
     /// Record how a finished thread went: status, duration, and its cost and tokens
@@ -330,33 +43,8 @@ impl Db {
     /// cases should change. Returns false if the thread isn't finished or was recorded.
     pub fn record_outcome(&self, thread_id: &str) -> bool {
         let Some(t) = self.thread(thread_id) else { return false };
-        if t.status == "running" {
-            return false;
-        }
-        let task_type = self.thread_meta(thread_id).map(|(t, _)| t).unwrap_or_default();
-        let inserted = {
-            let c = self.c();
-            let (cost, tokens): (f64, i64) = c
-                .query_row(
-                    "SELECT COALESCE(SUM(cost), 0), COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens
-                       + cache_write_tokens), 0) FROM usage WHERE thread_id = ?1",
-                    [thread_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap_or((0.0, 0));
-            let duration = t.finished.unwrap_or_else(now).saturating_sub(t.created) as i64;
-            c.execute(
-                "INSERT OR IGNORE INTO thread_outcomes (thread_id, conversation_id, model_id, device_id, task_type,
-                   status, duration_s, cost, tokens, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![t.id, t.conversation_id, t.model, t.device_id, task_type, t.status, duration, cost, tokens, now() as i64],
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false)
-        };
-        if inserted {
-            self.check_use_cases(&t.model, &task_type);
-        }
-        inserted
+        let model = self.models().into_iter().find(|m| m.id == t.model);
+        core_registry::record_thread_outcome(&self.c(), &t, model.as_ref())
     }
 
     /// Record one deterministic probe outcome into `thread_outcomes` with `source = 'probe'`,
@@ -374,41 +62,23 @@ impl Db {
         tokens: u64,
         detail: &str,
     ) -> Result<()> {
-        let status = if passed { "done" } else { "failed" };
-        let duration_s = ((latency_ms + 500) / 1000) as i64;
-        let note: String = detail.trim().chars().take(500).collect();
-        self.c().execute(
-            "INSERT OR REPLACE INTO thread_outcomes
-               (thread_id, conversation_id, model_id, device_id, task_type, status, grade_note,
-                duration_s, duration_ms, cost, tokens, created, source)
-             VALUES (?1, '', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'probe')",
-            params![
-                probe_run_id,
-                model_id,
-                device_id,
-                norm(task_type),
-                status,
-                (!note.is_empty()).then_some(note),
-                duration_s,
-                latency_ms as i64,
-                cost,
-                tokens as i64,
-                now() as i64,
-            ],
-        )?;
-        Ok(())
+        core_registry::record_probe_outcome(
+            &self.c(),
+            probe_run_id,
+            model_id,
+            device_id,
+            task_type,
+            passed,
+            latency_ms,
+            cost,
+            tokens,
+            detail,
+        )
     }
 
     /// The (model, task type) of a recorded outcome; an error says why there's none.
     fn outcome_key(&self, thread_id: &str) -> Result<(String, String)> {
-        let key = self
-            .c()
-            .query_row(
-                "SELECT model_id, task_type FROM thread_outcomes WHERE thread_id = ?1 AND source = 'thread'",
-                [thread_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+        let key = core_registry::outcome_key(&self.c(), thread_id)?;
         match (key, self.thread(thread_id)) {
             (Some(k), _) => Ok(k),
             (None, Some(t)) if t.status == "running" => {
@@ -421,39 +91,28 @@ impl Db {
 
     /// The orchestrator's 1–5 grade for a finished thread's result.
     pub fn grade_thread(&self, thread_id: &str, grade: i64, note: &str) -> Result<()> {
-        if !(1..=5).contains(&grade) {
-            bail!("grade must be 1 to 5");
-        }
-        let (model, task_type) = self.outcome_key(thread_id)?;
-        let note: String = note.trim().chars().take(500).collect();
-        self.c().execute(
-            "UPDATE thread_outcomes SET grade = ?1, grade_note = ?2 WHERE thread_id = ?3",
-            params![grade, (!note.is_empty()).then_some(note), thread_id],
-        )?;
-        self.check_use_cases(&model, &task_type);
-        Ok(())
+        core_registry::validate_grade(grade)?;
+        let (model_id, task_type) = self.outcome_key(thread_id)?;
+        let model = self.models().into_iter().find(|m| m.id == model_id);
+        core_registry::grade_outcome(&self.c(), thread_id, grade, note, model.as_ref(), &task_type)
     }
 
     /// Your thumbs up (1), down (-1), or neither (`None`) for a finished thread.
     pub fn rate_thread(&self, thread_id: &str, rating: Option<i64>) -> Result<()> {
-        let (model, task_type) = self.outcome_key(thread_id)?;
-        self.c().execute(
-            "UPDATE thread_outcomes SET user_rating = ?1 WHERE thread_id = ?2",
-            params![rating.map(|r| r.signum()), thread_id],
-        )?;
-        self.check_use_cases(&model, &task_type);
-        Ok(())
+        let (model_id, task_type) = self.outcome_key(thread_id)?;
+        let model = self.models().into_iter().find(|m| m.id == model_id);
+        core_registry::rate_outcome(&self.c(), thread_id, rating, model.as_ref(), &task_type)
     }
 
     /// Stats per model or device for real thread outcomes: one row per task type, plus
     /// (unless `task_type` is given) one row with an empty task type for everything together.
     pub fn outcome_stats(&self, by: By, subject: Option<&str>, task_type: Option<&str>) -> Vec<OutcomeStats> {
-        self.outcome_stats_by_source(by, subject, task_type, "thread")
+        core_registry::outcome_stats(&self.c(), by, subject, task_type)
     }
 
     /// Stats per model for deterministic probe runs (`source = 'probe'`).
     pub fn probe_stats(&self, model_id: Option<&str>, task_type: Option<&str>) -> Vec<OutcomeStats> {
-        self.outcome_stats_by_source(By::Model, model_id, task_type, "probe")
+        core_registry::probe_stats(&self.c(), model_id, task_type)
     }
 
     /// Stats per model or device filtered by outcome `source` (`thread` or `probe`).
@@ -464,117 +123,32 @@ impl Db {
         task_type: Option<&str>,
         source: &str,
     ) -> Vec<OutcomeStats> {
-        let col = match by {
-            By::Model => "model_id",
-            By::Device => "device_id",
-        };
-        let rows: Vec<OutcomeRow> = {
-            let c = self.c();
-            let mut st = c
-                .prepare(&format!(
-                    "SELECT {col}, task_type, status, grade, user_rating, duration_s, duration_ms, cost, tokens
-                     FROM thread_outcomes
-                     WHERE source = ?1 AND (?2 IS NULL OR {col} = ?2) AND (?3 IS NULL OR task_type = ?3)"
-                ))
-                .unwrap();
-            st.query_map(params![source, subject, task_type.map(norm)], |r| {
-                Ok(OutcomeRow {
-                    subject: r.get(0)?,
-                    task_type: r.get(1)?,
-                    status: r.get(2)?,
-                    grade: r.get(3)?,
-                    rating: r.get(4)?,
-                    duration_s: r.get(5)?,
-                    duration_ms: r.get(6)?,
-                    cost: r.get(7)?,
-                    tokens: r.get(8)?,
-                })
-            })
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect()
-        };
-        let mut groups: BTreeMap<(String, String), Vec<&OutcomeRow>> = BTreeMap::new();
-        for r in &rows {
-            if task_type.is_none() {
-                groups.entry((r.subject.clone(), String::new())).or_default().push(r);
-            }
-            if !r.task_type.is_empty() {
-                groups.entry((r.subject.clone(), r.task_type.clone())).or_default().push(r);
-            }
-        }
-        groups.iter().map(|((s, t), rows)| summarize(s, t, source, rows)).collect()
+        core_registry::outcome_stats_by_source(&self.c(), by, subject, task_type, source)
     }
 
     pub fn registry_stats(&self) -> RegistryStats {
-        RegistryStats {
-            models: self.outcome_stats(By::Model, None, None),
-            devices: self.outcome_stats(By::Device, None, None),
-            probes: self.probe_stats(None, None),
-        }
+        core_registry::registry_stats(&self.c())
     }
 
     // ---- use-case proposals
 
     pub fn proposals(&self, status: Option<&str>) -> Vec<RegistryProposal> {
-        let c = self.c();
-        let mut st = c
-            .prepare(&format!(
-                "SELECT {PROPOSAL_COLS} FROM registry_proposals WHERE ?1 IS NULL OR status = ?1 ORDER BY id DESC"
-            ))
-            .unwrap();
-        st.query_map([status], proposal_row).unwrap().filter_map(Result::ok).collect()
+        core_registry::proposals(&self.c(), status)
     }
 
     pub fn proposal(&self, id: i64) -> Option<RegistryProposal> {
-        self.c()
-            .query_row(&format!("SELECT {PROPOSAL_COLS} FROM registry_proposals WHERE id = ?1"), [id], proposal_row)
-            .optional()
-            .ok()
-            .flatten()
+        core_registry::proposal(&self.c(), id)
     }
 
     /// Propose new use-case text for a model. One pending proposal per model.
     pub fn propose_use_cases(&self, model_id: &str, text: &str, reason: &str, source: &str) -> Result<RegistryProposal> {
-        let Some(model) = self.models().into_iter().find(|m| m.id == model_id) else { bail!("no model {model_id:?}") };
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("the proposed use cases are empty");
-        }
-        if text.chars().count() > MAX_USE_CASES_CHARS {
-            bail!("keep use cases under {MAX_USE_CASES_CHARS} characters");
-        }
-        if text == model.use_cases.trim() {
-            bail!("that's already {model_id}'s use cases");
-        }
-        let id = {
-            let c = self.c();
-            let pending: Option<i64> = c
-                .query_row(
-                    "SELECT id FROM registry_proposals WHERE model_id = ?1 AND status = 'pending'",
-                    [model_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(p) = pending {
-                bail!("{model_id} already has a pending proposal (#{p}); the user decides on it first");
-            }
-            c.execute(
-                "INSERT INTO registry_proposals (model_id, field, text, reason, status, source, created)
-                 VALUES (?1, 'use_cases', ?2, ?3, 'pending', ?4, ?5)",
-                params![model_id, text, reason.trim(), source, now() as i64],
-            )?;
-            c.last_insert_rowid()
+        let Some(model) = self.models().into_iter().find(|m| m.id == model_id) else {
+            bail!("no model {model_id:?}")
         };
-        Ok(self.proposal(id).expect("just inserted"))
+        core_registry::propose_use_cases(&self.c(), &model, text, reason, source)
     }
 
     /// Create or update a pending use-case proposal from a probe run.
-    ///
-    /// If the model already has a pending proposal (for example, drafted from a model card on
-    /// import or from an earlier probe run), updates it in place while preserving any non-probe
-    /// prefix. Returns `Ok(None)` if the resulting text already matches the model's current
-    /// `use_cases` and there is no pending proposal to update.
     pub fn upsert_probe_proposal(
         &self,
         model_id: &str,
@@ -584,167 +158,39 @@ impl Db {
         let Some(model) = self.models().into_iter().find(|m| m.id == model_id) else {
             bail!("no model {model_id:?}")
         };
-        let summary = probe_summary.trim();
-        if summary.is_empty() {
-            return Ok(None);
-        }
-        let reason = probe_reason.trim();
-        let existing: Option<RegistryProposal> = self
-            .c()
-            .query_row(
-                &format!("SELECT {PROPOSAL_COLS} FROM registry_proposals WHERE model_id = ?1 AND status = 'pending'"),
-                [model_id],
-                proposal_row,
-            )
-            .optional()?;
-        let base = match &existing {
-            Some(p) => strip_probe_clause(&p.text),
-            None => strip_probe_clause(&model.use_cases),
-        };
-        let combined = combine_use_cases(base, summary);
-        if let Some(p) = existing {
-            let merged_reason = if p.source == "catalog" && !p.reason.trim().is_empty() {
-                format!("{} {reason}", p.reason.trim())
-            } else {
-                reason.to_string()
-            };
-            self.c().execute(
-                "UPDATE registry_proposals SET text = ?1, reason = ?2, source = 'probe', created = ?3 WHERE id = ?4",
-                params![combined, merged_reason, now() as i64, p.id],
-            )?;
-            return Ok(self.proposal(p.id));
-        }
-        if combined == model.use_cases.trim() {
-            return Ok(None);
-        }
-        self.propose_use_cases(model_id, &combined, reason, "probe").map(Some)
+        core_registry::upsert_probe_proposal(&self.c(), &model, probe_summary, probe_reason)
     }
 
     /// Accept (the model's use cases become the proposed text) or reject a pending proposal.
     pub fn decide_proposal(&self, id: i64, accept: bool) -> Result<RegistryProposal> {
-        let Some(p) = self.proposal(id) else { bail!("no proposal #{id}") };
-        if p.status != "pending" {
-            bail!("proposal #{id} was already {}", p.status);
-        }
         let mut c = self.c();
-        let tx = c.transaction()?;
-        if accept && tx.execute("UPDATE models SET use_cases = ?1 WHERE id = ?2", params![p.text, p.model_id])? == 0 {
-            bail!("model {} isn't in the registry any more", p.model_id);
-        }
-        tx.execute(
-            "UPDATE registry_proposals SET status = ?1, decided = ?2 WHERE id = ?3",
-            params![if accept { "accepted" } else { "rejected" }, now() as i64, id],
-        )?;
-        tx.commit()?;
-        drop(c);
-        Ok(self.proposal(id).expect("exists"))
+        core_registry::decide_proposal(&mut c, id, accept)
     }
 
-    /// The automatic check after an outcome: when a model has at least
-    /// [`PROPOSAL_MIN_RUNS`] finished threads of a task type, succeeds at
-    /// [`PROPOSAL_HIGH`] or more (or [`PROPOSAL_LOW`] or less), and its use cases don't
-    /// mention the task type, propose adding "<type> tasks" (or "not for <type>
-    /// tasks"). Never repeats a proposal made before (so a rejection sticks) and
-    /// waits while the model has one pending.
+    /// Automatic check after an outcome.
     pub fn check_use_cases(&self, model_id: &str, task_type: &str) -> Option<RegistryProposal> {
-        if task_type.is_empty() {
-            return None;
-        }
         let model = self.models().into_iter().find(|m| m.id == model_id)?;
-        if model.use_cases.to_lowercase().contains(task_type) {
-            return None;
-        }
-        let s = self.outcome_stats(By::Model, Some(model_id), Some(task_type)).into_iter().next()?;
-        let finished = s.done + s.failed;
-        let rate = s.success_rate?;
-        if finished < PROPOSAL_MIN_RUNS {
-            return None;
-        }
-        let addition = if rate >= PROPOSAL_HIGH {
-            format!("{task_type} tasks")
-        } else if rate <= PROPOSAL_LOW {
-            format!("not for {task_type} tasks")
-        } else {
-            return None;
-        };
-        let base = model.use_cases.trim().trim_end_matches(['.', ';', ',', ' ']);
-        let text = if base.is_empty() { addition } else { format!("{base}; {addition}") };
-        let already: bool = self
-            .c()
-            .query_row(
-                "SELECT 1 FROM registry_proposals WHERE model_id = ?1 AND (text = ?2 OR status = 'pending')",
-                params![model_id, text],
-                |_| Ok(()),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .is_some();
-        if already {
-            return None;
-        }
-        let reason = format!(
-            "{} of {finished} finished {task_type} threads succeeded ({:.0}%)",
-            s.successes,
-            rate * 100.0
-        );
-        match self.propose_use_cases(model_id, &text, &reason, "stats") {
-            Ok(p) => {
-                tracing::info!(model = model_id, proposal = p.id, "proposed new use cases: {}", p.text);
-                Some(p)
-            }
-            Err(e) => {
-                tracing::warn!("use-case proposal for {model_id}: {e:#}");
-                None
-            }
-        }
+        core_registry::check_use_cases(&self.c(), &model, task_type)
     }
 
     // ---- priority rules
 
     pub fn add_rule(&self, text: &str, rule: &RuleSpec) -> Result<PriorityRule> {
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("describe the rule, e.g. \"Sensitive data: local only\"");
-        }
-        let rule = validate_rule(rule)?;
-        let id = {
-            let c = self.c();
-            c.execute(
-                "INSERT INTO priority_rules (text, rule, enabled, created) VALUES (?1, ?2, 1, ?3)",
-                params![text, serde_json::to_string(&rule)?, now() as i64],
-            )?;
-            c.last_insert_rowid()
-        };
-        Ok(self.rules().into_iter().find(|r| r.id == id).expect("just inserted"))
+        core_registry::add_rule(&self.c(), text, rule)
     }
 
     /// Every rule, enabled or not, oldest first.
     pub fn rules(&self) -> Vec<PriorityRule> {
-        let c = self.c();
-        let mut st = c.prepare("SELECT id, text, rule, enabled, created FROM priority_rules ORDER BY id").unwrap();
-        st.query_map([], |r| {
-            let rule: String = r.get(2)?;
-            Ok(PriorityRule {
-                id: r.get(0)?,
-                text: r.get(1)?,
-                rule: serde_json::from_str(&rule).unwrap_or_default(),
-                enabled: r.get::<_, i64>(3)? != 0,
-                created: r.get::<_, i64>(4)? as u64,
-            })
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect()
+        core_registry::rules(&self.c())
     }
 
     /// Returns false if there's no such rule.
     pub fn set_rule_enabled(&self, id: i64, enabled: bool) -> Result<bool> {
-        Ok(self.c().execute("UPDATE priority_rules SET enabled = ?1 WHERE id = ?2", params![enabled, id])? > 0)
+        core_registry::set_rule_enabled(&self.c(), id, enabled)
     }
 
     pub fn delete_rule(&self, id: i64) -> Result<bool> {
-        Ok(self.c().execute("DELETE FROM priority_rules WHERE id = ?1", [id])? > 0)
+        core_registry::delete_rule(&self.c(), id)
     }
 
     // ---- routing
@@ -757,7 +203,7 @@ impl Db {
     }
 
     /// Provider ids configured to run through a device.
-    fn device_providers(&self) -> std::collections::HashSet<String> {
+    fn device_providers(&self) -> HashSet<String> {
         self.providers()
             .unwrap_or_default()
             .into_iter()
@@ -766,16 +212,19 @@ impl Db {
             .collect()
     }
 
-    /// Whether a model counts as local: flagged, or its provider's URL is local.
+    /// Whether a model counts as local: flagged, hosted on a device, or its provider's URL is local.
     pub fn model_is_local(&self, m: &ModelEntry) -> bool {
-        m.local
-            || self.device_providers().contains(&m.provider_id)
-            || self.provider_urls().get(&m.provider_id).cloned().flatten().is_some_and(|u| is_local_url(&u))
+        let urls = self.provider_urls();
+        let device_providers = self.device_providers();
+        core_registry::model_is_local(
+            m,
+            urls.get(&m.provider_id).and_then(|u| u.as_deref()),
+            device_providers.contains(&m.provider_id),
+        )
     }
 
-    /// Choose the model for a thread (see the module docs), or check the one the
-    /// orchestrator named against the rules. Errors are meant for the orchestrator
-    /// to relay.
+    /// Choose the model for a thread, or check the one the orchestrator named against
+    /// the rules. Errors are meant for the orchestrator to relay.
     pub fn route_model(&self, requested: Option<&str>, task_type: Option<&str>, tags: &[String]) -> Result<Route, String> {
         self.route_model_with(requested, task_type, tags, false)
     }
@@ -789,7 +238,7 @@ impl Db {
         tags: &[String],
         prefer_cheaper: bool,
     ) -> Result<Route, String> {
-        self.route_model_available(requested, task_type, tags, prefer_cheaper, &std::collections::HashSet::new())
+        self.route_model_available(requested, task_type, tags, prefer_cheaper, &HashSet::new())
     }
 
     /// Route while excluding unavailable providers from automatic selection.
@@ -801,249 +250,34 @@ impl Db {
         task_type: Option<&str>,
         tags: &[String],
         prefer_cheaper: bool,
-        unavailable_providers: &std::collections::HashSet<String>,
+        unavailable_providers: &HashSet<String>,
     ) -> Result<Route, String> {
         let models = self.models();
-        if models.is_empty() {
-            return Err("no models registered".into());
-        }
-        let task_type = task_type.map(norm).unwrap_or_default();
-        let tags = clean_tags(tags);
         let urls = self.provider_urls();
         let device_providers = self.device_providers();
-        let local: HashMap<String, bool> = models
-            .iter()
-            .map(|m| {
-                let url_local = urls.get(&m.provider_id).cloned().flatten().is_some_and(|u| is_local_url(&u));
-                (m.id.clone(), m.local || device_providers.contains(&m.provider_id) || url_local)
-            })
-            .collect();
-        let rules: Vec<PriorityRule> =
-            self.rules().into_iter().filter(|r| r.enabled && rule_applies(&r.rule, &task_type, &tags)).collect();
-        let filters: Vec<&PriorityRule> = rules.iter().filter(|r| r.rule.require.is_some() || r.rule.forbid.is_some()).collect();
-        // The first filter rule a model fails, described, if any.
-        let blocked_by = |m: &ModelEntry| -> Option<String> {
-            let l = local[&m.id];
-            filters
-                .iter()
-                .find(|r| {
-                    r.rule.require.as_deref().is_some_and(|p| !has_property(m, l, p))
-                        || r.rule.forbid.as_deref().is_some_and(|p| has_property(m, l, p))
-                })
-                .map(|r| describe_rule(r))
-        };
-
-        if let Some(key) = requested {
-            let m = self.find_model(key).ok_or_else(|| format!("no model {key:?} in the registry"))?;
-            if let Some(r) = blocked_by(&m) {
-                return Err(format!(
-                    "model {} is ruled out for this task by priority rule {}. Leave model out to let the registry \
-                     choose, or pick one that fits from list_models.",
-                    m.id, r
-                ));
-            }
-            return Ok(Route { model: m, reason: None });
-        }
-
-        let mut allowed: Vec<ModelEntry> = models
-            .iter()
-            .filter(|m| blocked_by(m).is_none() && !unavailable_providers.contains(&m.provider_id))
-            .cloned()
-            .collect();
-        if allowed.is_empty() {
-            if models.iter().any(|m| blocked_by(m).is_none() && unavailable_providers.contains(&m.provider_id)) {
-                return Err("No automatically selectable model is currently available; the matching device-hosted model is offline. Connect its hosting device or choose another model.".into());
-            }
-            let why: Vec<String> = filters.iter().map(|r| describe_rule(r)).collect();
-            return Err(format!(
-                "No registered model satisfies the priority rules for this task ({}). Tell the user: they can add a \
-                 model that fits (`grouper models add … --local` for a local one) or change the rules (`grouper rules`).",
-                why.join("; ")
-            ));
-        }
-
-        let stats: HashMap<String, OutcomeStats> = if task_type.is_empty() {
-            HashMap::new()
-        } else {
-            self.outcome_stats(By::Model, None, Some(&task_type)).into_iter().map(|s| (s.subject.clone(), s)).collect()
-        };
-        // 0: proven for this task type, 1: not enough record, 2: poor record.
-        let tier = |m: &ModelEntry| match stats.get(&m.id) {
-            Some(s) if s.done + s.failed >= MIN_ROUTING_RUNS => {
-                if s.success_rate.unwrap_or(0.0) >= 0.5 { 0 } else { 2 }
-            }
-            _ => 1,
-        };
-        let role_rank = |m: &ModelEntry| {
-            if m.roles.iter().any(|r| r == "thread") {
-                0
-            } else if m.roles.iter().any(|r| r == "orchestrator") {
-                1
-            } else {
-                2
-            }
-        };
-        let prefs: Vec<&str> = rules.iter().filter_map(|r| r.rule.prefer.as_deref()).collect();
-        allowed.sort_by(|a, b| {
-            use std::cmp::Ordering::Equal;
-            for p in &prefs {
-                let o = match *p {
-                    "cheapest" => price(a).total_cmp(&price(b)),
-                    "local" => local[&b.id].cmp(&local[&a.id]),
-                    "free" => b.free.cmp(&a.free),
-                    _ => Equal,
-                };
-                if o != Equal {
-                    return o;
-                }
-            }
-            tier(a)
-                .cmp(&tier(b))
-                .then_with(|| match (stats.get(&a.id), stats.get(&b.id)) {
-                    (Some(x), Some(y)) if tier(a) == 0 => y
-                        .success_rate
-                        .unwrap_or(0.0)
-                        .total_cmp(&x.success_rate.unwrap_or(0.0))
-                        .then(y.mean_grade.unwrap_or(0.0).total_cmp(&x.mean_grade.unwrap_or(0.0)))
-                        .then(x.mean_cost.unwrap_or(0.0).total_cmp(&y.mean_cost.unwrap_or(0.0))),
-                    _ => Equal,
-                })
-                .then_with(|| if prefer_cheaper { price(a).total_cmp(&price(b)) } else { Equal })
-                .then(role_rank(a).cmp(&role_rank(b)))
-                .then(a.id.cmp(&b.id))
-        });
-        let several = allowed.len() > 1;
-        let model = allowed.swap_remove(0);
-
-        let mut why: Vec<String> = filters.iter().map(|r| format!("rule {}", describe_rule(r))).collect();
-        if !prefs.is_empty() {
-            why.push(format!("preferring {}", prefs.join(", then ")));
-        }
-        if prefer_cheaper && several {
-            why.push("cheaper among equals for the thread's budget".into());
-        }
-        if tier(&model) == 0 {
-            let s = &stats[&model.id];
-            why.push(format!(
-                "best {task_type} record: {}/{} succeeded{}",
-                s.successes,
-                s.done + s.failed,
-                s.mean_grade.map(|g| format!(", grade {g:.1}")).unwrap_or_default()
-            ));
-        } else if prefs.is_empty() {
-            let default = self.default_model("thread").map(|m| m.id);
-            why.push(if default.as_deref() == Some(model.id.as_str()) {
-                "registry default for threads".into()
-            } else {
-                "the default among the models the rules allow".into()
-            });
-        }
-        Ok(Route { reason: Some(format!("model {}: {}", model.id, why.join("; "))), model })
+        let local = core_registry::local_map(&models, &urls, &device_providers);
+        core_registry::route_model(
+            &self.c(),
+            &models,
+            &local,
+            requested,
+            task_type,
+            tags,
+            prefer_cheaper,
+            unavailable_providers,
+        )
     }
-}
-
-/// Strip any previous probe-generated summary clause so re-probing replaces rather than duplicates it.
-fn strip_probe_clause(text: &str) -> &str {
-    let trimmed = text.trim();
-    for marker in ["; passed ", "; failed ", "; Passed ", "; Failed "] {
-        if let Some(idx) = trimmed.find(marker)
-            && trimmed[idx..].to_ascii_lowercase().contains("probe")
-        {
-            return trimmed[..idx].trim().trim_end_matches(['.', ';', ',', ' ']);
-        }
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if (lower.starts_with("passed ") || lower.starts_with("failed ")) && lower.contains("probe") {
-        return "";
-    }
-    trimmed.trim_end_matches(['.', ';', ',', ' '])
-}
-
-/// Join an optional base use-case description with a probe summary, fitting within [`MAX_USE_CASES_CHARS`].
-fn combine_use_cases(base: &str, summary: &str) -> String {
-    let full = if base.is_empty() {
-        summary.to_string()
-    } else {
-        format!("{base}; {summary}")
-    };
-    if full.chars().count() <= MAX_USE_CASES_CHARS {
-        return full;
-    }
-    let mut out: String = full.chars().take(MAX_USE_CASES_CHARS.saturating_sub(1)).collect();
-    out = out.trim_end().to_string();
-    out.push('…');
-    out
-}
-
-/// One brief summary line for a model's probe results, for the orchestrator's `list_models`.
-pub fn probe_overview_line(probe_stats: &[OutcomeStats], model_id: &str) -> Option<String> {
-    let overall = probe_stats.iter().find(|s| s.subject == model_id && s.task_type.is_empty())?;
-    let total = overall.done + overall.failed;
-    if total == 0 {
-        return None;
-    }
-    let pct = overall.success_rate.unwrap_or(0.0) * 100.0;
-    let parts: Vec<String> = probe_stats
-        .iter()
-        .filter(|s| s.subject == model_id && !s.task_type.is_empty())
-        .map(|s| {
-            let n = s.done + s.failed;
-            if n == 1 {
-                format!("{} {}", s.task_type, if s.successes == 1 { "pass" } else { "fail" })
-            } else {
-                format!("{} {}/{}", s.task_type, s.successes, n)
-            }
-        })
-        .collect();
-    let mut line = format!("{}/{total} passed ({pct:.0}%)", overall.successes);
-    if !parts.is_empty() {
-        line.push_str(&format!(": {}", parts.join(", ")));
-    }
-    if let Some(d) = overall.median_duration_s {
-        line.push_str(&format!("; median {}", format_duration_s(d)));
-    }
-    Some(line)
 }
 
 /// What `list_models` shows the orchestrator: each model with its effective
 /// `local` flag, stats per task type, brief probe summary and any pending proposal,
 /// plus the enabled rules.
 pub fn models_overview(db: &Db) -> Value {
-    let stats = db.outcome_stats(By::Model, None, None);
-    let probes = db.probe_stats(None, None);
-    let pending = db.proposals(Some("pending"));
-    let models: Vec<Value> = db
-        .models()
-        .into_iter()
-        .map(|m| {
-            let local = db.model_is_local(&m);
-            let mut v = serde_json::to_value(&m).unwrap_or_default();
-            v["local"] = json!(local);
-            let lines: Vec<String> = stats.iter().filter(|s| s.subject == m.id).map(stats_line).collect();
-            if !lines.is_empty() {
-                v["stats"] = json!(lines);
-            }
-            if let Some(summary) = probe_overview_line(&probes, &m.id) {
-                v["probes"] = json!(summary);
-            }
-            if let Some(p) = pending.iter().find(|p| p.model_id == m.id) {
-                v["pending_use_cases_proposal"] = json!({"id": p.id, "text": p.text, "reason": p.reason});
-            }
-            v
-        })
-        .collect();
-    let rules: Vec<Value> = db
-        .rules()
-        .into_iter()
-        .filter(|r| r.enabled)
-        .map(|r| json!({"id": r.id, "text": r.text, "rule": r.rule}))
-        .collect();
-    json!({
-        "models": models,
-        "priority_rules": rules,
-        "task_types": TASK_TYPES,
-        "note": "Prices are USD per million tokens. Stats are from finished threads by task type; probes are from deterministic probe suites."
-    })
+    let models = db.models();
+    let urls = db.provider_urls();
+    let device_providers = db.device_providers();
+    let local = core_registry::local_map(&models, &urls, &device_providers);
+    core_registry::models_overview(&db.c(), &models, &local)
 }
 
 // ---- orchestrator tools
@@ -1156,7 +390,7 @@ async fn rate(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<St
     if let Some(r) = deny_unless_admin(&hub, &headers) {
         return r;
     }
-    let rating = match norm(&b.rating).as_str() {
+    let rating = match core_registry::norm(&b.rating).as_str() {
         "up" | "+1" | "1" => Some(1),
         "down" | "-1" => Some(-1),
         "clear" | "none" | "0" => None,
@@ -1255,6 +489,7 @@ async fn delete_rule(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): 
 mod tests {
     use super::*;
     use core_protocol::ProviderConfig;
+    use rusqlite::Connection;
 
     fn tmp() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("grouper-registry-test-{}", crate::db::random_hex(4)))
@@ -1308,52 +543,6 @@ mod tests {
         if rating.is_some() {
             db.rate_thread(&t.id, rating).unwrap();
         }
-    }
-
-    #[test]
-    fn local_urls() {
-        for u in ["http://localhost:11434/v1", "http://127.0.0.1:8080", "http://[::1]:1234/x", "https://gpu-box.local/v1",
-            "http://user@LOCALHOST", "localhost:11434"]
-        {
-            assert!(is_local_url(u), "{u}");
-        }
-        for u in ["https://openrouter.ai/api/v1", "https://api.anthropic.com", "http://localhost.example.com", "", "http://"] {
-            assert!(!is_local_url(u), "{u}");
-        }
-    }
-
-    #[test]
-    fn summaries() {
-        let r = |status: &str, d: i64, cost: f64| OutcomeRow {
-            subject: "m".into(),
-            task_type: "code".into(),
-            status: status.into(),
-            grade: None,
-            rating: None,
-            duration_s: d,
-            duration_ms: None,
-            cost,
-            tokens: 0,
-        };
-        let rows = [r("done", 10, 0.1), r("failed", 1, 0.3), r("done", 5, 0.2), r("stopped", 3, 0.2)];
-        let s = summarize("m", "code", "thread", &rows.iter().collect::<Vec<_>>());
-        assert_eq!(s.median_duration_s, Some(4.0));
-        assert!((s.mean_cost.unwrap() - 0.2).abs() < 1e-9);
-        assert_eq!((s.successes, s.success_rate.map(|x| (x * 3.0).round())), (2, Some(2.0)));
-        let s = summarize("m", "code", "thread", &rows[..3].iter().collect::<Vec<_>>());
-        assert_eq!((s.median_duration_s, s.mean_grade), (Some(5.0), None));
-        assert_eq!(summarize("m", "", "thread", &[]).success_rate, None);
-    }
-
-    #[test]
-    fn rules_are_validated() {
-        let r = validate_rule(&RuleSpec { when_tag: Some(" Sensitive ".into()), require: Some("LOCAL".into()), ..Default::default() })
-            .unwrap();
-        assert_eq!((r.when_tag.as_deref(), r.require.as_deref()), (Some("sensitive"), Some("local")));
-        assert!(validate_rule(&RuleSpec { require: Some("fast".into()), ..Default::default() }).is_err());
-        assert!(validate_rule(&RuleSpec { prefer: Some("best".into()), ..Default::default() }).is_err());
-        assert!(validate_rule(&RuleSpec { when_tag: Some("x".into()), ..Default::default() }).is_err());
-        assert!(serde_json::from_str::<RuleSpec>(r#"{"when_tags": "x", "require": "local"}"#).is_err(), "typos are refused");
     }
 
     #[test]
@@ -1497,7 +686,7 @@ mod tests {
         .unwrap();
         assert_eq!(db.route_model(None, None, &tags(&["private"])).unwrap().model.id, "local-model");
 
-        let unavailable = std::collections::HashSet::from(["device".to_string()]);
+        let unavailable = HashSet::from(["device".to_string()]);
         assert_eq!(
             db.route_model_available(None, None, &[], false, &unavailable).unwrap().model.id,
             "cloud-model"

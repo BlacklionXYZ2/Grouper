@@ -46,6 +46,8 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 | Path | What |
 |---|---|
 | `crates/core-protocol` | Wire protocol and shared types (frames, events, registry rows) |
+| `crates/core-registry` | Model and device registry: learning, stats, routing, priority rules, cost maths, probes |
+| `crates/core-memory` | Long-term memory and skills: SQLite + FTS5 storage, search and recall blocks |
 | `crates/providers` | Model adapters: Anthropic, OpenAI-compatible, scripted |
 | `crates/core-agent` | The loop engine, workspace and shell tools, permission rules, thread runner |
 | `crates/hub/web` | The web app (plain ES modules, embedded in `grouper-hub`) |
