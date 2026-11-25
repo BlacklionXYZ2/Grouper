@@ -9,6 +9,8 @@ pub mod orchestrator;
 pub mod registry;
 pub mod secrets;
 pub mod server;
+pub mod session;
 pub mod skills;
 pub mod threads;
 pub mod usage;
+pub mod web;

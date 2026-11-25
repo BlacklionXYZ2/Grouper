@@ -295,7 +295,18 @@ impl Hub {
         }
     }
 
+    /// Who is calling: the `Authorization: Bearer` token when there is one (used alone,
+    /// as for every API client), otherwise the web client's session cookie
+    /// ([`crate::session`]), which carries its device's admin flag.
     pub(crate) fn auth(&self, headers: &HeaderMap) -> Option<Auth> {
+        if headers.contains_key(header::AUTHORIZATION) {
+            return self.auth_bearer(headers);
+        }
+        self.db.session_auth(crate::session::cookie_session(headers)?)
+    }
+
+    /// Only a Bearer token: for the device connection, which a browser session never opens.
+    pub(crate) fn auth_bearer(&self, headers: &HeaderMap) -> Option<Auth> {
         let token = headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")?;
         self.db.authenticate(token)
     }
@@ -402,7 +413,10 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::skills::routes())
         .merge(crate::limits::routes())
         .merge(crate::files::routes())
+        .merge(crate::session::routes())
+        .merge(crate::web::routes())
         .with_state(hub)
+        .layer(axum::middleware::from_fn(crate::session::guard))
 }
 
 pub(crate) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
@@ -777,7 +791,9 @@ async fn events_ws(
 }
 
 async fn connect(State(hub): State<Arc<Hub>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    let device_id = authed!(hub, headers).device_id;
+    let Some(Auth { device_id, .. }) = hub.auth_bearer(&headers) else {
+        return err(StatusCode::UNAUTHORIZED, "invalid or missing device token");
+    };
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
