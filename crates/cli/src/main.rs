@@ -1153,18 +1153,18 @@ async fn limits_cmd(api: &Api, cmd: Option<LimitsCmd>) -> Result<()> {
     let default = if l.warn_at_fraction.is_none() { " (default)" } else { "" };
     println!("warn_at_fraction                {}{default}", report.warn_at_fraction);
     println!(
-        "{:<31}  {}",
+        "{:<30}  {}",
         "approval_timeout_secs",
         l.approval_timeout_secs.map(|n| n.to_string()).unwrap_or_else(off)
     );
     let action_note = if l.approval_timeout_action == ApprovalTimeoutAction::Deny { " (default)" } else { "" };
-    println!("{:<31}  {}{action_note}", "approval_timeout_action", l.approval_timeout_action.as_str());
+    println!("{:<30}  {}{action_note}", "approval_timeout_action", l.approval_timeout_action.as_str());
     let ask = match l.ask_timeout_secs {
         Some(n) if n == DEFAULT_ASK_TIMEOUT_SECS => format!("{n} (default)"),
         Some(n) => n.to_string(),
         None => off(),
     };
-    println!("{:<31}  {ask}", "ask_timeout_secs");
+    println!("{:<30}  {ask}", "ask_timeout_secs");
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let left = report.day_resets_at.saturating_sub(now);
     println!(
