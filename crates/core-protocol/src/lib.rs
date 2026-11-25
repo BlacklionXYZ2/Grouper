@@ -588,6 +588,45 @@ pub struct ModelImportRequest {
     /// When omitted, a new row is not local and an existing row keeps its flag.
     #[serde(default)]
     pub local: Option<bool>,
+    /// Run the built-in probe suite after importing. Off by default (probes spend tokens).
+    #[serde(default)]
+    pub probe: bool,
+}
+
+/// Result of one deterministic probe task (`POST /v1/models/{id}/probe`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ProbeResult {
+    /// Short probe id, e.g. `code`, `writing`, `research`, `data`, `tool_use`.
+    pub id: String,
+    /// Registry task type recorded on the outcome row.
+    pub task_type: String,
+    pub passed: bool,
+    pub latency_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost: f64,
+    /// Deterministic grader summary or provider error.
+    pub detail: String,
+}
+
+/// Summary of running the built-in probe suite against one model (`POST /v1/models/{id}/probe`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ProbeReport {
+    pub model_id: String,
+    pub passed: usize,
+    pub total: usize,
+    pub total_latency_ms: u64,
+    pub total_tokens: u64,
+    pub total_cost: f64,
+    pub results: Vec<ProbeResult>,
+    /// Pending use-case proposal created or updated from these results, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_text: Option<String>,
+    /// Set when the suite stopped early (for example, after hitting the daily budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_reason: Option<String>,
 }
 
 /// Saved registry row plus the use-case proposal waiting for confirmation, if one was drafted.
@@ -596,6 +635,12 @@ pub struct ModelImportResult {
     pub model: ModelEntry,
     #[serde(default)]
     pub proposal_id: Option<i64>,
+    /// Probe results when `probe: true` was requested on import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeReport>,
+    /// Why probing did not complete after the model was imported, if `probe: true` failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_error: Option<String>,
 }
 
 /// Aggregated metered usage returned by `GET /v1/usage`.
@@ -862,13 +907,20 @@ pub struct MemoryInput {
 
 // ---- model registry learning: outcomes, stats, proposals, priority rules
 
-/// How threads did, for one model or device and one task type (`GET /v1/registry/stats`).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+fn default_outcome_source() -> String {
+    "thread".into()
+}
+
+/// How threads or probes did, for one model or device and one task type (`GET /v1/registry/stats`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct OutcomeStats {
     /// Model id or device id.
     pub subject: String,
     /// `code`, `research`, …; empty for every task type together.
     pub task_type: String,
+    /// Where these outcomes came from: `thread` or `probe`.
+    #[serde(default = "default_outcome_source")]
+    pub source: String,
     pub done: u64,
     pub failed: u64,
     pub stopped: u64,
@@ -877,18 +929,43 @@ pub struct OutcomeStats {
     /// successes / (done + failed); stopped threads don't count. `None` before any.
     pub success_rate: Option<f64>,
     pub median_duration_s: Option<f64>,
-    /// USD per thread.
+    /// USD per thread (or per probe).
     pub mean_cost: Option<f64>,
+    /// Mean tokens per outcome, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_tokens: Option<f64>,
     /// The orchestrator's 1–5 grades.
     pub mean_grade: Option<f64>,
     /// Your thumbs up minus thumbs down.
     pub net_rating: i64,
 }
 
+impl Default for OutcomeStats {
+    fn default() -> Self {
+        Self {
+            subject: String::new(),
+            task_type: String::new(),
+            source: default_outcome_source(),
+            done: 0,
+            failed: 0,
+            stopped: 0,
+            successes: 0,
+            success_rate: None,
+            median_duration_s: None,
+            mean_cost: None,
+            mean_tokens: None,
+            mean_grade: None,
+            net_rating: 0,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct RegistryStats {
     pub models: Vec<OutcomeStats>,
     pub devices: Vec<OutcomeStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<OutcomeStats>,
 }
 
 /// A change to a model's registry row that waits for your approval, so the table
@@ -904,7 +981,7 @@ pub struct RegistryProposal {
     pub reason: String,
     /// `pending`, `accepted` or `rejected`.
     pub status: String,
-    /// `stats` (the hub's automatic check), `orchestrator`, or `catalog` (drafted from a model card).
+    /// `stats` (the hub's automatic check), `orchestrator`, `catalog` (drafted from a model card), or `probe`.
     pub source: String,
     pub created: u64,
     pub decided: Option<u64>,

@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS thread_outcomes (
   thread_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, model_id TEXT NOT NULL, device_id TEXT NOT NULL,
   task_type TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, grade INTEGER, grade_note TEXT, user_rating INTEGER,
   duration_s INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
-  created INTEGER NOT NULL);
+  created INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'thread', duration_ms INTEGER);
 CREATE INDEX IF NOT EXISTS thread_outcomes_model ON thread_outcomes (model_id, task_type);
 CREATE TABLE IF NOT EXISTS registry_proposals (
   id INTEGER PRIMARY KEY AUTOINCREMENT, model_id TEXT NOT NULL, field TEXT NOT NULL, text TEXT NOT NULL,
@@ -53,13 +53,27 @@ CREATE TABLE IF NOT EXISTS priority_rules (
   created INTEGER NOT NULL);
 ";
 
-/// Create this module's tables and add `models.local` to older databases.
+/// Create this module's tables and add newer columns to older databases.
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
-    let has_local: bool = conn.prepare("SELECT 1 FROM pragma_table_info('models') WHERE name = 'local'")?.exists([])?;
-    if !has_local {
-        conn.execute_batch("ALTER TABLE models ADD COLUMN local INTEGER NOT NULL DEFAULT 0;")?;
+    for (table, column, sql) in [
+        ("models", "local", "ALTER TABLE models ADD COLUMN local INTEGER NOT NULL DEFAULT 0;"),
+        (
+            "thread_outcomes",
+            "source",
+            "ALTER TABLE thread_outcomes ADD COLUMN source TEXT NOT NULL DEFAULT 'thread';",
+        ),
+        ("thread_outcomes", "duration_ms", "ALTER TABLE thread_outcomes ADD COLUMN duration_ms INTEGER;"),
+    ] {
+        let has: bool =
+            conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?.exists([column])?;
+        if !has {
+            conn.execute_batch(sql)?;
+        }
     }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS thread_outcomes_source ON thread_outcomes (source, model_id, task_type);",
+    )?;
     Ok(())
 }
 
@@ -189,13 +203,20 @@ struct OutcomeRow {
     grade: Option<i64>,
     rating: Option<i64>,
     duration_s: i64,
+    duration_ms: Option<i64>,
     cost: f64,
+    tokens: i64,
 }
 
-fn summarize(subject: &str, task_type: &str, rows: &[&OutcomeRow]) -> OutcomeStats {
-    let mut s = OutcomeStats { subject: subject.into(), task_type: task_type.into(), ..Default::default() };
+fn summarize(subject: &str, task_type: &str, source: &str, rows: &[&OutcomeRow]) -> OutcomeStats {
+    let mut s = OutcomeStats {
+        subject: subject.into(),
+        task_type: task_type.into(),
+        source: source.into(),
+        ..Default::default()
+    };
     let mut durations = Vec::new();
-    let (mut cost, mut grades, mut graded) = (0.0, 0i64, 0u64);
+    let (mut cost, mut tokens, mut grades, mut graded) = (0.0, 0i64, 0i64, 0u64);
     for r in rows {
         match r.status.as_str() {
             "done" => s.done += 1,
@@ -210,19 +231,35 @@ fn summarize(subject: &str, task_type: &str, rows: &[&OutcomeRow]) -> OutcomeSta
             graded += 1;
         }
         s.net_rating += r.rating.unwrap_or(0);
-        durations.push(r.duration_s as f64);
+        let dur_s = r.duration_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(r.duration_s as f64);
+        durations.push(dur_s);
         cost += r.cost;
+        tokens += r.tokens;
     }
     let finished = s.done + s.failed;
     s.success_rate = (finished > 0).then(|| s.successes as f64 / finished as f64);
     s.mean_grade = (graded > 0).then(|| grades as f64 / graded as f64);
     if !rows.is_empty() {
         s.mean_cost = Some(cost / rows.len() as f64);
+        if tokens > 0 || source == "probe" {
+            s.mean_tokens = Some(tokens as f64 / rows.len() as f64);
+        }
         durations.sort_by(f64::total_cmp);
         let n = durations.len();
         s.median_duration_s = Some(if n % 2 == 1 { durations[n / 2] } else { (durations[n / 2 - 1] + durations[n / 2]) / 2.0 });
     }
     s
+}
+
+/// Format latency seconds cleanly: `240ms`, `1.4s`, `41s`.
+pub fn format_duration_s(secs: f64) -> String {
+    if secs < 1.0 {
+        format!("{:.0}ms", secs * 1000.0)
+    } else if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{secs:.0}s")
+    }
 }
 
 /// `code: 8/9 ok (89%), grade 4.3, $0.0120/thread, 41s median, rating +2`
@@ -322,13 +359,55 @@ impl Db {
         inserted
     }
 
+    /// Record one deterministic probe outcome into `thread_outcomes` with `source = 'probe'`,
+    /// distinguishable from real thread outcomes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_probe_outcome(
+        &self,
+        probe_run_id: &str,
+        model_id: &str,
+        device_id: &str,
+        task_type: &str,
+        passed: bool,
+        latency_ms: u64,
+        cost: f64,
+        tokens: u64,
+        detail: &str,
+    ) -> Result<()> {
+        let status = if passed { "done" } else { "failed" };
+        let duration_s = ((latency_ms + 500) / 1000) as i64;
+        let note: String = detail.trim().chars().take(500).collect();
+        self.c().execute(
+            "INSERT OR REPLACE INTO thread_outcomes
+               (thread_id, conversation_id, model_id, device_id, task_type, status, grade_note,
+                duration_s, duration_ms, cost, tokens, created, source)
+             VALUES (?1, '', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'probe')",
+            params![
+                probe_run_id,
+                model_id,
+                device_id,
+                norm(task_type),
+                status,
+                (!note.is_empty()).then_some(note),
+                duration_s,
+                latency_ms as i64,
+                cost,
+                tokens as i64,
+                now() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// The (model, task type) of a recorded outcome; an error says why there's none.
     fn outcome_key(&self, thread_id: &str) -> Result<(String, String)> {
         let key = self
             .c()
-            .query_row("SELECT model_id, task_type FROM thread_outcomes WHERE thread_id = ?1", [thread_id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT model_id, task_type FROM thread_outcomes WHERE thread_id = ?1 AND source = 'thread'",
+                [thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()?;
         match (key, self.thread(thread_id)) {
             (Some(k), _) => Ok(k),
@@ -366,9 +445,25 @@ impl Db {
         Ok(())
     }
 
-    /// Stats per model or device: one row per task type, plus (unless `task_type`
-    /// is given) one row with an empty task type for everything together.
+    /// Stats per model or device for real thread outcomes: one row per task type, plus
+    /// (unless `task_type` is given) one row with an empty task type for everything together.
     pub fn outcome_stats(&self, by: By, subject: Option<&str>, task_type: Option<&str>) -> Vec<OutcomeStats> {
+        self.outcome_stats_by_source(by, subject, task_type, "thread")
+    }
+
+    /// Stats per model for deterministic probe runs (`source = 'probe'`).
+    pub fn probe_stats(&self, model_id: Option<&str>, task_type: Option<&str>) -> Vec<OutcomeStats> {
+        self.outcome_stats_by_source(By::Model, model_id, task_type, "probe")
+    }
+
+    /// Stats per model or device filtered by outcome `source` (`thread` or `probe`).
+    pub fn outcome_stats_by_source(
+        &self,
+        by: By,
+        subject: Option<&str>,
+        task_type: Option<&str>,
+        source: &str,
+    ) -> Vec<OutcomeStats> {
         let col = match by {
             By::Model => "model_id",
             By::Device => "device_id",
@@ -377,11 +472,12 @@ impl Db {
             let c = self.c();
             let mut st = c
                 .prepare(&format!(
-                    "SELECT {col}, task_type, status, grade, user_rating, duration_s, cost FROM thread_outcomes
-                     WHERE (?1 IS NULL OR {col} = ?1) AND (?2 IS NULL OR task_type = ?2)"
+                    "SELECT {col}, task_type, status, grade, user_rating, duration_s, duration_ms, cost, tokens
+                     FROM thread_outcomes
+                     WHERE source = ?1 AND (?2 IS NULL OR {col} = ?2) AND (?3 IS NULL OR task_type = ?3)"
                 ))
                 .unwrap();
-            st.query_map(params![subject, task_type.map(norm)], |r| {
+            st.query_map(params![source, subject, task_type.map(norm)], |r| {
                 Ok(OutcomeRow {
                     subject: r.get(0)?,
                     task_type: r.get(1)?,
@@ -389,7 +485,9 @@ impl Db {
                     grade: r.get(3)?,
                     rating: r.get(4)?,
                     duration_s: r.get(5)?,
-                    cost: r.get(6)?,
+                    duration_ms: r.get(6)?,
+                    cost: r.get(7)?,
+                    tokens: r.get(8)?,
                 })
             })
             .unwrap()
@@ -405,11 +503,15 @@ impl Db {
                 groups.entry((r.subject.clone(), r.task_type.clone())).or_default().push(r);
             }
         }
-        groups.iter().map(|((s, t), rows)| summarize(s, t, rows)).collect()
+        groups.iter().map(|((s, t), rows)| summarize(s, t, source, rows)).collect()
     }
 
     pub fn registry_stats(&self) -> RegistryStats {
-        RegistryStats { models: self.outcome_stats(By::Model, None, None), devices: self.outcome_stats(By::Device, None, None) }
+        RegistryStats {
+            models: self.outcome_stats(By::Model, None, None),
+            devices: self.outcome_stats(By::Device, None, None),
+            probes: self.probe_stats(None, None),
+        }
     }
 
     // ---- use-case proposals
@@ -465,6 +567,57 @@ impl Db {
             c.last_insert_rowid()
         };
         Ok(self.proposal(id).expect("just inserted"))
+    }
+
+    /// Create or update a pending use-case proposal from a probe run.
+    ///
+    /// If the model already has a pending proposal (for example, drafted from a model card on
+    /// import or from an earlier probe run), updates it in place while preserving any non-probe
+    /// prefix. Returns `Ok(None)` if the resulting text already matches the model's current
+    /// `use_cases` and there is no pending proposal to update.
+    pub fn upsert_probe_proposal(
+        &self,
+        model_id: &str,
+        probe_summary: &str,
+        probe_reason: &str,
+    ) -> Result<Option<RegistryProposal>> {
+        let Some(model) = self.models().into_iter().find(|m| m.id == model_id) else {
+            bail!("no model {model_id:?}")
+        };
+        let summary = probe_summary.trim();
+        if summary.is_empty() {
+            return Ok(None);
+        }
+        let reason = probe_reason.trim();
+        let existing: Option<RegistryProposal> = self
+            .c()
+            .query_row(
+                &format!("SELECT {PROPOSAL_COLS} FROM registry_proposals WHERE model_id = ?1 AND status = 'pending'"),
+                [model_id],
+                proposal_row,
+            )
+            .optional()?;
+        let base = match &existing {
+            Some(p) => strip_probe_clause(&p.text),
+            None => strip_probe_clause(&model.use_cases),
+        };
+        let combined = combine_use_cases(base, summary);
+        if let Some(p) = existing {
+            let merged_reason = if p.source == "catalog" && !p.reason.trim().is_empty() {
+                format!("{} {reason}", p.reason.trim())
+            } else {
+                reason.to_string()
+            };
+            self.c().execute(
+                "UPDATE registry_proposals SET text = ?1, reason = ?2, source = 'probe', created = ?3 WHERE id = ?4",
+                params![combined, merged_reason, now() as i64, p.id],
+            )?;
+            return Ok(self.proposal(p.id));
+        }
+        if combined == model.use_cases.trim() {
+            return Ok(None);
+        }
+        self.propose_use_cases(model_id, &combined, reason, "probe").map(Some)
     }
 
     /// Accept (the model's use cases become the proposed text) or reject a pending proposal.
@@ -789,10 +942,75 @@ impl Db {
     }
 }
 
+/// Strip any previous probe-generated summary clause so re-probing replaces rather than duplicates it.
+fn strip_probe_clause(text: &str) -> &str {
+    let trimmed = text.trim();
+    for marker in ["; passed ", "; failed ", "; Passed ", "; Failed "] {
+        if let Some(idx) = trimmed.find(marker)
+            && trimmed[idx..].to_ascii_lowercase().contains("probe")
+        {
+            return trimmed[..idx].trim().trim_end_matches(['.', ';', ',', ' ']);
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if (lower.starts_with("passed ") || lower.starts_with("failed ")) && lower.contains("probe") {
+        return "";
+    }
+    trimmed.trim_end_matches(['.', ';', ',', ' '])
+}
+
+/// Join an optional base use-case description with a probe summary, fitting within [`MAX_USE_CASES_CHARS`].
+fn combine_use_cases(base: &str, summary: &str) -> String {
+    let full = if base.is_empty() {
+        summary.to_string()
+    } else {
+        format!("{base}; {summary}")
+    };
+    if full.chars().count() <= MAX_USE_CASES_CHARS {
+        return full;
+    }
+    let mut out: String = full.chars().take(MAX_USE_CASES_CHARS.saturating_sub(1)).collect();
+    out = out.trim_end().to_string();
+    out.push('…');
+    out
+}
+
+/// One brief summary line for a model's probe results, for the orchestrator's `list_models`.
+pub fn probe_overview_line(probe_stats: &[OutcomeStats], model_id: &str) -> Option<String> {
+    let overall = probe_stats.iter().find(|s| s.subject == model_id && s.task_type.is_empty())?;
+    let total = overall.done + overall.failed;
+    if total == 0 {
+        return None;
+    }
+    let pct = overall.success_rate.unwrap_or(0.0) * 100.0;
+    let parts: Vec<String> = probe_stats
+        .iter()
+        .filter(|s| s.subject == model_id && !s.task_type.is_empty())
+        .map(|s| {
+            let n = s.done + s.failed;
+            if n == 1 {
+                format!("{} {}", s.task_type, if s.successes == 1 { "pass" } else { "fail" })
+            } else {
+                format!("{} {}/{}", s.task_type, s.successes, n)
+            }
+        })
+        .collect();
+    let mut line = format!("{}/{total} passed ({pct:.0}%)", overall.successes);
+    if !parts.is_empty() {
+        line.push_str(&format!(": {}", parts.join(", ")));
+    }
+    if let Some(d) = overall.median_duration_s {
+        line.push_str(&format!("; median {}", format_duration_s(d)));
+    }
+    Some(line)
+}
+
 /// What `list_models` shows the orchestrator: each model with its effective
-/// `local` flag, stats per task type and any pending proposal, plus the enabled rules.
+/// `local` flag, stats per task type, brief probe summary and any pending proposal,
+/// plus the enabled rules.
 pub fn models_overview(db: &Db) -> Value {
     let stats = db.outcome_stats(By::Model, None, None);
+    let probes = db.probe_stats(None, None);
     let pending = db.proposals(Some("pending"));
     let models: Vec<Value> = db
         .models()
@@ -804,6 +1022,9 @@ pub fn models_overview(db: &Db) -> Value {
             let lines: Vec<String> = stats.iter().filter(|s| s.subject == m.id).map(stats_line).collect();
             if !lines.is_empty() {
                 v["stats"] = json!(lines);
+            }
+            if let Some(summary) = probe_overview_line(&probes, &m.id) {
+                v["probes"] = json!(summary);
             }
             if let Some(p) = pending.iter().find(|p| p.model_id == m.id) {
                 v["pending_use_cases_proposal"] = json!({"id": p.id, "text": p.text, "reason": p.reason});
@@ -821,7 +1042,7 @@ pub fn models_overview(db: &Db) -> Value {
         "models": models,
         "priority_rules": rules,
         "task_types": TASK_TYPES,
-        "note": "Prices are USD per million tokens. Stats are from finished threads by task type."
+        "note": "Prices are USD per million tokens. Stats are from finished threads by task type; probes are from deterministic probe suites."
     })
 }
 
@@ -1110,16 +1331,18 @@ mod tests {
             grade: None,
             rating: None,
             duration_s: d,
+            duration_ms: None,
             cost,
+            tokens: 0,
         };
         let rows = [r("done", 10, 0.1), r("failed", 1, 0.3), r("done", 5, 0.2), r("stopped", 3, 0.2)];
-        let s = summarize("m", "code", &rows.iter().collect::<Vec<_>>());
+        let s = summarize("m", "code", "thread", &rows.iter().collect::<Vec<_>>());
         assert_eq!(s.median_duration_s, Some(4.0));
         assert!((s.mean_cost.unwrap() - 0.2).abs() < 1e-9);
         assert_eq!((s.successes, s.success_rate.map(|x| (x * 3.0).round())), (2, Some(2.0)));
-        let s = summarize("m", "code", &rows[..3].iter().collect::<Vec<_>>());
+        let s = summarize("m", "code", "thread", &rows[..3].iter().collect::<Vec<_>>());
         assert_eq!((s.median_duration_s, s.mean_grade), (Some(5.0), None));
-        assert_eq!(summarize("m", "", &[]).success_rate, None);
+        assert_eq!(summarize("m", "", "thread", &[]).success_rate, None);
     }
 
     #[test]

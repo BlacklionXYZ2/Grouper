@@ -326,7 +326,12 @@ enum ModelsCmd {
         /// Runs on your own hardware (for "sensitive → local" priority rules)
         #[arg(long)]
         local: bool,
+        /// Run the built-in probe suite after importing (spends tokens).
+        #[arg(long)]
+        probe: bool,
     },
+    /// Run the built-in deterministic probe suite against a registered model and draft use cases.
+    Probe { id: String },
     Remove { id: String },
     /// How threads went per model and device, by task type.
     Stats,
@@ -1057,7 +1062,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Models(ModelsCmd::Import { provider, model, id, roles, local }) => {
+        Cmd::Models(ModelsCmd::Import { provider, model, id, roles, local, probe }) => {
             let roles: Vec<String> =
                 roles.split(',').map(str::trim).filter(|role| !role.is_empty()).map(String::from).collect();
             let result: ModelImportResult = serde_json::from_value(
@@ -1069,6 +1074,7 @@ async fn main() -> Result<()> {
                         id,
                         roles: (!roles.is_empty()).then_some(roles),
                         local: local.then_some(true),
+                        probe,
                     },
                 )
                 .await?,
@@ -1089,8 +1095,24 @@ async fn main() -> Result<()> {
             if !m.modalities.is_empty() {
                 println!("{:<16} modalities: {}", "", m.modalities.join(", "));
             }
+            if let Some(report) = &result.probe {
+                print_probe_report(report);
+            } else if let Some(err) = &result.probe_error {
+                eprintln!("probe failed: {err}");
+            }
             if let Some(n) = result.proposal_id {
                 println!("use cases drafted: accept with `grouper models accept {n}`");
+            }
+        }
+        Cmd::Models(ModelsCmd::Probe { id }) => {
+            let report: core_client::core_protocol::ProbeReport =
+                serde_json::from_value(api.post(&format!("/v1/models/{}/probe", url_segment(&id)), &json!({})).await?)?;
+            print_probe_report(&report);
+            if let Some(n) = report.proposal_id {
+                if let Some(text) = &report.proposal_text {
+                    println!("proposed use cases (#{n}): {text}");
+                }
+                println!("accept with `grouper models accept {n}` (or `grouper models reject {n}`)");
             }
         }
         Cmd::Models(ModelsCmd::Add {
@@ -1207,6 +1229,42 @@ now: {} thread(s) running; estimated spend today ${:.4} (UTC day, resets in {}h 
     Ok(())
 }
 
+fn format_latency_s(secs: f64) -> String {
+    if secs < 1.0 {
+        format!("{:.0}ms", secs * 1000.0)
+    } else if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{secs:.0}s")
+    }
+}
+
+fn print_probe_report(report: &core_client::core_protocol::ProbeReport) {
+    println!(
+        "probe {}: {}/{} passed  {}  {} tok  ${:.4}",
+        report.model_id,
+        report.passed,
+        report.total,
+        format_latency_s(report.total_latency_ms as f64 / 1000.0),
+        report.total_tokens,
+        report.total_cost
+    );
+    for r in &report.results {
+        println!(
+            "  {:<10} {:<4} {:>7}  {:>5} tok  ${:.4}  {}",
+            r.task_type,
+            if r.passed { "pass" } else { "fail" },
+            format_latency_s(r.latency_ms as f64 / 1000.0),
+            r.input_tokens + r.output_tokens,
+            r.cost,
+            r.detail
+        );
+    }
+    if let Some(why) = &report.stopped_reason {
+        eprintln!("probe stopped early: {why}");
+    }
+}
+
 async fn registry_cmd(api: &Api, cmd: ModelsCmd) -> Result<()> {
     use core_client::core_protocol::{OutcomeStats, RegistryProposal, RegistryStats};
     let print_proposal = |p: &RegistryProposal| {
@@ -1244,6 +1302,28 @@ async fn registry_cmd(api: &Api, cmd: ModelsCmd) -> Result<()> {
             };
             print("models", &s.models);
             print("devices", &s.devices);
+            println!("probes:");
+            if s.probes.is_empty() {
+                println!("  no probe runs yet");
+            }
+            for r in &s.probes {
+                let what = if r.task_type.is_empty() { "(all)" } else { r.task_type.as_str() };
+                let rate = r.success_rate.map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "-".into());
+                let cost = r.mean_cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "-".into());
+                let time = r.median_duration_s.map(format_latency_s).unwrap_or_else(|| "-".into());
+                let tokens = r.mean_tokens.map(|t| format!("{t:.0} tok")).unwrap_or_else(|| "-".into());
+                println!(
+                    "  {:<16} {:<10} {:>3}/{:<3} pass {:>5}  median {:<7} {:<9} {}",
+                    r.subject,
+                    what,
+                    r.successes,
+                    r.done + r.failed,
+                    rate,
+                    time,
+                    cost,
+                    tokens
+                );
+            }
         }
         ModelsCmd::Proposals { all } => {
             let q = if all { "?status=all" } else { "" };

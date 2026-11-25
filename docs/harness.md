@@ -147,6 +147,13 @@ HTTP, so every device shows the same chat and thread panel.
 - When stats clearly disagree with a model's use cases, the hub (or the orchestrator)
   proposes new text; you accept or reject it (`grouper models proposals`), so the table
   doesn't drift.
+- **Probe tasks**: `grouper models probe <id>` (`POST /v1/models/{id}/probe`, or opt-in
+  `grouper models import … --probe`) runs a small built-in suite of cheap, deterministically
+  graded tasks (code, writing, research, data, tool use) through the normal provider path
+  (including device-hosted models). Probes count as usage and respect the daily budget; their
+  per-task pass/fail, latency, tokens and cost are recorded with `source = 'probe'` separate
+  from real thread outcomes, shown in `grouper models stats` and briefly in `list_models`,
+  and drafted into a pending use-case proposal for you to confirm.
 
 ## Accounting
 

@@ -422,6 +422,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/memories/{id}", put(update_memory).delete(delete_memory))
         .merge(crate::registry::routes())
         .merge(crate::catalog::routes())
+        .merge(crate::probes::routes())
         .merge(crate::skills::routes())
         .merge(crate::limits::routes())
         .merge(crate::files::routes())

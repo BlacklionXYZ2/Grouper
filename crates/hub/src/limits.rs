@@ -490,6 +490,34 @@ pub fn turn_refusal(db: &Db, conversation_id: &str) -> Option<String> {
     budget_refusal(&l, today, conversation, at)
 }
 
+/// Why a daily budget stops new work outside a conversation (such as model probes).
+pub fn daily_budget_refusal(db: &Db) -> Option<String> {
+    let l = db.limits();
+    let limit = l.daily_budget_usd?;
+    let at = now();
+    let today = db.spent_since(day_start(at));
+    budget_refusal(&Limits { daily_budget_usd: Some(limit), ..Default::default() }, today, 0.0, at)
+}
+
+/// After a standalone call (such as a model probe) recorded usage: stop active threads
+/// if the daily budget has now been reached.
+pub(crate) fn after_daily_usage(hub: &Arc<Hub>, cost: f64) {
+    if cost <= 0.0 {
+        return;
+    }
+    let Some(limit) = hub.db.limits().daily_budget_usd else { return };
+    let spent = hub.db.spent_since(day_start(now()));
+    if reached(spent, limit) {
+        let ids = hub.db.active_threads().into_iter().map(|t| t.id).collect();
+        let summary = format!(
+            "Stopped: the daily budget of ${} was reached (estimated ${} today, UTC).",
+            usd(limit),
+            usd(spent)
+        );
+        stop_for_budget(hub, ids, summary);
+    }
+}
+
 /// Refuse a turn when a budget is spent: what woke the conversation is kept in its
 /// history (the next turn sees it), and an error says why and how to raise the limit.
 pub(crate) fn refuse_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: &[Wake]) -> bool {

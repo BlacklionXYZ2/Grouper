@@ -360,7 +360,7 @@ pub fn import_from_catalog(
     db.upsert_model(&entry)?;
     let proposal_id = draft_proposal(db, &id, &card.use_cases_draft);
     let model = db.models().into_iter().find(|model| model.id == id).context("saved model is missing")?;
-    Ok(ModelImportResult { model, proposal_id })
+    Ok(ModelImportResult { model, proposal_id, probe: None, probe_error: None })
 }
 
 /// Replace prices (and the free flag, which is derived from them) from a catalog card.
@@ -404,12 +404,37 @@ async fn fetch_openrouter_models(client: &reqwest::Client, provider: &ProviderCo
     response.json().await.context("OpenRouter /models returned invalid JSON")
 }
 
+/// Import one model from parsed catalog cards and, only when `req.probe` is true,
+/// run the built-in probe suite against it afterward.
+pub async fn import_with_cards(
+    hub: &Arc<Hub>,
+    provider_id: &str,
+    cards: &[CatalogModel],
+    req: &ModelImportRequest,
+) -> Result<ModelImportResult> {
+    let mut result = import_from_catalog(&hub.db, provider_id, cards, req)?;
+    if req.probe {
+        match crate::probes::run_probes(hub, &result.model.id).await {
+            Ok(report) => {
+                if let Some(id) = report.proposal_id {
+                    result.proposal_id = Some(id);
+                }
+                result.probe = Some(report);
+            }
+            Err(error) => {
+                result.probe_error = Some(error.to_string());
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Fetch the catalog for an OpenRouter provider and save one model. Other providers error before any request.
-pub async fn import(hub: &Hub, req: ModelImportRequest) -> Result<ModelImportResult> {
+pub async fn import(hub: &Arc<Hub>, req: ModelImportRequest) -> Result<ModelImportResult> {
     let Some(provider) = hub.db.provider(&req.provider)? else { bail!("no provider {}", req.provider) };
     require_openrouter(&provider)?;
     let body = fetch_openrouter_models(&http_client()?, &provider).await?;
-    import_from_catalog(&hub.db, &provider.id, &parse_openrouter_models(&body), &req)
+    import_with_cards(hub, &provider.id, &parse_openrouter_models(&body), &req).await
 }
 
 /// Re-pull prices for one registered model. The provider must be OpenRouter.
@@ -655,6 +680,7 @@ mod tests {
             id: None,
             roles: Some(vec!["thread".into()]),
             local: None,
+            probe: false,
         };
         let saved = import_from_catalog(&db, "openrouter", &cards(), &req).unwrap();
         assert_eq!(saved.model.id, "anthropic-claude-sonnet-4");
@@ -704,6 +730,7 @@ mod tests {
                 id: Some("free-llama".into()),
                 roles: None,
                 local: Some(false),
+                probe: false,
             },
         )
         .unwrap();
@@ -773,6 +800,7 @@ mod tests {
                 id: None,
                 roles: None,
                 local: None,
+                probe: false,
             },
         )
         .await
@@ -835,6 +863,7 @@ mod tests {
                 id: None,
                 roles: None,
                 local: None,
+                probe: false,
             };
             assert!(import_from_catalog(&db, "openrouter", &parsed, &req).is_err(), "{tag}: import must fail");
         }

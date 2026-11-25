@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod memory;
 pub mod offline;
 pub mod orchestrator;
+pub mod probes;
 pub mod registry;
 pub mod secrets;
 pub mod server;
