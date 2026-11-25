@@ -110,6 +110,9 @@ pub struct Hub {
     pub(crate) hub_threads: Mutex<HashMap<String, ThreadControl>>,
     pub(crate) orchestrators: Mutex<HashMap<String, mpsc::UnboundedSender<Wake>>>,
     events: broadcast::Sender<Event>,
+    /// Held while an event is stored and broadcast, so subscribers receive stored
+    /// events in `seq` order (they drop a seq lower than one they've already seen).
+    emit_order: std::sync::Mutex<()>,
     pub(crate) next_id: AtomicU64,
     pub(crate) limits: crate::limits::LimitState,
 }
@@ -127,6 +130,7 @@ impl Hub {
             orchestrators: Mutex::new(HashMap::new()),
             // Roomy: streamed text sends many small events.
             events: broadcast::channel(8192).0,
+            emit_order: std::sync::Mutex::new(()),
             next_id: AtomicU64::new(1),
             limits: Default::default(),
         })
@@ -143,6 +147,7 @@ impl Hub {
 
     /// Store an event and send it to everyone watching.
     pub fn emit(&self, conversation_id: &str, thread_id: Option<&str>, body: EventBody) -> Event {
+        let _order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
         let e = self.db.add_event(conversation_id, thread_id, body);
         let _ = self.events.send(e.clone());
         e
