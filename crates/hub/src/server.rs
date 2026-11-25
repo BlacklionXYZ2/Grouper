@@ -67,6 +67,8 @@ pub(crate) struct Live {
     pub(crate) tools: Vec<ToolDef>,
     /// The hub's MCP client for this connection, once initialized.
     pub(crate) mcp: Option<rmcp::Peer<rmcp::RoleClient>>,
+    /// Whether this device opted in to read-only subscription usage probes.
+    pub(crate) usage_probes: bool,
     pub(crate) close: CloseHandle,
     /// Becomes `true` once the session has sent any final error, dropped its writer and aborted its tasks.
     pub(crate) closed: watch::Receiver<bool>,
@@ -950,6 +952,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                 tx: tx.clone(),
                 tools: Vec::new(),
                 mcp: None,
+                usage_probes: false,
                 close: close_handle.clone(),
                 closed: closed_rx,
             },
@@ -1131,6 +1134,7 @@ async fn handle_thread_frame(hub: &Arc<Hub>, device_id: &str, conn_id: u64, msg:
         }
         NodeMessage::ThreadFinished { thread_id, ok, summary } if hub.owns_thread(device_id, &thread_id) => {
             hub.thread_finished(&thread_id, ok, &summary).await;
+            crate::usage::after_device_thread(hub, device_id, &thread_id);
         }
         NodeMessage::ApprovalRequest { approval_id, thread_id, tool, input, reason }
             if hub.owns_thread(device_id, &thread_id) =>
@@ -1679,7 +1683,7 @@ mod tests {
         let (_closed_tx, closed_rx) = watch::channel(false);
         hub.live.lock().await.insert(
             device.id.clone(),
-            Live { conn_id: 1, tx, tools: Vec::new(), mcp: None, close, closed: closed_rx },
+            Live { conn_id: 1, tx, tools: Vec::new(), mcp: None, usage_probes: false, close, closed: closed_rx },
         );
 
         assert!(hub.send_to(&device.id, HubMessage::Pong).await);
@@ -1701,11 +1705,11 @@ mod tests {
             let mut live = hub.live.lock().await;
             live.insert(
                 device.id.clone(),
-                Live { conn_id: 2, tx: slow_tx, tools: Vec::new(), mcp: None, close: slow_close, closed: s_rx },
+                Live { conn_id: 2, tx: slow_tx, tools: Vec::new(), mcp: None, usage_probes: false, close: slow_close, closed: s_rx },
             );
             live.insert(
                 other.id.clone(),
-                Live { conn_id: 3, tx: fast_tx, tools: Vec::new(), mcp: None, close: fast_close, closed: f_rx },
+                Live { conn_id: 3, tx: fast_tx, tools: Vec::new(), mcp: None, usage_probes: false, close: fast_close, closed: f_rx },
             );
         }
         hub.broadcast(HubMessage::Pong).await;

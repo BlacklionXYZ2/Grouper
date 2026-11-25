@@ -13,7 +13,7 @@ use std::sync::Arc;
 use core_agent::folders::Folders;
 use core_agent::tools::builtin_defs;
 use core_protocol::tunnel::{Tunnel, result_from_text, tool_to_mcp};
-use core_protocol::{Capability, FOLDERS_META_KEY, NodeMessage, ToolDef};
+use core_protocol::{Capability, FOLDERS_META_KEY, NodeMessage, ToolDef, USAGE_PROBES_META_KEY};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult, MetaObject, PaginatedRequestParams,
     ServerCapabilities, ServerConfig,
@@ -36,6 +36,8 @@ pub(crate) struct DeviceServer {
     folders: Arc<Folders>,
     /// Where thread workspaces live, for the hub's workspace tools.
     workspace_root: Option<PathBuf>,
+    /// Whether this device opted in to read-only subscription usage probes.
+    usage_probes: bool,
 }
 
 impl DeviceServer {
@@ -53,6 +55,7 @@ impl DeviceServer {
             host,
             folders,
             workspace_root: config.workspace_root.clone(),
+            usage_probes: config.usage_probes,
         }
     }
 
@@ -64,12 +67,18 @@ impl DeviceServer {
     }
 
     async fn run(&self, name: &str, args: Value) -> (bool, String) {
-        // The hub fetching a thread's files: checked first, so no other tool can shadow them.
+        // Internal hub-only tools: checked first, so no other tool can shadow them.
         if crate::workspace_files::is_internal(name) {
             let (root, name) = (self.workspace_root.clone(), name.to_string());
             return tokio::task::spawn_blocking(move || crate::workspace_files::call(root.as_deref(), &name, &args))
                 .await
                 .unwrap_or_else(|e| (false, e.to_string()));
+        }
+        if crate::usage_probes::is_internal(name) {
+            if !self.usage_probes {
+                return (false, serde_json::json!({"error": "usage probes are disabled on this device"}).to_string());
+            }
+            return crate::usage_probes::call(&args).await;
         }
         if self.workspace.iter().any(|d| d.name == name) {
             return (false, format!("{name} only runs inside a thread on this device"));
@@ -93,9 +102,14 @@ impl ServerHandler for DeviceServer {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build())
             .with_server_info(Implementation::new("grouper-device", CLIENT_VERSION));
+        let mut meta = serde_json::Map::new();
         if self.workspace_root.is_some() && !self.folders.is_empty() {
-            let mut meta = serde_json::Map::new();
             meta.insert(FOLDERS_META_KEY.into(), serde_json::to_value(self.folders.infos()).unwrap_or_default());
+        }
+        if self.usage_probes {
+            meta.insert(USAGE_PROBES_META_KEY.into(), serde_json::json!(crate::usage_probes::SUPPORTED_PROVIDERS));
+        }
+        if !meta.is_empty() {
             info.meta = Some(MetaObject(meta));
         }
         info

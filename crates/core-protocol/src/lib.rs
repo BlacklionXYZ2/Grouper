@@ -126,10 +126,16 @@ pub fn valid_folder_name(name: &str) -> bool {
 /// [`FolderInfo`] list.
 pub const FOLDERS_META_KEY: &str = "grouper/folders";
 
+/// Key in the device MCP server's `initialize` result `_meta` advertising opted-in
+/// read-only subscription usage probes (e.g. `["claude", "codex"]`).
+pub const USAGE_PROBES_META_KEY: &str = "grouper/usage_probes";
+
 /// Device MCP tools only the hub calls (never listed, never offered to threads):
-/// list a thread's workspace (`{thread_id}`) and read one file from it (`{thread_id, path}`).
+/// list a thread's workspace (`{thread_id}`), read one file from it (`{thread_id, path}`),
+/// and probe local subscription usage (`{providers?: ["claude", "codex"]}`).
 pub const WORKSPACE_LIST_TOOL: &str = "grouper_workspace_list";
 pub const WORKSPACE_READ_TOOL: &str = "grouper_workspace_read";
+pub const USAGE_PROBE_TOOL: &str = "grouper_usage_probe";
 /// Largest workspace file the hub fetches from a device.
 pub const MAX_WORKSPACE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -632,6 +638,27 @@ pub struct UsageSnapshot {
     #[serde(default)]
     pub device_id: Option<String>,
     pub fetched_at: u64,
+}
+
+/// One provider's result from the internal device [`USAGE_PROBE_TOOL`] call.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageProbeEntry {
+    /// Canonical provider name (`claude`, `codex`).
+    pub provider: String,
+    /// `ok`, `not_signed_in`, `expired`, or `unavailable`.
+    pub status: String,
+    /// Human-readable status detail when `status != "ok"` (never contains tokens or secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Normalized snapshots when `status == "ok"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<UsageSnapshot>,
+}
+
+/// JSON payload returned by the internal device [`USAGE_PROBE_TOOL`] call.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageProbeResponse {
+    pub results: Vec<UsageProbeEntry>,
 }
 
 /// What the hub does when [`Limits::approval_timeout_secs`] elapses.

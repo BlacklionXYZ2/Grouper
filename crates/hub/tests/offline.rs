@@ -102,6 +102,7 @@ impl Setup {
             allow_shell: false,
             mcp_config: Some(self.dir.join("mcp.json")),
             folders: Vec::new(),
+            usage_probes: false,
         };
         let (stop, stopped) = watch::channel(false);
         (stop, tokio::spawn(core_client::run(config, Arc::new(Tools), Arc::new(Quiet), stopped)))

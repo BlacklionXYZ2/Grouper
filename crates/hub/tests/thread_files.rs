@@ -137,6 +137,7 @@ async fn scoped_folders_and_thread_files() {
             FolderSpec { name: "test".into(), path: scoped.clone(), mode: FolderMode::Read },
             FolderSpec { name: "rw".into(), path: rw.clone(), mode: FolderMode::ReadWrite },
         ],
+        usage_probes: false,
     };
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let client = tokio::spawn(core_client::run(config, Arc::new(Tools), Arc::new(Quiet), stopped));

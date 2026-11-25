@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use core_protocol::tunnel::{Tunnel, result_text, tool_from_mcp};
 use core_protocol::{
-    FOLDERS_META_KEY, FolderInfo, HubMessage, MCP_GRACE_SECS, ToolCallResponse, ToolDef, mcp_call_timeout,
-    mcp_server_of, valid_folder_name,
+    FOLDERS_META_KEY, FolderInfo, HubMessage, MCP_GRACE_SECS, ToolCallResponse, ToolDef, USAGE_PROBES_META_KEY,
+    mcp_call_timeout, mcp_server_of, valid_folder_name,
 };
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, JsonObject};
 use rmcp::service::{NotificationContext, RoleClient};
@@ -99,16 +99,27 @@ impl McpSession {
                 Err(_) => return tracing::warn!(device = %device_id, "MCP initialize timed out"),
             };
             let peer = client.peer().clone();
-            let folders = reported_folders(peer.peer_info().and_then(|i| i.meta.as_ref().map(|m| m.0.clone())));
+            let meta = peer.peer_info().and_then(|i| i.meta.as_ref().map(|m| m.0.clone()));
+            let folders = reported_folders(meta.clone());
+            let usage_probes = reported_usage_probes(meta.as_ref());
             {
                 let Some(h) = hub.upgrade() else { return };
                 let mut live = h.live.lock().await;
                 match live.get_mut(&device_id).filter(|l| l.conn_id == conn_id) {
                     Some(l) => {
                         l.mcp = Some(peer.clone());
+                        l.usage_probes = usage_probes;
                         h.db.set_device_folders(&device_id, &folders);
                     }
                     None => return,
+                }
+                drop(live);
+                if usage_probes {
+                    let probe_hub = Arc::clone(&h);
+                    let probe_device_id = device_id.clone();
+                    tokio::spawn(async move {
+                        crate::usage::probe_device(&probe_hub, &probe_device_id, None).await;
+                    });
                 }
             }
             loop {
@@ -130,6 +141,15 @@ pub(crate) fn reported_folders(meta: Option<serde_json::Map<String, Value>>) -> 
     let Some(v) = meta.and_then(|mut m| m.remove(FOLDERS_META_KEY)) else { return Vec::new() };
     let folders: Vec<FolderInfo> = serde_json::from_value(v).unwrap_or_default();
     folders.into_iter().filter(|f| valid_folder_name(&f.name)).collect()
+}
+
+/// Whether the device advertised opted-in subscription usage probes in `initialize` `_meta`.
+pub(crate) fn reported_usage_probes(meta: Option<&serde_json::Map<String, Value>>) -> bool {
+    match meta.and_then(|m| m.get(USAGE_PROBES_META_KEY)) {
+        Some(Value::Bool(true)) => true,
+        Some(Value::Array(items)) => !items.is_empty(),
+        _ => false,
+    }
 }
 
 /// Apply a listed tool set only if `conn_id` is still the live connection for `device_id`.
@@ -221,6 +241,17 @@ mod tests {
     }
 
     #[test]
+    fn usage_probes_flag_from_meta() {
+        let meta = |v: Value| v.as_object().cloned();
+        assert!(!reported_usage_probes(None));
+        assert!(!reported_usage_probes(meta(json!({})).as_ref()));
+        assert!(!reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: false})).as_ref()));
+        assert!(!reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: []})).as_ref()));
+        assert!(reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: true})).as_ref()));
+        assert!(reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: ["claude", "codex"]})).as_ref()));
+    }
+
+    #[test]
     fn call_timeouts() {
         assert_eq!(call_timeout("system_info", &json!({})), TOOL_TIMEOUT);
         let agent = call_timeout("codex__codex_chat", &json!({"timeout_seconds": 100}));
@@ -240,7 +271,7 @@ mod tests {
         let (_closed_tx, closed_rx) = tokio::sync::watch::channel(false);
         hub.live.lock().await.insert(
             dev.id.clone(),
-            crate::server::Live { conn_id: 2, tx, tools: Vec::new(), mcp: None, close, closed: closed_rx },
+            crate::server::Live { conn_id: 2, tx, tools: Vec::new(), mcp: None, usage_probes: false, close, closed: closed_rx },
         );
         let tool = |name: &str| ToolDef { name: name.into(), description: "d".into(), input_schema: json!({}) };
         // Current connection (conn_id 2) writes its tool list.

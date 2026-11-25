@@ -950,7 +950,7 @@ mod tests {
         let (_closed_tx, closed) = tokio::sync::watch::channel(false);
         hub.live.lock().await.insert(
             device.id.clone(),
-            Live { conn_id: 1, tx, tools: vec![], mcp: None, close, closed },
+            Live { conn_id: 1, tx, tools: vec![], mcp: None, usage_probes: false, close, closed },
         );
         let conv = hub.db.create_conversation("project", "ask").unwrap();
         let start = |hub: std::sync::Arc<crate::server::Hub>, conv: String, device: String| async move {
@@ -999,7 +999,7 @@ mod tests {
         let (_closed_tx, closed) = tokio::sync::watch::channel(false);
         hub.live.lock().await.insert(
             device.id.clone(),
-            Live { conn_id: 1, tx, tools: vec![], mcp: None, close, closed },
+            Live { conn_id: 1, tx, tools: vec![], mcp: None, usage_probes: false, close, closed },
         );
         let conv = hub.db.create_conversation("project", "approvals").unwrap();
         let on_device = hub.db.create_thread(&conv, "D", &device.id, "m", None, "brief").unwrap();
@@ -1134,7 +1134,7 @@ mod tests {
         let (_closed_tx, closed) = tokio::sync::watch::channel(false);
         hub.live.lock().await.insert(
             device.id.clone(),
-            Live { conn_id: 1, tx, tools: vec![], mcp: None, close, closed },
+            Live { conn_id: 1, tx, tools: vec![], mcp: None, usage_probes: false, close, closed },
         );
         let conv = hub.db.create_conversation("project", "approval stop").unwrap();
         let thread = hub.db.create_thread(&conv, "T", &device.id, "m", None, "brief").unwrap();

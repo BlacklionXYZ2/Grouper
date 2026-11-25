@@ -541,8 +541,9 @@ impl Tool for ListUsage {
         ToolDef {
             name: "list_usage".into(),
             description: "Read cost and availability information: Grouper's metered totals for the last 7 days, \
-                          grouped by provider, plus the latest provider-reported balances and, when the user set \
-                          limits, what's left of each budget."
+                          grouped by provider, plus the latest provider-reported balances, device subscription \
+                          usage windows (Claude/Codex, with snapshot age and device online status) and, when \
+                          the user set limits, what's left of each budget."
                 .into(),
             input_schema: json!({"type": "object", "properties": {}}),
         }
@@ -557,7 +558,24 @@ impl Tool for ListUsage {
             Ok(rows) => rows,
             Err(error) => return ToolOutput::err(error.to_string()),
         };
-        let mut out = json!({"period": "last_7_days", "totals": totals, "latest_snapshots": snapshots});
+        let devices = self.0.hub.devices().await;
+        let enriched: Vec<Value> = snapshots
+            .into_iter()
+            .map(|snap| {
+                let mut row = serde_json::to_value(&snap).unwrap_or_else(|_| json!({}));
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("age_secs".into(), json!(now.saturating_sub(snap.fetched_at)));
+                    if let Some(dev_id) = snap.device_id.as_deref()
+                        && let Some(dev) = devices.iter().find(|d| d.id == dev_id)
+                    {
+                        obj.insert("device_name".into(), json!(dev.name));
+                        obj.insert("device_online".into(), json!(dev.online));
+                    }
+                }
+                row
+            })
+            .collect();
+        let mut out = json!({"period": "last_7_days", "totals": totals, "latest_snapshots": enriched});
         if let Some(limits) = crate::limits::overview(&self.0.hub, &self.0.conversation_id).await {
             out["limits"] = limits;
         }

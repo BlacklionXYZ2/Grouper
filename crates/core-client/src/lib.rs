@@ -33,6 +33,7 @@ mod device_provider;
 mod handover;
 pub mod mcp_host;
 mod mcp_server;
+pub mod usage_probes;
 mod workspace_files;
 
 use mcp_host::{HostTool, McpHost};
@@ -85,6 +86,9 @@ pub struct Config {
     /// Scoped folders threads here may reach as `@<name>/<path>` (see
     /// [`core_agent::folders`]). The caller loads them ([`folders::load`]).
     pub folders: Vec<FolderSpec>,
+    /// Opt in to read-only subscription usage probes (Claude Code, Codex).
+    /// Off by default because these call unofficial provider endpoints.
+    pub usage_probes: bool,
 }
 
 enum Outcome {

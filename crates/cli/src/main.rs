@@ -61,6 +61,11 @@ enum Cmd {
         /// Scoped folders file. Default: <config dir>/grouper/folders.json.
         #[arg(long, env = "GROUPER_FOLDERS_CONFIG")]
         folders_config: Option<PathBuf>,
+        /// Enable read-only subscription usage probes (Claude Code, Codex). Off by default:
+        /// calls unofficial provider endpoints using the CLIs' local sign-in credentials.
+        /// Tokens stay on this device and are never sent to the hub.
+        #[arg(long, env = "GROUPER_USAGE_PROBES")]
+        usage_probes: bool,
     },
     /// List a thread's workspace files, or download one: grouper files <thread> [<path> [-o <out>]]
     Files {
@@ -759,7 +764,7 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Login | Cmd::Logout => unreachable!(),
-        Cmd::Connect { workspace, no_shell, mcp_config, folders, folders_config } => {
+        Cmd::Connect { workspace, no_shell, mcp_config, folders, folders_config, usage_probes } => {
             let workspace = workspace.unwrap_or_else(|| {
                 dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Grouper").join("workspaces")
             });
@@ -767,6 +772,9 @@ async fn main() -> Result<()> {
             let folders = core_client::folders::load(folders_config.as_deref(), &folders).map_err(anyhow::Error::msg)?;
             for f in &folders {
                 println!("scoped folder @{} ({}): {}", f.name, f.mode.as_str(), f.path.display());
+            }
+            if usage_probes {
+                println!("subscription usage probes: enabled (read-only, unofficial Claude/Codex endpoints)");
             }
             let config = core_client::Config {
                 hub_url: api.base.clone(),
@@ -787,6 +795,7 @@ async fn main() -> Result<()> {
                 allow_shell: !no_shell,
                 mcp_config,
                 folders,
+                usage_probes,
             };
             let (tx, rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {

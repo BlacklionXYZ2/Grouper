@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
-use core_client::core_protocol::{UsageSnapshot, UsageTotal};
+use core_client::core_protocol::{DeviceInfo, UsageSnapshot, UsageTotal};
 
 use crate::Api;
 
@@ -42,9 +44,9 @@ impl UsageGroup {
 
 #[derive(Subcommand)]
 enum UsageCommand {
-    /// Show the latest balances and spending windows reported by providers.
+    /// Show the latest provider balances and device subscription usage windows.
     Balances {
-        /// Poll supported providers before printing.
+        /// Poll supported providers and online opted-in devices before printing.
         #[arg(long)]
         refresh: bool,
     },
@@ -130,28 +132,133 @@ async fn balances(api: &Api) -> Result<()> {
         println!("no provider balances available");
         return Ok(());
     }
-    println!("{:<14} {:<9} {:<10} {:>14} {:>14} {:>8} {:>12}", "provider", "kind", "window", "used/balance", "limit", "used", "age");
+    let devices: HashMap<String, (String, bool)> = api
+        .get::<Vec<DeviceInfo>>("/v1/devices")
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| (d.id, (d.name, d.online)))
+        .collect();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    for row in rows {
-        let currency = row.currency.as_deref().unwrap_or("");
-        let amount = row.used_amount.map(|value| format!("{value:.4} {currency}")).unwrap_or_else(|| "-".into());
-        let limit = row.limit_amount.map(|value| format!("{value:.4} {currency}")).unwrap_or_else(|| "-".into());
-        let percent = row.used_pct.map(|value| format!("{value:.1}%")).unwrap_or_else(|| "-".into());
-        println!(
-            "{:<14} {:<9} {:<10} {:>14} {:>14} {:>8} {:>12}",
-            truncate(&row.provider, 14),
-            row.kind,
-            truncate(&row.window, 10),
-            amount,
-            limit,
-            percent,
-            age(now.saturating_sub(row.fetched_at))
-        );
-    }
+    print!("{}", format_balances(&rows, &devices, now));
     Ok(())
+}
+
+fn display_provider(provider: &str) -> String {
+    match provider {
+        "claude" => "Claude".into(),
+        "codex" => "Codex".into(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+fn format_reset_time(resets_at: u64, now: u64) -> String {
+    let days = (resets_at / 86_400) as i64;
+    let sod = resets_at % 86_400;
+    let hh = sod / 3_600;
+    let mm = (sod % 3_600) / 60;
+    if resets_at <= now.saturating_add(86_400) && resets_at.saturating_add(86_400) >= now {
+        format!("{hh:02}:{mm:02}")
+    } else {
+        let (y, m, d) = civil_from_days(days);
+        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02} UTC")
+    }
+}
+
+// Inverse of Howard Hinnant's civil-from-days algorithm (public domain).
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(m <= 2);
+    (y as i32, m as u32, d as u32)
+}
+
+fn device_tag(row: &UsageSnapshot, devices: &HashMap<String, (String, bool)>, now: u64) -> String {
+    let age_str = format!("{} ago", age(now.saturating_sub(row.fetched_at)));
+    match row.device_id.as_deref() {
+        Some(id) => match devices.get(id) {
+            Some((name, true)) => format!("[{name}, {age_str}]"),
+            Some((name, false)) => format!("[{name}, offline, {age_str}]"),
+            None => format!("[{id}, {age_str}]"),
+        },
+        None => format!("[{age_str}]"),
+    }
+}
+
+fn format_balances(rows: &[UsageSnapshot], devices: &HashMap<String, (String, bool)>, now: u64) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let (windows, others): (Vec<&UsageSnapshot>, Vec<&UsageSnapshot>) =
+        rows.iter().partition(|r| r.kind == "window" || r.kind == "status");
+
+    for row in &windows {
+        let provider = display_provider(&row.provider);
+        let tag = device_tag(row, devices, now);
+        if row.kind == "status" {
+            let _ = writeln!(out, "{provider}: {}  {tag}", row.window);
+        } else {
+            let pct = row
+                .used_pct
+                .map(|v| {
+                    if (v - v.round()).abs() < 0.05 {
+                        format!("{:.0}%", v.round())
+                    } else {
+                        format!("{v:.1}%")
+                    }
+                })
+                .unwrap_or_else(|| "-".into());
+            let reset = row
+                .resets_at
+                .map(|ts| format!(" (resets {})", format_reset_time(ts, now)))
+                .unwrap_or_default();
+            let _ = writeln!(out, "{provider} {}: {pct}{reset}  {tag}", row.window);
+        }
+    }
+
+    if !others.is_empty() {
+        if !windows.is_empty() {
+            out.push('\n');
+        }
+        let _ = writeln!(
+            out,
+            "{:<14} {:<9} {:<10} {:>14} {:>14} {:>8} {:>12}",
+            "provider", "kind", "window", "used/balance", "limit", "used", "age"
+        );
+        for row in others {
+            let currency = row.currency.as_deref().unwrap_or("");
+            let amount = row.used_amount.map(|value| format!("{value:.4} {currency}")).unwrap_or_else(|| "-".into());
+            let limit = row.limit_amount.map(|value| format!("{value:.4} {currency}")).unwrap_or_else(|| "-".into());
+            let percent = row.used_pct.map(|value| format!("{value:.1}%")).unwrap_or_else(|| "-".into());
+            let _ = writeln!(
+                out,
+                "{:<14} {:<9} {:<10} {:>14} {:>14} {:>8} {:>12}",
+                truncate(&row.provider, 14),
+                row.kind,
+                truncate(&row.window, 10),
+                amount,
+                limit,
+                percent,
+                age(now.saturating_sub(row.fetched_at))
+            );
+        }
+    }
+    out
 }
 
 fn sum(rows: &[UsageTotal]) -> UsageTotal {
@@ -194,5 +301,84 @@ fn age(seconds: u64) -> String {
         format!("{}h", seconds / 3_600)
     } else {
         format!("{}d", seconds / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_subscription_windows_offline_age_status_and_balances() {
+        // 2026-11-25T12:00:00Z = 1_795_608_000; 14:05:00Z = 1_795_615_500.
+        let now = 1_795_608_000;
+        let devices = HashMap::from([
+            ("d1".to_string(), ("PC".to_string(), true)),
+            ("d2".to_string(), ("Mac".to_string(), false)),
+        ]);
+        let rows = vec![
+            UsageSnapshot {
+                account: "claude-max".into(),
+                provider: "claude".into(),
+                kind: "window".into(),
+                window: "5h".into(),
+                used_pct: Some(42.0),
+                used_amount: None,
+                limit_amount: None,
+                currency: None,
+                resets_at: Some(1_795_615_500),
+                source: "probe".into(),
+                device_id: Some("d1".into()),
+                fetched_at: now - 120,
+            },
+            UsageSnapshot {
+                account: "chatgpt-pro".into(),
+                provider: "codex".into(),
+                kind: "window".into(),
+                window: "7d".into(),
+                used_pct: Some(18.5),
+                used_amount: None,
+                limit_amount: None,
+                currency: None,
+                resets_at: Some(now + 3 * 86_400 + 7_500),
+                source: "probe".into(),
+                device_id: Some("d2".into()),
+                fetched_at: now - 3_600,
+            },
+            UsageSnapshot {
+                account: "codex".into(),
+                provider: "codex".into(),
+                kind: "status".into(),
+                window: "unavailable: HTTP 403".into(),
+                used_pct: None,
+                used_amount: None,
+                limit_amount: None,
+                currency: None,
+                resets_at: None,
+                source: "probe".into(),
+                device_id: Some("d1".into()),
+                fetched_at: now - 5,
+            },
+            UsageSnapshot {
+                account: "openrouter".into(),
+                provider: "openrouter".into(),
+                kind: "balance".into(),
+                window: "total".into(),
+                used_pct: Some(25.0),
+                used_amount: Some(12.5),
+                limit_amount: Some(50.0),
+                currency: Some("USD".into()),
+                resets_at: None,
+                source: "admin_api".into(),
+                device_id: None,
+                fetched_at: now - 600,
+            },
+        ];
+
+        let rendered = format_balances(&rows, &devices, now);
+        assert!(rendered.contains("Claude 5h: 42% (resets 14:05)  [PC, 2m ago]"), "{rendered}");
+        assert!(rendered.contains("Codex 7d: 18.5% (resets 2026-11-28 14:05 UTC)  [Mac, offline, 1h ago]"), "{rendered}");
+        assert!(rendered.contains("Codex: unavailable: HTTP 403  [PC, 5s ago]"), "{rendered}");
+        assert!(rendered.contains("openrouter"), "{rendered}");
     }
 }

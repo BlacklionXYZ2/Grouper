@@ -190,6 +190,7 @@ impl GrouperClient {
                     eprintln!("grouper: scoped folders: {e}");
                     Vec::new()
                 }),
+                usage_probes: false,
             },
             handler,
             listener,
