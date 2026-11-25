@@ -120,6 +120,10 @@ pub enum HubMessage {
     ThreadInput { thread_id: String, from: String, text: String },
     StopThread { thread_id: String },
     ApprovalResult { approval_id: String, approved: bool },
+    /// Offline hand-over: a file the hub prepared for a thread while this device was
+    /// away. Write it into that thread's workspace (`path` is workspace-relative, with
+    /// `/`) before the thread's `StartThread`, which follows on the same connection.
+    WorkspaceFile { thread_id: String, path: String, content_base64: String },
 }
 
 /// A tool definition as models see it.
@@ -280,6 +284,16 @@ pub enum EventBody {
     ThreadActivity { event: AgentEvent },
     ThreadInput { from: String, text: String },
     ThreadFinished { status: String, summary: String },
+    /// The thread's device is offline (it was when the thread started, or it
+    /// disconnected mid-thread). The thread waits for it; meanwhile the hub works
+    /// towards a checkpoint in its own workspace.
+    ThreadWaiting { device_id: String, reason: String },
+    /// The hub's part of a waiting thread reached its checkpoint: `summary` is its
+    /// checkpoint report. The thread keeps waiting for `device_id`.
+    ThreadCheckpoint { device_id: String, summary: String },
+    /// The device is back: the hub copied `files` from its workspace (and left out
+    /// `skipped`, with reasons) and the thread continues there with `brief`.
+    ThreadHandedOver { device_id: String, files: Vec<String>, skipped: Vec<String>, brief: String },
     ApprovalRequested { approval_id: String, device_id: String, tool: String, input: Value, reason: String },
     ApprovalResolved { approval_id: String, approved: bool },
     /// The orchestrator finished a turn; it wakes again on the next message or thread result.
@@ -326,7 +340,8 @@ pub struct ThreadInfo {
     pub title: String,
     pub device_id: String,
     pub model: String,
-    /// `running`, `done`, `failed` or `stopped`.
+    /// `running`, `waiting_device` (its device is offline; see
+    /// [`EventBody::ThreadWaiting`]), `done`, `failed` or `stopped`.
     pub status: String,
     /// Why it runs where it does, when that isn't its natural device.
     pub reason: Option<String>,

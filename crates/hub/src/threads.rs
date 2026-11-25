@@ -10,6 +10,7 @@ use core_protocol::{AgentEvent, EventBody, HubMessage, ThreadInfo, ThreadSpec};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use crate::offline::WAITING_DEVICE;
 use crate::orchestrator::Wake;
 use crate::server::{ApprovalRoute, HUB_DEVICE, Hub};
 
@@ -32,7 +33,7 @@ pub struct ThreadRequest {
 
 pub const MAX_THREAD_TURNS: u32 = 40;
 
-fn thread_system(device_name: &str, on_hub: bool) -> String {
+pub(crate) fn thread_system(device_name: &str, on_hub: bool) -> String {
     let place = if on_hub {
         "on the Grouper hub (a cloud machine). You have file tools in a private workspace there, no shell".to_string()
     } else {
@@ -66,7 +67,7 @@ impl Hub {
     }
 
     /// Resolve a device by id or (case-insensitive) name.
-    fn resolve_device(&self, key: &str) -> Option<(String, String)> {
+    pub(crate) fn resolve_device(&self, key: &str) -> Option<(String, String)> {
         if key.eq_ignore_ascii_case(HUB_DEVICE) {
             return Some((HUB_DEVICE.into(), "Hub".into()));
         }
@@ -85,15 +86,14 @@ impl Hub {
         let (device_id, device_name) =
             self.resolve_device(&req.device).ok_or_else(|| format!("no device called {:?}", req.device))?;
         let on_hub = device_id == HUB_DEVICE;
-        if !self.is_online(&device_id).await {
-            return Err(format!(
-                "{device_name} is offline. Tell the user, or start the thread on device \"hub\" with a hub_reason \
-                 so the work is ready when {device_name} is back."
-            ));
-        }
+        // An offline device gets the thread anyway: it waits for the device while the
+        // hub prepares the work up to a checkpoint (see `offline.rs`).
+        let online = self.is_online(&device_id).await;
         let route = self.db.route_model(req.model.as_deref(), req.task_type.as_deref(), &req.tags)?;
         let model = route.model;
-        let reason = [req.hub_reason.clone().filter(|_| on_hub), route.reason].into_iter().flatten().collect::<Vec<_>>();
+        let offline = (!online).then(|| format!("{device_name} is offline; the hub prepares a checkpoint"));
+        let reason =
+            [req.hub_reason.clone().filter(|_| on_hub), offline, route.reason].into_iter().flatten().collect::<Vec<_>>();
         let reason = (!reason.is_empty()).then(|| reason.join("; "));
         let brief = render_brief(&req);
         let info = self
@@ -126,8 +126,11 @@ impl Hub {
 
         if on_hub {
             self.run_on_hub(spec).await;
+        } else if !online {
+            self.wait_for_device(&info.id, &format!("{device_name} was offline when the thread started"), false).await;
         } else if !self.send_to(&device_id, HubMessage::StartThread { spec }).await {
-            self.thread_finished(&info.id, false, "The device went offline before the thread started.").await;
+            self.wait_for_device(&info.id, &format!("{device_name} went offline before the thread started"), false)
+                .await;
         }
         Ok(self.db.thread(&info.id).unwrap_or(info))
     }
@@ -254,6 +257,9 @@ impl Hub {
 
     /// Deliver a message to a running thread.
     async fn send_thread_input(&self, t: &ThreadInfo, from: &str, text: &str) -> Result<(), String> {
+        if t.status == WAITING_DEVICE {
+            return self.waiting_thread_input(t, from, text).await;
+        }
         if t.status != "running" {
             return Err(format!("thread {} is {}", t.id, t.status));
         }
@@ -300,12 +306,19 @@ impl Hub {
     pub async fn stop_thread(self: &Arc<Self>, thread_id: &str, by: &str) -> Result<(), String> {
         let t = self.db.thread(thread_id).ok_or("no such thread")?;
         let summary = format!("Stopped by the {by}.");
-        if !self.db.finish_thread(thread_id, "stopped", &summary) {
+        // A waiting thread's live part, if any, is its hub part.
+        let waiting = t.status == WAITING_DEVICE;
+        let stopped = if waiting {
+            self.db.finish_waiting_thread(thread_id, "stopped", &summary)
+        } else {
+            self.db.finish_thread(thread_id, "stopped", &summary)
+        };
+        if !stopped {
             return Err(format!("thread {} is already {}", t.id, t.status));
         }
         self.db.record_outcome(thread_id);
         self.clear_approvals(thread_id).await;
-        if t.device_id == HUB_DEVICE {
+        if t.device_id == HUB_DEVICE || waiting {
             if let Some(c) = self.hub_threads.lock().await.get(&t.id) {
                 c.stop();
             }
@@ -332,18 +345,19 @@ impl Hub {
         self.approvals.lock().await.retain(|_, r| r.thread_id != thread_id);
     }
 
-    /// A device disconnected: its threads can't continue, and its approvals are moot.
+    /// A device disconnected: its approvals are moot, and its threads wait for it to
+    /// come back while the hub works towards a checkpoint (see `offline.rs`).
     pub(crate) async fn device_gone(self: &Arc<Self>, device_id: &str) {
         self.approvals.lock().await.retain(|_, r| r.device_id != device_id);
         for t in self.db.running_threads_on(device_id) {
-            self.thread_finished(&t.id, false, "The device disconnected before the thread finished.").await;
+            self.wait_for_device(&t.id, "the device disconnected while the thread was running", true).await;
         }
     }
 }
 
 /// Host for threads running on the hub itself.
-struct HubHost {
-    hub: std::sync::Weak<Hub>,
+pub(crate) struct HubHost {
+    pub(crate) hub: std::sync::Weak<Hub>,
 }
 
 #[async_trait]

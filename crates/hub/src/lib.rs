@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod db;
 pub mod mcp;
 pub mod memory;
+pub mod offline;
 pub mod orchestrator;
 pub mod registry;
 pub mod secrets;

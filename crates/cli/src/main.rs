@@ -448,6 +448,16 @@ fn print_event(e: &Event) {
         EventBody::ThreadFinished { status, summary } => {
             println!("  ■ thread {t} {status}: {}", short(&json!(summary), 300))
         }
+        EventBody::ThreadWaiting { device_id, reason } => {
+            println!("  ⏸ thread {t} waiting for {device_id} ({reason}); the hub prepares a checkpoint")
+        }
+        EventBody::ThreadCheckpoint { device_id, summary } => {
+            println!("  ◆ thread {t} hub checkpoint, waiting for {device_id}: {}", short(&json!(summary), 300))
+        }
+        EventBody::ThreadHandedOver { device_id, files, skipped, .. } => {
+            let left_out = if skipped.is_empty() { String::new() } else { format!(", {} not copied", skipped.len()) };
+            println!("  ▶ thread {t} handed over to {device_id} with {} file(s) from the hub{left_out}", files.len())
+        }
         EventBody::ApprovalRequested { approval_id, device_id, tool, input, reason } => {
             println!("  ! approval {approval_id} on {device_id}: {tool} {} — {reason}", short(input, 160));
             println!("    run `grouper approve {approval_id}` or `grouper deny {approval_id}`");

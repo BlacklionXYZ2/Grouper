@@ -196,6 +196,7 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     conn.execute_batch(crate::memory::SCHEMA)?;
     crate::registry::migrate(&conn)?;
     conn.execute_batch(crate::skills::SCHEMA)?;
+    conn.execute_batch(crate::offline::SCHEMA)?;
     // Databases made before admin tokens: every existing token becomes a plain
     // device token; grant admin with `grouper-hub device admin <id>`.
     let has_admin: bool = conn

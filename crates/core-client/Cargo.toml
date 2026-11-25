@@ -10,6 +10,7 @@ core-protocol = { workspace = true, features = ["tunnel"] }
 core-agent.workspace = true
 providers.workspace = true
 async-trait.workspace = true
+base64 = "0.22"
 dirs = "6"
 futures-util.workspace = true
 # Same version rmcp's child-process transport uses; adds killing the whole process tree.

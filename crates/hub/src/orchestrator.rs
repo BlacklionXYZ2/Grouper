@@ -21,12 +21,18 @@ pub enum Wake {
     ThreadDone { thread_id: String, title: String, status: String, summary: String },
     ThreadAsk { thread_id: String, title: String, question: String },
     UserStepIn { thread_id: String, title: String, text: String },
+    /// Something happened to a thread that doesn't end it, e.g. it is waiting for its
+    /// device, reached a hub checkpoint, or was handed over (`offline.rs`).
+    ThreadUpdate { thread_id: String, title: String, what: String, details: String },
 }
 
 impl Wake {
     fn render(&self) -> String {
         match self {
             Wake::User(t) => t.clone(),
+            Wake::ThreadUpdate { thread_id, title, what, details } => {
+                format!("[Thread {thread_id} \"{title}\" {what}]\n{details}")
+            }
             Wake::ThreadDone { thread_id, title, status, summary } => {
                 format!("[Thread {thread_id} \"{title}\" {status}]\n{summary}")
             }
@@ -48,6 +54,7 @@ impl Wake {
             Wake::ThreadDone { title, summary, .. } => format!("{title}\n{summary}"),
             Wake::ThreadAsk { title, question, .. } => format!("{title}\n{question}"),
             Wake::UserStepIn { text, .. } => text.clone(),
+            Wake::ThreadUpdate { title, details, .. } => format!("{title}\n{details}"),
         }
     }
 }
@@ -63,8 +70,9 @@ this conversation. Put everything it needs in the brief: goal, context, constrai
 - Start independent pieces of work in parallel by calling start_thread several times in one response.
 - Threads run in the background. After starting them, tell the user briefly what you started and end your turn. \
 You'll be woken when a thread finishes, asks you something, or the user steps in.
-- If a device is offline, ask the user what to do, or start the work on \"hub\" with a hub_reason so it's ready \
-when the device is back.
+- If a device is offline, you can still start a thread on it: it waits for the device (status waiting_device) \
+while the hub does what it can up to a checkpoint, then continues on the device when it reconnects. Tell the user, \
+and ask whether to wait, use another device, or cancel (stop_thread) when it matters.
 - When a thread asks you something, answer it with message_thread (or start another thread to find out first).
 - When results come in, give the user a clear, short summary. Mention files by device and path.
 - Use list_devices, list_models and list_usage when you need to choose where and with what model to run something.
@@ -118,15 +126,19 @@ impl Hub {
             .iter()
             .map(|d| format!("{} ({}, {})", d.name, d.id, if d.online { "online" } else { "offline" }))
             .collect();
-        let running: Vec<String> = self
-            .db
-            .threads(Some(conversation_id))
-            .into_iter()
-            .filter(|t| t.status == "running")
-            .map(|t| format!("{} \"{}\" on {}", t.id, t.title, t.device_id))
-            .collect();
+        let threads = self.db.threads(Some(conversation_id));
+        let list = |status: &str| -> Vec<String> {
+            threads
+                .iter()
+                .filter(|t| t.status == status)
+                .map(|t| format!("{} \"{}\" on {}", t.id, t.title, t.device_id))
+                .collect()
+        };
+        let (running, waiting) = (list("running"), list(crate::offline::WAITING_DEVICE));
+        let waiting =
+            if waiting.is_empty() { String::new() } else { format!(" Waiting for their device: {}.", waiting.join("; ")) };
         format!(
-            "[Status] Devices: {}. Running threads: {}.",
+            "[Status] Devices: {}. Running threads: {}.{waiting}",
             devs.join(", "),
             if running.is_empty() { "none".into() } else { running.join("; ") }
         )
@@ -352,7 +364,13 @@ impl Tool for StartThread {
                 .unwrap_or_default(),
         };
         match self.0.hub.start_thread(&self.0.conversation_id, req).await {
-            Ok(t) => to_json(json!({"thread_id": t.id, "device": t.device_id, "model": t.model, "status": t.status})),
+            Ok(t) => {
+                let mut out = json!({"thread_id": t.id, "device": t.device_id, "model": t.model, "status": t.status});
+                if t.status == crate::offline::WAITING_DEVICE {
+                    out["note"] = json!(crate::offline::WAITING_NOTE);
+                }
+                to_json(out)
+            }
             Err(e) => ToolOutput::err(e),
         }
     }
@@ -364,7 +382,9 @@ impl Tool for MessageThread {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "message_thread".into(),
-            description: "Send a message to a running thread: answer its question or give it new instructions.".into(),
+            description: "Send a message to a running thread: answer its question or give it new instructions. \
+                          A thread waiting for its device gets it in its hub part, or when it continues on the device."
+                .into(),
             input_schema: json!({"type": "object", "properties": {
                 "thread_id": {"type": "string"}, "text": {"type": "string"}
             }, "required": ["thread_id", "text"]}),
@@ -388,7 +408,7 @@ impl Tool for StopThread {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "stop_thread".into(),
-            description: "Stop a running thread.".into(),
+            description: "Stop a running thread, or one waiting for its device.".into(),
             input_schema: json!({"type": "object", "properties": {"thread_id": {"type": "string"}}, "required": ["thread_id"]}),
         }
     }

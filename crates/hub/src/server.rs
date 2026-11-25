@@ -662,6 +662,9 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     let providers = hub.db.providers().map_err(|error| error.to_string())?;
     let conn_id = hub.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded_channel::<HubMessage>();
+    // A device runs one connection: threads still marked running from an earlier one
+    // (dropped without the hub noticing yet) died with it on the device.
+    let orphans = hub.db.running_threads_on(&device_id);
     hub.live.lock().await.insert(device_id.clone(), Live { conn_id, tx: tx.clone(), tools: Vec::new(), mcp: None });
     hub.db.touch(&device_id);
     let _ = tx.send(HubMessage::Welcome {
@@ -673,6 +676,8 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     hub.broadcast_presence().await;
     // The hub's MCP client: lists the device's tools now and on every change.
     let mcp = McpSession::start(&hub, device_id.clone(), conn_id, tx.clone());
+    // Threads waiting for this device continue here once its tools are known.
+    tokio::spawn(crate::offline::device_connected(Arc::downgrade(&hub), device_id.clone(), conn_id, orphans));
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {

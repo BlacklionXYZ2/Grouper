@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 
+mod handover;
 pub mod mcp_host;
 mod mcp_server;
 
@@ -386,6 +387,18 @@ async fn connect_once(
                     Ok(HubMessage::ApprovalResult { approval_id, approved }) => {
                         if let Some(tx) = threads.approvals.lock().unwrap().remove(&approval_id) {
                             let _ = tx.send(approved);
+                        }
+                    }
+                    // Written before the thread's StartThread, which follows on this connection.
+                    Ok(HubMessage::WorkspaceFile { thread_id, path, content_base64 }) => {
+                        let written = match &config.workspace_root {
+                            Some(root) => handover::write_file(root, &thread_id, &path, &content_base64),
+                            None => Err("this device doesn't run threads".into()),
+                        };
+                        if let Err(e) = written {
+                            tracing::warn!("hand-over file for {thread_id}: {e}");
+                            let text = format!("Couldn't write the hub's file {path}: {e}");
+                            let _ = out_tx.send(NodeMessage::ThreadEvent { thread_id, event: AgentEvent::Notice { text } });
                         }
                     }
                     Ok(HubMessage::Pong) => {}

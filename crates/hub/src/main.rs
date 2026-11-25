@@ -102,6 +102,8 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Serve { bind } => {
             let hub = server::Hub::new(db, cli.data.clone());
+            // Threads waiting for a device keep waiting; a hub part that was running stops at once.
+            hub.recover_waiting_threads();
             // Threads that were running when the hub stopped can't be resumed.
             for t in hub.db.threads(None).into_iter().filter(|t| t.status == "running") {
                 hub.db.finish_thread(&t.id, "failed", "The hub restarted while this thread was running.");
