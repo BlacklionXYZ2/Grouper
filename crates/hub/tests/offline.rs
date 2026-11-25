@@ -74,6 +74,7 @@ async fn setup(tag: &str, script: Value) -> Setup {
         free: true,
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
+        modalities: vec![],
     })
     .unwrap();
     let (device, token) = db.add_device("Laptop", "windows", false).unwrap();
@@ -154,7 +155,7 @@ impl Setup {
 
     async fn chat(&self, text: &str) -> String {
         self.hub
-            .chat(ChatRequest { conversation_id: None, mode: Some("project".into()), text: text.into() })
+            .chat(ChatRequest { conversation_id: None, mode: Some("project".into()), text: text.into(), model: None })
             .await
             .unwrap()
     }
