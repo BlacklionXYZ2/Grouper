@@ -135,7 +135,7 @@ The segment sets `group` to `day`, `provider`, `model`, `conversation` or `threa
 
 Snapshots from `GET /v1/usage/snapshots`: account, provider, kind, window, used amount or percent, limit, `resets_at`, source, `device_id` and age from `fetched_at`. Pull to refresh calls `POST /v1/usage/refresh`, then refetches. Age over an hour is stale. Source `estimate` is labelled estimated.
 
-The hub enforces no spend cap. Settings stores a daily USD figure in the App Group under "Warn me at". Crossing today's `day` row shows a line on Chat and one passive notification that day. Send still sends.
+Limits come from the hub (`GET /v1/limits`, `PUT /v1/limits`, admin): running-thread caps (account and per device), budgets per thread, conversation and UTC day, and the warning fraction. All are off until set. The section shows each limit with today's estimated spend against it and a reset time for the daily budget, and edits them with a numeric field plus an "Off" toggle. A `budget_warning` event shows a line on Chat and one passive notification per scope and period; a stopped thread shows its budget summary; a refused turn shows the hub's message with a button to the limit that caused it. Spend is always labelled estimated.
 
 **States.** Empty explains that only calls through Grouper are metered. Offline shows the last totals and snapshots with their fetch time.
 
