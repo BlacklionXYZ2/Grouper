@@ -177,6 +177,9 @@ fn is_link_entry(entry: &std::fs::DirEntry, ft: &std::fs::FileType) -> bool {
             return true;
         }
     }
+    // Only Windows needs the entry (to read its reparse-point attribute).
+    #[cfg(not(windows))]
+    let _ = entry;
     false
 }
 
