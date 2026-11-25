@@ -133,6 +133,7 @@ impl Db {
         let conn = Connection::open(data_dir.join("grouper.db"))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(crate::memory::SCHEMA)?;
         // Databases made before admin tokens: every existing token becomes a plain
         // device token; grant admin with `grouper-hub device admin <id>`.
         let has_admin: bool = conn
@@ -146,7 +147,7 @@ impl Db {
         Ok(db)
     }
 
-    fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 

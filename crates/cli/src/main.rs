@@ -92,6 +92,35 @@ enum Cmd {
     /// The model registry.
     #[command(subcommand)]
     Models(ModelsCmd),
+    /// Long-term memory about you and your projects, shared by every conversation.
+    #[command(subcommand)]
+    Memory(MemoryCmd),
+}
+
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// List memories, most recently changed first, or search them.
+    List {
+        #[arg(long, short)]
+        search: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Save a memory: grouper memory add "<text>" [--tags a,b]
+    Add {
+        text: String,
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+    },
+    /// Replace a memory's text (and tags, if given).
+    Edit {
+        id: i64,
+        text: String,
+        #[arg(long, value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+    },
+    /// Delete a memory.
+    Forget { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -514,6 +543,7 @@ async fn main() -> Result<()> {
             api.delete(&format!("/v1/models/{id}")).await?;
             println!("removed {id}");
         }
+        Cmd::Memory(cmd) => memory_cmd(&api, cmd).await?,
     }
     Ok(())
 }
@@ -529,4 +559,46 @@ async fn usage_line(api: &Api, conversation: &str) -> String {
         }
     }
     format!("threads used {i} input / {o} output tokens")
+}
+
+async fn memory_cmd(api: &Api, cmd: MemoryCmd) -> Result<()> {
+    use core_client::core_protocol::{MemoryEntry, MemoryInput};
+    let print = |m: &MemoryEntry| {
+        let tags = if m.tags.is_empty() { String::new() } else { format!("  [{}]", m.tags.join(", ")) };
+        println!("#{:<5} {}{tags}", m.id, m.content.replace('\n', " ⏎ "));
+    };
+    match cmd {
+        MemoryCmd::List { search, limit } => {
+            let mut params = vec![("limit", limit.to_string())];
+            if let Some(q) = search {
+                params.push(("q", q));
+            }
+            // Built with Url so the search text is percent-encoded.
+            let url = reqwest::Url::parse_with_params("http://hub/v1/memories", &params)?;
+            let list: Vec<MemoryEntry> = api.get(&format!("/v1/memories?{}", url.query().unwrap_or(""))).await?;
+            if list.is_empty() {
+                println!("no memories");
+            }
+            for m in &list {
+                print(m);
+            }
+        }
+        MemoryCmd::Add { text, tags } => {
+            let m: MemoryEntry =
+                serde_json::from_value(api.post("/v1/memories", &MemoryInput { content: text, tags: Some(tags) }).await?)?;
+            print!("saved ");
+            print(&m);
+        }
+        MemoryCmd::Edit { id, text, tags } => {
+            let m: MemoryEntry =
+                serde_json::from_value(api.put(&format!("/v1/memories/{id}"), &MemoryInput { content: text, tags }).await?)?;
+            print!("updated ");
+            print(&m);
+        }
+        MemoryCmd::Forget { id } => {
+            api.delete(&format!("/v1/memories/{id}")).await?;
+            println!("forgot #{id}");
+        }
+    }
+    Ok(())
 }

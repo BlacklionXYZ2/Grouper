@@ -230,6 +230,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/threads/{id}/message", post(thread_message))
         .route("/v1/threads/{id}/stop", post(thread_stop))
         .route("/v1/approvals/{id}", post(approval))
+        .route("/v1/memories", get(list_memories).post(add_memory))
+        .route("/v1/memories/{id}", put(update_memory).delete(delete_memory))
         .with_state(hub)
 }
 
@@ -625,4 +627,58 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     hub.broadcast_presence().await;
     tracing::info!(device = %device_id, "disconnected");
     result
+}
+
+// ---- long-term memory (personal, so admin only, reads included)
+
+#[derive(Deserialize)]
+struct MemoryQuery {
+    q: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `GET /v1/memories?q=&limit=`: search, or the most recently changed without `q`.
+async fn list_memories(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q): Query<MemoryQuery>) -> Response {
+    admin!(hub, headers);
+    let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+    let list = match q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => hub.db.search_memories(text, limit),
+        None => hub.db.memories(limit),
+    };
+    Json(list).into_response()
+}
+
+async fn add_memory(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Json(body): Json<core_protocol::MemoryInput>,
+) -> Response {
+    admin!(hub, headers);
+    match hub.db.add_memory(&body.content, &body.tags.unwrap_or_default(), None) {
+        Ok(m) => Json(m).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn update_memory(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<core_protocol::MemoryInput>,
+) -> Response {
+    admin!(hub, headers);
+    match hub.db.update_memory(id, &body.content, body.tags.as_deref()) {
+        Ok(Some(m)) => Json(m).into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, format!("no memory #{id}")),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn delete_memory(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<i64>) -> Response {
+    admin!(hub, headers);
+    match hub.db.delete_memory(id) {
+        Ok(true) => Json(json!({"deleted": id})).into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, format!("no memory #{id}")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }

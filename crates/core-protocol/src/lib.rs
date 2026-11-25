@@ -350,6 +350,33 @@ pub fn split_token(token: &str) -> Option<(&str, &str)> {
     (!id.is_empty() && !secret.is_empty()).then_some((id, secret))
 }
 
+/// A long-term memory about the user or their projects, shared by every conversation
+/// (`GET /v1/memories`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct MemoryEntry {
+    pub id: i64,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// The conversation it was remembered in; `None` when added by the user directly.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    pub created: u64,
+    pub updated: u64,
+    /// When it was last put in front of a model.
+    #[serde(default)]
+    pub last_used: Option<u64>,
+}
+
+/// Body of `POST /v1/memories` and `PUT /v1/memories/{id}`. On update, `tags: None`
+/// keeps the current tags.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct MemoryInput {
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
