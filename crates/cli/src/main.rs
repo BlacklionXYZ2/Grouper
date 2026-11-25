@@ -125,6 +125,19 @@ enum Cmd {
     /// Saved skills: procedures that worked, reused for similar tasks.
     #[command(subcommand)]
     Skills(SkillsCmd),
+    /// Limits on running threads and on (estimated) spending. All off unless you set them.
+    Limits {
+        #[command(subcommand)]
+        cmd: Option<LimitsCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LimitsCmd {
+    /// grouper limits set <key> <value|off>, e.g. `daily_budget_usd 5`, `max_running_threads 3`.
+    /// Keys: max_running_threads, max_running_threads_per_device, thread_budget_usd,
+    /// conversation_budget_usd, daily_budget_usd, warn_at_fraction (default 0.8).
+    Set { key: String, value: String },
 }
 
 #[derive(Subcommand)]
@@ -471,6 +484,18 @@ fn print_event(e: &Event) {
             }
         }
         EventBody::Error { message } => println!("  ⚠ {message}"),
+        EventBody::BudgetWarning { scope, spent, limit } => {
+            let what = match scope.as_str() {
+                "daily" => "today's".to_string(),
+                "conversation" => "this conversation's".to_string(),
+                "thread" => format!("thread {t}'s"),
+                other => format!("the {other}"),
+            };
+            println!(
+                "  $ budget warning: {what} estimated spend is ${spent:.4} of its ${limit:.2} budget ({:.0}%)",
+                spent / limit * 100.0
+            )
+        }
     }
 }
 
@@ -920,7 +945,47 @@ async fn main() -> Result<()> {
         }
         Cmd::Rules(cmd) => rules_cmd(&api, cmd).await?,
         Cmd::Skills(cmd) => skills_cmd(&api, cmd).await?,
+        Cmd::Limits { cmd } => limits_cmd(&api, cmd).await?,
     }
+    Ok(())
+}
+
+async fn limits_cmd(api: &Api, cmd: Option<LimitsCmd>) -> Result<()> {
+    use core_client::core_protocol::{LIMIT_KEYS, LimitsReport};
+    let report: LimitsReport = match cmd {
+        None => api.get("/v1/limits").await?,
+        Some(LimitsCmd::Set { key, value }) => {
+            if !LIMIT_KEYS.contains(&key.as_str()) {
+                bail!("unknown limit {key:?}; the limits are {}", LIMIT_KEYS.join(", "));
+            }
+            let value = match value.trim().trim_start_matches('$') {
+                "off" | "none" | "null" => Value::Null,
+                v => json!(v.parse::<f64>().with_context(|| format!("{key} takes a number or off"))?),
+            };
+            serde_json::from_value(api.put("/v1/limits", &serde_json::Map::from_iter([(key, value)])).await?)?
+        }
+    };
+    let l = &report.limits;
+    let off = || "off".to_string();
+    let money = |v: Option<f64>| v.map(|v| format!("${v}")).unwrap_or_else(off);
+    let count = |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_else(off);
+    println!("max_running_threads             {}", count(l.max_running_threads));
+    println!("max_running_threads_per_device  {}", count(l.max_running_threads_per_device));
+    println!("thread_budget_usd               {}", money(l.thread_budget_usd));
+    println!("conversation_budget_usd         {}", money(l.conversation_budget_usd));
+    println!("daily_budget_usd                {}", money(l.daily_budget_usd));
+    let default = if l.warn_at_fraction.is_none() { " (default)" } else { "" };
+    println!("warn_at_fraction                {}{default}", report.warn_at_fraction);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let left = report.day_resets_at.saturating_sub(now);
+    println!(
+        "
+now: {} thread(s) running; estimated spend today ${:.4} (UTC day, resets in {}h {}m)",
+        report.running_threads,
+        report.spent_today_usd,
+        left / 3600,
+        left % 3600 / 60
+    );
     Ok(())
 }
 

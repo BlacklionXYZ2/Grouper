@@ -59,6 +59,7 @@ pub struct Hub {
     pub(crate) orchestrators: Mutex<HashMap<String, mpsc::UnboundedSender<Wake>>>,
     events: broadcast::Sender<Event>,
     pub(crate) next_id: AtomicU64,
+    pub(crate) limits: crate::limits::LimitState,
 }
 
 impl Hub {
@@ -73,6 +74,7 @@ impl Hub {
             // Roomy: streamed text sends many small events.
             events: broadcast::channel(8192).0,
             next_id: AtomicU64::new(1),
+            limits: Default::default(),
         })
     }
 
@@ -253,6 +255,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::registry::routes())
         .merge(crate::catalog::routes())
         .merge(crate::skills::routes())
+        .merge(crate::limits::routes())
         .with_state(hub)
 }
 

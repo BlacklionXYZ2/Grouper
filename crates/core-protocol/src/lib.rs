@@ -299,6 +299,9 @@ pub enum EventBody {
     /// The orchestrator finished a turn; it wakes again on the next message or thread result.
     TurnFinished { running_threads: u32 },
     Error { message: String },
+    /// Estimated spend crossed the warning fraction of a budget (see [`Limits`]): once per
+    /// `scope` (`thread`, `conversation` or `daily`) and period. Amounts are USD.
+    BudgetWarning { scope: String, spent: f64, limit: f64 },
 }
 
 /// `POST /v1/chat`
@@ -474,6 +477,59 @@ pub struct UsageSnapshot {
     #[serde(default)]
     pub device_id: Option<String>,
     pub fetched_at: u64,
+}
+
+/// Account limits on running threads and estimated spending (`GET`/`PUT /v1/limits`).
+/// Every field is optional and `None` means no limit, which is the default. `PUT`
+/// takes a JSON object with only the keys to change; `null` turns one off.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    /// Threads running at once across the account (hub parts of threads waiting for
+    /// their device count too).
+    #[serde(default)]
+    pub max_running_threads: Option<u32>,
+    /// Threads running at once on any one device (the hub included).
+    #[serde(default)]
+    pub max_running_threads_per_device: Option<u32>,
+    /// Default cap for one thread. `start_thread` may ask for less, never more.
+    #[serde(default)]
+    pub thread_budget_usd: Option<f64>,
+    /// Cap for one conversation: its orchestrator (or standard chat) and its threads.
+    #[serde(default)]
+    pub conversation_budget_usd: Option<f64>,
+    /// Cap for all usage in one UTC day.
+    #[serde(default)]
+    pub daily_budget_usd: Option<f64>,
+    /// Warn when spend reaches this fraction of a budget. `None` means [`DEFAULT_WARN_AT_FRACTION`].
+    #[serde(default)]
+    pub warn_at_fraction: Option<f64>,
+}
+
+pub const DEFAULT_WARN_AT_FRACTION: f64 = 0.8;
+
+/// The keys of [`Limits`], as `PUT /v1/limits` and `grouper limits set` take them.
+pub const LIMIT_KEYS: &[&str] = &[
+    "max_running_threads",
+    "max_running_threads_per_device",
+    "thread_budget_usd",
+    "conversation_budget_usd",
+    "daily_budget_usd",
+    "warn_at_fraction",
+];
+
+/// Response of `GET`/`PUT /v1/limits`: the settings and where things stand.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LimitsReport {
+    pub limits: Limits,
+    /// The warning fraction in force.
+    pub warn_at_fraction: f64,
+    /// Estimated spend so far in the current UTC day.
+    pub spent_today_usd: f64,
+    /// Unix seconds when the daily budget resets (next 00:00 UTC).
+    pub day_resets_at: u64,
+    /// Threads counted against `max_running_threads` now.
+    pub running_threads: u32,
 }
 
 /// A provider as listed to clients (keys never leave the hub this way).

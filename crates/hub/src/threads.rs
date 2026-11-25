@@ -29,6 +29,8 @@ pub struct ThreadRequest {
     pub task_type: Option<String>,
     /// e.g. `sensitive`, `draft`: priority rules match on these.
     pub tags: Vec<String>,
+    /// Spending cap for this thread (USD, estimated); never above the user's `thread_budget_usd`.
+    pub budget_usd: Option<f64>,
 }
 
 pub const MAX_THREAD_TURNS: u32 = 40;
@@ -89,7 +91,11 @@ impl Hub {
         // An offline device gets the thread anyway: it waits for the device while the
         // hub prepares the work up to a checkpoint (see `offline.rs`).
         let online = self.is_online(&device_id).await;
-        let route = self.db.route_model(req.model.as_deref(), req.task_type.as_deref(), &req.tags)?;
+        // Running-thread caps and spent budgets (`limits.rs`); held until the thread is recorded.
+        let place = if online { (device_id.as_str(), device_name.as_str()) } else { (HUB_DEVICE, "the hub") };
+        let admission = crate::limits::admit(self, conversation_id, place.0, place.1, req.budget_usd).await?;
+        let cheaper = req.model.is_none() && admission.budget.is_some();
+        let route = self.db.route_model_with(req.model.as_deref(), req.task_type.as_deref(), &req.tags, cheaper)?;
         let model = route.model;
         let offline = (!online).then(|| format!("{device_name} is offline; the hub prepares a checkpoint"));
         let reason =
@@ -101,6 +107,7 @@ impl Hub {
             .create_thread(conversation_id, req.title.trim(), &device_id, &model.id, reason.as_deref(), &brief)
             .map_err(|e| e.to_string())?;
         self.db.set_thread_meta(&info.id, req.task_type.as_deref().unwrap_or_default(), &req.tags);
+        admission.record(&self.db, &info.id);
         self.emit(
             conversation_id,
             Some(&info.id),
@@ -170,17 +177,18 @@ impl Hub {
         });
     }
 
-    pub(crate) fn thread_event(&self, thread_id: &str, event: AgentEvent) {
+    pub(crate) fn thread_event(self: &Arc<Self>, thread_id: &str, event: AgentEvent) {
         let Some(t) = self.db.thread(thread_id) else { return };
         if matches!(event, AgentEvent::TextDelta { .. }) {
             // Streamed text is shown live; the full message arrives as Text and is stored.
             self.emit_live(&t.conversation_id, Some(thread_id), EventBody::ThreadActivity { event });
             return;
         }
+        let mut cost = None;
         if let AgentEvent::Usage { provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens } =
             &event
         {
-            self.db.record_usage(
+            cost = Some(self.db.record_usage(
                 Some(&t.conversation_id),
                 Some(thread_id),
                 provider_id,
@@ -189,9 +197,13 @@ impl Hub {
                 *output_tokens,
                 *cache_read_tokens,
                 *cache_write_tokens,
-            );
+            ));
         }
         self.emit(&t.conversation_id, Some(thread_id), EventBody::ThreadActivity { event });
+        // After the usage event, so a warning or stop follows what caused it.
+        if let Some(cost) = cost {
+            crate::limits::after_usage(self, &t.conversation_id, Some(&t), cost);
+        }
     }
 
     pub(crate) async fn thread_finished(self: &Arc<Self>, thread_id: &str, ok: bool, summary: &str) {
@@ -304,8 +316,13 @@ impl Hub {
 
     /// `by` is `user` or `orchestrator`.
     pub async fn stop_thread(self: &Arc<Self>, thread_id: &str, by: &str) -> Result<(), String> {
+        self.stop_thread_as(thread_id, by, &format!("Stopped by the {by}.")).await
+    }
+
+    /// Stop with the given summary; `by` is `user`, `orchestrator` or `budget` (`limits.rs`).
+    pub(crate) async fn stop_thread_as(self: &Arc<Self>, thread_id: &str, by: &str, summary: &str) -> Result<(), String> {
         let t = self.db.thread(thread_id).ok_or("no such thread")?;
-        let summary = format!("Stopped by the {by}.");
+        let summary = summary.to_string();
         // A waiting thread's live part, if any, is its hub part.
         let waiting = t.status == WAITING_DEVICE;
         let stopped = if waiting {

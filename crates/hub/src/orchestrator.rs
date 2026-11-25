@@ -27,7 +27,7 @@ pub enum Wake {
 }
 
 impl Wake {
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         match self {
             Wake::User(t) => t.clone(),
             Wake::ThreadUpdate { thread_id, title, what, details } => {
@@ -137,8 +137,9 @@ impl Hub {
         let (running, waiting) = (list("running"), list(crate::offline::WAITING_DEVICE));
         let waiting =
             if waiting.is_empty() { String::new() } else { format!(" Waiting for their device: {}.", waiting.join("; ")) };
+        let limits = crate::limits::status_note(self, conversation_id).await.unwrap_or_default();
         format!(
-            "[Status] Devices: {}. Running threads: {}.{waiting}",
+            "[Status] Devices: {}. Running threads: {}.{waiting}{limits}",
             devs.join(", "),
             if running.is_empty() { "none".into() } else { running.join("; ") }
         )
@@ -159,6 +160,10 @@ async fn worker(hub: Weak<Hub>, conversation_id: String, mut rx: mpsc::Unbounded
 async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     let Some(conv) = hub.db.conversation(conversation_id) else { return };
     let project = conv.mode == "project";
+    // A spent daily or conversation budget (`limits.rs`): keep what arrived, say why, and stop here.
+    if crate::limits::refuse_turn(hub, conversation_id, &wakes) {
+        return;
+    }
 
     let mut text = wakes.iter().map(Wake::render).collect::<Vec<_>>().join("\n\n");
     if project {
@@ -275,7 +280,7 @@ impl Hooks for ConversationHooks {
                 self.hub.emit_live(&self.conversation_id, None, EventBody::AssistantDelta { text });
             }
             AgentEvent::Usage { provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens } => {
-                self.hub.db.record_usage(
+                let cost = self.hub.db.record_usage(
                     Some(&self.conversation_id),
                     None,
                     &provider_id,
@@ -285,6 +290,7 @@ impl Hooks for ConversationHooks {
                     cache_read_tokens,
                     cache_write_tokens,
                 );
+                crate::limits::after_usage(&self.hub, &self.conversation_id, None, cost);
             }
             _ => {}
         }
@@ -342,7 +348,8 @@ impl Tool for StartThread {
                 "model": {"type": "string", "description": "Model id from list_models (optional; the registry chooses otherwise)"},
                 "task_type": {"type": "string", "description": "code, research, writing, data or ops"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "e.g. [\"sensitive\"] for private data, [\"draft\"]"},
-                "hub_reason": {"type": "string", "description": "When device is hub: why it runs there (e.g. the target device is offline)"}
+                "hub_reason": {"type": "string", "description": "When device is hub: why it runs there (e.g. the target device is offline)"},
+                "budget_usd": {"type": "number", "description": "Optional spending cap for this thread in USD (estimated). It can only lower the user's per-thread budget; the thread is stopped when it's reached"}
             }, "required": ["title", "device", "goal"]}),
         }
     }
@@ -362,10 +369,14 @@ impl Tool for StartThread {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
                 .unwrap_or_default(),
+            budget_usd: input.get("budget_usd").and_then(|v| v.as_f64().or_else(|| v.as_str()?.trim().trim_start_matches('$').parse().ok())),
         };
         match self.0.hub.start_thread(&self.0.conversation_id, req).await {
             Ok(t) => {
                 let mut out = json!({"thread_id": t.id, "device": t.device_id, "model": t.model, "status": t.status});
+                if let Some(budget) = self.0.hub.db.thread_budget(&t.id, &self.0.hub.db.limits()) {
+                    out["budget_usd"] = json!(budget);
+                }
                 if t.status == crate::offline::WAITING_DEVICE {
                     out["note"] = json!(crate::offline::WAITING_NOTE);
                 }
@@ -497,7 +508,8 @@ impl Tool for ListUsage {
         ToolDef {
             name: "list_usage".into(),
             description: "Read cost and availability information: Grouper's metered totals for the last 7 days, \
-                          grouped by provider, plus the latest provider-reported balances."
+                          grouped by provider, plus the latest provider-reported balances and, when the user set \
+                          limits, what's left of each budget."
                 .into(),
             input_schema: json!({"type": "object", "properties": {}}),
         }
@@ -512,6 +524,10 @@ impl Tool for ListUsage {
             Ok(rows) => rows,
             Err(error) => return ToolOutput::err(error.to_string()),
         };
-        to_json(json!({"period": "last_7_days", "totals": totals, "latest_snapshots": snapshots}))
+        let mut out = json!({"period": "last_7_days", "totals": totals, "latest_snapshots": snapshots});
+        if let Some(limits) = crate::limits::overview(&self.0.hub, &self.0.conversation_id).await {
+            out["limits"] = limits;
+        }
+        to_json(out)
     }
 }

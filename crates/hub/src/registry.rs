@@ -612,6 +612,18 @@ impl Db {
     /// orchestrator named against the rules. Errors are meant for the orchestrator
     /// to relay.
     pub fn route_model(&self, requested: Option<&str>, task_type: Option<&str>, tags: &[String]) -> Result<Route, String> {
+        self.route_model_with(requested, task_type, tags, false)
+    }
+
+    /// [`Db::route_model`], with `prefer_cheaper` (the thread has a budget, `limits.rs`):
+    /// among models the rules and records leave equal, the cheaper one wins.
+    pub fn route_model_with(
+        &self,
+        requested: Option<&str>,
+        task_type: Option<&str>,
+        tags: &[String],
+        prefer_cheaper: bool,
+    ) -> Result<Route, String> {
         let models = self.models();
         if models.is_empty() {
             return Err("no models registered".into());
@@ -709,14 +721,19 @@ impl Db {
                         .then(x.mean_cost.unwrap_or(0.0).total_cmp(&y.mean_cost.unwrap_or(0.0))),
                     _ => Equal,
                 })
+                .then_with(|| if prefer_cheaper { price(a).total_cmp(&price(b)) } else { Equal })
                 .then(role_rank(a).cmp(&role_rank(b)))
                 .then(a.id.cmp(&b.id))
         });
+        let several = allowed.len() > 1;
         let model = allowed.swap_remove(0);
 
         let mut why: Vec<String> = filters.iter().map(|r| format!("rule {}", describe_rule(r))).collect();
         if !prefs.is_empty() {
             why.push(format!("preferring {}", prefs.join(", then ")));
+        }
+        if prefer_cheaper && several {
+            why.push("cheaper among equals for the thread's budget".into());
         }
         if tier(&model) == 0 {
             let s = &stats[&model.id];
