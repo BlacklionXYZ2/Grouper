@@ -18,13 +18,14 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
-const DEFAULT_HUB: &str = "http://127.0.0.1:8080";
-
 /// Grouper command-line client.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Hub base URL, e.g. https://hub.example.com
+    /// Hub base URL.
+    ///
+    /// Order: this flag, then GROUPER_HUB, then the hub saved by `grouper login`,
+    /// then https://grouper.clockmillbarn.uk.
     #[arg(long, env = "GROUPER_HUB", global = true)]
     hub: Option<String>,
     /// A device token, instead of the one `grouper login` saved (for automation and recovery).
@@ -788,12 +789,9 @@ fn open_browser(url: &str) -> bool {
 /// for the owner to approve it in a browser, then saves the hub, this device's token and the install
 /// id. The token is never printed.
 async fn login(cli_hub: Option<&str>, name: Option<&str>, no_browser: bool) -> Result<()> {
-    let hub = match cli_hub.map(str::trim).filter(|h| !h.is_empty()) {
-        Some(h) => h.trim_end_matches('/').to_string(),
-        None => credentials::load(false)?
-            .map(|c| c.hub)
-            .context("which hub? run `grouper login --hub <url>` (or set GROUPER_HUB)")?,
-    };
+    // Trailing slash is stripped so `{hub}/v1/...` does not gain a double slash.
+    // The saved value is whatever login resolved, without that slash.
+    let hub = credentials::resolve_hub(cli_hub)?.trim_end_matches('/').to_string();
     let parsed = reqwest::Url::parse(&hub).context("--hub must be a URL such as https://hub.example.com")?;
     if !matches!(parsed.scheme(), "http" | "https") {
         bail!("--hub must be an http:// or https:// URL");
@@ -895,7 +893,7 @@ async fn main() -> Result<()> {
     }
 
     let cache = cli.cache;
-    let (hub, token) = credentials::resolve(cli.hub, cli.token, DEFAULT_HUB)?;
+    let (hub, token) = credentials::resolve(cli.hub, cli.token, credentials::DEFAULT_HUB)?;
     let api = Api { base: hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
 
     match cli.cmd {
@@ -1588,4 +1586,34 @@ async fn memory_cmd(api: &Api, cmd: MemoryCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn login_needs_no_arguments_and_help_names_the_default_hub() {
+        let _lock = credentials::test_env::lock();
+        {
+            let _hub = credentials::test_env::VarGuard::unset("GROUPER_HUB");
+            let cli = Cli::try_parse_from(["grouper", "login"]).expect("grouper login has no required arguments");
+            assert!(cli.hub.is_none());
+            assert!(matches!(cli.cmd, Cmd::Login { name: None, no_browser: false }));
+            let devices = Cli::try_parse_from(["grouper", "devices"]).expect("grouper devices");
+            assert!(devices.hub.is_none());
+
+            let help = Cli::command().render_long_help().to_string();
+            assert!(help.contains(credentials::DEFAULT_HUB), "{help}");
+            assert!(help.contains("GROUPER_HUB"), "{help}");
+        }
+        {
+            let _hub = credentials::test_env::VarGuard::set("GROUPER_HUB", "https://env.example");
+            let from_env = Cli::try_parse_from(["grouper", "login"]).expect("login");
+            assert_eq!(from_env.hub.as_deref(), Some("https://env.example"));
+            let from_flag = Cli::try_parse_from(["grouper", "--hub", "https://flag.example", "devices"]).expect("devices");
+            assert_eq!(from_flag.hub.as_deref(), Some("https://flag.example"));
+        }
+    }
 }

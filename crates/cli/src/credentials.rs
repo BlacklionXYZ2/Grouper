@@ -14,6 +14,11 @@ const FILE_NAME: &str = "credentials.json";
 pub const THREAD_SHELL_ENV: &str = "GROUPER_THREAD_SHELL";
 /// Overrides where the credentials file is (default `<config dir>/grouper/credentials.json`).
 const PATH_ENV: &str = "GROUPER_CREDENTIALS_FILE";
+/// Hub address when the process environment names one. `--hub` still wins.
+const HUB_ENV: &str = "GROUPER_HUB";
+/// Hub address when `--hub`, `GROUPER_HUB` and the credentials file give none.
+/// `grouper --help` documents this same string.
+pub const DEFAULT_HUB: &str = "https://grouper.clockmillbarn.uk";
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "dev.grouper.cli";
 #[cfg(target_os = "macos")]
@@ -102,7 +107,36 @@ pub fn resolve(
     cli_token: Option<String>,
     default_hub: &str,
 ) -> Result<(String, String)> {
-    resolve_with(cli_hub, cli_token, default_hub, load)
+    // Fold `GROUPER_HUB` in here so a caller that did not already merge the env
+    // (clap does, when the flag is absent) still keeps flag, then env, then saved.
+    resolve_with(explicit_hub(cli_hub.as_deref()), cli_token, default_hub, load)
+}
+
+/// Hub address for `grouper login` and anything else that does not need a token yet.
+/// Order: `--hub`, then `GROUPER_HUB`, then the hub saved in the credentials file,
+/// then [`DEFAULT_HUB`].
+pub fn resolve_hub(cli_hub: Option<&str>) -> Result<String> {
+    if let Some(hub) = explicit_hub(cli_hub) {
+        return Ok(hub);
+    }
+    if let Some(saved) = load(false)? {
+        return Ok(saved.hub);
+    }
+    Ok(DEFAULT_HUB.to_string())
+}
+
+/// `--hub` when it is non-empty after trimming, otherwise a non-empty `GROUPER_HUB`.
+fn explicit_hub(cli_hub: Option<&str>) -> Option<String> {
+    cli_hub
+        .map(str::trim)
+        .filter(|hub| !hub.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var(HUB_ENV)
+                .ok()
+                .map(|hub| hub.trim().to_string())
+                .filter(|hub| !hub.is_empty())
+        })
 }
 
 fn resolve_with(
@@ -121,7 +155,7 @@ fn resolve_with(
         }
         (Some(hub), None) => {
             let Some(saved) = loader(false)? else {
-                bail!("no token: pass --token, set GROUPER_TOKEN, or run `grouper login --hub <url>`");
+                bail!("no token: pass --token, set GROUPER_TOKEN, or run `grouper login`");
             };
             if normalize_hub(&hub) != normalize_hub(&saved.hub) {
                 bail!(
@@ -142,7 +176,7 @@ fn resolve_with(
                 .unwrap_or_else(|| default_hub.to_string());
             let token = saved
                 .and_then(|credentials| credentials.token)
-                .context("no token: pass --token, set GROUPER_TOKEN, or run `grouper login --hub <url>`")?;
+                .context("no token: pass --token, set GROUPER_TOKEN, or run `grouper login`")?;
             Ok((hub, token))
         }
     }
@@ -400,6 +434,56 @@ mod dpapi {
     }
 }
 
+/// Process-environment lock for tests. `GROUPER_HUB` and `GROUPER_CREDENTIALS_FILE`
+/// are process-wide, and `cargo test` runs these tests in parallel.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    pub fn lock() -> MutexGuard<'static, ()> {
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Restores one environment variable when dropped. Hold [`lock`] first.
+    pub struct VarGuard {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl VarGuard {
+        pub fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: the caller holds `lock()` until this guard drops, so no other
+            // grouper-cli test mutates the process environment at the same time.
+            unsafe { std::env::set_var(key, value) }
+            Self { key, prev }
+        }
+
+        pub fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: same as `set`.
+            unsafe { std::env::remove_var(key) }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for VarGuard {
+        fn drop(&mut self) {
+            // SAFETY: same as `set`. Drop runs before the lock is released when the
+            // guard is declared after `lock()`.
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,22 +536,98 @@ mod tests {
 
     #[test]
     fn load_refuses_inside_thread_shell() {
-        let prev = std::env::var_os(THREAD_SHELL_ENV);
-        // SAFETY: only this unit test touches GROUPER_THREAD_SHELL in grouper-cli.
-        unsafe {
-            std::env::set_var(THREAD_SHELL_ENV, "1");
-        }
+        let _lock = super::test_env::lock();
+        let _shell = super::test_env::VarGuard::set(THREAD_SHELL_ENV, "1");
         let err_with_token = load(true).err().unwrap();
         let err_without_token = load(false).err().unwrap();
         let err_resolve = resolve(None, None, "http://127.0.0.1:8080").err().unwrap();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(THREAD_SHELL_ENV, v),
-                None => std::env::remove_var(THREAD_SHELL_ENV),
-            }
-        }
         for err in [err_with_token, err_without_token, err_resolve] {
             assert_eq!(err.to_string(), "stored credentials are not available inside a Grouper thread shell");
+        }
+    }
+
+    #[test]
+    fn hub_address_resolution_order() {
+        let _lock = super::test_env::lock();
+        let path = std::env::temp_dir().join(format!(
+            "grouper-cli-credentials-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        // Set the override before any credentials read, and never the real file.
+        let _creds = super::test_env::VarGuard::set(PATH_ENV, &path);
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _remove = RemoveFile(path.clone());
+
+        {
+            let _hub = super::test_env::VarGuard::unset(HUB_ENV);
+            assert!(
+                !path.exists(),
+                "the temp credentials file must not already exist at {}",
+                path.display()
+            );
+            assert_eq!(resolve_hub(None).unwrap(), DEFAULT_HUB);
+            let (hub, token) = resolve(None, Some("cli-token".into()), DEFAULT_HUB).unwrap();
+            assert_eq!((hub.as_str(), token.as_str()), (DEFAULT_HUB, "cli-token"));
+
+            // A credentials file with no hub is the same as no saved hub.
+            std::fs::write(&path, "{}\n").unwrap();
+            assert_eq!(resolve_hub(None).unwrap(), DEFAULT_HUB);
+
+            save("https://saved.example", "saved-token", &"a".repeat(32)).unwrap();
+            assert_eq!(resolve_hub(None).unwrap(), "https://saved.example");
+            let (hub, token) = resolve(None, None, DEFAULT_HUB).unwrap();
+            assert_eq!((hub.as_str(), token.as_str()), ("https://saved.example", "saved-token"));
+            // An explicit token still uses the saved hub when no flag or env is set.
+            let (hub, token) = resolve(None, Some("cli-token".into()), DEFAULT_HUB).unwrap();
+            assert_eq!((hub.as_str(), token.as_str()), ("https://saved.example", "cli-token"));
+        }
+
+        {
+            let _hub = super::test_env::VarGuard::set(HUB_ENV, "https://env.example");
+            assert_eq!(resolve_hub(None).unwrap(), "https://env.example");
+            let message = resolve(None, None, DEFAULT_HUB).unwrap_err().to_string();
+            assert!(message.contains("https://saved.example"), "{message}");
+            assert!(message.contains("https://env.example"), "{message}");
+            assert!(message.contains("--token"), "{message}");
+        }
+
+        {
+            // Same hub as the file, different case and a trailing slash: saved token is used.
+            let _hub = super::test_env::VarGuard::set(HUB_ENV, "HTTPS://SAVED.EXAMPLE/");
+            assert_eq!(resolve_hub(None).unwrap(), "HTTPS://SAVED.EXAMPLE/");
+            let (hub, token) = resolve(None, None, DEFAULT_HUB).unwrap();
+            assert_eq!((hub.as_str(), token.as_str()), ("HTTPS://SAVED.EXAMPLE/", "saved-token"));
+        }
+
+        {
+            // Blank flag and blank env are absent, so the saved hub is next.
+            let _hub = super::test_env::VarGuard::set(HUB_ENV, "   ");
+            assert_eq!(resolve_hub(Some("  ")).unwrap(), "https://saved.example");
+        }
+
+        {
+            let _hub = super::test_env::VarGuard::set(HUB_ENV, "https://env.example");
+            assert_eq!(resolve_hub(Some(" https://flag.example/ ")).unwrap(), "https://flag.example/");
+            // Flag plus token must not read the credentials file. This file does not parse,
+            // so a read would fail the call above.
+            let bad = path.with_file_name(format!(
+                "grouper-cli-credentials-bad-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::write(&bad, "not json\n").unwrap();
+            let _bad_file = RemoveFile(bad.clone());
+            let _bad_path = super::test_env::VarGuard::set(PATH_ENV, &bad);
+            let (hub, token) = resolve(Some("https://flag.example".into()), Some("flag-token".into()), DEFAULT_HUB).unwrap();
+            assert_eq!((hub.as_str(), token.as_str()), ("https://flag.example", "flag-token"));
+            let message = resolve(None, None, DEFAULT_HUB).unwrap_err().to_string();
+            assert!(message.contains("parsing saved credentials"), "{message}");
         }
     }
 }
