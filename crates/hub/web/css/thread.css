@@ -8,45 +8,7 @@
    step and its progress bar, Needs you); model-family colours mark the thread's
    own turns, dots and pills. */
 
-/* ---- the second highlight colour (brand purple), text-safe in every scheme:
-   light #5b3fc4 on white 7.4:1 and on its soft fill 6.3:1; dark #a78bfa on
-   --surface 6.4:1 and on its soft fill 5.7:1. The bar fill is not text (3:1 to
-   its track is enough). */
-:root {
-  --purple: #5b3fc4;
-  --purple-fill: #7c4de8;
-  --purple-soft: #ece7fc;
-}
-
-:root[data-theme="dark"] {
-  --purple: #a78bfa;
-  --purple-fill: #8b5cf6;
-  --purple-soft: #251f3f;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --purple: #a78bfa;
-    --purple-fill: #8b5cf6;
-    --purple-soft: #251f3f;
-  }
-}
-
-@media (prefers-contrast: more) {
-  :root:not([data-theme="dark"]) {
-    --purple: #47309f;
-  }
-
-  :root[data-theme="dark"] {
-    --purple: #c4b0ff;
-  }
-}
-
-@media (prefers-contrast: more) and (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --purple: #c4b0ff;
-  }
-}
+/* The brand purple tokens (--purple, --purple-fill, --purple-soft) now live in app.css. */
 
 /* ---- pop-out: the same chat at full width, over the chat it came from */
 
