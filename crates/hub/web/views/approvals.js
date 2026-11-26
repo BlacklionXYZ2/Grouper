@@ -5,11 +5,11 @@
 // reply: the owner answers, stops the thread, or goes somewhere else.
 //
 // One request at a time, oldest first ("1 of N", Previous/Next, no wrapping).
-// Order, top to bottom: "Run this tool?"; tool and device; thread with its model
-// (family mark and name); the chat, in a thread view; the hub's reason, most
-// prominent; the exact input behind a "Review exact input before approving"
-// disclosure; the timeout and what happens then; then the queue controls, Approve
-// / Deny, and Change it / Stop thread.
+// Order, top to bottom: shield + "Run this tool?"; tool · via device and thread
+// with its model (family mark and name), plus the chat in a thread view; hairline;
+// the hub's reason; the exact input behind a "View exact input" disclosure;
+// Deny and Approve side by side at equal size (Approve locked until expanded);
+// then the gate hint, queue controls, timeout, and Change it / Open thread / Stop.
 //
 // Safety rules kept here:
 //   - Approve stays disabled until the exact input has been expanded (an
@@ -349,16 +349,36 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
     const riskRule = !isManualReason(a.reason);
 
     const heading = h('h2', { class: 'dock-title', id: titleId, tabindex: '-1' }, 'Run this tool?');
-    const toolLine = h('p', { class: 'dock-tool' }, h('span', { class: 'mono dock-tool-name' }, a.tool), ` on ${device}`);
+    const head = h(
+      'div',
+      { class: 'dock-head' },
+      h('span', { class: ['dock-shield', riskRule && 'risk'] }, icon('shield')),
+      heading,
+    );
+    const toolLine = h(
+      'p',
+      { class: 'dock-tool' },
+      h('span', { class: 'mono dock-tool-name' }, a.tool),
+      h('span', { class: 'dock-sep', 'aria-hidden': 'true' }, ' · '),
+      h('span', { class: 'dock-device' }, `via ${device}`),
+    );
     const threadLine = h('p', { class: 'dock-thread has-fam fam-unknown' });
     const chatLine = threadId ? h('p', { class: 'hint dock-chat' }) : null;
-    const reasonText = a.reason || 'This tool is set to Manual, so every call waits for you.';
-    const reason = h(
+    const context = h(
       'div',
-      { class: ['reason', 'dock-reason', riskRule && 'risk'] },
-      icon(riskRule ? 'warning' : 'shield'),
-      h('div', null, riskRule ? h('strong', { class: 'reason-kind' }, 'A safety rule asked. ') : null, reasonText),
+      { class: 'dock-context' },
+      h('span', { class: 'dock-tool-icon' }, icon('tool')),
+      h('div', { class: 'dock-meta-lines' }, toolLine, threadLine, chatLine),
     );
+    const reasonText = a.reason || 'This tool is set to Manual, so every call waits for you.';
+    const reason = riskRule
+      ? h(
+          'div',
+          { class: 'reason dock-reason risk' },
+          icon('warning'),
+          h('div', null, h('strong', { class: 'reason-kind' }, 'A safety rule asked. '), reasonText),
+        )
+      : h('p', { class: 'dock-reason-plain' }, reasonText);
 
     // The exact input: collapsed until the owner opens it, which turns Approve on.
     const pre = h('pre', { class: 'code dock-code', id: inputId, tabindex: '0', 'aria-label': `Exact input for ${a.tool}` }, pretty(a.input));
@@ -383,20 +403,20 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
           }
         },
       },
-      h('summary', null, chevron(), 'Review exact input before approving'),
+      h('summary', null, icon('code'), h('span', { class: 'dock-input-label' }, 'View exact input'), chevron()),
       pre,
     );
     const time = h('p', { class: 'hint dock-time' }, timeoutText(a));
     const threadLink =
       !threadId && a.thread_id
-        ? h('p', { class: 'hint dock-open' }, h('a', { href: `#/chat/${enc(a.conversation_id || cid)}/thread/${enc(a.thread_id)}` }, 'Open the thread'))
+        ? h('a', { class: 'link-btn dock-link dock-open', href: `#/chat/${enc(a.conversation_id || cid)}/thread/${enc(a.thread_id)}` }, 'Open thread')
         : null;
 
     const statusEl = h('p', { class: 'dock-status', role: 'status' });
 
     // Queue controls: one request at a time, oldest first, no wrapping.
-    const prev = h('button', { class: 'btn btn-sm dock-nav', type: 'button', 'aria-label': 'Previous request', onclick: () => step(-1) }, icon('back'), h('span', { class: 'dock-nav-word' }, 'Previous'));
-    const next = h('button', { class: 'btn btn-sm dock-nav', type: 'button', 'aria-label': 'Next request', onclick: () => step(1) }, h('span', { class: 'dock-nav-word' }, 'Next'), icon('chevron'));
+    const prev = h('button', { class: 'btn btn-sm btn-ghost dock-nav', type: 'button', 'aria-label': 'Previous request', onclick: () => step(-1) }, icon('back'), h('span', { class: 'dock-nav-word' }, 'Previous'));
+    const next = h('button', { class: 'btn btn-sm btn-ghost dock-nav', type: 'button', 'aria-label': 'Next request', onclick: () => step(1) }, h('span', { class: 'dock-nav-word' }, 'Next'), icon('chevron'));
     const pos = h('span', { class: 'dock-pos' });
     const queue = h(
       'div',
@@ -425,7 +445,7 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
     const approve = h(
       'button',
       {
-        class: ['btn', 'btn-lg', 'dock-approve', riskRule ? null : 'btn-primary'],
+        class: ['btn', 'btn-lg', 'dock-approve', riskRule ? 'btn-outline' : 'btn-primary'],
         type: 'button',
         'aria-describedby': gateId,
         onclick: () => answer(true),
@@ -437,12 +457,17 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
       icon('check'),
       'Approve',
     );
-    const deny = h('button', { class: 'btn btn-lg dock-deny', type: 'button', onclick: () => answer(false) }, icon('x'), 'Deny');
+    const deny = h('button', { class: 'btn btn-lg btn-outline dock-deny', type: 'button', onclick: () => answer(false) }, icon('x'), 'Deny');
     const gate = h('p', { class: 'hint dock-gate', id: gateId });
-    const change = h('button', { class: 'link-btn', type: 'button', onclick: () => answer(false, true) }, 'Change it: deny and tell the thread what to do instead');
-    const stopBtn = h('button', { class: 'link-btn danger', type: 'button', onclick: () => stopIt() }, icon('stop'), 'Stop thread');
-    const actions = h('div', { class: ['approval-actions', riskRule && 'equal'] }, approve, deny);
-    const links = h('div', { class: 'approval-links' }, change, stopBtn);
+    const change = h(
+      'button',
+      { class: 'link-btn dock-link', type: 'button', title: 'Deny and tell the thread what to do instead', onclick: () => answer(false, true) },
+      'Change it',
+      srOnly(': deny and tell the thread what to do instead'),
+    );
+    const stopBtn = h('button', { class: 'link-btn danger dock-link', type: 'button', onclick: () => stopIt() }, icon('stop'), 'Stop thread');
+    const actions = h('div', { class: ['approval-actions', riskRule && 'equal'] }, deny, approve);
+    const links = h('div', { class: 'approval-links' }, change, threadLink, stopBtn);
     const settledEl = settled
       ? h('div', { class: ['banner', outcomes.has(a.approval_id) ? 'info' : 'warn', 'dock-settled'] }, icon(outcomes.has(a.approval_id) ? 'check' : 'shield'), h('span', { class: 'grow' }, settled))
       : null;
@@ -451,14 +476,16 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
         ? h('p', { class: 'hint dock-notify' }, 'Want an alert when a tool needs review? ', h('a', { href: '#/settings' }, 'Turn on notifications in Settings'), '.')
         : null;
 
+    card.classList.toggle('is-risk', riskRule);
+    card.classList.toggle('is-settled', Boolean(settled));
     setChildren(
       card,
-      h('div', { class: 'dock-head' }, heading),
-      h('div', { class: 'dock-body' }, toolLine, threadLine, chatLine, reason, details, time, threadLink),
+      h('div', { class: 'dock-top' }, head, context),
+      h('div', { class: 'dock-body' }, reason, details),
       h(
         'div',
         { class: 'dock-foot' },
-        settled ? settledEl : [queue, statusEl, actions, gate, links, hint],
+        settled ? settledEl : [statusEl, actions, gate, queue, time, links, hint],
       ),
     );
     refs = { heading, details, time, prev, next, pos, queue, approve, deny, change, stopBtn, statusEl, gate, threadLine, chatLine, a };
@@ -479,9 +506,11 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
       setFamilyClass(refs.threadLine, fam);
       setChildren(
         refs.threadLine,
-        familyMark(fam),
+        h('span', { class: 'dock-thread-prefix' }, 'Thread: '),
         h('span', { class: 'dock-thread-title' }, title),
-        h('span', { class: 'dock-model' }, srOnly(`, ${familyLabel(fam)}: `), h('span', { class: 'mono' }, modelId || 'model not recorded')),
+        h('span', { class: 'dock-sep', 'aria-hidden': 'true' }, ' · '),
+        familyMark(fam),
+        h('span', { class: 'dock-model' }, srOnly(`${familyLabel(fam)}: `), h('span', { class: 'mono' }, modelId || 'model not recorded')),
       );
     }
     if (refs.chatLine) {
@@ -508,7 +537,7 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
     const seen = acknowledged.has(a.approval_id);
     refs.approve.disabled = !writable || !seen;
     refs.deny.disabled = refs.change.disabled = refs.stopBtn.disabled = !writable;
-    setText(refs.gate, seen ? '' : 'Approve turns on once you open “Review exact input”.');
+    setText(refs.gate, seen ? '' : 'Approve turns on once you open “View exact input”.');
     refs.gate.hidden = seen;
     let text = statuses.get(a.approval_id) || '';
     if (!isAdmin()) text = 'This session uses a device token, which can’t answer approvals. Sign in with an admin token to answer.';
