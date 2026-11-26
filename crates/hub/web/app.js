@@ -310,7 +310,9 @@ function buildNav() {
   const needsBadge = countBadge('need you');
   needsBadge.setAttribute('aria-hidden', 'true');
   const needsAge = h('span', { class: 'side-needs-age', 'aria-hidden': 'true' });
-  const needsItem = h('a', { class: 'side-item', href: '#/inbox' }, h('span', { class: 'label' }, 'Needs you'), needsAge, needsBadge);
+  // Words for screen readers follow the visible label, so the name starts with what's shown.
+  const needsWords = h('span', { class: 'visually-hidden' });
+  const needsItem = h('a', { class: 'side-item', href: '#/inbox' }, h('span', { class: 'label' }, 'Needs you', needsWords), needsAge, needsBadge);
   const sections = [
     navLink('#/devices', 'Devices', 'devices-fill', ['devices']),
     navLink('#/models', 'Models', 'models-fill', ['models'], 'waiting'),
@@ -354,7 +356,7 @@ function buildNav() {
     tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings', 'inbox'], 'pending'),
   ];
   setChildren(els.tabbar, tabs.map((t) => t.a));
-  nav = { newChat, needsItem, needsBadge, needsAge, chatList, chatEmpty, more, sections, status, tabs };
+  nav = { newChat, needsItem, needsWords, needsBadge, needsAge, chatList, chatEmpty, more, sections, status, tabs };
 }
 
 function chatSideItem() {
@@ -450,7 +452,7 @@ function renderNav() {
   const needsParts = [];
   if (approvalCount) needsParts.push(approvalCount === 1 ? '1 approval' : `${approvalCount} approvals`);
   if (waitingCount) needsParts.push(`${waitingCount} waiting for a device`);
-  setAttr(nav.needsItem, 'aria-label', `Needs you: ${needsParts.length ? `${needsParts.join(', ')}, newest ${ago(newest)}` : 'nothing right now'}`);
+  setText(nav.needsWords, `: ${needsParts.length ? `${needsParts.join(', ')}, newest ${ago(newest)}` : 'nothing right now'}`);
 
   setAttr(nav.newChat, 'aria-current', r.view === 'chat' && r.conversation === null ? 'page' : null);
   for (const f of nav.sections) {
