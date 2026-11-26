@@ -14,9 +14,16 @@ is visible at a glance as coloured, named, per-model rows. Checkable principles:
 
 - **V1. Navy, not grey.** Every dark surface has a blue cast (blue channel is 8–14 above red). No neutral
   or warm greys anywhere in dark mode.
-- **V2. One accent.** Teal is the only action colour: New chat, send, Approve, selected tab, links.
-  A screen has at most one filled teal button. Purple, orange and indigo appear only as thread/model
-  identity; mint green only as "good state" (running chip, online, Free, done tick).
+- **V2. Colourful accents on a navy base (owner, 26 Nov evening: "there should still be coloured
+  accents rather than being a monotonous blend of blues").** Teal stays the primary action colour (New
+  chat, send, Approve, selected tab, links) and a screen has at most one filled teal button. But every
+  screen carries visible colour beyond blue: the icon's purple (`#8B5CF6` family) is a second brand
+  accent for highlights (Needs you, the selected chat's indicator, plan progress, focus of attention);
+  model-family colours (teal, purple, orange, pink, amber, green…) are strong and visible on dots, pills,
+  marks, avatars and thread rows; brand surfaces (sign-in, empty states, the mark) use the icon's
+  teal→blue→purple gradient. Mint green means "good state". The squint test: a dark screenshot shows
+  navy plus at least two clearly different accent hues, never a single blue wash. Contrast rules still
+  hold.
 - **V3. Depth by tone, not shadow.** Three steps: main canvas (darkest), sidebar and panels (one step up),
   cards/bubbles/composer (two steps up), each with a 1px hairline. Shadows only on things that float
   (palette, model picker, toasts).
@@ -135,6 +142,29 @@ together. Also update `theme-color` in `index.html` and `manifest.webmanifest`.
 | **Brand** (`icon.svg`, `.brand-mark`, `.boot-mark`, `login.js`, app icons) | Teal rounded square with three white circles. Sign-in: one card with the placeholder mark. No tagline. | Fish-school mark (Q1) in sidebar head, assistant avatar, favicon, PWA and app icons, boot screen. Sign-in becomes two columns on desktop: brand panel (mark, wordmark, tagline, three value lines) on the `--backdrop` gradient, sign-in card on the right; one column on phone. The art's right-hand marketing panel is for the README/landing page only. |
 | **Everything else** (devices, usage, memory, skills, settings, inbox, palette) | Not in the art. | Inherit tokens, radii and row density only. No layout work in this round. |
 | **Mac app** (`GrouperMacApp.swift`) | Sidebar has Chats, Devices, Models, Settings only; system colours. | Same sidebar order and look as the web. Needs you, Usage, Memory and Skills pages do not exist on Mac yet; adding them is feature work outside this plan (listed in drift). |
+
+## Owner answers (26 November 2026, evening)
+
+These replace the recommendations below where they differ.
+
+- **Logo (Q1):** the owner supplied the app icon (`docs/concept-art/2026-11-26-app-icon.jpg`: a large fish
+  surrounded by a school, teal to blue to purple on a navy rounded square). It is being vectorised and
+  replaces the placeholder mark everywhere.
+- **Threads (Q3):** threads behave like a chat (the side panel and the pop-out both show the chat-style
+  transcript; no summary cards). Each thread shows a **live plan checklist** pinned at its top, like
+  Claude's task list: the thread breaks its task into steps that tick off as it works. Contract: threads
+  have a built-in tool `update_plan` with input `{"items":[{"content", "status":
+  "pending"|"in_progress"|"completed", "active_form"?}]}` (always the whole list); the latest call's input
+  is the plan; clients don't show the call as a tool row.
+- **Popular models (Q5):** not now; a possible feature if Grouper gets a cloud-hosted option.
+- **"Add to context" (Q9):** on the roadmap for later.
+- **Colour (V2):** coloured accents, not a monotonous blend of blues (V2 above was rewritten).
+
+## Roadmap (owner, 26 November 2026)
+
+- "Add to context": attach a thread's file to the next message to the orchestrator.
+- "Popular" models section, if Grouper gets a cloud-hosted option that can see usage across users.
+- Attach, image and code buttons in the composer once the hub has an attachment API.
 
 ## 4. Owner questions
 
