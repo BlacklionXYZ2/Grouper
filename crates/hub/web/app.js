@@ -8,6 +8,7 @@
 //   #/chat/<id>/threads    this conversation with the threads panel open
 //   #/threads              current or last conversation with the panel open, or #/chat
 //   #/threads/<t>          resolves the thread's conversation and opens the inspector
+//   #/inbox                Needs you: approvals and waiting threads across all chats
 //   #/devices #/devices/<id> #/models #/usage #/memory #/skills #/settings #/more
 //
 // The shell (sidebar, tab bar) is built once per sign-in and updated in place, so
@@ -16,7 +17,7 @@
 
 import { h, icon, setChildren, syncList, setText, setAttr } from './lib/dom.js';
 import { get, enc, isAbort, onApiError } from './lib/api.js';
-import { store, on, emit, threadsIn, approvalsIn, pendingApprovals, resetStore } from './lib/store.js';
+import { store, on, emit, threadsIn, approvalsIn, needsYouCount, waitingThreads, resetStore } from './lib/store.js';
 import { startLive, stopLive, loadConversations, loadThreads, loadDevices, loadModels, loadApprovals } from './lib/live.js';
 import { closeDrawer, navigate, syncInert, bar, skeletonBlocks, errorBanner } from './lib/ui.js';
 import { ago } from './lib/format.js';
@@ -30,7 +31,7 @@ import { renderMemory } from './views/memory.js';
 import { renderSkills } from './views/skills.js';
 import { renderSettings } from './views/settings.js';
 import { renderMore } from './views/more.js';
-import { openApproval } from './views/approvals.js';
+import { renderInbox } from './views/inbox.js';
 
 const root = document.getElementById('app');
 const LAST_CONV = 'grouper.lastConversation';
@@ -212,12 +213,6 @@ function currentHash() {
   return location.hash || '#/chat';
 }
 
-function needsYouCount() {
-  const approvalThreads = new Set([...store.approvals.values()].map((a) => a.thread_id));
-  const waiting = [...store.threads.values()].filter((t) => t.status === 'waiting_device' && !approvalThreads.has(t.id)).length;
-  return store.approvals.size + waiting;
-}
-
 // The navigation is built once (buildNav) and updated in place (renderNav).
 let nav = null;
 let navFrame = 0;
@@ -246,26 +241,14 @@ function buildNav() {
     const a = h('a', { class: 'side-item', href }, icon(iconName), h('span', { class: 'label' }, label), badge);
     return { a, view, badge };
   };
-  const approvalsBtn = h(
-    'button',
-    {
-      class: 'banner warn',
-      type: 'button',
-      hidden: true,
-      onclick: () => {
-        const currentCid = store.currentConversation;
-        const here = currentCid ? approvalsIn(currentCid) : [];
-        if (here.length) {
-          openApproval(here[0].approval_id, { conversationId: currentCid });
-          return;
-        }
-        const first = pendingApprovals()[0];
-        if (first?.conversation_id) navigate(`#/chat/${enc(first.conversation_id)}`);
-      },
-    },
-    icon('shield'),
-    h('span', { class: 'grow' }),
-    icon('chevron'),
+  // Needs you: everything waiting on the owner across all chats (#/inbox).
+  const needsBadge = countBadge('need you');
+  const needsItem = h(
+    'a',
+    { class: 'side-item side-needs', href: '#/inbox' },
+    icon('inbox'),
+    h('span', { class: 'label' }, h('span', { class: 'title' }, 'Needs you'), h('span', { class: 'sub' })),
+    needsBadge,
   );
   const chatList = h('ul', { class: 'side-list' });
   const chatEmpty = h('p', { class: 'side-empty' }, 'No conversations yet.');
@@ -289,7 +272,7 @@ function buildNav() {
     h(
       'div',
       { class: 'sidebar-scroll' },
-      approvalsBtn,
+      needsItem,
       h('section', { class: 'side-section', 'aria-labelledby': 'side-chats' }, h('h2', { class: 'side-title', id: 'side-chats' }, 'Chats'), chatList, chatEmpty),
     ),
     h('nav', { class: 'side-foot', 'aria-label': 'Sections' }, foot.map((f) => f.a), conn),
@@ -306,7 +289,7 @@ function buildNav() {
     tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings'], 'pending'),
   ];
   setChildren(els.tabbar, tabs.map((t) => t.a));
-  nav = { approvalsBtn, chatList, chatEmpty, foot, conn, tabs };
+  nav = { needsItem, needsBadge, chatList, chatEmpty, foot, conn, tabs };
 }
 
 function sideItem() {
@@ -325,7 +308,6 @@ function chatSideItem() {
 function renderNav() {
   if (!els || !nav) return;
   const r = parseRoute();
-  const currentCid = store.currentConversation;
 
   // Chats, newest first, with per-chat running/waiting lines and approval badges.
   syncList(
@@ -351,20 +333,15 @@ function renderNav() {
   );
   nav.chatEmpty.hidden = store.conversations.length > 0;
 
-  const currentApprovals = currentCid ? approvalsIn(currentCid) : [];
-
-  // Global sidebar approval indicator so nothing in other chats is missed.
-  const approvals = pendingApprovals();
-  nav.approvalsBtn.hidden = !approvals.length;
-  const approvalText =
-    currentCid && !currentApprovals.length && approvals.length
-      ? approvals.length === 1
-        ? '1 approval in another chat'
-        : `${approvals.length} approvals in other chats`
-      : approvals.length === 1
-        ? '1 approval waiting'
-        : `${approvals.length} approvals waiting`;
-  setText(nav.approvalsBtn.querySelector('.grow'), approvalText);
+  // Needs you: the count badge, and the same in words (status is never colour alone).
+  const approvalCount = store.approvals.size;
+  const waitingCount = waitingThreads().length;
+  setAttr(nav.needsItem, 'aria-current', r.view === 'inbox' ? 'page' : null);
+  setBadge(nav.needsBadge, approvalCount + waitingCount);
+  const needsParts = [];
+  if (approvalCount) needsParts.push(approvalCount === 1 ? '1 approval' : `${approvalCount} approvals`);
+  if (waitingCount) needsParts.push(`${waitingCount} waiting`);
+  setText(nav.needsItem.querySelector('.sub'), needsParts.length ? needsParts.join(' · ') : 'Nothing right now');
 
   for (const f of nav.foot) {
     setAttr(f.a, 'aria-current', f.view.includes(r.view) ? 'page' : null);
@@ -560,6 +537,7 @@ function route() {
       skills: renderSkills,
       settings: renderSettings,
       more: renderMore,
+      inbox: renderInbox,
     };
     const render = renderers[r.view] || renderChat;
     document.title = 'Grouper';
