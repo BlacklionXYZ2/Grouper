@@ -5093,3 +5093,549 @@ dialog.sheet-dialog.model-picker {
     color: CanvasText;
   }
 }
+
+/* ---- usage & limits: two tracks (API costs | subscriptions), breakdown, limits */
+
+.view-body.u-body {
+  max-width: 1200px;
+}
+
+.u-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px 16px;
+  margin: 0 0 18px;
+}
+
+.u-range {
+  flex: 0 1 240px;
+}
+
+.u-custom {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.u-custom[hidden] {
+  display: none;
+}
+
+.u-custom .field {
+  flex: 1 1 160px;
+}
+
+.u-toolbar-note {
+  flex: 1 1 260px;
+  align-self: center;
+}
+
+.u-tracks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr));
+  gap: 20px 24px;
+  align-items: start;
+  margin: 0 0 32px;
+}
+
+.u-track {
+  min-width: 0;
+}
+
+.u-track-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin: 0 0 6px;
+}
+
+.u-track-head h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.u-track-head h2 .icon {
+  color: var(--text-2);
+}
+
+.u-track-body {
+  display: grid;
+  gap: 12px;
+}
+
+.u-track-body[aria-busy="true"] > .u-cards,
+.u-track-body[aria-busy="true"] > .u-subgrid,
+.u-breakdown [aria-busy="true"] > .u-table {
+  opacity: 0.7;
+  transition: opacity 0.15s var(--ease);
+}
+
+.u-banner {
+  margin: 0;
+}
+
+.u-big,
+.u-num,
+.u-rep-v,
+.u-facts dd,
+.u-rowcard-cost,
+.u-share {
+  font-variant-numeric: tabular-nums;
+}
+
+.u-big {
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.badge.u-est {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.u-summary {
+  padding: 12px 16px;
+}
+
+.u-summary-k {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.u-summary-v {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+
+.u-summary-s {
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.u-cards {
+  display: grid;
+  gap: 12px;
+}
+
+.u-card {
+  padding: 14px 16px;
+  min-width: 0;
+}
+
+.u-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 4px;
+}
+
+.u-card-titles {
+  min-width: 0;
+}
+
+.u-card h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.u-card-sub {
+  font-size: 12.5px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.u-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.u-block {
+  border-top: 1px solid var(--border);
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.u-block h4 {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--text-2);
+}
+
+.u-block .hint {
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.u-figure {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.u-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 6px 14px;
+  margin: 6px 0 0;
+}
+
+.u-facts dt {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.u-facts dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 550;
+}
+
+.u-rep + .u-rep {
+  margin-top: 10px;
+}
+
+.u-rep-line {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 2px 12px;
+  font-size: 14px;
+}
+
+.u-rep-k {
+  color: var(--text-2);
+}
+
+.u-rep-v {
+  font-weight: 600;
+}
+
+.u-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
+.u-meta > .icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+/* The words wrap beside their icon; badges drop below them. */
+.u-meta > .icon + span:not(.badge) {
+  flex: 1 1 10em;
+  min-width: 0;
+}
+
+.u-dim,
+.u-meta-inline {
+  color: var(--text-3);
+  font-weight: 400;
+}
+
+/* A meter: the bar is decoration; the words beside it carry the value. */
+.u-meter-wrap {
+  margin-top: 6px;
+}
+
+.u-meter {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.u-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.u-meter-wrap.warn .u-meter-fill {
+  background: var(--warn);
+}
+
+.u-meter-wrap.danger .u-meter-fill {
+  background: var(--danger);
+}
+
+.u-meter-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.u-meter-text strong {
+  color: var(--text);
+}
+
+.u-subgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 210px), 1fr));
+  gap: 12px;
+}
+
+.u-plan .u-card-head {
+  margin-bottom: 2px;
+}
+
+.u-statuses {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.u-statuses .banner {
+  margin: 0;
+  font-size: 13.5px;
+}
+
+.u-empty {
+  text-align: left;
+  color: var(--text);
+  padding: 16px 18px;
+}
+
+.u-empty p {
+  margin: 0 0 8px;
+  max-width: 62ch;
+}
+
+.u-empty p:last-child {
+  margin-bottom: 0;
+}
+
+.u-cmd {
+  margin: 0 0 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  overflow-x: auto;
+  font-size: 13.5px;
+}
+
+.u-caption {
+  margin-top: 0;
+}
+
+.u-breakdown .table .u-rowhead {
+  background: transparent;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 500;
+  white-space: normal;
+  min-width: 180px;
+}
+
+.u-breakdown .table tfoot th {
+  background: transparent;
+  color: var(--text);
+  font-size: 13.5px;
+  border-top: 1px solid var(--border-strong);
+  border-bottom: none;
+}
+
+.u-breakdown .table a,
+.u-rowcards a {
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 3px;
+}
+
+.u-breakdown .table a:hover,
+.u-rowcards a:hover {
+  color: var(--accent);
+  text-decoration-color: currentColor;
+}
+
+.u-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+
+.u-share {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.u-share-bar {
+  display: inline-block;
+  width: 48px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.u-share-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.u-rowcards {
+  display: none;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  gap: 10px;
+}
+
+.u-rowcard {
+  padding: 12px 14px;
+}
+
+.u-rowcard-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 10px;
+  flex-wrap: wrap;
+}
+
+.u-rowcard-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.u-rowcard-cost {
+  font-weight: 650;
+  font-size: 15px;
+  white-space: nowrap;
+}
+
+.u-rowcard-total {
+  background: var(--surface-2);
+}
+
+.u-chat-stats:empty {
+  display: none;
+}
+
+.limit-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+.limit-now {
+  margin-top: 4px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.limit-now[hidden] {
+  display: none;
+}
+
+.u-legend h2 {
+  margin: 0 0 10px;
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.u-legend dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 14px;
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--text-2);
+}
+
+.u-legend dd {
+  margin: 0;
+}
+
+@media (max-width: 760px) {
+  .u-range {
+    flex: 1 1 100%;
+  }
+
+  .u-tracks {
+    gap: 28px;
+  }
+
+  .u-table {
+    display: none;
+  }
+
+  .u-rowcards {
+    display: grid;
+  }
+
+  .u-legend dl {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .u-legend dd {
+    margin-bottom: 8px;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .u-meter,
+  .u-share-bar {
+    outline: 1px solid var(--text-2);
+  }
+}
+
+@media (forced-colors: active) {
+  .u-meter,
+  .u-share-bar {
+    border: 1px solid CanvasText;
+    background: Canvas;
+  }
+
+  .u-meter-fill,
+  .u-share-fill {
+    background: Highlight;
+    forced-color-adjust: none;
+  }
+
+  .badge.u-est {
+    border-color: CanvasText;
+  }
+}
