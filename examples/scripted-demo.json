@@ -2,6 +2,238 @@
  "delay_ms": 300,
  "rules": [
   {
+   "system": "orchestrator of Grouper",
+   "last": "Show me a plan demo",
+   "reply": [
+    {
+     "type": "text",
+     "text": "Starting a thread on the hub; watch its plan tick off."
+    },
+    {
+     "type": "tool_use",
+     "name": "start_thread",
+     "input": {
+      "title": "Plan demo",
+      "device": "hub",
+      "goal": "Write short notes to notes.md, showing a live plan while you work.",
+      "hub_reason": "Plan demo: file-only work, so it runs on the hub."
+     }
+    }
+   ]
+  },
+  {
+   "system": "orchestrator of Grouper",
+   "last": "Plan demo: file-only work",
+   "reply": [
+    {
+     "type": "text",
+     "text": "The plan demo thread is running."
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "# Brief: Plan demo",
+   "delay_ms": 1500,
+   "reply": [
+    {
+     "type": "text",
+     "text": "Four steps; here's the plan."
+    },
+    {
+     "type": "tool_use",
+     "name": "update_plan",
+     "input": {
+      "items": [
+       {
+        "content": "Read the brief",
+        "status": "in_progress",
+        "active_form": "Reading the brief"
+       },
+       {
+        "content": "Outline the notes",
+        "status": "pending",
+        "active_form": "Outlining the notes"
+       },
+       {
+        "content": "Write notes.md",
+        "status": "pending",
+        "active_form": "Writing notes.md"
+       },
+       {
+        "content": "Check the workspace",
+        "status": "pending",
+        "active_form": "Checking the workspace"
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "Plan updated: 0 of 4 done.",
+   "delay_ms": 1500,
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "update_plan",
+     "input": {
+      "items": [
+       {
+        "content": "Read the brief",
+        "status": "completed",
+        "active_form": "Reading the brief"
+       },
+       {
+        "content": "Outline the notes",
+        "status": "in_progress",
+        "active_form": "Outlining the notes"
+       },
+       {
+        "content": "Write notes.md",
+        "status": "pending",
+        "active_form": "Writing notes.md"
+       },
+       {
+        "content": "Check the workspace",
+        "status": "pending",
+        "active_form": "Checking the workspace"
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "Plan updated: 1 of 4 done.",
+   "delay_ms": 1500,
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "update_plan",
+     "input": {
+      "items": [
+       {
+        "content": "Read the brief",
+        "status": "completed",
+        "active_form": "Reading the brief"
+       },
+       {
+        "content": "Outline the notes",
+        "status": "completed",
+        "active_form": "Outlining the notes"
+       },
+       {
+        "content": "Write notes.md",
+        "status": "in_progress",
+        "active_form": "Writing notes.md"
+       },
+       {
+        "content": "Check the workspace",
+        "status": "pending",
+        "active_form": "Checking the workspace"
+       }
+      ]
+     }
+    },
+    {
+     "type": "tool_use",
+     "name": "write_file",
+     "input": {
+      "path": "notes.md",
+      "content": "# Notes\n\n- A plan is a checklist the thread keeps current.\n- One step is in progress at a time.\n"
+     }
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "Plan updated: 2 of 4 done.",
+   "delay_ms": 1500,
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "update_plan",
+     "input": {
+      "items": [
+       {
+        "content": "Read the brief",
+        "status": "completed",
+        "active_form": "Reading the brief"
+       },
+       {
+        "content": "Outline the notes",
+        "status": "completed",
+        "active_form": "Outlining the notes"
+       },
+       {
+        "content": "Write notes.md",
+        "status": "completed",
+        "active_form": "Writing notes.md"
+       },
+       {
+        "content": "Check the workspace",
+        "status": "in_progress",
+        "active_form": "Checking the workspace"
+       }
+      ]
+     }
+    },
+    {
+     "type": "tool_use",
+     "name": "list_files",
+     "input": {}
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "Plan updated: 3 of 4 done.",
+   "delay_ms": 1500,
+   "reply": [
+    {
+     "type": "tool_use",
+     "name": "update_plan",
+     "input": {
+      "items": [
+       {
+        "content": "Read the brief",
+        "status": "completed",
+        "active_form": "Reading the brief"
+       },
+       {
+        "content": "Outline the notes",
+        "status": "completed",
+        "active_form": "Outlining the notes"
+       },
+       {
+        "content": "Write notes.md",
+        "status": "completed",
+        "active_form": "Writing notes.md"
+       },
+       {
+        "content": "Check the workspace",
+        "status": "completed",
+        "active_form": "Checking the workspace"
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "system": "subagent in Grouper",
+   "last": "Plan updated: 4 of 4 done.",
+   "reply": [
+    {
+     "type": "text",
+     "text": "Done. Wrote notes.md in my workspace; all four plan steps are complete."
+    }
+   ]
+  },
+  {
    "system": "helpful personal assistant",
    "reply": [
     {
