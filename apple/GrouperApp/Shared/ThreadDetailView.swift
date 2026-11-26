@@ -25,6 +25,7 @@ struct ThreadDetailView: View {
     @State private var showStopConfirmation = false
     @State private var openCalls: Set<String> = []
     @State private var planExpanded = true
+    @FocusState private var composerFocused: Bool
 
     private var liveThread: ThreadInfo {
         model.threads.first { $0.id == thread.id } ?? thread
@@ -53,6 +54,7 @@ struct ThreadDetailView: View {
                 .padding()
             }
             .background(Theme.bg)
+            .dismissesKeyboardOnTap($composerFocused)
             .onChange(of: transcript.messages.count) { _, _ in
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end") }
             }
@@ -314,6 +316,7 @@ struct ThreadDetailView: View {
                                   prompt: Text("Message this thread").foregroundStyle(Theme.text3), axis: .vertical)
                             .lineLimit(1...4).textFieldStyle(.plain).font(Theme.Typeface.body).foregroundStyle(Theme.text)
                             .padding(.horizontal, 8).grouperMinimumControlSize()
+                            .focused($composerFocused)
                         HStack {
                             Button(role: .destructive) {
                                 if liveThread.status == "running" { showStopConfirmation = true } else { stop() }

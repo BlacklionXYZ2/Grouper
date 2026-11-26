@@ -418,3 +418,19 @@ struct ThreadsCard: View {
         return parts.map { "\($0.count) \($0.count == 1 ? $0.one : $0.many)" }.joined(separator: " · ")
     }
 }
+
+extension View {
+    /// The keyboard for a chat's composer (owner, 26 Nov): a tap on the transcript dismisses it,
+    /// but scrolling never does. The composer is multi-line, so Return adds a line instead of
+    /// closing the keyboard, and without this nothing else would. iOS only: on the Mac, clicking
+    /// the transcript (to select text) keeps the composer's focus as before.
+    func dismissesKeyboardOnTap(_ focus: FocusState<Bool>.Binding) -> some View {
+        #if os(iOS)
+        return self
+            .scrollDismissesKeyboard(.never)
+            .simultaneousGesture(TapGesture().onEnded { focus.wrappedValue = false })
+        #else
+        return self
+        #endif
+    }
+}

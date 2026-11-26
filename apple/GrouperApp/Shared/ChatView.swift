@@ -36,6 +36,7 @@ struct ChatView: View {
                 .frame(maxWidth: .infinity)
             }
             .background(Theme.bg)
+            .dismissesKeyboardOnTap($composerFocused)
             .onChange(of: model.transcript.count) { _, _ in withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end") } }
             // VERIFY ON MAC: Confirm safeAreaBar(edge: .bottom) scroll-edge blur and Reduce Transparency
             // with the GlassSurface composer card and its round send button on iOS 26 and macOS 26.
