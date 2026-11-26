@@ -131,6 +131,8 @@ impl Hub {
         let reason = [device_reason, req.hub_reason.clone().filter(|_| on_hub), offline, route.reason]
             .into_iter()
             .flatten()
+            // Fragments may end with a full stop; joined with "; " that reads "hub.; model".
+            .map(|r| r.trim_end().trim_end_matches('.').to_string())
             .collect::<Vec<_>>();
         let reason = (!reason.is_empty()).then(|| reason.join("; "));
         let brief = render_brief(&req);
