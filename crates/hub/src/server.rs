@@ -131,6 +131,10 @@ pub struct Hub {
     pub(crate) relayed_usage: std::sync::Mutex<HashMap<String, Vec<providers::Usage>>>,
     /// Model ids with an in-progress built-in probe suite.
     pub(crate) probe_runs: std::sync::Mutex<HashSet<String>>,
+    /// Calls (tool + input) the user denied, per conversation. The same call from any
+    /// thread of that conversation is refused without asking again until the user next
+    /// speaks in it, so a model can't get a denial re-asked by starting a new thread.
+    pub(crate) denied_calls: std::sync::Mutex<HashMap<String, HashSet<String>>>,
     handover_ack_timeout: std::sync::Mutex<Duration>,
     pub(crate) hub_threads: Mutex<HashMap<String, ThreadControl>>,
     pub(crate) orchestrators: Mutex<HashMap<String, mpsc::UnboundedSender<Wake>>>,
@@ -155,6 +159,7 @@ impl Hub {
             model_request_ids: Mutex::new(HashMap::new()),
             relayed_usage: std::sync::Mutex::new(HashMap::new()),
             probe_runs: std::sync::Mutex::new(HashSet::new()),
+            denied_calls: std::sync::Mutex::new(HashMap::new()),
             handover_ack_timeout: std::sync::Mutex::new(crate::offline::HANDOVER_ACK_TIMEOUT),
             hub_threads: Mutex::new(HashMap::new()),
             orchestrators: Mutex::new(HashMap::new()),
@@ -395,6 +400,7 @@ impl Hub {
         if let Some(model) = &requested {
             self.db.set_conversation_model(&id, Some(model))?;
         }
+        self.forget_denials(&id);
         self.emit(&id, None, EventBody::UserMessage { text: text.clone() });
         self.wake(&id, Wake::User(text)).await;
         Ok(id)
@@ -433,6 +439,14 @@ impl Hub {
         let Some(mut route) = self.approvals.lock().await.remove(approval_id) else { return false };
         if let Some(timer) = route.timer.take() {
             timer.abort();
+        }
+        if !approved {
+            self.denied_calls
+                .lock()
+                .unwrap()
+                .entry(route.conversation_id.clone())
+                .or_default()
+                .insert(crate::threads::denial_key(&route.tool, &route.input));
         }
         match route.local {
             Some(tx) => {
@@ -1822,6 +1836,126 @@ mod tests {
         assert!(fast_rx.try_recv().is_ok());
 
         drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_is_refused_in_other_threads_of_the_chat_until_the_user_speaks() {
+        let dir =
+            std::env::temp_dir().join(format!("grouper-denied-chat-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (worker, _) = db.add_device("Laptop", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let c1 = hub.db.create_conversation("project", "chat").unwrap();
+        let c2 = hub.db.create_conversation("project", "other").unwrap();
+        let t1 = hub
+            .db
+            .create_thread(&c1, "T1", &worker.id, "m", None, "b")
+            .unwrap();
+        let t2 = hub
+            .db
+            .create_thread(&c1, "T2", &worker.id, "m", None, "b")
+            .unwrap();
+        let t3 = hub
+            .db
+            .create_thread(&c2, "T3", &worker.id, "m", None, "b")
+            .unwrap();
+        let rm = json!({"command": "rm important.txt"});
+
+        // The user denies the call in T1.
+        let (tx, _rx) = oneshot::channel();
+        let a1 = format!("{}-1", t1.id);
+        assert!(
+            hub.request_approval(
+                &worker.id,
+                &t1.id,
+                &a1,
+                "run_shell",
+                rm.clone(),
+                "shell",
+                Some(tx)
+            )
+            .await
+        );
+        assert!(hub.resolve_approval(&a1, false).await);
+
+        // A new thread in the same chat asks for the same call: refused, the user isn't asked.
+        let (tx, rx) = oneshot::channel();
+        let a2 = format!("{}-1", t2.id);
+        assert!(
+            hub.request_approval(
+                &worker.id,
+                &t2.id,
+                &a2,
+                "run_shell",
+                rm.clone(),
+                "shell",
+                Some(tx)
+            )
+            .await
+        );
+        assert!(matches!(rx.await, Ok(ApprovalAnswer::Deny)));
+        assert!(hub.pending_approvals(None).await.is_empty());
+        // From a device (no local channel) it's refused too; the caller replies "denied".
+        assert!(
+            !hub.request_approval(
+                &worker.id,
+                &t2.id,
+                &format!("{}-2", t2.id),
+                "run_shell",
+                rm.clone(),
+                "shell",
+                None
+            )
+            .await
+        );
+
+        // A different call, or the same call in another chat, still asks.
+        let (tx, _rx) = oneshot::channel();
+        let other = json!({"command": "ls"});
+        assert!(
+            hub.request_approval(
+                &worker.id,
+                &t2.id,
+                &format!("{}-3", t2.id),
+                "run_shell",
+                other,
+                "shell",
+                Some(tx)
+            )
+            .await
+        );
+        let (tx, _rx) = oneshot::channel();
+        assert!(
+            hub.request_approval(
+                &worker.id,
+                &t3.id,
+                &format!("{}-1", t3.id),
+                "run_shell",
+                rm.clone(),
+                "shell",
+                Some(tx)
+            )
+            .await
+        );
+        assert_eq!(hub.pending_approvals(None).await.len(), 2);
+
+        // Once the user speaks in the chat, the call is asked again.
+        hub.forget_denials(&c1);
+        let (tx, _rx) = oneshot::channel();
+        assert!(
+            hub.request_approval(
+                &worker.id,
+                &t2.id,
+                &format!("{}-4", t2.id),
+                "run_shell",
+                rm,
+                "shell",
+                Some(tx)
+            )
+            .await
+        );
+        assert_eq!(hub.pending_approvals(Some(&c1)).await.len(), 2);
         std::fs::remove_dir_all(dir).ok();
     }
 

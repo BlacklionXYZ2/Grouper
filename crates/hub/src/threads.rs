@@ -12,6 +12,11 @@ use core_protocol::{
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+/// Identifies one call for remembering a user's denial: the tool and its exact input.
+pub(crate) fn denial_key(tool: &str, input: &Value) -> String {
+    format!("{tool}\0{input}")
+}
+
 use crate::offline::WAITING_DEVICE;
 use crate::orchestrator::Wake;
 use crate::server::{ApprovalAnswer, ApprovalRoute, HUB_DEVICE, Hub};
@@ -293,6 +298,21 @@ impl Hub {
         if approvals.contains_key(approval_id) {
             return false;
         }
+        // The user already denied this exact call in this conversation (perhaps to
+        // another thread): refuse it without asking again. A device gets the usual
+        // `ApprovalResult { approved: false }` from its caller when this returns false.
+        let key = denial_key(tool, &input);
+        if self.denied_calls.lock().unwrap().get(&t.conversation_id).is_some_and(|d| d.contains(&key)) {
+            drop(approvals);
+            tracing::info!(thread = thread_id, tool, "refused a call the user already denied in this conversation");
+            return match local {
+                Some(tx) => {
+                    let _ = tx.send(ApprovalAnswer::Deny);
+                    true
+                }
+                None => false,
+            };
+        }
         let requested_at = crate::db::now();
         let timeout_secs = self.db.limits().approval_timeout_secs;
         approvals.insert(
@@ -453,9 +473,16 @@ impl Hub {
         self.send_thread_input(&t, "orchestrator", text).await
     }
 
+    /// Forget the calls the user denied in a conversation: they have spoken since, and
+    /// may have changed their mind. Their next approval request decides.
+    pub(crate) fn forget_denials(&self, conversation_id: &str) {
+        self.denied_calls.lock().unwrap().remove(conversation_id);
+    }
+
     /// The user stepping into a thread. The orchestrator is told.
     pub async fn user_thread_message(self: &Arc<Self>, thread_id: &str, text: &str) -> Result<(), String> {
         let t = self.db.thread(thread_id).ok_or("no such thread")?;
+        self.forget_denials(&t.conversation_id);
         self.send_thread_input(&t, "user", text).await?;
         self.wake(&t.conversation_id, Wake::UserStepIn { thread_id: t.id, title: t.title, text: text.into() }).await;
         Ok(())
