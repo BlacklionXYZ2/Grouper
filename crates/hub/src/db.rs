@@ -189,7 +189,7 @@ fn migrate_provider_secrets(conn: &mut Connection, secrets: &Secrets) -> Result<
 fn has_sealed_provider_keys(conn: &Connection) -> Result<bool> {
     Ok(conn
         .prepare(
-            "SELECT 1 FROM providers WHERE api_key LIKE 'enc:v1:%'              UNION ALL SELECT 1 FROM hub_meta WHERE value LIKE 'enc:v1:%' LIMIT 1",
+            "SELECT 1 FROM providers WHERE api_key LIKE 'enc:v1:%' UNION ALL SELECT 1 FROM hub_meta WHERE value LIKE 'enc:v1:%' LIMIT 1",
         )?
         .exists([])?)
 }
