@@ -213,7 +213,9 @@ export function openModelPicker({ role, current = '', opener = null }) {
               'div',
               { class: 'mp-opt-line' },
               h('span', { class: 'mp-opt-id' }, m.id),
-              m.free ? h('span', { class: 'badge accent' }, 'Free') : h('span', { class: 'badge muted' }, 'Paid'),
+              m.free
+                ? h('span', { class: 'badge accent' }, 'Free')
+                : h('span', { class: 'badge muted' }, known ? 'Paid' : 'No price set'),
               m.local ? h('span', { class: 'badge' }, 'Local') : null,
               m.roles.includes(role) ? h('span', { class: 'badge' }, 'Role default') : null,
             ),

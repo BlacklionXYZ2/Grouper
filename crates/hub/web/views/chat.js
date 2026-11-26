@@ -98,7 +98,9 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
 
   // ---- bar, chat menu, strip, approval banner
 
-  const threadsLabel = h('span', { class: 'threads-label' }, 'Threads 0');
+  // On a phone the word hides and the count stays; the button keeps its full name.
+  const threadsCount = h('span', { class: 'threads-count' }, '0');
+  const threadsLabel = h('span', { class: 'threads-label' }, h('span', { class: 'threads-word' }, 'Threads '), threadsCount);
   const threadsNeed = h('span', { class: 'visually-hidden' });
   const threadsDot = h('span', { class: 'threads-dot', 'aria-hidden': 'true', hidden: true });
   const threadsBtn = isNew
@@ -303,7 +305,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     const approvals = approvalsIn(cid);
     const claimed = new Set(approvals.map((a) => a.thread_id));
     const need = approvals.length + threads.filter((t) => t.status === 'waiting_device' && !claimed.has(t.id)).length;
-    setText(threadsLabel, `Threads ${threads.length}`);
+    setText(threadsCount, String(threads.length));
     setText(threadsNeed, need === 0 ? '' : need === 1 ? ', 1 needs you' : `, ${need} need you`);
     threadsDot.hidden = need === 0;
   }

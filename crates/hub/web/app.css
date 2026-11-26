@@ -1654,6 +1654,18 @@ code,
   white-space: nowrap;
 }
 
+/* Phones: icon and count only, so the chat title has room. */
+@media (max-width: 760px) {
+  .threads-word {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+}
+
 .threads-dot {
   width: 8px;
   height: 8px;
