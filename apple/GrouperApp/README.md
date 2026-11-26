@@ -6,9 +6,51 @@ device node. Tokens are stored in the Keychain as `grouper.admin` and
 `grouper.device` (with the device's id in `grouper.device.id`); they are never written
 to defaults or logs.
 
+## Sign in with Google
+
+`docs/accounts-design.md` has the design. The sign-in screen asks for the hub address,
+then checks `GET /v1/auth/status`. When the hub has Google sign-in on and the app has a
+client ID, it shows **Sign in with Google**, with the admin-token field under **Use a token
+instead**. An unclaimed hub first asks for its setup code (`XXXX-XXXX-XXXX`, from the hub's
+log or `grouper-hub setup-code`). The app gets a nonce from the hub
+(`POST /v1/auth/google/nonce`) and opens Google in `ASWebAuthenticationSession`, using an
+authorization code with PKCE (S256) and no client secret. It exchanges the code at Google's
+token endpoint for an ID token, then sends that to `POST /v1/auth/google` with `client`
+`ios` or `macos` and the device name "Grouper on <device name>". The hub answers with an
+admin token for this install. The app keeps it in the Keychain as `grouper.admin`, the
+same as a pasted token, and connects the same way. On the Mac, connecting also registers
+the Mac's node device. Settings > Account shows the linked Google account with **Unlink**,
+or offers **Link your Google account** on a hub that has a token owner but no Google account.
+
+The URL building, PKCE, callback checks, token exchange and hub calls live in
+`GrouperAPI` (`GoogleOAuth`, `HubClient.signInWithGoogle` and related calls) and have unit
+tests. The browser step is `Shared/GoogleWebSignIn.swift`.
+
+### Client IDs and URL schemes
+
+Each app has its own Google OAuth client ID. Both are Google's **iOS** client type: one for
+bundle ID `uk.clockmillbarn.grouper.ios` and one for `uk.clockmillbarn.grouper.macos`. Client
+IDs are public identifiers, not secrets. They aren't set yet (`TODO(owner)`), so for now the
+Google button stays hidden. To set them, edit each app's Info.plist (`iOS/Info.plist`,
+`macOS/Info.plist`):
+
+1. `GrouperGoogleClientID`: the full client ID, e.g.
+   `1234-abcd.apps.googleusercontent.com`. If it's empty or isn't a Google client ID, the
+   app hides Google sign-in.
+2. Under `CFBundleURLTypes`, the entry named `uk.clockmillbarn.grouper.google`: replace the
+   placeholder scheme `com.googleusercontent.apps.REPLACE-WITH-…` with the reversed client
+   ID, e.g. `com.googleusercontent.apps.1234-abcd`. Google sends the sign-in back to
+   `<that scheme>:/oauth2redirect`, and the app derives the same scheme from the client ID.
+
+The hub must also trust both client IDs: they are its defaults once they're filled in
+`crates/hub/src/google_auth.rs`, or set them with `GROUPER_GOOGLE_CLIENT_IDS`.
+
+The "G" on the button is drawn in SwiftUI (`GoogleGMark`). Swap it for Google's official
+asset from their branding guidelines once the app has an asset catalogue.
+
 ## This Mac as a device
 
-Sign-in asks only for the hub URL and an admin token. The admin token powers the
+Sign-in gets an admin token, either pasted or from Google sign-in. The admin token powers the
 window; the local node never gets it. On Connect, and at launch with saved
 credentials, the Mac checks its saved device token. With none (or one the hub rejects
 with 401) it registers itself through `POST /v1/devices` under the Mac's computer

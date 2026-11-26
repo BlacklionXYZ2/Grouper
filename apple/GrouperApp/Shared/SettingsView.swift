@@ -1,3 +1,4 @@
+import GrouperAPI
 import SwiftUI
 
 struct SettingsView: View {
@@ -14,6 +15,7 @@ struct SettingsView: View {
                 LabeledContent("Status", value: model.online ? "Connected" : "Offline")
                 Button("Check now") { Task { await model.connect(save: false) } }
             }
+            AccountSettingsSection()
             #if os(macOS)
             Section("This Mac") {
                 if model.registeringDevice {
@@ -72,6 +74,58 @@ struct SettingsView: View {
         .formStyle(.grouped)
         #endif
         .navigationTitle("Settings")
+    }
+}
+
+/// Settings > Account (docs/accounts-design.md): the Google account that owns the hub, with
+/// Unlink, or "Link your Google account" so the owner can sign in with Google instead of a token.
+struct AccountSettingsSection: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var confirmUnlink = false
+
+    var body: some View {
+        Section("Account") {
+            if let account = model.linkedGoogle {
+                LabeledContent("Google account") {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(account.email).textSelection(.enabled)
+                        if !account.name.isEmpty {
+                            Text(account.name).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Button(model.googleBusy ? "Unlinking…" : "Unlink", role: .destructive) { confirmUnlink = true }
+                    .disabled(model.googleBusy)
+                    .confirmationDialog("Unlink \(account.email)?", isPresented: $confirmUnlink, titleVisibility: .visible) {
+                        Button("Unlink", role: .destructive) { Task { await model.unlinkGoogle() } }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("Signing in to this hub with Google stops working until you link an account again. Tokens and devices keep working.")
+                    }
+            } else if model.client == nil {
+                Text("Sign in to see the Google account linked to the hub.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else if !model.googleLinkLoaded {
+                HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Checking the linked account…") }
+            } else if GoogleSignIn.oauth == nil {
+                Text("This app has no Google client ID, so Google sign-in is off.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else if model.authStatus?.google != true {
+                Text("Google sign-in isn't turned on for this hub.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else {
+                Button(model.googleBusy ? "Linking…" : "Link your Google account") {
+                    Task { await model.linkGoogle() }
+                }
+                .disabled(model.googleBusy || model.client == nil)
+                Text("Then you can sign in to this hub with Google instead of pasting a token.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let message = model.accountMessage {
+                Text(message).font(.caption).foregroundStyle(.red)
+            }
+        }
+        .task(id: model.signedIn) { await model.refreshGoogleLink() }
     }
 }
 

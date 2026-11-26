@@ -10,6 +10,17 @@
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
+    <!-- Google sign-in returns here: the reversed GrouperGoogleClientID, e.g.
+         com.googleusercontent.apps.1234-abcd for 1234-abcd.apps.googleusercontent.com.
+         TODO(owner): replace the placeholder when the Mac client ID is set. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict><key>CFBundleURLName</key><string>uk.clockmillbarn.grouper.google</string><key>CFBundleURLSchemes</key><array><string>com.googleusercontent.apps.REPLACE-WITH-MAC-CLIENT-ID-PREFIX</string></array></dict>
+    </array>
+    <!-- Grouper's Google OAuth client ID for the Mac app (an "iOS" client for bundle ID
+         uk.clockmillbarn.grouper.macos). A public identifier, not a secret. Empty hides
+         "Sign in with Google". TODO(owner): Grouper's Mac client ID. -->
+    <key>GrouperGoogleClientID</key><string></string>
     <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
     <key>LSMinimumSystemVersion</key><string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 </dict>
