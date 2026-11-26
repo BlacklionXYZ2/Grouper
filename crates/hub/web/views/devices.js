@@ -42,6 +42,19 @@ function renderList(container) {
     ),
   );
   let error = null;
+  // The Google account every device here belongs to (admin sessions can read it).
+  let owner = null;
+  const aborter = new AbortController();
+  if (isAdmin()) {
+    get('/v1/auth/google/link', { signal: aborter.signal })
+      .then((res) => {
+        owner = res?.owner || null;
+        if (owner) render();
+      })
+      .catch(() => {
+        /* no owner line; the list still works */
+      });
+  }
 
   function render() {
     if (error && !store.devices.length) {
@@ -56,9 +69,10 @@ function renderList(container) {
     const others = devices.filter((d) => d.id !== 'hub');
     setChildren(
       body,
+      owner?.email ? h('p', { class: 'devices-owner' }, icon('shield'), h('span', null, 'Linked to ', h('strong', null, owner.email))) : null,
       !store.online && store.everOnline ? h('div', { class: 'banner warn' }, icon('offline'), `Offline. This list is from ${ago(store.devicesAt / 1000)}.`) : null,
       !others.length
-        ? h('div', { class: 'banner info' }, icon('devices'), h('div', { class: 'grow' }, 'No devices yet. On a computer, run ', h('code', null, 'grouper connect'), ' with a device token so threads can run there.'))
+        ? h('div', { class: 'banner info' }, icon('devices'), h('div', { class: 'grow' }, 'No devices yet. On a computer, run ', h('code', null, 'grouper login'), ' and then ', h('code', null, 'grouper connect'), ' so threads can run there.'))
         : null,
       h(
         'div',
@@ -91,7 +105,10 @@ function renderList(container) {
   const offs = [on('devices', render), on('online', render)];
   render();
   refresh();
-  return () => offs.forEach((off) => off());
+  return () => {
+    offs.forEach((off) => off());
+    aborter.abort();
+  };
 }
 
 /** Tools whose Bypass hands a model a whole shell or another agent: type the name to confirm. */

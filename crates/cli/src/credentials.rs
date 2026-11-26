@@ -12,6 +12,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 const FILE_NAME: &str = "credentials.json";
 pub const THREAD_SHELL_ENV: &str = "GROUPER_THREAD_SHELL";
+/// Overrides where the credentials file is (default `<config dir>/grouper/credentials.json`).
+const PATH_ENV: &str = "GROUPER_CREDENTIALS_FILE";
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "dev.grouper.cli";
 #[cfg(target_os = "macos")]
@@ -22,10 +24,62 @@ pub struct Credentials {
     pub token: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+/// `<config dir>/grouper/credentials.json`. The token is DPAPI-protected on Windows, in the
+/// Keychain on macOS, and plain in an owner-only (0600) file elsewhere. `install_id` is this CLI
+/// install's random id: the hub reuses its device when it signs in again. Logging out keeps it.
+#[derive(Default, Deserialize, Serialize)]
 struct StoredCredentials {
-    hub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_id: Option<String>,
+}
+
+/// A fresh install id: 32 random hex characters.
+fn new_install_id() -> String {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).expect("system randomness");
+    hex::encode(buf)
+}
+
+fn read_stored() -> Result<Option<StoredCredentials>> {
+    let path = credentials_path()?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading saved credentials from {}", path.display()));
+        }
+    };
+    let stored = serde_json::from_str(&text).with_context(|| format!("parsing saved credentials from {}", path.display()))?;
+    Ok(Some(stored))
+}
+
+/// This install's id, made and saved on first use.
+pub fn install_id() -> Result<String> {
+    if std::env::var_os(THREAD_SHELL_ENV).is_some() {
+        bail!("signing in isn't available inside a Grouper thread shell");
+    }
+    let mut stored = read_stored()?.unwrap_or_default();
+    if let Some(id) = stored.install_id.as_deref().filter(|id| valid_install_id(id)) {
+        return Ok(id.to_string());
+    }
+    let id = new_install_id();
+    stored.install_id = Some(id.clone());
+    write_stored(&stored)?;
+    Ok(id)
+}
+
+/// The hub's rule for install ids: 16 to 64 characters of `[A-Za-z0-9_-]`.
+fn valid_install_id(id: &str) -> bool {
+    (16..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Where the credentials file is (for messages).
+pub fn path() -> Result<PathBuf> {
+    credentials_path()
 }
 
 pub fn normalize_hub(url: &str) -> String {
@@ -98,41 +152,34 @@ pub fn load(with_token: bool) -> Result<Option<Credentials>> {
     if std::env::var_os(THREAD_SHELL_ENV).is_some() {
         bail!("stored credentials are not available inside a Grouper thread shell");
     }
-    let path = credentials_path()?;
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading saved credentials from {}", path.display()));
-        }
-    };
-    let stored: StoredCredentials = serde_json::from_str(&text)
-        .with_context(|| format!("parsing saved credentials from {}", path.display()))?;
+    let Some(stored) = read_stored()? else { return Ok(None) };
+    let Some(hub) = stored.hub.clone() else { return Ok(None) };
     let token = if with_token {
         Some(load_token(&stored)?.context("saved credentials do not contain a device token")?)
     } else {
         None
     };
-    Ok(Some(Credentials {
-        hub: stored.hub,
-        token,
-    }))
+    Ok(Some(Credentials { hub, token }))
 }
 
-pub fn save(hub: &str, token: &str) -> Result<()> {
+/// Save the hub and token from `grouper login`, keeping this install's id.
+pub fn save(hub: &str, token: &str, install_id: &str) -> Result<()> {
+    let stored = StoredCredentials {
+        hub: Some(hub.to_string()),
+        token: save_token(token)?,
+        install_id: Some(install_id.to_string()),
+    };
+    write_stored(&stored)
+}
+
+fn write_stored(stored: &StoredCredentials) -> Result<()> {
     let path = credentials_path()?;
     let parent = path
         .parent()
         .context("credentials path has no parent directory")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating config directory {}", parent.display()))?;
-
-    let stored = StoredCredentials {
-        hub: hub.to_string(),
-        token: save_token(token)?,
-    };
-    let contents = serde_json::to_vec_pretty(&stored)?;
+    let contents = serde_json::to_vec_pretty(stored)?;
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -158,19 +205,34 @@ pub fn save(hub: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn remove() -> Result<()> {
+/// Forget the hub and token. The install id stays, so signing in again reuses this device.
+/// Returns the hub it was signed in to, if any.
+pub fn remove() -> Result<Option<String>> {
     remove_token()?;
-    let path = credentials_path()?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("removing credentials file {}", path.display()))
+    // An unreadable file is removed outright.
+    let stored = read_stored().unwrap_or_default();
+    let hub = stored.as_ref().and_then(|s| s.hub.clone());
+    match stored.and_then(|s| s.install_id) {
+        Some(install_id) => write_stored(&StoredCredentials { install_id: Some(install_id), ..Default::default() })?,
+        None => {
+            let path = credentials_path()?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("removing credentials file {}", path.display()));
+                }
+            }
         }
     }
+    Ok(hub)
 }
 
 fn credentials_path() -> Result<PathBuf> {
+    // For tests and second profiles: keep these credentials somewhere else.
+    if let Some(path) = std::env::var_os(PATH_ENV).filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
     let config = dirs::config_dir()
         .context("the operating system did not provide a user config directory")?;
     Ok(config.join("grouper").join(FILE_NAME))

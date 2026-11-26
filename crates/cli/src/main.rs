@@ -27,7 +27,7 @@ struct Cli {
     /// Hub base URL, e.g. https://hub.example.com
     #[arg(long, env = "GROUPER_HUB", global = true)]
     hub: Option<String>,
-    /// This device's token from `grouper-hub device add`.
+    /// A device token, instead of the one `grouper login` saved (for automation and recovery).
     #[arg(long, env = "GROUPER_TOKEN", global = true, hide_env_values = true)]
     token: Option<String>,
     /// Local cache for `grouper sync` and for reading offline. Default: <local data dir>/grouper/cache.db.
@@ -39,9 +39,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Save this device's hub URL and token securely for future commands.
-    Login,
-    /// Remove this device's saved hub URL and token.
+    /// Sign this computer in: shows a code and a link to approve it in a browser where you're
+    /// signed in to Grouper (with Google), then saves the hub URL and this device's own token.
+    /// Signing in again from the same computer reuses its device.
+    Login {
+        /// The name this computer shows in Devices (default: its hostname).
+        #[arg(long)]
+        name: Option<String>,
+        /// Don't try to open the link in a browser; just print it.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Forget the saved hub URL and token on this computer (it stays listed in Devices until you revoke it).
     Logout,
     /// Connect this machine as a device: stay online and run threads the orchestrator starts here.
     Connect {
@@ -740,19 +749,131 @@ fn read_key() -> Result<String> {
     Ok(k.trim().to_string())
 }
 
-fn read_device_token() -> Result<String> {
-    let token = if std::io::stdin().is_terminal() {
-        rpassword::prompt_password("Device token: ")?
-    } else {
-        let mut token = String::new();
-        std::io::stdin().read_line(&mut token)?;
-        token
-    };
-    let token = token.trim().to_string();
-    if token.is_empty() {
-        bail!("device token is empty");
+/// A hub's JSON answer, or its `{"error": ...}` as an error.
+async fn hub_json(r: reqwest::Response) -> Result<Value> {
+    let status = r.status();
+    let body: Value = r.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        let msg = body["error"].as_str().map(String::from).unwrap_or_else(|| status.to_string());
+        bail!("{msg}");
     }
-    Ok(token)
+    Ok(body)
+}
+
+/// Open an http(s) URL in the default browser. Whether it could be started.
+fn open_browser(url: &str) -> bool {
+    use std::process::{Command, Stdio};
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok()
+}
+
+/// `grouper login`: the device link flow (docs/accounts-design.md). Prints a code and a link, waits
+/// for the owner to approve it in a browser, then saves the hub, this device's token and the install
+/// id. The token is never printed.
+async fn login(cli_hub: Option<&str>, name: Option<&str>, no_browser: bool) -> Result<()> {
+    let hub = match cli_hub.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => h.trim_end_matches('/').to_string(),
+        None => credentials::load(false)?
+            .map(|c| c.hub)
+            .context("which hub? run `grouper login --hub <url>` (or set GROUPER_HUB)")?,
+    };
+    let parsed = reqwest::Url::parse(&hub).context("--hub must be a URL such as https://hub.example.com")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("--hub must be an http:// or https:// URL");
+    }
+    let install_id = credentials::install_id()?;
+    let name = name.map(str::trim).filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| {
+        let host = hostname();
+        if host.is_empty() { "Grouper CLI".into() } else { host }
+    });
+    let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+
+    let start = http
+        .post(format!("{hub}/v1/auth/link/start"))
+        .json(&json!({"name": name, "platform": std::env::consts::OS, "install_id": install_id}))
+        .send()
+        .await
+        .with_context(|| format!("couldn't reach the hub at {hub}"))?;
+    let start = hub_json(start).await.context("the hub refused to start signing in")?;
+    let code = start["code"].as_str().context("the hub sent no code")?.to_string();
+    let poll_secret = start["poll_secret"].as_str().context("the hub sent no poll secret")?.to_string();
+    let expires_in = start["expires_in"].as_u64().unwrap_or(600);
+    let mut wait = start["interval"].as_u64().unwrap_or(3).clamp(1, 30);
+    // Only an http(s) link from this hub is shown or opened.
+    let verify_url = match start["verify_url"].as_str() {
+        Some(u) if u.starts_with('/') => format!("{hub}{u}"),
+        Some(u) if reqwest::Url::parse(u).is_ok_and(|p| matches!(p.scheme(), "http" | "https")) => u.to_string(),
+        _ => format!("{hub}/#/link?code={code}"),
+    };
+
+    println!("To sign this computer in to {hub}, open this link in a browser where you're signed in to Grouper:");
+    println!();
+    println!("    {verify_url}");
+    println!();
+    println!("Check that the page shows the code {code} and \"{name}\", then approve it.");
+    if !no_browser && open_browser(&verify_url) {
+        println!("(Opened it in your browser.)");
+    }
+    println!("Waiting for approval… (Ctrl-C to cancel)");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in + 5);
+    let mut warned = false;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+            _ = tokio::signal::ctrl_c() => bail!("cancelled; nothing was saved"),
+        }
+        if std::time::Instant::now() > deadline {
+            bail!("the code expired before it was approved; run `grouper login` again");
+        }
+        let r = match http.post(format!("{hub}/v1/auth/link/poll")).json(&json!({"poll_secret": poll_secret})).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if !warned {
+                    eprintln!("(can't reach the hub right now, still trying: {e})");
+                    warned = true;
+                }
+                continue;
+            }
+        };
+        if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            wait = (wait + 1).min(30);
+            continue;
+        }
+        let body = hub_json(r).await.context("checking the sign-in failed")?;
+        match body["status"].as_str() {
+            Some("pending") => continue,
+            Some("denied") => bail!("the sign-in was denied in the browser; nothing was saved"),
+            Some("expired") => bail!("the code expired before it was approved; run `grouper login` again"),
+            Some("approved") => {
+                let token = body["token"].as_str().context("the hub approved the sign-in but sent no token")?;
+                credentials::save(&hub, token, &install_id)?;
+                let device = body["device"]["name"].as_str().unwrap_or(&name);
+                println!("Signed in to {hub} as \"{device}\".");
+                println!("Saved in {}. Run `grouper connect` to put this computer online.", credentials::path()?.display());
+                return Ok(());
+            }
+            other => bail!("the hub answered with an unknown status {other:?}"),
+        }
+    }
 }
 
 #[tokio::main]
@@ -762,16 +883,12 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Login => {
-            let hub = cli.hub.as_deref().context("login requires --hub <url>")?.trim_end_matches('/');
-            let token = read_device_token()?;
-            credentials::save(hub, &token)?;
-            println!("saved credentials for {hub}");
-            return Ok(());
-        }
+        Cmd::Login { name, no_browser } => return login(cli.hub.as_deref(), name.as_deref(), *no_browser).await,
         Cmd::Logout => {
-            credentials::remove()?;
-            println!("removed saved credentials");
+            match credentials::remove()? {
+                Some(hub) => println!("Signed out of {hub} on this computer."),
+                None => println!("Not signed in."),
+            }
             return Ok(());
         }
         _ => {}
@@ -782,7 +899,7 @@ async fn main() -> Result<()> {
     let api = Api { base: hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
 
     match cli.cmd {
-        Cmd::Login | Cmd::Logout => unreachable!(),
+        Cmd::Login { .. } | Cmd::Logout => unreachable!(),
         Cmd::Connect { workspace, no_shell, mcp_config, folders, folders_config, usage_probes } => {
             let workspace = workspace.unwrap_or_else(|| {
                 dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Grouper").join("workspaces")

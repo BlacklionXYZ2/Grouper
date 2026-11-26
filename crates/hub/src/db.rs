@@ -55,6 +55,46 @@ pub struct Device {
     pub admin: bool,
 }
 
+/// The app or CLI install a device belongs to: its random `install_id` and the kind of client
+/// that registered it (`ios`, `macos` or `cli` for Google sign-in; `node` for a plain device).
+#[derive(Clone, Copy, Debug)]
+pub struct Install<'a> {
+    pub id: &'a str,
+    pub kind: &'a str,
+}
+
+/// Kinds of [`Install`]: plain (non-admin) devices from `POST /v1/devices` and the device link flow.
+pub const NODE_INSTALL: &str = "node";
+
+/// An `install_id` as clients send it: 16 to 64 characters of `[A-Za-z0-9_-]`.
+pub fn valid_install_id(id: &str) -> bool {
+    (16..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A new device would pass the hub's device limit.
+#[derive(Debug)]
+pub struct DeviceCapReached(pub usize);
+
+impl std::fmt::Display for DeviceCapReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "this hub already has {} devices; revoke one first", self.0)
+    }
+}
+
+impl std::error::Error for DeviceCapReached {}
+
+/// What [`Db::issue_device`] did.
+#[derive(Debug)]
+pub struct IssuedDevice {
+    pub device: Device,
+    /// Shown once; only its hash is kept.
+    pub token: String,
+    /// An existing device of the same install got this token (its old one is revoked).
+    pub reused: bool,
+    /// Hashes of the browser sessions that ended with the old token.
+    pub ended_sessions: Vec<String>,
+}
+
 /// Who a valid token belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Auth {
@@ -228,6 +268,11 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
     ensure_column(&conn, "devices", "folders", "ALTER TABLE devices ADD COLUMN folders TEXT NOT NULL DEFAULT '[]'")?;
+    // Which app or CLI install a device belongs to, so signing in again from it reuses the device.
+    ensure_column(&conn, "devices", "install_id", "ALTER TABLE devices ADD COLUMN install_id TEXT")?;
+    ensure_column(&conn, "devices", "install_kind", "ALTER TABLE devices ADD COLUMN install_kind TEXT")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS devices_install ON devices (install_id);")?;
+    conn.execute_batch(crate::link::SCHEMA)?;
     ensure_column(&conn, "push_subscriptions", "session_id", "ALTER TABLE push_subscriptions ADD COLUMN session_id TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS push_subscriptions_session ON push_subscriptions (session_id);")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
@@ -354,6 +399,23 @@ impl Db {
     // ---- devices
 
     pub fn add_device(&self, name: &str, platform: &str, admin: bool) -> Result<(Device, String)> {
+        let issued = self.issue_device(name, platform, admin, None, None)?;
+        Ok((issued.device, issued.token))
+    }
+
+    /// A token for a new device, or, when `install` names a live device of the same install and
+    /// kind (and admin flag), a fresh token for that device: its old token stops working and its
+    /// browser sessions and push subscriptions go, as when it is revoked. `max_live` caps how many
+    /// live devices a new one may join (a reused device doesn't count). The caller closes the old
+    /// connection and tells live sockets ([`crate::server::Hub::issue_device`]).
+    pub fn issue_device(
+        &self,
+        name: &str,
+        platform: &str,
+        admin: bool,
+        install: Option<Install<'_>>,
+        max_live: Option<usize>,
+    ) -> Result<IssuedDevice> {
         let name = name.trim();
         if name.is_empty() {
             bail!("device name is empty");
@@ -361,17 +423,87 @@ impl Db {
         if name.eq_ignore_ascii_case("hub") {
             bail!("\"hub\" is reserved for the hub itself");
         }
-        let id = random_hex(6);
+        if let Some(i) = &install
+            && !valid_install_id(i.id)
+        {
+            bail!("install_id must be 16 to 64 characters of letters, digits, - and _");
+        }
         let secret = random_hex(32);
         let platform = platform.trim().to_lowercase();
-        self.c().execute(
-            "INSERT INTO devices (id, name, platform, secret_hash, created, admin) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, name, platform, hash(&secret), ts(), admin],
-        )?;
-        Ok((
-            Device { id: id.clone(), name: name.into(), platform, revoked: false, last_seen: None, admin },
-            format!("{id}.{secret}"),
-        ))
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let existing: Option<String> = match &install {
+            Some(i) => tx
+                .query_row(
+                    "SELECT id FROM devices WHERE install_id = ?1 AND install_kind = ?2 AND admin = ?3 AND revoked = 0
+                     ORDER BY created DESC LIMIT 1",
+                    params![i.id, i.kind, admin],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        let (id, ended_sessions) = match existing {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE devices SET secret_hash = ?1, name = ?2, platform = ?3 WHERE id = ?4",
+                    params![hash(&secret), name, platform, id],
+                )?;
+                let sessions = {
+                    let mut st = tx.prepare("SELECT id_hash FROM sessions WHERE device_id = ?1")?;
+                    st.query_map([&id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                tx.execute("DELETE FROM sessions WHERE device_id = ?1", [&id])?;
+                tx.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [&id])?;
+                (id, Some(sessions))
+            }
+            None => {
+                if let Some(max) = max_live {
+                    let live: i64 = tx.query_row("SELECT COUNT(*) FROM devices WHERE revoked = 0", [], |r| r.get(0))?;
+                    if live as usize >= max {
+                        return Err(DeviceCapReached(max).into());
+                    }
+                }
+                let id = random_hex(6);
+                tx.execute(
+                    "INSERT INTO devices (id, name, platform, secret_hash, created, admin, install_id, install_kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![id, name, platform, hash(&secret), ts(), admin, install.map(|i| i.id), install.map(|i| i.kind)],
+                )?;
+                (id, None)
+            }
+        };
+        tx.commit()?;
+        Ok(IssuedDevice {
+            token: format!("{id}.{secret}"),
+            device: Device { id, name: name.into(), platform, revoked: false, last_seen: None, admin },
+            reused: ended_sessions.is_some(),
+            ended_sessions: ended_sessions.unwrap_or_default(),
+        })
+    }
+
+    /// The name of the live device an install would reuse, if any (see [`Db::issue_device`]).
+    pub fn install_device_name(&self, install: Install<'_>, admin: bool) -> Option<String> {
+        self.c()
+            .query_row(
+                "SELECT name FROM devices WHERE install_id = ?1 AND install_kind = ?2 AND admin = ?3 AND revoked = 0
+                 ORDER BY created DESC LIMIT 1",
+                params![install.id, install.kind, admin],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Encrypt a short secret with the master key (as provider keys are).
+    pub(crate) fn seal(&self, plaintext: &str) -> Result<String> {
+        self.secrets.seal(plaintext)
+    }
+
+    /// Decrypt what [`Db::seal`] made.
+    pub(crate) fn unseal(&self, sealed: &str) -> Result<String> {
+        self.secrets.open(sealed)
     }
 
     /// Grant or remove admin rights for a device's token.

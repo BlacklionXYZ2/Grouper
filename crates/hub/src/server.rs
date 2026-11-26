@@ -153,6 +153,8 @@ pub struct Hub {
     pub(crate) google: crate::google_auth::GoogleAuth,
     /// Web Push notifications for approvals ([`crate::push`]).
     pub(crate) push: crate::push::PushState,
+    /// Device link rate limits ([`crate::link`]).
+    pub(crate) link: crate::link::LinkState,
 }
 
 impl Hub {
@@ -180,7 +182,33 @@ impl Hub {
             limits: Default::default(),
             google: crate::google_auth::GoogleAuth::from_env(),
             push: crate::push::PushState::new(hub.clone(), initial_push_subs),
+            link: Default::default(),
         })
+    }
+
+    /// [`Db::issue_device`], then the live side of a reused device: its old token's browser sessions
+    /// and node connection close as on revocation, and clients see the presence change.
+    pub(crate) async fn issue_device(
+        &self,
+        name: &str,
+        platform: &str,
+        admin: bool,
+        install: Option<crate::db::Install<'_>>,
+        max_live: Option<usize>,
+    ) -> anyhow::Result<crate::db::IssuedDevice> {
+        let issued = self.db.issue_device(name, platform, admin, install, max_live)?;
+        if issued.reused {
+            for session in &issued.ended_sessions {
+                self.invalidate_session(session);
+            }
+            self.sync_push_sub_count();
+            if let Some(live) = self.live.lock().await.get(&issued.device.id) {
+                live.close.trigger(CloseReason::Revoked);
+            }
+            tracing::info!(device = %issued.device.id, "same install signed in again: new token, the old one is revoked");
+        }
+        self.broadcast_presence(&issued.device.id).await;
+        Ok(issued)
     }
 
     /// A globally unique approval id that never collides across hub restarts.
@@ -555,6 +583,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::files::routes())
         .merge(crate::session::routes())
         .merge(crate::google_auth::routes())
+        .merge(crate::link::routes())
         .merge(crate::push::routes())
         .merge(crate::web::routes())
         .with_state(hub)
@@ -603,34 +632,68 @@ struct NewDevice {
     name: String,
     #[serde(default)]
     platform: Option<String>,
+    #[serde(default)]
+    install_id: Option<String>,
+}
+
+/// A device name as clients send it: 1 to 64 characters, no control characters.
+pub(crate) fn check_device_name(name: &str) -> Result<&str, &'static str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err("name must be 1 to 64 characters, without control characters");
+    }
+    Ok(name)
+}
+
+/// A platform as clients send it: one short word (`unknown` when left out).
+pub(crate) fn check_platform(platform: Option<&str>) -> Result<&str, &'static str> {
+    let platform = platform.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("unknown");
+    if platform.len() > 32 || !platform.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("platform must be one short word, such as macos, windows, linux or ios");
+    }
+    Ok(platform)
+}
+
+/// An optional `install_id` as clients send it (absent or null is none; anything else must be valid).
+pub(crate) fn check_install_id(install_id: Option<&str>) -> Result<Option<&str>, &'static str> {
+    match install_id {
+        None => Ok(None),
+        Some(id) if crate::db::valid_install_id(id) => Ok(Some(id)),
+        Some(_) => Err("install_id must be 16 to 64 characters of letters, digits, - and _"),
+    }
+}
+
+/// How a failed [`Hub::issue_device`] is answered.
+pub(crate) fn issue_error(e: anyhow::Error) -> Response {
+    if e.downcast_ref::<crate::db::DeviceCapReached>().is_some() {
+        return err(StatusCode::CONFLICT, e);
+    }
+    err(StatusCode::BAD_REQUEST, e)
 }
 
 /// `POST /v1/devices` (admin): register a plain device and return its token, which is shown only
 /// here. The Mac app calls it so the owner never pastes a device token. Admin tokens are made only
 /// on the hub's CLI. The body is read after the admin check, so a device token always gets 403.
+/// With an `install_id` that a live plain device already has, that device gets a fresh token (the
+/// old one is revoked) instead of a new device being made.
 async fn register_device(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     let caller = admin!(hub, headers).device_id;
     let Ok(req) = serde_json::from_slice::<NewDevice>(&body) else {
         return err(StatusCode::BAD_REQUEST, r#"body must be {"name": "...", "platform": "macos"}"#);
     };
-    let name = req.name.trim();
-    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
-        return err(StatusCode::BAD_REQUEST, "name must be 1 to 64 characters, without control characters");
-    }
-    let platform = req.platform.as_deref().map(str::trim).filter(|p| !p.is_empty()).unwrap_or("unknown");
-    if platform.len() > 32 || !platform.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-        return err(StatusCode::BAD_REQUEST, "platform must be one short word, such as macos, windows, linux or ios");
-    }
-    if hub.db.devices().iter().filter(|d| !d.revoked).count() >= MAX_DEVICES {
-        return err(StatusCode::CONFLICT, format!("this hub already has {MAX_DEVICES} devices; revoke one first"));
-    }
-    let (device, token) = match hub.db.add_device(name, platform, false) {
-        Ok(created) => created,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    let (name, platform, install_id) =
+        match (check_device_name(&req.name), check_platform(req.platform.as_deref()), check_install_id(req.install_id.as_deref())) {
+            (Ok(n), Ok(p), Ok(i)) => (n, p, i),
+            (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => return err(StatusCode::BAD_REQUEST, why),
+        };
+    let install = install_id.map(|id| crate::db::Install { id, kind: crate::db::NODE_INSTALL });
+    let device = match hub.issue_device(name, platform, false, install, Some(MAX_DEVICES)).await {
+        Ok(issued) => issued,
+        Err(e) => return issue_error(e),
     };
-    tracing::info!(%caller, device = %device.id, name = %device.name, platform = %device.platform, "device registered");
+    let (token, reused, device) = (device.token, device.reused, device.device);
+    tracing::info!(%caller, device = %device.id, name = %device.name, platform = %device.platform, reused, "device registered");
     let info = hub.devices().await.into_iter().find(|d| d.id == device.id);
-    hub.broadcast_presence(&device.id).await;
     Json(json!({ "device": info, "token": token })).into_response()
 }
 
