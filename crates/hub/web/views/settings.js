@@ -56,6 +56,14 @@ export function renderSettings(container) {
     ),
   );
 
+  const googleAccountSlot = h('div', { class: 'card card-pad' }, skeleton(2));
+  const googleAccount = h(
+    'section',
+    { class: 'section', 'aria-labelledby': 's-google-account' },
+    h('div', { class: 'section-head' }, h('h2', { id: 's-google-account' }, 'Account')),
+    googleAccountSlot,
+  );
+
   const sessionsSlot = h('div', null, skeleton(2));
   const sessions = h(
     'section',
@@ -153,7 +161,83 @@ export function renderSettings(container) {
     notifyListSlot,
   );
 
-  body.append(account, sessions, providers, hub, appearance, notifications);
+  body.append(account, googleAccount, sessions, providers, hub, appearance, notifications);
+
+  // ---- Google account (hub owner)
+  async function loadGoogleAccount() {
+    if (!admin) {
+      setChildren(googleAccountSlot, h('p', { class: 'hint' }, 'Google account settings need an admin token.'));
+      return;
+    }
+    setChildren(googleAccountSlot, skeleton(2));
+    try {
+      const data = await get('/v1/auth/google/link', { signal });
+      if (signal.aborted) return;
+      renderGoogleAccount(data?.owner || null);
+    } catch (err) {
+      if (isAbort(err)) return;
+      setChildren(googleAccountSlot, errorBanner(err, loadGoogleAccount));
+    }
+  }
+
+  function renderGoogleAccount(owner) {
+    if (owner) {
+      setChildren(
+        googleAccountSlot,
+        h('div', { class: 'row-title' }, `Linked Google account: ${owner.email}`),
+        h(
+          'div',
+          { class: 'meta' },
+          owner.name ? h('span', null, owner.name) : null,
+          owner.claimed_at ? h('span', null, `Linked ${dateTime(owner.claimed_at)}`) : null,
+        ),
+        h('p', { class: 'hint' }, 'This Google account owns the hub and can sign in without a token. Tokens keep working if you unlink it.'),
+        h(
+          'div',
+          { class: 'section-actions' },
+          h('button', { class: 'btn', type: 'button', 'data-write': true, onclick: () => unlinkGoogle(owner) }, 'Unlink'),
+        ),
+      );
+      return;
+    }
+    setChildren(
+      googleAccountSlot,
+      h('div', { class: 'row-title' }, 'No Google account linked'),
+      h('p', { class: 'hint', id: 'google-link-note' }, 'Link from the iPhone or Mac app.'),
+      h(
+        'div',
+        { class: 'section-actions' },
+        h(
+          'button',
+          {
+            class: 'btn',
+            type: 'button',
+            disabled: true,
+            'aria-describedby': 'google-link-note',
+          },
+          'Link your Google account',
+        ),
+      ),
+    );
+  }
+
+  async function unlinkGoogle(owner) {
+    const ok = await confirmAction({
+      title: 'Unlink Google account?',
+      body: `Unlink ${owner.email} from this hub? You won’t be able to sign in with Google until a Google account is linked or claimed again. Device tokens and existing sessions keep working.`,
+      confirmLabel: 'Unlink',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await del('/v1/auth/google/link');
+      if (signal.aborted) return;
+      toast('Google account unlinked. Tokens keep working.');
+      loadGoogleAccount();
+    } catch (err) {
+      toastError(err);
+    }
+  }
 
   // ---- hub info
   let hubInfo = store.hub;
@@ -734,6 +818,7 @@ export function renderSettings(container) {
     }),
   ];
 
+  loadGoogleAccount();
   loadHub();
   loadSessions();
   loadProviders();

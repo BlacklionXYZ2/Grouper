@@ -3443,6 +3443,89 @@ code.nowrap {
   min-width: 64px;
 }
 
+.login-form {
+  display: grid;
+  gap: 14px;
+}
+
+.login-card .banner {
+  margin: 0;
+}
+
+.login-card .banner .grow {
+  overflow-wrap: anywhere;
+}
+
+/* Google Identity branding: white surface, dark ink, and multicolour G in both themes. */
+.google-btn {
+  width: 100%;
+  min-height: 44px;
+  gap: 10px;
+  background: #ffffff;
+  color: #1f1f1f;
+  border: 1px solid #747775;
+  font-weight: 550;
+  font-size: 15px;
+}
+
+.google-btn:hover:not(:disabled) {
+  background: #f8f9fa;
+  box-shadow: 0 1px 2px rgba(60, 64, 67, 0.3), 0 1px 3px 1px rgba(60, 64, 67, 0.15);
+}
+
+.google-btn:active:not(:disabled) {
+  background: #eeeeee;
+}
+
+.google-g {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.login-disclosure {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.login-disclosure > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+  list-style: none;
+}
+
+.login-disclosure > summary::-webkit-details-marker,
+.login-disclosure > summary::marker {
+  display: none;
+  content: "";
+}
+
+.login-disclosure > summary > .icon {
+  width: 16px;
+  height: 16px;
+  transition: transform 0.15s var(--ease);
+}
+
+.login-disclosure[open] > summary > .icon {
+  transform: rotate(90deg);
+}
+
+.login-disclosure[open] > .login-form {
+  margin-top: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-disclosure > summary > .icon {
+    transition: none;
+  }
+}
+
 /* ---- thread sheet */
 
 .sheet-status:empty {
@@ -3610,7 +3693,8 @@ code.nowrap {
   .new-messages,
   .menu-item,
   button.strip,
-  .provider-group > summary {
+  .provider-group > summary,
+  .login-disclosure > summary {
     min-height: 44px;
   }
 }
@@ -3853,6 +3937,12 @@ code.nowrap {
 
   .btn {
     border-width: 1.5px;
+  }
+
+  .google-btn {
+    background: #ffffff;
+    color: #1f1f1f;
+    border-color: #3c4043;
   }
 
   .btn-primary {
@@ -4258,6 +4348,7 @@ code.nowrap {
 
   /* Buttons and icon buttons. */
   .btn,
+  .google-btn,
   .new-messages {
     background: ButtonFace;
     color: ButtonText;

@@ -28,7 +28,7 @@ import { h, icon, setChildren, syncList, setText, setAttr } from './lib/dom.js';
 import { get, enc, isAbort, onApiError } from './lib/api.js';
 import { store, on, emit, threadsIn, approvalsIn, needsYouCount, waitingThreads, resetStore } from './lib/store.js';
 import { startLive, stopLive, loadConversations, loadThreads, loadDevices, loadModels, loadApprovals } from './lib/live.js';
-import { closeDrawer, navigate, syncInert, bar, skeletonBlocks, errorBanner } from './lib/ui.js';
+import { closeDrawer, navigate, syncInert, bar, skeletonBlocks, errorBanner, toast } from './lib/ui.js';
 import { ago } from './lib/format.js';
 import { renderLogin } from './views/login.js';
 import { renderChat } from './views/chat.js';
@@ -67,8 +67,14 @@ export function applyTheme() {
   else document.documentElement.dataset.theme = theme;
 }
 
+function onHashChange() {
+  if (store.me && els) route();
+  else if (!store.me && !els) showLogin();
+}
+
 async function boot() {
   applyTheme();
+  window.addEventListener('hashchange', onHashChange);
   try {
     const me = await get('/v1/session');
     if (!me?.signed_in) {
@@ -94,10 +100,17 @@ async function boot() {
 function showLogin() {
   root.className = '';
   root.removeAttribute('aria-busy');
-  setChildren(root, renderLogin((me) => {
-    store.me = me;
-    startApp();
-  }));
+  const r = parseRoute();
+  setChildren(
+    root,
+    renderLogin(
+      (me) => {
+        store.me = me;
+        startApp();
+      },
+      r.view === 'claim' ? { claim: true, code: r.code, error: r.error } : undefined,
+    ),
+  );
 }
 
 function startApp() {
@@ -107,7 +120,6 @@ function startApp() {
   if (!started) {
     // Once per page: these outlive sign-outs and check `store.me` themselves.
     started = true;
-    window.addEventListener('hashchange', route);
     onApiError((e) => {
       if (e.status === 401 && store.me) signedOut();
     });
@@ -437,6 +449,9 @@ export function parseRoute() {
     // The provider filter changes in place: it's not part of the route key below.
     return { view: 'usage', conversation, provider: query.get('provider') || null };
   }
+  if (view === 'claim') {
+    return { view: 'claim', code: query.get('code') || '', error: query.get('error') || '' };
+  }
   return { view, id: a };
 }
 
@@ -500,6 +515,12 @@ function route() {
   if (!els || !store.me) return;
   closeDrawer();
   const r = parseRoute();
+
+  if (r.view === 'claim') {
+    if (r.error) toast(r.error, 'error');
+    location.replace('#/');
+    return;
+  }
 
   // #/threads opens the panel on the chat you were in (or the last one).
   if (r.view === 'threads-redirect') {
