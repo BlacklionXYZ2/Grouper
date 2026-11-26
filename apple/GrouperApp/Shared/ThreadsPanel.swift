@@ -23,12 +23,18 @@ struct ThreadsPanel: View {
                 }
                 #endif
                 .navigationDestination(for: String.self) { id in
-                    if let thread = model.threads.first(where: { $0.id == id && $0.conversationId == conversationId }) {
-                        ThreadDetailView(thread: thread)
-                    } else {
-                        ContentUnavailableView("Thread not found on this hub", systemImage: "questionmark.circle",
-                                               description: Text("It may have been removed or belong to another chat."))
+                    Group {
+                        if let thread = model.threads.first(where: { $0.id == id && $0.conversationId == conversationId }) {
+                            ThreadDetailView(thread: thread)
+                        } else {
+                            ContentUnavailableView("Thread not found on this hub", systemImage: "questionmark.circle",
+                                                   description: Text("It may have been removed or belong to another chat."))
+                        }
                     }
+                    #if os(macOS)
+                    // A stack inside the inspector has no reliable system Back on the Mac.
+                    .safeAreaInset(edge: .top, spacing: 0) { backBar }
+                    #endif
                 }
         }
         // Approvals reviewed from the panel present from the panel, so they never
@@ -37,7 +43,36 @@ struct ThreadsPanel: View {
         // A thread chosen elsewhere (a chat card on Mac, "Change it" in an approval)
         // opens here when the panel is showing.
         .onChange(of: model.selectedThreadId, initial: true) { _, id in open(id) }
+        #if os(iOS)
+        // On iPhone the chat's own approval sheet waits while this sheet is up, so an
+        // approval opened from a notification or banner is shown here instead.
+        .onChange(of: model.selectedApprovalId, initial: true) { _, id in review(id) }
+        #endif
     }
+
+    #if os(macOS)
+    private var backBar: some View {
+        HStack {
+            Button { if !path.isEmpty { path.removeLast() } } label: {
+                Label("Threads", systemImage: "chevron.left")
+            }
+            .keyboardShortcut("[", modifiers: .command)
+            .accessibilityLabel("Back to threads")
+            Spacer()
+            Button("Close", action: onClose).keyboardShortcut(.cancelAction)
+        }
+        .padding(.horizontal).padding(.vertical, 6)
+        .background(.bar)
+    }
+    #endif
+
+    #if os(iOS)
+    private func review(_ id: String?) {
+        guard let id, let approval = model.approvals(in: conversationId).first(where: { $0.id == id }) else { return }
+        reviewing = approval
+        model.selectedApprovalId = nil
+    }
+    #endif
 
     private func open(_ id: String?) {
         guard let id, model.threads.contains(where: { $0.id == id && $0.conversationId == conversationId }) else { return }
@@ -170,7 +205,7 @@ private struct ThreadsList: View {
                     HStack(spacing: 4) {
                         Text(threadTitle(approval.threadId))
                         Text("·")
-                        Text(Date(timeIntervalSince1970: TimeInterval(approval.ts)), style: .relative)
+                        RelativeAgeText(seconds: approval.ts)
                     }
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }

@@ -119,6 +119,48 @@ final class ThreadPresentationTests: XCTestCase {
         XCTAssertEqual(live.text, "1m 00s")
     }
 
+    func testLifecycleEventsUpdateThreadRowsAtOnce() throws {
+        var threads: [ThreadInfo] = []
+        XCTAssertTrue(ThreadInfo.upsert(&threads, with: try event(#"{"seq":1,"conversation_id":"c","thread_id":"t","ts":100,"kind":"thread_started","title":"Task","device_id":"mac","model":"opus","reason":"fast","brief":"do"}"#)))
+        XCTAssertEqual(threads.first?.status, "running")
+        XCTAssertEqual(threads.first?.created, 100)
+        XCTAssertEqual(threads.first?.model, "opus")
+
+        ThreadInfo.upsert(&threads, with: try event(#"{"seq":2,"conversation_id":"c","thread_id":"t","ts":110,"kind":"thread_waiting","device_id":"mac","reason":"offline"}"#))
+        XCTAssertEqual(threads.first?.status, "waiting_device")
+        ThreadInfo.upsert(&threads, with: try event(#"{"seq":3,"conversation_id":"c","thread_id":"t","ts":120,"kind":"thread_handed_over","device_id":"pc","files":[],"skipped":[],"brief":"go on"}"#))
+        XCTAssertEqual(threads.first?.status, "running")
+        XCTAssertEqual(threads.first?.deviceId, "pc")
+        ThreadInfo.upsert(&threads, with: try event(#"{"seq":4,"conversation_id":"c","thread_id":"t","ts":347,"kind":"thread_finished","status":"done","summary":"All done"}"#))
+        XCTAssertEqual(threads.first?.status, "done")
+        XCTAssertEqual(threads.first?.summary, "All done")
+        XCTAssertEqual(threads.first?.elapsed().text, "took 4m 07s")
+        // A late waiting event cannot reopen a finished thread.
+        XCTAssertFalse(ThreadInfo.upsert(&threads, with: try event(#"{"seq":5,"conversation_id":"c","thread_id":"t","ts":400,"kind":"thread_waiting","device_id":"mac","reason":"late"}"#)))
+        XCTAssertEqual(threads.count, 1)
+    }
+
+    func testStaleFetchDoesNotReopenAFinishedThread() throws {
+        let done = ThreadInfo(id: "t", conversationId: "c", title: "T", deviceId: "mac", model: "m", status: "done", reason: nil, summary: nil, created: 1, finished: 2)
+        let fresh = ThreadInfo(id: "new", conversationId: "c", title: "N", deviceId: "mac", model: "m", status: "running", reason: nil, summary: nil, created: 3, finished: nil)
+        let other = ThreadInfo(id: "o", conversationId: "other", title: "O", deviceId: "mac", model: "m", status: "running", reason: nil, summary: nil, created: 1, finished: nil)
+        let staleFetch = [ThreadInfo(id: "t", conversationId: "c", title: "T", deviceId: "mac", model: "m", status: "running", reason: nil, summary: nil, created: 1, finished: nil)]
+        let merged = ThreadInfo.merge([done, fresh, other], fetched: staleFetch, conversationId: "c")
+        XCTAssertEqual(merged.first { $0.id == "t" }?.status, "done")
+        XCTAssertNotNil(merged.first { $0.id == "new" }, "a thread the fetch has not seen yet is kept")
+        XCTAssertNotNil(merged.first { $0.id == "o" }, "other chats are untouched")
+        XCTAssertEqual(merged.count, 3)
+
+        // The chat card keeps a stored thread_finished over a stale running row.
+        let raws = [
+            #"{"seq":1,"conversation_id":"c","thread_id":"t","ts":1,"kind":"thread_started","title":"T","device_id":"mac","model":"m","reason":null,"brief":"do"}"#,
+            #"{"seq":2,"conversation_id":"c","thread_id":"t","ts":2,"kind":"thread_finished","status":"failed","summary":"broke"}"#,
+        ]
+        let folder = TranscriptFolder(conversationId: "c", events: try raws.map(event))
+        guard case .thread(let card) = folder.transcript(threads: staleFetch).first else { return XCTFail("card missing") }
+        XCTAssertEqual(card.status, "failed")
+    }
+
     func testProviderListDecodesViaDevice() throws {
         let raw = #"[{"id":"local","kind":"openai","base_url":"http://127.0.0.1:1234/v1","has_key":false,"via_device":"Gaming PC","options":{"via_device":"Gaming PC"}},{"id":"anthropic","kind":"anthropic","base_url":null,"has_key":true}]"#
         let providers = try JSONDecoder.grouper.decode([ProviderInfo].self, from: Data(raw.utf8))

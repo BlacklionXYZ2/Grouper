@@ -47,6 +47,9 @@ final class AppModel: ObservableObject {
     @Published var selectedDeviceId: String?
     @Published var threadMessageDrafts: [String: String] = [:]
     @Published var newChatMode = "project"
+    /// The model picked for a chat that has not been sent yet. Cleared whenever the
+    /// chat changes, so a choice never carries into another chat.
+    @Published var newChatModel: String?
 
     private let streamTask = TaskBox()
 
@@ -224,6 +227,7 @@ final class AppModel: ObservableObject {
     func selectConversation(_ id: String) async {
         guard let client else { return }
         selectedConversationId = id
+        newChatModel = nil
         streamTask.cancel()
         do {
             async let events = client.events(conversationId: id)
@@ -232,8 +236,7 @@ final class AppModel: ObservableObject {
             let scoped = try await scopedThreads
             guard selectedConversationId == id else { return }
             folders[id] = TranscriptFolder(conversationId: id, events: fetchedEvents)
-            threads.removeAll { $0.conversationId == id }
-            threads.append(contentsOf: scoped)
+            threads = ThreadInfo.merge(threads, fetched: scoped, conversationId: id)
             online = true
             followEvents(conversationId: id)
         } catch {
@@ -293,8 +296,7 @@ final class AppModel: ObservableObject {
         guard let client else { return }
         do {
             let updated = try await client.threads(conversationId: conversationId)
-            threads.removeAll { $0.conversationId == conversationId }
-            threads.append(contentsOf: updated)
+            threads = ThreadInfo.merge(threads, fetched: updated, conversationId: conversationId)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -311,6 +313,7 @@ final class AppModel: ObservableObject {
         selectedConversationId = nil
         selectedThreadId = nil
         newChatMode = mode
+        newChatModel = nil
     }
 
     func messageThread(_ id: String, text: String) async -> Bool {
@@ -398,6 +401,9 @@ final class AppModel: ObservableObject {
         let stored = folder.ingest(event)
         folders[event.conversationId] = folder
         guard stored else { return }
+        // Update the thread row now: the views read status, elapsed time and
+        // existence from `threads`, and the refresh below may be slow or fail.
+        ThreadInfo.upsert(&threads, with: event)
         #if os(iOS)
         switch event.body {
         case .threadStarted(let started):

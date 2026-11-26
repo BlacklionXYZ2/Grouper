@@ -15,7 +15,6 @@ struct ModelPickerSheet: View {
     let current: String?
     let onPick: (String?) -> Void
     @State private var query = ""
-    @State private var searching = true
     #if os(macOS)
     @FocusState private var searchFocused: Bool
     #endif
@@ -55,7 +54,9 @@ struct ModelPickerSheet: View {
                 }
             }
             #if os(iOS)
-            .searchable(text: $query, isPresented: $searching, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search by name, provider, family or role")
+            // Not activated on open: active search mode hides the title and Cancel, and
+            // its own Cancel would only leave search instead of closing the picker.
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search by name, provider, family or role")
             .navigationBarTitleDisplayMode(.inline)
             #endif
             .navigationTitle(role == "standard" ? "Standard model" : "Orchestrator model")

@@ -147,6 +147,19 @@ struct TagBadge: View {
     }
 }
 
+/// "5 min. ago" for a hub timestamp (seconds since 1970), refreshed once a minute.
+/// `Text(date, style: .relative)` ticks every second and has no "ago".
+struct RelativeAgeText: View {
+    let seconds: UInt64
+
+    var body: some View {
+        TimelineView(.everyMinute) { _ in
+            Text(Date(timeIntervalSince1970: TimeInterval(seconds))
+                .formatted(.relative(presentation: .numeric, unitsStyle: .abbreviated)))
+        }
+    }
+}
+
 /// A thread's elapsed time: ticking once a second while it runs or waits, the
 /// total once it is over. The timeline only exists while the thread is live.
 struct ElapsedText: View {

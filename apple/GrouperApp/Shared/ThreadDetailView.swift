@@ -135,7 +135,11 @@ struct ThreadDetailView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Label("\(deviceName) is offline", systemImage: "clock.fill").font(.headline).foregroundStyle(.orange)
                 if let device = model.devices.first(where: { $0.id == liveThread.deviceId }), let last = device.lastSeen {
-                    Text("Last seen \(Date(timeIntervalSince1970: TimeInterval(last)), style: .relative) ago").font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 4) {
+                        Text("Last seen")
+                        RelativeAgeText(seconds: last)
+                    }
+                    .font(.caption).foregroundStyle(.secondary)
                 } else {
                     Text("Not seen yet.").font(.caption).foregroundStyle(.secondary)
                 }
