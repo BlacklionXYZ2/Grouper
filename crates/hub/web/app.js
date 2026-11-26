@@ -6,8 +6,13 @@
 //   #/chat/<id>            a conversation
 //   #/chat/<id>/thread/<t> a conversation with a thread open in the inspector
 //   #/chat/<id>/threads    this conversation with the threads panel open
+//   #/chat/<id>?approval=<a>           the conversation with its approval dock on request <a>
+//   #/chat/<id>/thread/<t>?approval=<a> the same, with thread <t> open and its dock on <a>
+//                          (notifications and inbox Review use the first; the dock checks
+//                          <a> against the hub's pending list and says when it's gone)
 //   #/threads              current or last conversation with the panel open, or #/chat
 //   #/threads/<t>          resolves the thread's conversation and opens the inspector
+//                          (keeps `?approval=<a>`)
 //   #/inbox                Needs you: approvals and waiting threads across all chats
 //   #/models               the registry
 //   #/models/<id>          the registry with that model's provider group open, its row shown and focused
@@ -36,6 +41,7 @@ import { renderSkills } from './views/skills.js';
 import { renderSettings } from './views/settings.js';
 import { renderMore } from './views/more.js';
 import { renderInbox } from './views/inbox.js';
+import { startNotifications, stopNotifications, forgetNotifications } from './lib/push.js';
 
 const root = document.getElementById('app');
 const LAST_CONV = 'grouper.lastConversation';
@@ -109,6 +115,7 @@ function startApp() {
     });
   }
   startLive();
+  startNotifications();
   Promise.allSettled([
     loadConversations(),
     loadDevices(),
@@ -131,6 +138,9 @@ function startApp() {
 /** The session ended on the hub (expired, logged out elsewhere, token revoked). */
 export function signedOut() {
   stopLive();
+  // The session is already gone on the hub: unsubscribe here (the hub drops its row).
+  stopNotifications();
+  forgetNotifications({ server: false });
   resetStore();
   mainCleanup?.();
   inspectorCleanup?.();
@@ -386,13 +396,19 @@ export function parseRoute() {
       return { view: 'chat', conversation: a, threadsPanel: true };
     }
     if (a === 'new' && b === 'thread' && c) {
-      return { view: 'thread-redirect', thread: c };
+      return { view: 'thread-redirect', thread: c, approval: query.get('approval') || undefined };
     }
-    return { view, conversation: a && a !== 'new' ? a : a === 'new' ? null : undefined, thread: b === 'thread' ? c : undefined };
+    return {
+      view,
+      conversation: a && a !== 'new' ? a : a === 'new' ? null : undefined,
+      thread: b === 'thread' ? c : undefined,
+      // The approval dock's selection; not part of the view's key (it changes in place).
+      approval: query.get('approval') || undefined,
+    };
   }
   if (view === 'threads' && !a) return { view: 'threads-redirect' };
   if ((view === 'threads' || view === 'thread') && a) {
-    return { view: 'thread-redirect', thread: a };
+    return { view: 'thread-redirect', thread: a, approval: query.get('approval') || undefined };
   }
   if (view === 'usage') {
     const conversation = query.get('conversation') || (a === 'conversation' ? b : a) || null;
@@ -402,7 +418,12 @@ export function parseRoute() {
   return { view, id: a };
 }
 
-function renderThreadRedirect(container, { thread: threadId }) {
+/** `?approval=<id>` for a route that carries one (redirects keep it). */
+function approvalQuery(r) {
+  return r.approval ? `?approval=${enc(r.approval)}` : '';
+}
+
+function renderThreadRedirect(container, { thread: threadId, approval }) {
   const body = h('div', { class: 'view-body narrow' }, skeletonBlocks(2));
   container.append(h('section', { class: 'view' }, bar({ title: 'Opening thread…' }), body));
   const aborter = new AbortController();
@@ -416,7 +437,7 @@ function renderThreadRedirect(container, { thread: threadId }) {
         const known = store.threads.get(threadId);
         store.threads.set(threadId, { ...known, ...thread, checkpoint: known?.checkpoint });
         emit('threads');
-        location.replace(`#/chat/${enc(thread.conversation_id)}/thread/${enc(threadId)}`);
+        location.replace(`#/chat/${enc(thread.conversation_id)}/thread/${enc(threadId)}${approvalQuery({ approval })}`);
         return;
       }
       showMissing();
@@ -469,7 +490,7 @@ function route() {
   if (r.view === 'thread-redirect' && r.thread) {
     const known = store.threads.get(r.thread);
     if (known?.conversation_id) {
-      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}`);
+      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}${approvalQuery(r)}`);
       return;
     }
   }
@@ -492,7 +513,7 @@ function route() {
   if (r.view === 'chat' && r.conversation && r.thread) {
     const known = store.threads.get(r.thread);
     if (known?.conversation_id && known.conversation_id !== r.conversation) {
-      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}`);
+      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}${approvalQuery(r)}`);
       return;
     }
   }

@@ -1,5 +1,7 @@
 // Settings: who is signed in, active browser sessions, the hub, provider keys
-// (write-only), appearance, and signing out.
+// (write-only), appearance, approval notifications for this browser, and signing
+// out. Signing out (or revoking this browser's session) first removes this
+// browser's push subscription from the hub and unsubscribes, best effort.
 
 import { h, icon, setChildren } from '../lib/dom.js';
 import { get, put, del, enc, describe, isAbort } from '../lib/api.js';
@@ -7,6 +9,21 @@ import { store, on, deviceName, isAdmin } from '../lib/store.js';
 import { stopLive, loadDevices } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { ago, date, dateTime } from '../lib/format.js';
+import {
+  support as notifySupport,
+  permission as notifyPermission,
+  optedIn,
+  currentSubscription,
+  enableNotifications,
+  disableNotifications,
+  forgetNotifications,
+  listSubscriptions,
+  removeSubscription,
+  sendTest,
+  showLocalTest,
+  storedSubscriptionId,
+  setHasPush,
+} from '../lib/push.js';
 
 const THEME_KEY = 'grouper.theme';
 const PROVIDER_KINDS = [
@@ -121,7 +138,22 @@ export function renderSettings(container) {
     ),
   );
 
-  body.append(account, sessions, providers, hub, appearance);
+  const notifySlot = h('div', { class: 'card card-pad notify-card' }, skeleton(2));
+  const notifyListSlot = h('div');
+  const notifications = h(
+    'section',
+    { class: 'section', 'aria-labelledby': 's-notify' },
+    h('div', { class: 'section-head' }, h('h2', { id: 's-notify' }, 'Notifications')),
+    h(
+      'p',
+      { class: 'section-note' },
+      'Grouper can notify this browser when a tool needs your review. Notifications show tool/device/chat names, never the command or its contents. You must open Grouper to inspect and approve.',
+    ),
+    notifySlot,
+    notifyListSlot,
+  );
+
+  body.append(account, sessions, providers, hub, appearance, notifications);
 
   // ---- hub info
   let hubInfo = store.hub;
@@ -159,6 +191,190 @@ export function renderSettings(container) {
       if (isAbort(err)) return;
       setChildren(hubSlot, errorBanner(err, loadHub));
     }
+  }
+
+  // ---- approval notifications (this browser's opt-in; spec 5.11, 5.14)
+  let notifyMessage = ''; // the outcome of the last action, in words
+  let notifyBusy = false;
+  let hubPush = 'unknown'; // 'ok' | 'missing' (no push API on this hub) | 'forbidden'
+
+  async function renderNotify() {
+    const kind = notifySupport();
+    const perm = notifyPermission();
+    const sub = kind === 'push' ? await currentSubscription() : null;
+    if (signal.aborted) return;
+    const on = optedIn() && perm === 'granted' && (kind === 'page-only' || Boolean(sub));
+    let state;
+    let detail = null;
+    const buttons = [];
+    const btn = (label, iconName, onclick, primary = false) =>
+      h('button', { class: ['btn', primary && 'btn-primary'], type: 'button', 'data-write': true, disabled: notifyBusy, onclick }, iconName ? icon(iconName) : null, label);
+
+    if (!admin) {
+      state = 'Not available in this session';
+      detail = 'This session uses a device token, which can’t answer approvals, so it can’t receive their notifications. Sign in with an admin token to turn them on.';
+    } else if (kind === 'ios-home-screen') {
+      state = 'Add Grouper to your Home Screen to enable web notifications';
+      detail = 'In Safari, tap Share, then Add to Home Screen, and open Grouper from the new icon. Settings there will offer notifications.';
+    } else if (kind === 'insecure') {
+      state = 'Needs the hub’s HTTPS address';
+      detail = 'Browsers only allow notifications on secure pages. Open Grouper over https:// (or on localhost) to turn them on.';
+    } else if (kind === 'unsupported') {
+      state = 'Not supported in this browser';
+      detail = 'This browser can’t show web notifications. You can still find requests in Needs you and in each chat.';
+    } else if (hubPush === 'missing' && kind === 'push') {
+      state = 'Not available on this hub';
+      detail = 'This hub doesn’t offer web notifications yet. Update the hub to turn them on.';
+    } else if (hubPush === 'forbidden') {
+      state = 'Not available in this session';
+      detail = 'The hub refused: this session can’t manage notifications. Sign in with an admin token.';
+    } else if (perm === 'denied') {
+      state = 'Blocked in this browser';
+      detail = `Notifications for ${location.host} are blocked in your browser’s settings, so Grouper won’t ask again. To allow them, open this site’s settings (usually the icon beside the address), allow notifications, then reload this page.`;
+      if (sub || optedIn()) buttons.push(btn('Turn off for this browser', null, () => runNotify(turnOff)));
+    } else if (on) {
+      state = kind === 'page-only' ? 'On while Grouper is open in this browser' : 'On for this browser';
+      detail =
+        kind === 'page-only'
+          ? 'This browser has no background push, so alerts show only while a Grouper tab is open.'
+          : 'Each browser opts in on its own. If Grouper is open on the request’s chat, the dock shows it instead.';
+      buttons.push(btn('Send a test notification', 'play', () => runNotify(test)), btn('Turn off for this browser', null, () => runNotify(turnOff)));
+    } else {
+      state = 'Off for this browser';
+      detail = perm === 'granted' ? 'The browser already allows notifications; turning them on won’t ask again.' : 'Your browser will ask for permission once, when you press the button.';
+      buttons.push(btn('Enable approval notifications', 'shield', () => runNotify(turnOn), true));
+    }
+
+    setChildren(
+      notifySlot,
+      h('div', { class: 'row-title row-badges' }, state, admin ? h('span', { class: ['badge', on ? 'accent' : 'muted'] }, on ? 'On' : 'Off') : null),
+      detail ? h('p', { class: 'hint' }, detail) : null,
+      admin && kind !== 'unsupported' && kind !== 'ios-home-screen' ? h('p', { class: 'hint' }, `Browser permission: ${perm === 'granted' ? 'allowed' : perm === 'denied' ? 'blocked' : 'not asked yet'}.`) : null,
+      buttons.length ? h('div', { class: 'section-actions' }, buttons) : null,
+      h('p', { class: 'hint notify-result', role: 'status' }, notifyMessage),
+    );
+  }
+
+  async function runNotify(action) {
+    if (notifyBusy) return;
+    notifyBusy = true;
+    notifyMessage = '';
+    // No re-render before the action: the browser's permission prompt must come
+    // straight from the click (Safari refuses it after an await).
+    try {
+      notifyMessage = (await action()) || '';
+    } catch (err) {
+      if (err?.status === 404) hubPush = 'missing';
+      if (err?.status === 403) hubPush = 'forbidden';
+      notifyMessage = describe(err);
+    }
+    notifyBusy = false;
+    if (signal.aborted) return;
+    await renderNotify();
+    loadNotifyList();
+  }
+
+  async function turnOn() {
+    const r = await enableNotifications();
+    if (r.permission === 'denied') return 'The browser blocked notifications. Grouper won’t ask again.';
+    if (r.permission !== 'granted') return 'Notifications stay off: the browser didn’t get permission.';
+    setHasPush(r.mode === 'push');
+    hubPush = 'ok';
+    return r.mode === 'page' ? 'On. Alerts show while Grouper is open here.' : 'On. This browser will be notified when a tool needs your review.';
+  }
+
+  async function turnOff() {
+    try {
+      await disableNotifications();
+    } finally {
+      setHasPush(false);
+    }
+    return 'Off for this browser.';
+  }
+
+  async function test() {
+    if (notifySupport() === 'page-only') {
+      await showLocalTest();
+      return 'Test shown.';
+    }
+    const results = await sendTest(storedSubscriptionId());
+    const list = Array.isArray(results) ? results : Array.isArray(results?.results) ? results.results : null;
+    if (!list) return 'Test sent. It should arrive in a few seconds.';
+    if (!list.length) return 'The hub has no subscription for this browser. Turn notifications off and on again.';
+    const failed = list.filter((x) => x && x.ok === false);
+    if (!failed.length) return 'Test sent. It should arrive in a few seconds.';
+    return `The push service refused the test: ${failed.map((x) => x.error || x.status || 'failed').join('; ')}`;
+  }
+
+  // Every browser with notifications on (no keys or endpoints are shown).
+  async function loadNotifyList() {
+    if (!admin || hubPush === 'missing' || hubPush === 'forbidden') {
+      notifyListSlot.replaceChildren();
+      return;
+    }
+    let rows;
+    try {
+      rows = (await listSubscriptions({ signal })) || [];
+      hubPush = 'ok';
+    } catch (err) {
+      if (isAbort(err)) return;
+      if (err.status === 404) hubPush = 'missing';
+      else if (err.status === 403) hubPush = 'forbidden';
+      notifyListSlot.replaceChildren();
+      if (err.status === 404 || err.status === 403) renderNotify();
+      return;
+    }
+    if (signal.aborted) return;
+    if (!rows.length) {
+      notifyListSlot.replaceChildren();
+      return;
+    }
+    const mine = storedSubscriptionId();
+    setChildren(
+      notifyListSlot,
+      h('h3', { class: 'sub-title notify-list-title' }, 'Browsers with notifications on'),
+      h(
+        'ul',
+        { class: 'list card' },
+        rows.map((row) =>
+          h(
+            'li',
+            { class: 'list-row' },
+            h(
+              'div',
+              { class: 'grow' },
+              h('div', { class: 'row-title row-badges' }, row.label || 'Browser', String(row.id) === mine ? h('span', { class: 'badge accent' }, 'This browser') : null),
+              h('div', { class: 'meta' }, row.created ? h('span', null, `Added ${dateTime(row.created)}`) : null, h('span', null, row.last_ok ? `Last delivered ${ago(row.last_ok)}` : 'Nothing delivered yet')),
+            ),
+            h(
+              'button',
+              {
+                class: 'btn btn-sm',
+                type: 'button',
+                'data-write': true,
+                'aria-label': `Remove notifications for ${row.label || 'this browser'}`,
+                onclick: () => removeRow(row, String(row.id) === mine),
+              },
+              'Remove',
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  async function removeRow(row, isMine) {
+    if (isMine) {
+      runNotify(turnOff);
+      return;
+    }
+    try {
+      await removeSubscription(row.id);
+      toast(`Notifications removed for ${row.label || 'that browser'}.`);
+    } catch (err) {
+      toastError(err);
+    }
+    loadNotifyList();
   }
 
   // ---- browser sessions
@@ -233,6 +449,8 @@ export function renderSettings(container) {
       danger: true,
     });
     if (!ok) return;
+    // This browser's notifications end with its session (while the session can still delete them).
+    if (s.current) await forgetNotifications();
     try {
       await del(`/v1/sessions/${enc(s.id)}`);
     } catch (err) {
@@ -483,6 +701,8 @@ export function renderSettings(container) {
 
   async function signOut() {
     if (!(await confirmAction({ title: 'Sign out of this browser?', body: 'You’ll need a hub token to sign in again.', confirmLabel: 'Sign out' }))) return;
+    // Remove this browser's push subscription first, while the session can still do it.
+    await forgetNotifications();
     try {
       await del('/v1/session');
     } catch (err) {
@@ -492,7 +712,14 @@ export function renderSettings(container) {
     finishSignOut();
   }
 
+  // The permission can change in the browser's own settings while this page is open.
+  const onVisible = () => {
+    if (document.visibilityState === 'visible' && !notifyBusy) renderNotify();
+  };
+  document.addEventListener('visibilitychange', onVisible);
+
   const offs = [
+    () => document.removeEventListener('visibilitychange', onVisible),
     on('online', () => {
       renderHub();
     }),
@@ -504,6 +731,8 @@ export function renderSettings(container) {
   loadHub();
   loadSessions();
   loadProviders();
+  renderNotify();
+  loadNotifyList();
 
   return () => {
     aborter.abort();
