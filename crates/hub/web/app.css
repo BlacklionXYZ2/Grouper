@@ -1586,6 +1586,15 @@ button.list-row:hover {
   font-weight: 700;
 }
 
+/* Needs you (sidebar and the phone Chat tab). Other counts stay amber.
+   --purple on --purple-soft is 6.3:1 light and 5.7:1 dark. */
+.side-needs .count,
+.tab .count {
+  background: var(--purple-soft);
+  color: var(--purple);
+  border: 1px solid var(--purple-fill);
+}
+
 .dot {
   width: 8px;
   height: 8px;
@@ -4491,7 +4500,9 @@ code.nowrap {
     font-weight: 700;
   }
 
-  .count {
+  .count,
+  .side-needs .count,
+  .tab .count {
     forced-color-adjust: none;
     background: Highlight;
     color: HighlightText;
