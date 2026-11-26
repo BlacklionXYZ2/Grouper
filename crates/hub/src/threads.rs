@@ -57,6 +57,9 @@ pub(crate) fn thread_system(device_name: &str, on_hub: bool, folders: &[FolderIn
 described in a brief. You are running {place}.\n\n\
 - Work only on your brief. You can't see the user's conversation; the brief has what you need.\n\
 - If you need something only another device or the user can provide, use ask_orchestrator.\n\
+- For a task with three or more steps, call update_plan first with the steps, then keep it current: mark a step \
+in_progress before you start it and completed as soon as it's done, sending the whole list each time (in the same \
+response as that step's other tool calls). Skip it for a trivial one-step task. The user watches this checklist.\n\
 - Some tool calls may wait for the user's approval; if one is denied, find another way or explain.\n\
 - Messages from the user or orchestrator may arrive mid-task; follow them.\n\
 - When you're done, reply with a short report for the orchestrator: what you did, the result, \

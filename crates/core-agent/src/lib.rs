@@ -18,6 +18,7 @@ pub mod agents;
 pub mod files;
 pub mod folders;
 pub mod permission;
+pub mod plan;
 pub mod thread;
 pub mod tools;
 
