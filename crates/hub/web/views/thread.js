@@ -224,15 +224,18 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
   );
   const startedEl = h('span', { class: 'thread-started' });
   const tokensEl = h('span', { class: 'thread-tokens', hidden: true });
-  const metaEl = h('p', { class: 'meta tv-meta' }, startedEl, tokensEl);
-  const reasonEl = h('p', { class: 'hint tv-reason', hidden: true });
+  const metaSep = h('span', { class: 'tv-meta-sep', 'aria-hidden': 'true', hidden: true }, ' · ');
+  const metaEl = h('p', { class: 'meta tv-meta' }, startedEl, metaSep, tokensEl);
+  // The routing reason is long: a native disclosure keeps it out of the way.
+  const reasonText = h('p', { class: 'hint tv-reason-text' });
+  const reasonEl = h('details', { class: 'tv-reason', hidden: true }, h('summary', null, 'Why here?'), reasonText);
   const head = h(
     'header',
     { class: 'sheet-head thread-head' },
     h('div', { class: 'sheet-head-row' }, titleEl, popBtn, closeBtn),
     h('div', { class: 'tv-chips' }, pillSlot, deviceChip, modelChip),
-    reasonEl,
     metaEl,
+    reasonEl,
   );
 
   // ---- the plan checklist, pinned at the top of the chat
@@ -586,8 +589,9 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     paintElapsed();
     syncTicker(th);
     renderModelChip(modelId);
-    setText(reasonEl, reason || '');
+    setText(reasonText, reason || '');
     reasonEl.hidden = !reason;
+    setFamilyClass(head, fam);
   }
 
   function renderModelChip(modelId) {
@@ -610,6 +614,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
 
   function renderTokens() {
     tokensEl.hidden = !(tokensIn || tokensOut);
+    metaSep.hidden = tokensEl.hidden || !startedEl.textContent;
     setText(tokensEl, tokensIn || tokensOut ? `${num(tokensIn)} in · ${num(tokensOut)} out tokens` : '');
   }
 
@@ -1030,7 +1035,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     const hadFocus = filesSlot.contains(document.activeElement);
     filesSlot.dataset.key = key;
     const count = files && !files.error ? ` (${files.files.length}${files.truncated ? '+' : ''})` : '';
-    setChildren(filesSlot, h('h3', { class: 'sub-title', id: 'files-title' }, `Files${count}`), content);
+    setChildren(filesSlot, h('h3', { class: 'sub-title tv-section-title', id: 'files-title' }, `Files${count}`), content);
     if (hadFocus) (filesSlot.querySelector('a, button') || titleEl).focus({ preventScroll: true });
   }
 
