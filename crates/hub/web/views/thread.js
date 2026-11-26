@@ -115,8 +115,12 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
   // Not a live region: the draft changes many times a second. Screen readers hear
   // it through the throttled #live-region (sentences, then the finish).
   const draftEl = h('div', { class: 'msg msg-assistant md', 'aria-label': 'Thread output so far', hidden: true });
+  // The draft's own model label, shown while it streams after someone else spoke.
+  // Kept apart from the transcript's labels so a step-in arriving mid-stream goes
+  // above both and never leaves a label with nothing under it.
+  const draftWho = h('div', { class: 'msg-who thread-who has-fam', hidden: true });
   const emptyEl = h('p', { class: 'hint thread-empty' });
-  const convo = h('div', { class: 'transcript thread-transcript', role: 'region', 'aria-label': 'Thread transcript', hidden: true }, draftEl, emptyEl);
+  const convo = h('div', { class: 'transcript thread-transcript', role: 'region', 'aria-label': 'Thread transcript', hidden: true }, draftWho, draftEl, emptyEl);
   const resultSlot = h('section', { 'aria-labelledby': 'res-title', hidden: true });
   const filesSlot = h('section', { 'aria-labelledby': 'files-title', hidden: true });
   const rawCount = h('span', { class: 'tool-name' });
@@ -149,13 +153,13 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     oninput: () => updateSendBtn(),
   });
   autoGrow(stepText, 140);
+  // A draft carried over from the approval sheet takes focus once the footer shows,
+  // after the first load (it's hidden until then, so focusing earlier does nothing).
+  let focusDraft = false;
   if (drafts.has(threadId)) {
     stepText.value = drafts.get(threadId);
     drafts.delete(threadId);
-    requestAnimationFrame(() => {
-      stepText.focus();
-      stepText.setSelectionRange(stepText.value.length, stepText.value.length);
-    });
+    focusDraft = true;
   }
   const stepBtn = h('button', { class: 'send-btn', type: 'submit', 'aria-label': 'Send to thread', disabled: true }, icon('send'));
   const stopBtn = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => stop() }, icon('stop'), 'Stop thread');
@@ -268,6 +272,13 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     renderFiles();
     renderRawCount();
     renderFoot(th);
+    if (focusDraft) {
+      focusDraft = false;
+      if (!stepForm.hidden && !stepText.disabled) {
+        stepText.focus();
+        stepText.setSelectionRange(stepText.value.length, stepText.value.length);
+      }
+    }
     refreshToolStates(th);
     renderEmpty(th);
     lastStatus = th.status;
@@ -409,7 +420,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
   // ---- the transcript (appended once, never rebuilt while streaming)
 
   function rebuildTranscript() {
-    for (const node of [...convo.children]) if (node !== draftEl && node !== emptyEl) node.remove();
+    for (const node of [...convo.children]) if (node !== draftWho && node !== draftEl && node !== emptyEl) node.remove();
     calls.clear();
     tokensIn = tokensOut = 0;
     lastSpeaker = null;
@@ -420,16 +431,33 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
   }
 
   function addItem(node) {
-    convo.insertBefore(node, draftEl);
+    convo.insertBefore(node, draftWho);
+  }
+
+  function threadModel() {
+    return t().model || events.find((e) => e.kind === 'thread_started')?.model || '';
   }
 
   /** The thread is about to speak: label it with its model if someone else spoke last. */
   function threadSpeaks() {
     if (lastSpeaker === 'thread') return;
     lastSpeaker = 'thread';
-    const modelId = t().model || events.find((e) => e.kind === 'thread_started')?.model || '';
+    const modelId = threadModel();
     const fam = familyOfId(modelId);
     addItem(h('div', { class: ['msg-who', 'thread-who', 'has-fam', `fam-${fam}`] }, familyMark(fam), h('span', { class: 'mono' }, modelId || 'Thread model')));
+  }
+
+  /** Label the streaming draft with the model unless the thread spoke last. */
+  function syncDraftWho() {
+    const show = !draftEl.hidden && lastSpeaker !== 'thread';
+    draftWho.hidden = !show;
+    if (!show) return;
+    const modelId = threadModel();
+    const fam = familyOfId(modelId);
+    if (draftWho.dataset.key === `${modelId}|${fam}`) return;
+    draftWho.dataset.key = `${modelId}|${fam}`;
+    setFamilyClass(draftWho, fam);
+    setChildren(draftWho, familyMark(fam), h('span', { class: 'mono' }, modelId || 'Thread model'));
   }
 
   /** A message to the thread from the orchestrator or the owner (right-hand bubble). */
@@ -557,7 +585,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
   }
 
   function renderEmpty(th) {
-    const has = convo.childElementCount > 2 || !draftEl.hidden;
+    const has = convo.childElementCount > 3 || !draftEl.hidden;
     emptyEl.hidden = has;
     setText(emptyEl, isActive(th.status) ? 'Working… output appears here as it streams.' : 'No output.');
   }
@@ -572,13 +600,13 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
       }
     } else {
       const atEnd = nearEnd();
-      threadSpeaks(); // labels the draft with the model unless the thread spoke last
       draftEl.replaceChildren(renderMarkdown(draft));
       const lastBlock = draftEl.lastElementChild;
       (lastBlock && /^(P|LI|H\d)$/.test(lastBlock.tagName) ? lastBlock : draftEl).append(h('span', { class: 'caret', 'aria-hidden': 'true' }));
       draftEl.hidden = false;
       if (atEnd) body.scrollTop = body.scrollHeight;
     }
+    syncDraftWho();
     renderEmpty(t());
   }
 
@@ -785,6 +813,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
         if (!loaded) return; // the load keeps it and draws everything
         const atEnd = nearEnd();
         appendEvent(e);
+        syncDraftWho(); // e.g. a step-in mid-stream: the draft below it needs its label
         if (e.kind === 'thread_activity' && e.event.type === 'usage') renderTokens();
         if (e.kind === 'thread_activity' && e.event.type === 'text') {
           speaker.reset();
@@ -817,7 +846,15 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     on('approvals', scheduleAll),
     on('devices', scheduleAll),
     on('models', scheduleAll),
-    on('online', scheduleAll),
+    on('online', (online) => {
+      // A dropped socket clears the draft in the store (the stored text repairs it):
+      // take the stale partial text and its caret off the screen too.
+      if (!online && loaded) {
+        speaker.reset();
+        renderDraft();
+      }
+      scheduleAll();
+    }),
   );
 
   renderAll();

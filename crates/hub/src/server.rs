@@ -435,18 +435,39 @@ impl Hub {
     }
 
     /// Resolve an approval request. Returns false if it doesn't exist (any more).
+    ///
+    /// A denial also denies any other pending request for the same call in the same
+    /// conversation (e.g. a model turn that asked for it twice at once).
     pub async fn resolve_approval(&self, approval_id: &str, approved: bool) -> bool {
-        let Some(mut route) = self.approvals.lock().await.remove(approval_id) else { return false };
+        let mut resolved = Vec::new();
+        {
+            let mut approvals = self.approvals.lock().await;
+            let Some(route) = approvals.remove(approval_id) else { return false };
+            if !approved {
+                let key = crate::threads::denial_key(&route.tool, &route.input);
+                let twins: Vec<String> = approvals
+                    .iter()
+                    .filter(|(_, r)| {
+                        r.conversation_id == route.conversation_id && crate::threads::denial_key(&r.tool, &r.input) == key
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                // Remembered while the routes are locked, so a request can't slip in between.
+                self.denied_calls.lock().unwrap().entry(route.conversation_id.clone()).or_default().insert(key);
+                resolved.extend(twins.into_iter().filter_map(|id| approvals.remove(&id).map(|r| (id, r))));
+            }
+            resolved.insert(0, (approval_id.to_string(), route));
+        }
+        for (id, route) in resolved {
+            self.answer_route(&id, route, approved).await;
+        }
+        true
+    }
+
+    /// Tell whoever waits on a resolved approval, and the clients.
+    async fn answer_route(&self, approval_id: &str, mut route: ApprovalRoute, approved: bool) {
         if let Some(timer) = route.timer.take() {
             timer.abort();
-        }
-        if !approved {
-            self.denied_calls
-                .lock()
-                .unwrap()
-                .entry(route.conversation_id.clone())
-                .or_default()
-                .insert(crate::threads::denial_key(&route.tool, &route.input));
         }
         match route.local {
             Some(tx) => {
@@ -465,7 +486,6 @@ impl Hub {
             Some(&route.thread_id),
             EventBody::ApprovalResolved { approval_id: approval_id.into(), approved },
         );
-        true
     }
 }
 
@@ -1956,6 +1976,84 @@ mod tests {
             .await
         );
         assert_eq!(hub.pending_approvals(Some(&c1)).await.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn denying_a_call_also_denies_identical_pending_requests_in_the_chat() {
+        let dir = std::env::temp_dir().join(format!("grouper-denied-twins-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (worker, _) = db.add_device("Laptop", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let (tx, mut device_rx) = mpsc::channel(8);
+        let (close, _close_rx) = CloseHandle::new();
+        let (_closed_tx, closed_rx) = watch::channel(false);
+        hub.live.lock().await.insert(
+            worker.id.clone(),
+            Live { conn_id: 1, tx, tools: Vec::new(), mcp: None, usage_probes: false, close, closed: closed_rx },
+        );
+        let c1 = hub.db.create_conversation("project", "chat").unwrap();
+        let c2 = hub.db.create_conversation("project", "other").unwrap();
+        let t1 = hub.db.create_thread(&c1, "T1", &worker.id, "m", None, "b").unwrap();
+        let t2 = hub.db.create_thread(&c1, "T2", &worker.id, "m", None, "b").unwrap();
+        let t3 = hub.db.create_thread(&c2, "T3", &worker.id, "m", None, "b").unwrap();
+        let rm = json!({"command": "rm important.txt"});
+
+        // One model turn asked for the same call twice at once (a hub-local wait and a
+        // device request), another thread asked too; plus a different call, and the
+        // same call in another chat.
+        let ask = |thread: &str, n: u32, input: &Value, local: bool| {
+            let hub = hub.clone();
+            let (worker, thread, input) = (worker.id.clone(), thread.to_string(), input.clone());
+            async move {
+                let (tx, rx) = oneshot::channel();
+                let id = format!("{thread}-{n}");
+                let tx = local.then_some(tx);
+                assert!(hub.request_approval(&worker, &thread, &id, "run_shell", input, "shell", tx).await);
+                (id, rx)
+            }
+        };
+        let (a1, mut r1) = ask(&t1.id, 1, &rm, true).await;
+        let (a2, mut r2) = ask(&t1.id, 2, &rm, true).await;
+        let (a3, _) = ask(&t1.id, 3, &rm, false).await;
+        let (a4, mut r4) = ask(&t2.id, 1, &rm, true).await;
+        let (a5, mut r5) = ask(&t1.id, 4, &json!({"command": "ls"}), true).await;
+        let (a6, mut r6) = ask(&t3.id, 1, &rm, true).await;
+        assert_eq!(hub.pending_approvals(None).await.len(), 6);
+
+        assert!(hub.resolve_approval(&a1, false).await);
+        assert_eq!(r1.try_recv().ok(), Some(ApprovalAnswer::Deny));
+        assert_eq!(r2.try_recv().ok(), Some(ApprovalAnswer::Deny));
+        assert_eq!(r4.try_recv().ok(), Some(ApprovalAnswer::Deny));
+        match device_rx.try_recv() {
+            Ok(HubMessage::ApprovalResult { approval_id, approved: false, timeout_secs: None }) => {
+                assert_eq!(approval_id, a3)
+            }
+            other => panic!("the device wasn't told: {other:?}"),
+        }
+        assert!(device_rx.try_recv().is_err());
+        // The different call and the other chat's request still wait.
+        assert!(r5.try_recv().is_err() && r6.try_recv().is_err());
+        let left: Vec<String> = hub.pending_approvals(None).await.into_iter().map(|p| p.approval_id).collect();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&a5) && left.contains(&a6), "{left:?}");
+        let mut resolved: Vec<String> = hub
+            .db
+            .events(&c1, 0, None)
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::ApprovalResolved { approval_id, approved: false } => Some(approval_id),
+                _ => None,
+            })
+            .collect();
+        resolved.sort();
+        let mut want = vec![a1, a2, a3, a4];
+        want.sort();
+        assert_eq!(resolved, want);
+        // Approving doesn't touch the others.
+        assert!(hub.resolve_approval(&a5, true).await);
+        assert!(r6.try_recv().is_err());
+        assert_eq!(hub.pending_approvals(None).await.len(), 1);
         std::fs::remove_dir_all(dir).ok();
     }
 
