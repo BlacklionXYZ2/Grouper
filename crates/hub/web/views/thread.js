@@ -345,7 +345,8 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     modelChip.dataset.key = key;
     setFamilyClass(modelChip, fam);
     setChildren(chipMark, familyMark(fam));
-    setText(chipName, modelId || 'model not recorded');
+    // The chip stays a fixed label; only a registry model's name links to its entry.
+    setChildren(chipName, entry ? h('a', { href: `#/models/${enc(modelId)}`, title: `Open ${modelId} in Models` }, modelId) : modelId || 'model not recorded');
     const f = familyInfo(fam);
     const via = entry?.provider_id ? `via ${entry.provider_id}` : '';
     setText(chipNote, [fam === 'unknown' ? '' : f.label, via, 'fixed'].filter(Boolean).join(' · '));

@@ -55,8 +55,11 @@ function isOpenRouterProvider(provider) {
   }
 }
 
-export function renderModels(container) {
+export function renderModels(container, { id: targetId = null } = {}) {
   const admin = isAdmin();
+  // #/models/<id>: open that model's group, bring its row into view and focus it,
+  // once, on the first list that loads.
+  let pendingTarget = targetId || null;
   const body = h('div', { class: 'view-body' });
   container.append(h('section', { class: 'view' }, bar({ title: 'Models', caption: 'Registry, stats, proposals and rules' }), body));
 
@@ -162,7 +165,7 @@ export function renderModels(container) {
   function narrowCard(m) {
     return h(
       'li',
-      { class: 'list-row' },
+      { class: 'list-row model-row', dataset: { modelId: m.id } },
       h(
         'div',
         { class: 'grow' },
@@ -194,7 +197,7 @@ export function renderModels(container) {
     const note = cacheNote(m);
     return h(
       'tr',
-      null,
+      { class: 'model-row', dataset: { modelId: m.id } },
       h('td', { class: 'wrap' }, h('strong', null, m.id), m.use_cases ? h('div', { class: 'row-sub' }, m.use_cases) : null),
       h('td', { class: 'mono' }, `${m.provider_id} / ${m.model}`, note ? h('div', { class: 'hint' }, note) : null),
       h('td', null, m.roles.length ? m.roles.join(', ') : '—'),
@@ -307,6 +310,7 @@ export function renderModels(container) {
         head('m-models', 'Models'),
         h('div', { class: 'card card-pad' }, h('p', null, 'No models yet. Add a provider key in ', h('a', { href: '#/settings' }, 'Settings'), ', then import a model below.')),
       );
+      showTarget();
       return;
     }
     const narrow = matchMedia('(max-width: 760px)').matches;
@@ -325,6 +329,31 @@ export function renderModels(container) {
         h('p', { class: 'hint' }, 'Prices are USD per million tokens. Edit a model to change roles, prices (including cache prices), context window, use cases or local flag.'),
       );
     });
+    showTarget();
+  }
+
+  /** The deep-linked model: expand its group, scroll to it, mark it briefly, focus it. */
+  function showTarget() {
+    if (!pendingTarget) return;
+    const id = pendingTarget;
+    pendingTarget = null;
+    const row = [...slots.models.querySelectorAll('.model-row')].find((el) => el.dataset.modelId === id);
+    if (!row) {
+      toast(`No model “${id}” in the registry. Showing all models.`);
+      return;
+    }
+    const details = row.closest('details');
+    if (details) details.open = true; // not remembered: collapsing stays the person's choice
+    const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    row.setAttribute('tabindex', '-1');
+    row.classList.add('is-target');
+    row.addEventListener('blur', () => row.removeAttribute('tabindex'), { once: true });
+    setTimeout(() => row.classList.remove('is-target'), 2400);
+    row.scrollIntoView({ block: 'center', behavior: still ? 'auto' : 'smooth' });
+    // Don't take focus from something the person moved to while the list loaded.
+    const active = document.activeElement;
+    const free = !active || active === document.body || active === container.querySelector('h1') || active === container.closest('main');
+    if (free) row.focus({ preventScroll: true });
   }
 
   async function refreshModelPrices(m, btn) {

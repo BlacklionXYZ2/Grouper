@@ -9,7 +9,11 @@
 //   #/threads              current or last conversation with the panel open, or #/chat
 //   #/threads/<t>          resolves the thread's conversation and opens the inspector
 //   #/inbox                Needs you: approvals and waiting threads across all chats
-//   #/devices #/devices/<id> #/models #/usage #/memory #/skills #/settings #/more
+//   #/models               the registry
+//   #/models/<id>          the registry with that model's provider group open, its row shown and focused
+//   #/usage                usage and limits; `?provider=<id>` filters the breakdown
+//   #/usage?conversation=<id>  one chat's usage (also takes `&provider=<id>`)
+//   #/devices #/devices/<id> #/memory #/skills #/settings #/more
 //
 // The shell (sidebar, tab bar) is built once per sign-in and updated in place, so
 // focus and scroll survive the live updates. Everything it subscribes to is torn
@@ -286,7 +290,8 @@ function buildNav() {
   const tabs = [
     tab('#/chat', 'Chat', 'chat', ['chat'], 'need you'),
     tab('#/devices', 'Devices', 'devices', ['devices']),
-    tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings'], 'pending'),
+    // The inbox is reached from More on phones for now, so More stays lit there.
+    tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings', 'inbox'], 'pending'),
   ];
   setChildren(els.tabbar, tabs.map((t) => t.a));
   nav = { needsItem, needsBadge, chatList, chatEmpty, foot, conn, tabs };
@@ -391,7 +396,8 @@ export function parseRoute() {
   }
   if (view === 'usage') {
     const conversation = query.get('conversation') || (a === 'conversation' ? b : a) || null;
-    return { view: 'usage', conversation };
+    // The provider filter changes in place: it's not part of the route key below.
+    return { view: 'usage', conversation, provider: query.get('provider') || null };
   }
   return { view, id: a };
 }

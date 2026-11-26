@@ -5,12 +5,14 @@
 //      shown as unofficial snapshots.
 // Then the metered breakdown (by provider, model, chat, thread or day; a provider
 // card's Filter button narrows it to that provider) and the hub's limits and
-// budgets. `#/usage?conversation=<id>` shows one chat's usage.
+// budgets. `#/usage?conversation=<id>` shows one chat's usage; `provider=<id>`
+// (alone or with `conversation=`) is the provider filter, so it survives a reload
+// and Back undoes it. Changing only the filter updates the page in place.
 
 import { h, icon, setChildren, setText, keepFocus, throttle } from '../lib/dom.js';
 import { get, post, put, qs, enc, describe, isAbort } from '../lib/api.js';
 import { store, on, isAdmin, deviceName, deviceOnline } from '../lib/store.js';
-import { bar, toast, toastError, skeleton, errorBanner, guardWrites, isOffline } from '../lib/ui.js';
+import { bar, toast, toastError, skeleton, errorBanner, guardWrites, isOffline, navigate } from '../lib/ui.js';
 import { num, usd, ago, dateTime, isoDay, plural } from '../lib/format.js';
 import { familyKey, familyMark, familyLabel } from '../lib/family.js';
 
@@ -245,7 +247,7 @@ function compareTuples(a, b) {
 
 // ---- the view
 
-export function renderUsage(container, { conversation: filterCid = null } = {}) {
+export function renderUsage(container, { conversation: filterCid = null, provider: routeProvider = null } = {}) {
   const admin = isAdmin();
   const barSlot = h('div', { class: 'bar-slot' });
   const body = h('div', { class: 'view-body u-body' });
@@ -301,7 +303,8 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
   let custom = { since: isoDay(new Date(Date.now() - 29 * 86400000)), until: todayIso };
   let group = 'model';
   // A provider card's filter: the breakdown shows only that provider's calls.
-  let providerFilter = null;
+  // It lives in the URL (`provider=`); clicks navigate and the route applies it.
+  let providerFilter = routeProvider || null;
   const st = { providers: null, byProvider: null, free: null, snaps: null, rows: null };
 
   function rangeQuery() {
@@ -432,6 +435,14 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
   function setProviderFilter(id) {
     const next = id && id !== providerFilter ? id : null;
     if (next === providerFilter) return;
+    // A history entry per change, so Back undoes it; the route event applies it.
+    navigate(`#/usage${qs({ conversation: filterCid, provider: next })}`);
+  }
+
+  /** Show the filter the URL names, in place: the chip, the cards' state, the rows. */
+  function applyProviderFilter(id) {
+    const next = id || null;
+    if (next === providerFilter) return;
     const previous = providerFilter;
     const chipHadFocus = filterSlot.contains(document.activeElement);
     providerFilter = next;
@@ -444,6 +455,11 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     }
     loadRows();
   }
+
+  // The route key ignores `provider=`, so this view stays and only the filter moves.
+  const offRoute = on('route', (r) => {
+    if (r.view === 'usage' && (r.conversation || null) === filterCid) applyProviderFilter(r.provider);
+  });
 
   function drawFilterChip() {
     if (!providerFilter) {
@@ -952,6 +968,18 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
 
   // ---- breakdown
 
+  /**
+   * The registry id behind a usage row's model. Usage records the provider's model
+   * string (what answered), so match on that, within the provider filter; a string two
+   * entries share stays ambiguous (null), and so does one no entry has.
+   */
+  function registryIdFor(model, provider) {
+    const pool = store.models.filter((m) => !provider || m.provider_id === provider);
+    const byModel = pool.filter((m) => m.model === model);
+    if (byModel.length === 1) return byModel[0].id;
+    return pool.find((m) => m.id === model)?.id || null;
+  }
+
   function rowLabel(r, g) {
     const key = r.key;
     if (g === 'conversation') {
@@ -967,7 +995,9 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     }
     if (g === 'model') {
       const fam = familyKey(key);
-      return h('a', { href: '#/models', class: 'u-model' }, familyMark(fam), h('span', { class: 'mono' }, key), h('span', { class: 'visually-hidden' }, ` (${familyLabel(fam)})`));
+      const id = registryIdFor(key, st.rows?.provider);
+      const link = id ? { href: `#/models/${enc(id)}`, title: `Open ${id} in Models` } : { href: '#/models', title: 'Open Models' };
+      return h('a', { ...link, class: 'u-model' }, familyMark(fam), h('span', { class: 'mono' }, key), h('span', { class: 'visually-hidden' }, ` (${familyLabel(fam)})`));
     }
     if (g === 'provider') return h('span', { class: 'u-provider-name' }, key);
     return h('span', { class: 'mono' }, key);
@@ -1342,6 +1372,9 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     relabel();
   });
   const offThreads = on('threads', relabel);
+  const offModels = on('models', () => {
+    if (st.rows?.group === 'model') drawBreakdown();
+  });
   const offDevices = on('devices', () => drawSubs());
   const offOnline = on('online', (online) => {
     syncRefresh();
@@ -1382,5 +1415,7 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     offThreads();
     offDevices();
     offOnline();
+    offRoute();
+    offModels();
   };
 }
