@@ -72,6 +72,9 @@ public struct ThreadTranscript: Equatable, Sendable {
             case .text(_, _, let text):
                 threadSpeaks(before: row.id)
                 messages.append(.text(id: row.id, text: text))
+            case .tool(_, _, let call, _) where call.name == ThreadPlan.toolName:
+                // The plan is shown as a checklist above the chat, not as a tool row.
+                break
             case .tool(_, _, let call, let result) where call.name == Self.askTool:
                 threadSpeaks(before: row.id)
                 messages.append(.ask(id: "ask:\(call.callId)", question: Self.question(from: call.input)))

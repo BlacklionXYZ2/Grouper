@@ -36,9 +36,9 @@ struct SettingsView: View {
                 }
                 .disabled(model.registeringDevice || model.client == nil)
                 Text("Makes a new device token for this Mac and revokes the old one on the hub.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(Theme.text2)
                 if let message = model.deviceMessage {
-                    Text(message).font(.caption).foregroundStyle(.red)
+                    Text(message).font(.caption).foregroundStyle(Theme.danger)
                 }
                 DisclosureGroup("Use an existing device token", isExpanded: $model.showManualDeviceToken) {
                     SecureField("Device token", text: $model.manualDeviceToken)
@@ -53,7 +53,7 @@ struct SettingsView: View {
                     .disabled(savingDeviceToken || model.client == nil
                               || model.manualDeviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     Text("For a plain device token made on the hub with grouper-hub device add. Never paste an admin token here.")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(Theme.text2)
                 }
             }
             #endif
@@ -66,13 +66,14 @@ struct SettingsView: View {
                 }
                 .disabled(model.registeringDevice)
                 Text("Signing out keeps this Mac's device token, so it can keep running threads. Removing this Mac also revokes its token on the hub.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(Theme.text2)
                 #endif
             }
         }
         #if os(macOS)
         .formStyle(.grouped)
         #endif
+        .grouperListBackground()
         .navigationTitle("Settings")
     }
 }
@@ -90,7 +91,7 @@ struct AccountSettingsSection: View {
                     VStack(alignment: .trailing, spacing: 2) {
                         Text(account.email).textSelection(.enabled)
                         if !account.name.isEmpty {
-                            Text(account.name).font(.caption).foregroundStyle(.secondary)
+                            Text(account.name).font(.caption).foregroundStyle(Theme.text2)
                         }
                     }
                 }
@@ -104,25 +105,25 @@ struct AccountSettingsSection: View {
                     }
             } else if model.client == nil {
                 Text("Sign in to see the Google account linked to the hub.")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(Theme.text2)
             } else if !model.googleLinkLoaded {
                 HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Checking the linked account…") }
             } else if GoogleSignIn.oauth == nil {
                 Text("This app has no Google client ID, so Google sign-in is off.")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(Theme.text2)
             } else if model.authStatus?.google != true {
                 Text("Google sign-in isn't turned on for this hub.")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(Theme.text2)
             } else {
                 Button(model.googleBusy ? "Linking…" : "Link your Google account") {
                     Task { await model.linkGoogle() }
                 }
                 .disabled(model.googleBusy || model.client == nil)
                 Text("Then you can sign in to this hub with Google instead of pasting a token.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(Theme.text2)
             }
             if let message = model.accountMessage {
-                Text(message).font(.caption).foregroundStyle(.red)
+                Text(message).font(.caption).foregroundStyle(Theme.danger)
             }
         }
         .task(id: model.signedIn) { await model.refreshGoogleLink() }
@@ -141,7 +142,7 @@ struct NotificationSettingsSection: View {
     var body: some View {
         Section("Notifications") {
             Text("Grouper can notify this \(deviceWord) when a tool needs your review. Notifications show tool, device, thread and chat names, never the command or its contents. You must open Grouper to inspect and approve.")
-                .font(.callout).foregroundStyle(.secondary)
+                .font(.callout).foregroundStyle(Theme.text2)
             if permission == .denied {
                 Text("Notifications for Grouper are turned off in system settings.").font(.callout)
                 if let url = ApprovalNotifications.systemSettingsURL {
@@ -159,7 +160,7 @@ struct NotificationSettingsSection: View {
             }
             // TODO(APNs): background delivery needs APNs and a paid Apple Developer account.
             Text("They arrive only while Grouper is running. Delivery while it is closed needs Apple push notifications, which aren’t set up yet.")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(Theme.text2)
         }
         .task { permission = await ApprovalNotifications.permission() }
     }
@@ -195,13 +196,18 @@ struct MoreView: View {
         NavigationStack {
             List {
                 NavigationLink { SettingsView() } label: { Label("Settings", systemImage: "gear") }
+                    .listRowBackground(Theme.surface)
                 Section("Later milestones") {
                     Label("Models", systemImage: "cpu")
                     Label("Usage", systemImage: "chart.bar")
                     Label("Memory", systemImage: "brain")
                     Label("Skills", systemImage: "sparkles")
-                }.foregroundStyle(.secondary)
-            }.navigationTitle("More")
+                }
+                .foregroundStyle(Theme.text3)
+                .listRowBackground(Theme.surface)
+            }
+            .grouperListBackground()
+            .navigationTitle("More")
         }
     }
 }
