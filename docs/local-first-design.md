@@ -17,6 +17,16 @@ sync with it. The cloud deployment stays in the docs until it can be justified a
   their default hub address (not shown at sign-in), changeable in Settings.
 - **Picking the hub:** "could you have Fable come up with a way for a user to pick which device is
   the hub?" (design below, section 4a).
+- **The hub is a device id (owner, 26 Nov, late):** "The hub isn't the domain. The hub is a device
+  id. Since you already have a device id system, it should be pretty easy to attribute ids to an
+  account and assign one as a hub." So the model is: **account** (the Google identity) → its
+  **devices** (the existing device ids) → **`hub_device_id`**, one of them. Picking or moving the hub
+  reassigns `hub_device_id` to another device id of the same account (and moves the data there).
+  This supersedes the separate `hub_id` / `instance_id` identity used below: wherever this document
+  says `hub_id`, read the account id; wherever it says `instance_id`, read `hub_device_id`. `epoch`
+  stays only as a counter of hub assignments (it rises each time `hub_device_id` changes) so a stale
+  hub can tell it was replaced. The domain is just the default address that reaches whichever
+  device is the hub.
 - **Windows app:** Tauri, as recommended.
 - **Hub device to start:** the Windows PC.
 - **Drive app-data record:** the owner asked what it is; not decided. With a default domain the
@@ -318,7 +328,7 @@ Wave 1 packages run in parallel and share no files. Later packages name what the
 | # | Package | Owns | Verify | Needs |
 |---|---|---|---|---|
 | **Wave 1** | | | | |
-| 1 | **Embeddable hub and local claim.** Serving moves from `main.rs` into `host` (`start(data, binds) → handle`); `backup` joins the library; `claim_local`; local mode (HTTP claim off, token sign-in loopback only); `/v1/hub` gains `epoch`, `instance_id`, `key_sha256`. | `crates/hub/src/{host.rs (new), main.rs, lib.rs, backup.rs, google_auth.rs, session.rs, db.rs}`, `server.rs` (`hub_info` only), `crates/core-protocol` | `cargo test --workspace`, `scripts/e2e.*` unchanged; new tests: local claim, HTTP claim refused in local mode, token sign-in refused off loopback | — |
+| 1 | **Embeddable hub and local claim.** Serving moves from `main.rs` into `host` (`start(data, binds) → handle`); `backup` joins the library; `claim_local`; local mode (HTTP claim off, token sign-in loopback only); accounts own device ids and one is the hub (`hub_device_id`; owner answer above); `/v1/hub` gains `account`, `hub_device_id`, `epoch`, `key_sha256`. | `crates/hub/src/{host.rs (new), main.rs, lib.rs, backup.rs, google_auth.rs, session.rs, db.rs}`, `server.rs` (`hub_info` only), `crates/core-protocol` | `cargo test --workspace`, `scripts/e2e.*` unchanged; new tests: local claim, HTTP claim refused in local mode, token sign-in refused off loopback | — |
 | 2 | **Web sign-in for local mode.** Google-only screen, localhost return, hub-offline state. | `crates/hub/web/views/login.js`, `app.js`, `css/brand.css` | Local hub + headless browser; `sw.test.mjs` | Q5 for a real sign-in |
 | 3 | **Apple apps: no URL, no token.** Built-in hub address, sign-in is one Google button, Settings → Hub address, refused / no-answer / phone waiting screens. | `apple/GrouperApp/Shared/{SignInView,SettingsView,AppModel}.swift`, `apple/GrouperKit/Sources/GrouperAPI/HubAddress.swift` (new) + its tests | `swift test`; **macOS CI** (`apple.yml`); **real iPhone and Mac** against today's hub at the domain | — |
 | 4 | **CLI default address.** `--hub` optional everywhere; `grouper login` works with no arguments. | `crates/cli/src/{main.rs,credentials.rs}` | Unit tests for address resolution; manual `grouper login` on Windows | — |
