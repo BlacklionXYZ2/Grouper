@@ -157,9 +157,11 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 
 ## CLI
 
+`--hub` is optional on every command, including `grouper login` with no arguments. The hub address is `--hub`, then `GROUPER_HUB`, then the hub saved by `grouper login`, then `https://grouper.clockmillbarn.uk`.
+
 | Command | Does |
 |---|---|
-| `grouper login [--hub <url>] [--name <name>] [--no-browser]`, `grouper logout` | Sign this computer in by approving it in the browser; saves the hub URL, its device token (DPAPI on Windows, Keychain on macOS, an owner-only file on Linux) and install id in `<config dir>/grouper/credentials.json` (`GROUPER_CREDENTIALS_FILE` overrides the path), so `GROUPER_TOKEN` isn't needed |
+| `grouper login [--hub <url>] [--name <name>] [--no-browser]`, `grouper logout` | Sign this computer in by approving it in the browser. With no `--hub` and no `GROUPER_HUB`, login uses the saved hub, or `https://grouper.clockmillbarn.uk`. Saves the hub URL, its device token (DPAPI on Windows, Keychain on macOS, an owner-only file on Linux) and install id in `<config dir>/grouper/credentials.json` (`GROUPER_CREDENTIALS_FILE` overrides the path), so `GROUPER_TOKEN` isn't needed |
 | `grouper connect` | Be a device: stay online, run threads here (`--workspace`, `--no-shell`, `--mcp-config`, `--folder name=path[:rw]`) |
 | `grouper files <thread> [<path> -o out]` | List or download a thread's output files, from whichever device it ran on |
 | `grouper chat "…"` (`-c <id>`, `--standard`) | Talk to Grouper; prints replies and thread activity |
