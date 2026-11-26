@@ -1,8 +1,9 @@
 # Usage and cost tracking — research and proposed design
 
-Status: research, 2026-11-24. Nothing built yet. Goal: Grouper always knows how much
-each linked account and API key has used and has left, so you don't need to check each
-one yourself, and the orchestrator can pick a provider that still has headroom.
+Status: steps 1–3 built (metered usage, OpenRouter/DeepSeek balance collectors, and
+opt-in device subscription probes for Claude Code and Codex). Goal: Grouper always knows
+how much each linked account and API key has used and has left, so you don't need to check
+each one yourself, and the orchestrator can pick a provider that still has headroom.
 
 Inspiration: **Limits: AI Usage Tracker** (iOS) shows subscription windows for Codex
 (ChatGPT), Claude, Cursor, Grok and Antigravity. Open-source apps that do the same and
@@ -94,8 +95,14 @@ change.
 1. Grouper's own metering + `usage` table + `grouper usage` (needed anyway).
 2. OpenRouter and DeepSeek collectors (official, normal keys, matches the free
    OpenRouter key you're planning to add).
-3. Claude and Codex probes on the Mac (the two most useful windows, both read from
-   CLIs you already use).
+3. **Built:** Claude Code and Codex subscription probes on devices
+   (`crates/core-client/src/usage_probes.rs`), exposed over the unlisted internal
+   `grouper_usage_probe` MCP tool when a device opts in (`grouper connect --usage-probes`,
+   default off). Credentials stay on the device (read-only from `~/.claude/.credentials.json`
+   / macOS Keychain and `~/.codex/auth.json`, never logged or forwarded). The hub polls
+   opted-in online devices on connect, every 10 minutes, and after threads using the
+   matching provider; snapshots keep their `device_id` and age when offline and show up in
+   `GET /v1/usage/snapshots`, `grouper usage balances`, and `list_usage`.
 4. Antigravity probe, then Cursor (cookie handling is the awkward part).
 5. Anthropic/OpenAI admin-key collectors if you want reconciliation of total spend.
 6. Alerts, routing, then the app UI and widgets.

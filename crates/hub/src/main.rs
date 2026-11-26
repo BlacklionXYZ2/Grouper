@@ -1,3 +1,5 @@
+mod backup;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -40,6 +42,23 @@ enum Cmd {
         #[arg(long)]
         options: Option<String>,
     },
+    /// Write a consistent snapshot of the database and thread workspaces (works while the hub
+    /// runs). The master key is not included: keep it, or GROUPER_MASTER_KEY, separately.
+    Backup {
+        /// Directory to create, or a path ending in `.tar.gz` / `.tgz`.
+        output: PathBuf,
+        /// Copy `<data>/workspaces` (pass `--include-workspaces=false` to skip it).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        include_workspaces: bool,
+    },
+    /// Restore a snapshot made by `backup` into the data directory.
+    Restore {
+        /// Directory or `.tar.gz` file produced by `backup`.
+        backup: PathBuf,
+        /// If the data directory already has hub files, move them aside (never deleted) and restore.
+        #[arg(long)]
+        force: bool,
+    },
     /// Add or update a model in the registry.
     Model {
         id: String,
@@ -56,6 +75,13 @@ enum Cmd {
         input_price: f64,
         #[arg(long, default_value_t = 0.0)]
         output_price: f64,
+        #[arg(long)]
+        cache_read_price: Option<f64>,
+        #[arg(long)]
+        cache_write_price: Option<f64>,
+        /// Runs on your own hardware (for "sensitive → local" priority rules).
+        #[arg(long)]
+        local: bool,
     },
 }
 
@@ -66,9 +92,20 @@ enum DeviceCmd {
         name: String,
         #[arg(long, default_value = "unknown")]
         platform: String,
+        /// Make this an admin token, for your own client: it can change tool
+        /// permissions, answer approvals, manage keys and models, and chat. Don't
+        /// give an admin token to a device that runs threads with a shell.
+        #[arg(long)]
+        admin: bool,
     },
     /// List registered devices.
     List,
+    /// Grant admin rights to a device's existing token (or remove them with --off).
+    Admin {
+        id: String,
+        #[arg(long)]
+        off: bool,
+    },
     /// Revoke a device's token.
     Revoke { id: String },
 }
@@ -79,15 +116,32 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
+    // Backup and restore must not open the database through `Db::open`: that migrates, seals keys
+    // and can create a master key. A snapshot has to work while `serve` is running, and a restore
+    // must not create an empty database before it decides the directory is empty.
+    match &cli.cmd {
+        Cmd::Backup { output, include_workspaces } => return backup::backup(&cli.data, output, *include_workspaces),
+        Cmd::Restore { backup, force } => return backup::restore(&cli.data, backup, *force),
+        _ => {}
+    }
+    let _serve_lock = if matches!(&cli.cmd, Cmd::Serve { .. }) {
+        Some(backup::lock_data_dir(&cli.data)?)
+    } else {
+        None
+    };
     let db = Db::open(&cli.data)?;
 
     match cli.cmd {
+        Cmd::Backup { .. } | Cmd::Restore { .. } => unreachable!("handled before opening the database"),
         Cmd::Serve { bind } => {
             let hub = server::Hub::new(db, cli.data.clone());
+            // Threads waiting for a device keep waiting; a hub part that was running stops at once.
+            hub.recover_waiting_threads();
             // Threads that were running when the hub stopped can't be resumed.
             for t in hub.db.threads(None).into_iter().filter(|t| t.status == "running") {
                 hub.db.finish_thread(&t.id, "failed", "The hub restarted while this thread was running.");
             }
+            tokio::spawn(hub::usage::collector_loop(hub.clone()));
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!("grouper-hub listening on {bind}, data in {}", cli.data.display());
             axum::serve(listener, server::router(hub))
@@ -96,15 +150,25 @@ async fn main() -> Result<()> {
                 })
                 .await?;
         }
-        Cmd::Device(DeviceCmd::Add { name, platform }) => {
-            let (d, token) = db.add_device(&name, &platform)?;
-            println!("Registered {} ({}) as {}", d.name, d.platform, d.id);
+        Cmd::Device(DeviceCmd::Add { name, platform, admin }) => {
+            let (d, token) = db.add_device(&name, &platform, admin)?;
+            let kind = if admin { "admin" } else { "device" };
+            println!("Registered {} ({}) as {} with a {kind} token", d.name, d.platform, d.id);
             println!("Token (shown once, keep it secret):\n{token}");
         }
         Cmd::Device(DeviceCmd::List) => {
             for d in db.devices() {
                 let state = if d.revoked { "revoked" } else { "active" };
-                println!("{}  {:<20} {:<8} {}", d.id, d.name, d.platform, state);
+                let kind = if d.admin { "admin" } else { "device" };
+                println!("{}  {:<20} {:<8} {:<7} {}", d.id, d.name, d.platform, state, kind);
+            }
+        }
+        Cmd::Device(DeviceCmd::Admin { id, off }) => {
+            db.set_admin(&id, !off)?;
+            if off {
+                println!("{id} now has a plain device token.");
+            } else {
+                println!("{id} now has an admin token. Don't use it on a device that runs threads with a shell.");
             }
         }
         Cmd::Device(DeviceCmd::Revoke { id }) => {
@@ -119,20 +183,67 @@ async fn main() -> Result<()> {
             db.upsert_provider(&ProviderConfig { id: id.clone(), kind, base_url, api_key: key, options })?;
             println!("Saved provider {id}. Connected devices get it when the hub restarts or via `grouper keys set`.");
         }
-        Cmd::Model { id, provider, model, roles, free, input_price, output_price } => {
+        Cmd::Model {
+            id,
+            provider,
+            model,
+            roles,
+            free,
+            input_price,
+            output_price,
+            cache_read_price,
+            cache_write_price,
+            local,
+        } => {
             db.upsert_model(&ModelEntry {
                 id: id.clone(),
                 provider_id: provider,
                 model,
                 input_price,
                 output_price,
+                cache_read_price,
+                cache_write_price,
                 context_window: 0,
                 use_cases: String::new(),
                 free,
                 roles: roles.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
+                local,
+                modalities: vec![],
             })?;
             println!("Saved model {id}.");
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn include_workspaces_flag_parses_false() {
+        let cli =
+            Cli::try_parse_from(["grouper-hub", "--data", "hub-data", "backup", "--include-workspaces=false", "out.tar.gz"])
+                .unwrap();
+        match cli.cmd {
+            Cmd::Backup { include_workspaces, output } => {
+                assert!(!include_workspaces);
+                assert_eq!(output.as_os_str(), "out.tar.gz");
+            }
+            _ => panic!("expected backup"),
+        }
+        assert_eq!(cli.data.as_os_str(), "hub-data");
+    }
+
+    #[test]
+    fn restore_force_flag_parses() {
+        let cli = Cli::try_parse_from(["grouper-hub", "restore", "snap.tar.gz", "--force"]).unwrap();
+        match cli.cmd {
+            Cmd::Restore { force, backup } => {
+                assert!(force);
+                assert_eq!(backup.as_os_str(), "snap.tar.gz");
+            }
+            _ => panic!("expected restore"),
+        }
+    }
 }

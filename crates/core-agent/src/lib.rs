@@ -11,9 +11,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use core_protocol::AgentEvent;
-use providers::{Block, Message, Provider, Request, Role, StopReason, ToolDef, Usage};
+use providers::{Block, Delta, Message, Provider, Request, Role, StopReason, ToolDef, Usage};
 use serde_json::Value;
 
+pub mod agents;
+pub mod files;
+pub mod folders;
 pub mod permission;
 pub mod thread;
 pub mod tools;
@@ -53,8 +56,10 @@ pub enum Gate {
 #[async_trait]
 pub trait Hooks: Send + Sync {
     fn event(&self, event: AgentEvent);
-    /// Decide whether a tool call may run (approvals live here).
-    async fn gate(&self, _tool: &str, _input: &Value) -> Gate {
+    /// Decide whether a tool call may run (approvals live here). It may rewrite the
+    /// arguments first (clamping a CLI agent's safety options); the `ToolCall` event,
+    /// the approval request and the call itself all see the rewritten arguments.
+    async fn gate(&self, _tool: &str, _input: &mut Value) -> Gate {
         Gate::Allow
     }
     /// Messages to add before the next model call (user stepping in, etc.).
@@ -132,24 +137,31 @@ pub async fn run_loop(
             tools: defs.clone(),
             max_tokens: cfg.max_tokens,
         };
-        let resp = match provider.complete(&req).await {
+        // Text reaches clients as it is generated; the full message follows as Text.
+        let on_delta = |d: Delta| {
+            if let Delta::Text(text) = d {
+                hooks.event(AgentEvent::TextDelta { text });
+            }
+        };
+        let resp = match provider.complete_stream(&req, &on_delta).await {
             Ok(r) => r,
             Err(e) => return LoopOutcome { final_text: last_text, usage, ending: Ending::Error(e.to_string()) },
         };
-        usage.add(&resp.usage);
-        hooks.event(AgentEvent::Usage {
-            provider_id: cfg.provider_id.clone(),
-            model: cfg.model.clone(),
-            input_tokens: resp.usage.input_tokens,
-            output_tokens: resp.usage.output_tokens,
-            cache_read_tokens: resp.usage.cache_read_tokens,
-            cache_write_tokens: resp.usage.cache_write_tokens,
-        });
         let text = resp.message.text();
         if !text.is_empty() {
             hooks.event(AgentEvent::Text { text: text.clone() });
             last_text = text;
         }
+        usage.add(&resp.usage);
+        hooks.event(AgentEvent::Usage {
+            provider_id: cfg.provider_id.clone(),
+            // A free model swapped for another on the same key bills (and counts) as the one that answered.
+            model: resp.model.clone().unwrap_or_else(|| cfg.model.clone()),
+            input_tokens: resp.usage.input_tokens,
+            output_tokens: resp.usage.output_tokens,
+            cache_read_tokens: resp.usage.cache_read_tokens,
+            cache_write_tokens: resp.usage.cache_write_tokens,
+        });
         let calls: Vec<(String, String, Value)> = resp
             .message
             .content
@@ -170,13 +182,21 @@ pub async fn run_loop(
 
         // Run every requested tool concurrently; results go back in one message, in order.
         let runs = calls.iter().map(|(id, name, input)| async move {
-            hooks.event(AgentEvent::ToolCall { call_id: id.clone(), name: name.clone(), input: input.clone() });
+            let mut input = input.clone();
             let out = match tools.iter().find(|t| t.def().name == *name) {
-                None => ToolOutput::err(format!("unknown tool {name}")),
-                Some(tool) => match hooks.gate(name, input).await {
-                    Gate::Deny(reason) => ToolOutput::err(format!("Not run: {reason}")),
-                    Gate::Allow => tool.call(input.clone()).await,
-                },
+                None => {
+                    hooks.event(AgentEvent::ToolCall { call_id: id.clone(), name: name.clone(), input });
+                    ToolOutput::err(format!("unknown tool {name}"))
+                }
+                Some(tool) => {
+                    // The gate runs first, so the log shows the arguments that actually run.
+                    let gate = hooks.gate(name, &mut input).await;
+                    hooks.event(AgentEvent::ToolCall { call_id: id.clone(), name: name.clone(), input: input.clone() });
+                    match gate {
+                        Gate::Deny(reason) => ToolOutput::err(format!("Not run: {reason}")),
+                        Gate::Allow => tool.call(input).await,
+                    }
+                }
             };
             let content = truncate(out.content);
             hooks.event(AgentEvent::ToolResult {
@@ -249,5 +269,19 @@ mod tests {
         assert_eq!(history.len(), 4);
         let results = &history[2].content;
         assert_eq!(results.len(), 2);
+
+        // The answer streamed in pieces, then arrived whole.
+        let events = rec.0.lock().unwrap();
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| if let AgentEvent::TextDelta { text } = e { Some(text.as_str()) } else { None })
+            .collect();
+        assert!(deltas.len() > 1);
+        assert_eq!(deltas.concat(), "all done");
+        let last_delta = events.iter().rposition(|e| matches!(e, AgentEvent::TextDelta { .. })).unwrap();
+        let text = events.iter().position(|e| matches!(e, AgentEvent::Text { .. })).unwrap();
+        let last_usage = events.iter().rposition(|e| matches!(e, AgentEvent::Usage { .. })).unwrap();
+        assert!(last_delta < text);
+        assert!(text < last_usage);
     }
 }

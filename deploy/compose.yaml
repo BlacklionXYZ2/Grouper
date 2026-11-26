@@ -15,8 +15,11 @@ services:
       - "8080:8080"
     volumes:
       - grouper-data:/data
+      - grouper-secrets:/secrets
     environment:
       RUST_LOG: info
+      GROUPER_MASTER_KEY_FILE: /secrets/master.key
 
 volumes:
   grouper-data:
+  grouper-secrets:

@@ -11,7 +11,8 @@
 //! The first rule whose `system` and `last` substrings both match (system prompt and
 //! the text of the last message, tool results included) wins. Stateless, so the
 //! same script drives the hub and every device. In tool inputs, `$THREAD_ID` is
-//! replaced by the first `Thread t…` id mentioned in the last message.
+//! replaced by the first `Thread t…` id mentioned in the last message. Optional
+//! `"delay_ms"` is how long each reply takes; streamed replies arrive a word at a time.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -70,9 +71,8 @@ fn substitute(v: &Value, thread_id: &Option<String>) -> Value {
     }
 }
 
-#[async_trait]
-impl Provider for Scripted {
-    async fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+impl Scripted {
+    fn reply(&self, req: &Request) -> Response {
         let last = last_text(req.messages.last());
         let matches = |rule: &Value, key: &str, hay: &str| {
             rule.get(key).and_then(Value::as_str).is_none_or(|needle| hay.contains(needle))
@@ -103,15 +103,112 @@ impl Provider for Scripted {
                 }),
             }
         }
-        if let Some(ms) = self.script.get("delay_ms").and_then(Value::as_u64) {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
         let has_calls = content.iter().any(|b| matches!(b, Block::ToolUse { .. }));
         let chars: usize = req.messages.iter().map(|m| last_text(Some(m)).len()).sum::<usize>() + req.system.len();
-        Ok(Response {
+        Response {
+            model: None,
             message: Message { role: Role::Assistant, content, raw: None },
             stop: if has_calls { StopReason::ToolUse } else { StopReason::EndTurn },
             usage: Usage { input_tokens: (chars / 4) as u64, output_tokens: 20, ..Default::default() },
-        })
+        }
+    }
+
+    /// `delay_ms` in the script: how long a whole reply takes.
+    fn delay(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.script.get("delay_ms").and_then(Value::as_u64).unwrap_or(0))
+    }
+}
+
+/// Split text into small chunks (a word and its trailing whitespace each), the way
+/// a model streams tokens. Concatenated, the chunks give back the text.
+fn chunks(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_space = false;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            in_space = true;
+        } else if in_space {
+            out.push(&text[start..i]);
+            start = i;
+            in_space = false;
+        }
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+#[async_trait]
+impl Provider for Scripted {
+    async fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+        let resp = self.reply(req);
+        tokio::time::sleep(self.delay()).await;
+        Ok(resp)
+    }
+
+    /// Streams text a word at a time: half of `delay_ms` passes before the first
+    /// word, the rest is spread between the words.
+    async fn complete_stream(&self, req: &Request, on_delta: OnDelta<'_>) -> Result<Response, ProviderError> {
+        let resp = self.reply(req);
+        let texts: Vec<&str> = resp
+            .message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut pieces: Vec<String> = Vec::new();
+        for (i, t) in texts.iter().enumerate() {
+            if i > 0 {
+                pieces.push("\n".into()); // Message::text joins blocks with '\n'
+            }
+            pieces.extend(chunks(t).into_iter().map(String::from));
+        }
+        let delay = self.delay();
+        if pieces.is_empty() {
+            tokio::time::sleep(delay).await;
+            return Ok(resp);
+        }
+        tokio::time::sleep(delay / 2).await;
+        let step = (delay / 2) / pieces.len() as u32;
+        for (i, p) in pieces.into_iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(step).await;
+            }
+            on_delta(Delta::Text(p));
+        }
+        Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunks_rejoin() {
+        for t in ["", "one", "Hello there,  world!\nNext line ", "  lead", "héllo wörld ✓"] {
+            assert_eq!(chunks(t).concat(), t);
+        }
+        assert_eq!(chunks("a bc  d"), vec!["a ", "bc  ", "d"]);
+    }
+
+    #[tokio::test]
+    async fn streams_in_pieces() {
+        let p = Scripted {
+            script: json!({"default": [{"type": "text", "text": "one two three"}, {"type": "text", "text": "four"}]}),
+            counter: AtomicU64::new(1),
+        };
+        let req = Request { model: "m".into(), system: "".into(), messages: vec![], tools: vec![], max_tokens: 10 };
+        let got = std::sync::Mutex::new(Vec::new());
+        let resp = p.complete_stream(&req, &|d| got.lock().unwrap().push(d)).await.unwrap();
+        let got = got.into_inner().unwrap();
+        assert!(got.len() > 3);
+        let text: String = got.iter().map(|d| if let Delta::Text(t) = d { t.as_str() } else { "" }).collect();
+        assert_eq!(text, resp.message.text());
     }
 }

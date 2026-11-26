@@ -1,0 +1,85 @@
+name: Grouper
+options:
+  bundleIdPrefix: uk.clockmillbarn.grouper
+  deploymentTarget:
+    iOS: "26.0"
+    macOS: "26.0"
+  xcodeVersion: "26.0"
+packages:
+  GrouperKit:
+    path: ../GrouperKit
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    DEVELOPMENT_TEAM: ""
+targets:
+  # VERIFY ON MAC: Add entitlements once signed with a team:
+  # - com.apple.developer.usernotifications.time-sensitive (for approval notifications during Focus)
+  # - App Group + Keychain access group once widgets/share/notification extensions share state or tokens.
+  # - NSAppTransportSecurity (NSAllowsLocalNetworking) if testing against non-HTTPS LAN hubs on iOS.
+  Grouper-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - Shared
+      - path: iOS
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: GrouperKit
+        product: GrouperAPI
+      - target: GrouperWidgets
+        embed: true
+    settings:
+      base:
+        INFOPLIST_FILE: iOS/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.ios
+        SUPPORTS_MACCATALYST: NO
+        TARGETED_DEVICE_FAMILY: "1"
+  GrouperWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: iOSWidgets
+        excludes:
+          - Info.plist
+      - path: iOS/ThreadActivityAttributes.swift
+      - path: iOS/StopThreadIntent.swift
+    settings:
+      base:
+        INFOPLIST_FILE: iOSWidgets/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.ios.widgets
+        SKIP_INSTALL: YES
+        TARGETED_DEVICE_FAMILY: "1"
+  Grouper-macOS:
+    type: application
+    platform: macOS
+    sources:
+      - Shared
+      - path: macOS
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: GrouperKit
+        product: GrouperAPI
+      - package: GrouperKit
+        product: GrouperKit
+    settings:
+      base:
+        INFOPLIST_FILE: macOS/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.macos
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+
+# Shared schemes, so `xcodebuild -scheme ...` (and CI) can resolve the local Swift package.
+schemes:
+  Grouper-macOS:
+    build:
+      targets:
+        Grouper-macOS: all
+      buildImplicitDependencies: true
+  Grouper-iOS:
+    build:
+      targets:
+        GrouperWidgets: all
+        Grouper-iOS: all
+      buildImplicitDependencies: true

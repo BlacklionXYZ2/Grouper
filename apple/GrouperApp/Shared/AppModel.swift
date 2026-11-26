@@ -1,0 +1,724 @@
+import Foundation
+import SwiftUI
+import GrouperAPI
+
+private final class TaskBox {
+    var task: Task<Void, Never>?
+
+    func replace(with newTask: Task<Void, Never>?) {
+        task?.cancel()
+        task = newTask
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+
+    deinit {
+        task?.cancel()
+    }
+}
+
+/// A one-line status in a chat, e.g. a tapped notification whose request is gone.
+struct ChatNotice: Equatable {
+    let conversationId: String?
+    let text: String
+}
+
+/// How an answer from the approval dock went.
+enum ApprovalAnswer: Equatable {
+    case done
+    /// Someone else answered first (the hub returned 404).
+    case settledElsewhere
+    case failed(String)
+}
+
+@MainActor
+final class AppModel: ObservableObject {
+    @Published var hubURL = ""
+    @Published var adminToken = ""
+    @Published var deviceToken = ""
+    @Published private(set) var client: HubClient?
+    @Published private(set) var signedIn = false
+    @Published private(set) var online = false {
+        didSet { if !online { approvalsReconciled = false } }
+    }
+    @Published var errorMessage: String?
+
+    @Published private(set) var conversations: [ConversationInfo] = []
+    @Published var selectedConversationId: String?
+    @Published private(set) var folders: [String: TranscriptFolder] = [:]
+    @Published private(set) var threads: [ThreadInfo] = []
+    @Published private(set) var models: [ModelEntry] = []
+    /// `GET /v1/providers` (admin), for the model picker's provider groups and key status.
+    @Published private(set) var providers: [ProviderInfo] = []
+    @Published private(set) var providersLoaded = false
+    @Published private(set) var providersFailed = false
+    @Published private(set) var devices: [DeviceInfo] = []
+    @Published private(set) var toolsByDevice: [String: [ToolInfo]] = [:]
+    @Published private(set) var streamState: EventStreamState = .disconnected
+    @Published var selectedThreadId: String?
+    @Published var selectedApprovalId: String?
+    @Published var selectedDeviceId: String?
+    @Published var threadMessageDrafts: [String: String] = [:]
+    @Published var newChatMode = "project"
+    /// The model picked for a chat that has not been sent yet. Cleared whenever the
+    /// chat changes, so a choice never carries into another chat.
+    @Published var newChatModel: String?
+
+    /// Pending approvals across every chat: `GET /v1/approvals` plus approval events.
+    @Published private(set) var approvalBook = ApprovalBook()
+    /// False after going offline (or a failed answer) until the pending list has been
+    /// fetched again; the dock keeps its actions off until then.
+    @Published private(set) var approvalsReconciled = false
+    /// The request that just left the open chat's dock, shown briefly with why.
+    @Published private(set) var settledApproval: SettledApproval?
+    /// Set when a notification opened the dock: the dock moves VoiceOver focus to its heading.
+    @Published var dockFocusRequest: String?
+    @Published var chatNotice: ChatNotice?
+    /// Bumped when something outside the chat (a notification) needs the chat shown.
+    @Published private(set) var chatRevealRequest = 0
+    /// Ids of palette rows the owner opened, most recent first (command palette).
+    @Published private(set) var paletteRecents: [String] = UserDefaults.standard.stringArray(forKey: "grouper.paletteRecents") ?? []
+    /// Chat views on screen. With one up and the app frontmost, that chat's
+    /// approvals show in its dock instead of as notifications.
+    var chatViewsOnScreen = 0
+
+    private static let recentsKey = "grouper.paletteRecents"
+    private let streamTask = TaskBox()
+    private let accountStreamTask = TaskBox()
+    private let settleTask = TaskBox()
+    private var approvalRefreshQueued = false
+    private var pendingRoute: ApprovalRoute?
+    private var initialLoadDone = false
+
+    init() {
+        hubURL = UserDefaults.standard.string(forKey: "grouper.hubURL") ?? ""
+        adminToken = KeychainStore.read(.admin) ?? ""
+        deviceToken = KeychainStore.read(.device) ?? ""
+        if !hubURL.isEmpty, !adminToken.isEmpty {
+            Task { [weak self] in await self?.connect(save: false) }
+        }
+    }
+
+    var selectedConversation: ConversationInfo? {
+        conversations.first { $0.id == selectedConversationId }
+    }
+
+    var selectedFolder: TranscriptFolder? {
+        guard let id = selectedConversationId else { return nil }
+        return folders[id]
+    }
+
+    var conversationThreads: [ThreadInfo] {
+        guard let id = selectedConversationId else { return [] }
+        return threads.filter { $0.conversationId == id }
+    }
+
+    var transcript: [TranscriptRow] {
+        selectedFolder?.transcript(threads: conversationThreads) ?? []
+    }
+
+    /// Every pending approval, oldest first (ties by id). The hub's list once it has
+    /// loaded; before that (or on a hub without `GET /v1/approvals`) the requests
+    /// folded from loaded chats, merged with any that arrived as events.
+    var pendingApprovals: [PendingApproval] {
+        if approvalBook.loaded { return approvalBook.ordered }
+        var byId: [String: PendingApproval] = approvalBook.pending
+        for folder in folders.values {
+            let folded = folder.pendingApprovals(threads: threads.filter { $0.conversationId == folder.conversationId })
+            for approval in folded where byId[approval.id] == nil && approvalBook.outcome(of: approval.id) == nil {
+                byId[approval.id] = approval
+            }
+        }
+        return ApprovalQueue.ordered(Array(byId.values))
+    }
+
+    var selectedThread: ThreadInfo? { threads.first { $0.id == selectedThreadId } }
+
+    /// Approve, Deny, Change it and Stop need a connection that has checked the
+    /// pending list since it was last offline.
+    var canAnswerApprovals: Bool { client != nil && online && approvalsReconciled }
+
+    /// Threads belong to their chat: there is no global thread list.
+    func threads(in conversationId: String) -> [ThreadInfo] {
+        threads.filter { $0.conversationId == conversationId }
+    }
+
+    func approvals(in conversationId: String) -> [PendingApproval] {
+        pendingApprovals.filter { $0.conversationId == conversationId }
+    }
+
+    /// Pending approvals plus threads waiting for a device, in one chat.
+    func needsYouCount(in conversationId: String) -> Int {
+        let pending = self.approvals(in: conversationId)
+        let withApproval = Set(pending.compactMap(\.threadId))
+        let waiting = self.threads(in: conversationId).filter { $0.status == "waiting_device" && !withApproval.contains($0.id) }
+        return pending.count + waiting.count
+    }
+
+    /// The thread's streamed text that no stored event has replaced yet.
+    func threadDraft(_ threadId: String) -> String {
+        guard let conversationId = threads.first(where: { $0.id == threadId })?.conversationId else { return "" }
+        return folders[conversationId]?.threadDrafts[threadId] ?? ""
+    }
+
+    func modelEntry(_ id: String) -> ModelEntry? { models.first { $0.id == id } }
+
+    /// The family of a registry id as the hub reports it on a thread or chat.
+    func family(ofModel id: String) -> ModelFamily { ModelFamily.of(registryId: id, in: models) }
+
+    func deviceDisplayName(_ id: String) -> String { deviceName(id) }
+
+    func threadTitle(_ id: String?) -> String {
+        guard let id, let title = threads.first(where: { $0.id == id })?.title, !title.isEmpty else { return "Thread" }
+        return title
+    }
+
+    func chatTitle(_ id: String) -> String {
+        guard let title = conversations.first(where: { $0.id == id })?.title, !title.isEmpty else { return "Chat" }
+        return title
+    }
+
+    func connect(save: Bool = true) async {
+        errorMessage = nil
+        let trimmedHub = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAdmin = adminToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedDevice = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let api = try HubClient(baseURL: trimmedHub, token: trimmedAdmin)
+            try await api.health()
+            _ = try await api.providers() // proves this is the admin token, not merely a valid device token
+            #if os(macOS)
+            if !trimmedDevice.isEmpty {
+                try await verifyDeviceToken(trimmedDevice, hubURL: trimmedHub)
+            }
+            #endif
+            hubURL = trimmedHub
+            adminToken = trimmedAdmin
+            deviceToken = trimmedDevice
+            client = api
+            signedIn = true
+            online = true
+            if save {
+                UserDefaults.standard.set(trimmedHub, forKey: "grouper.hubURL")
+                try KeychainStore.save(trimmedAdmin, as: .admin)
+                if !trimmedDevice.isEmpty { try KeychainStore.save(trimmedDevice, as: .device) }
+            }
+            await loadInitial()
+        } catch {
+            signedIn = false
+            online = false
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    #if os(macOS)
+    func saveDeviceToken() async -> Bool {
+        errorMessage = nil
+        let trimmedDevice = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedDevice.isEmpty else { return false }
+        do {
+            try await verifyDeviceToken(trimmedDevice, hubURL: hubURL)
+            deviceToken = trimmedDevice
+            try KeychainStore.save(trimmedDevice, as: .device)
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    private func verifyDeviceToken(_ token: String, hubURL: String) async throws {
+        let deviceAPI = try HubClient(baseURL: hubURL, token: token)
+        do {
+            _ = try await deviceAPI.providers()
+            throw HubClientError.badRequest("The device field contains an admin token. Use a separate non-admin device token for the Mac node.")
+        } catch HubClientError.forbidden(_) {
+            // Expected: a device token can read, but cannot access providers.
+        }
+    }
+    #endif
+
+    func signOut() {
+        streamTask.cancel()
+        accountStreamTask.cancel()
+        settleTask.cancel()
+        ApprovalNotifications.remove(approvalIds: Array(approvalBook.pending.keys))
+        approvalBook.reset()
+        settledApproval = nil
+        chatNotice = nil
+        dockFocusRequest = nil
+        pendingRoute = nil
+        initialLoadDone = false
+        paletteRecents = []
+        UserDefaults.standard.removeObject(forKey: Self.recentsKey)
+        client = nil
+        signedIn = false
+        online = false
+        adminToken = ""
+        errorMessage = nil
+        conversations.removeAll()
+        threads.removeAll()
+        folders.removeAll()
+        providers.removeAll()
+        providersLoaded = false
+        providersFailed = false
+        selectedConversationId = nil
+        selectedThreadId = nil
+        selectedApprovalId = nil
+        streamState = .disconnected
+        KeychainStore.delete(.admin)
+    }
+
+    func forgetDeviceToken() {
+        deviceToken = ""
+        KeychainStore.delete(.device)
+    }
+
+    func loadInitial() async {
+        guard let client else { return }
+        do {
+            async let loadedConversations = client.conversations()
+            async let loadedThreads = client.threads()
+            async let loadedModels = client.models()
+            async let loadedDevices = client.devices()
+            conversations = try await loadedConversations.sorted { $0.created > $1.created }
+            threads = try await loadedThreads
+            models = try await loadedModels
+            devices = try await loadedDevices
+            online = true
+            if selectedConversationId == nil { selectedConversationId = conversations.first?.id }
+            if let id = selectedConversationId { await selectConversation(id) }
+            await loadApprovals()
+            followAccountEvents()
+            initialLoadDone = true
+            await processPendingRoute()
+        } catch {
+            online = false
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func selectConversation(_ id: String) async {
+        guard let client else { return }
+        if selectedConversationId != id {
+            // Back in a chat, its dock starts at the oldest request again.
+            selectedApprovalId = nil
+            settledApproval = nil
+            if chatNotice?.conversationId != id { chatNotice = nil }
+        }
+        selectedConversationId = id
+        newChatModel = nil
+        rememberRecent(PaletteItem(target: .chat(id: id), title: "", subtitle: "").id)
+        streamTask.cancel()
+        do {
+            async let events = client.events(conversationId: id)
+            async let scopedThreads = client.threads(conversationId: id)
+            let fetchedEvents = try await events
+            let scoped = try await scopedThreads
+            guard selectedConversationId == id else { return }
+            folders[id] = TranscriptFolder(conversationId: id, events: fetchedEvents)
+            threads = ThreadInfo.merge(threads, fetched: scoped, conversationId: id)
+            online = true
+            followEvents(conversationId: id)
+        } catch {
+            guard selectedConversationId == id else { return }
+            online = false
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func send(_ text: String, model: String? = nil) async -> Bool {
+        guard let client else { return false }
+        do {
+            let response = try await client.sendChat(
+                text: text,
+                conversationId: selectedConversationId,
+                mode: selectedConversationId == nil ? newChatMode : nil,
+                model: selectedConversationId == nil ? model : nil
+            )
+            if selectedConversationId != response.conversationId {
+                await refreshConversations()
+                await selectConversation(response.conversationId)
+            }
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func setConversationModel(_ modelId: String?) async {
+        guard let client, let conversationId = selectedConversationId else { return }
+        do {
+            let updated = try await client.setConversationModel(modelId, conversationId: conversationId)
+            if let index = conversations.firstIndex(where: { $0.id == updated.id }) {
+                conversations[index] = updated
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Reloads the registry and the providers behind it, for the model picker.
+    func loadProviders() async {
+        guard let client else { return }
+        if let loaded = try? await client.models() { models = loaded }
+        do {
+            providers = try await client.providers().sorted { $0.id < $1.id }
+            providersLoaded = true
+            providersFailed = false
+        } catch {
+            // The picker still groups by provider id; it just cannot show kind or key status.
+            providersFailed = true
+        }
+    }
+
+    func refreshThreads(conversationId: String) async {
+        guard let client else { return }
+        do {
+            let updated = try await client.threads(conversationId: conversationId)
+            threads = ThreadInfo.merge(threads, fetched: updated, conversationId: conversationId)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func refreshConversations() async {
+        guard let client else { return }
+        do { conversations = try await client.conversations().sorted { $0.created > $1.created } }
+        catch { errorMessage = error.localizedDescription }
+    }
+
+    func beginNewChat(mode: String) {
+        streamTask.cancel()
+        selectedConversationId = nil
+        selectedThreadId = nil
+        selectedApprovalId = nil
+        settledApproval = nil
+        chatNotice = nil
+        newChatMode = mode
+        newChatModel = nil
+    }
+
+    func messageThread(_ id: String, text: String) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.messageThread(id: id, text: text); threadMessageDrafts[id] = ""; return true }
+        catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    @discardableResult
+    func stopThread(_ id: String) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.stopThread(id: id); return true }
+        catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    func rateThread(_ id: String, rating: String) async {
+        guard let client else { return }
+        do { _ = try await client.rateThread(id: id, rating: rating) }
+        catch { errorMessage = error.localizedDescription }
+    }
+
+    // MARK: - Approvals
+
+    /// Answers one request. Never retried automatically: on a network error the
+    /// pending list is fetched again before the dock offers the buttons again.
+    func answerApproval(_ id: String, approve: Bool) async -> ApprovalAnswer {
+        guard let client else { return .failed("Not connected to the hub.") }
+        approvalBook.beginAnswer(id)
+        do {
+            _ = try await client.resolveApproval(id: id, approve: approve)
+            updateApprovals { $0.settle(id, as: .answeredHere(approved: approve)) }
+            return .done
+        } catch HubClientError.notFound(_) {
+            updateApprovals { $0.settle(id, as: .answeredElsewhere) }
+            return .settledElsewhere
+        } catch {
+            approvalBook.cancelAnswer(id)
+            let message = error.localizedDescription
+            approvalsReconciled = false
+            await loadApprovals()
+            return .failed(message)
+        }
+    }
+
+    /// `GET /v1/approvals`: the hub's pending list is the source of truth.
+    func loadApprovals() async {
+        guard let client else { return }
+        let mark = approvalBook.fetchMark()
+        do {
+            let fetched = try await client.approvals()
+            let pending = fetched.map { $0.pending }
+            updateApprovals { $0.finishFetch(pending, since: mark) }
+            approvalsReconciled = true
+        } catch HubClientError.notFound(_) {
+            // A hub without the route: events and loaded chats still keep the list.
+            approvalsReconciled = online
+        } catch {
+            // Keep what we have; the dock waits for a successful check before answering.
+        }
+    }
+
+    func dismissSettledApproval() {
+        settleTask.cancel()
+        settledApproval = nil
+    }
+
+    /// A tapped notification: open its chat with that request in the dock. The
+    /// request is looked up in the hub's current list, never rebuilt from the
+    /// notification's text.
+    func openApprovalRoute(_ route: ApprovalRoute) {
+        pendingRoute = route
+        guard client != nil, initialLoadDone else { return } // loadInitial picks it up
+        Task { await processPendingRoute() }
+    }
+
+    private func processPendingRoute() async {
+        guard let route = pendingRoute else { return }
+        pendingRoute = nil
+        await loadApprovals()
+        if let approval = pendingApprovals.first(where: { $0.id == route.approvalId }) {
+            if selectedConversationId != approval.conversationId { await selectConversation(approval.conversationId) }
+            if selectedThreadId != nil, selectedThreadId != approval.threadId { selectedThreadId = nil }
+            selectedApprovalId = approval.id
+            settledApproval = nil
+            chatNotice = nil
+            dockFocusRequest = approval.id
+        } else {
+            if let id = route.conversationId, conversations.contains(where: { $0.id == id }), selectedConversationId != id {
+                await selectConversation(id)
+            }
+            let text: String
+            switch approvalBook.outcome(of: route.approvalId) {
+            case .answeredHere?: text = "You already answered this request."
+            case .some(let outcome): text = outcome.message
+            case nil: text = ApprovalOutcome.noLongerWaiting.message
+            }
+            chatNotice = ChatNotice(conversationId: route.conversationId ?? selectedConversationId, text: text)
+        }
+        chatRevealRequest += 1
+    }
+
+    /// Applies a change to the pending list and keeps the open chat's dock in step:
+    /// when the request it showed leaves, the dock says why and moves to the next.
+    private func updateApprovals(_ mutate: (inout ApprovalBook) -> ApprovalBook.Change) {
+        let conversationId = selectedConversationId
+        let queueBefore: [PendingApproval] = conversationId.map { approvals(in: $0) } ?? []
+        let shownBefore = ApprovalQueue.displayed(selected: selectedApprovalId, in: queueBefore)
+        var book = approvalBook
+        let change = mutate(&book)
+        approvalBook = book
+        switch change {
+        case .none:
+            break
+        case .added(let approval):
+            notify(approval)
+        case .removed(let ids):
+            ApprovalNotifications.remove(approvalIds: ids)
+            let removed = Set(ids)
+            if let shown = shownBefore, removed.contains(shown.id) {
+                let remaining: [PendingApproval] = conversationId.map { approvals(in: $0) } ?? []
+                selectedApprovalId = ApprovalQueue.successor(of: shown.id, previousOrder: queueBefore.map { $0.id }, remaining: remaining)
+                showSettled(SettledApproval(approval: shown, outcome: approvalBook.outcome(of: shown.id) ?? .noLongerWaiting))
+            } else if let selected = selectedApprovalId, removed.contains(selected) {
+                selectedApprovalId = nil
+            }
+        }
+    }
+
+    private func showSettled(_ settled: SettledApproval) {
+        settledApproval = settled
+        var seconds = 4.0
+        if case .answeredHere = settled.outcome { seconds = 1.5 }
+        let id = settled.id
+        settleTask.replace(with: Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled, let self, self.settledApproval?.id == id else { return }
+            self.settledApproval = nil
+        })
+    }
+
+    private func applyApprovalEvent(_ event: Event) {
+        guard event.seq > 0 else { return }
+        switch event.body {
+        case .approvalRequested, .approvalResolved, .threadFinished:
+            updateApprovals { $0.apply(event) }
+        default:
+            break
+        }
+    }
+
+    /// Fetches the pending list soon (coalesced): after a reconnect, and after a new
+    /// request so its timeout, which events don't carry, is known.
+    private func scheduleApprovalRefresh() {
+        guard !approvalRefreshQueued else { return }
+        approvalRefreshQueued = true
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard let self else { return }
+            self.approvalRefreshQueued = false
+            await self.loadApprovals()
+        }
+    }
+
+    /// A local notification for a new request, unless its chat is on screen in the
+    /// foreground (the dock is the notice there). Names only, never input or reason.
+    private func notify(_ approval: PendingApproval) {
+        scheduleApprovalRefresh()
+        if chatViewsOnScreen > 0, selectedConversationId == approval.conversationId, ApprovalNotifications.appIsActive() { return }
+        guard ApprovalNotifications.optedIn else { return }
+        let id = approval.id
+        let conversationId = approval.conversationId
+        let threadId = approval.threadId
+        let tool = approval.tool
+        let deviceId = approval.deviceId
+        Task { [weak self] in
+            guard let self else { return }
+            if !self.conversations.contains(where: { $0.id == conversationId }) { await self.refreshConversations() }
+            let body = ApprovalNotificationText.body(tool: tool, device: self.deviceName(deviceId),
+                                                     thread: self.threadTitle(threadId), chat: self.chatTitle(conversationId))
+            await ApprovalNotifications.post(approvalId: id, conversationId: conversationId, threadId: threadId, body: body)
+            // Answered while the notification was being posted: take it back down.
+            if self.approvalBook.pending[id] == nil { ApprovalNotifications.remove(approvalIds: [id]) }
+        }
+    }
+
+    /// Every chat's events, for approvals in chats that aren't open (the open chat
+    /// has its own stream) and thread rows. There is no account-wide catch-up route,
+    /// so each (re)connect re-fetches the pending list instead.
+    private func followAccountEvents() {
+        guard let client else { return }
+        accountStreamTask.replace(with: Task { [weak self] in
+            do {
+                for try await update in client.eventStream().updates() {
+                    guard let self, !Task.isCancelled else { return }
+                    switch update {
+                    case .state(let state):
+                        if state == .connected { self.scheduleApprovalRefresh() }
+                    case .stored(let event):
+                        self.handleAccountEvent(event)
+                    case .live:
+                        break
+                    }
+                }
+            } catch {
+                // The open chat's stream reports connection problems.
+            }
+        })
+    }
+
+    private func handleAccountEvent(_ event: Event) {
+        switch event.body {
+        case .threadStarted, .threadWaiting, .threadHandedOver, .threadFinished:
+            ThreadInfo.upsert(&threads, with: event)
+        default:
+            break
+        }
+        applyApprovalEvent(event)
+    }
+
+    // MARK: - Command palette
+
+    func rememberRecent(_ id: String) {
+        paletteRecents = CommandPalette.remember(id, in: paletteRecents)
+        UserDefaults.standard.set(paletteRecents, forKey: Self.recentsKey)
+    }
+
+    func refreshDevices() async {
+        guard let client else { return }
+        do { devices = try await client.devices(); online = true }
+        catch { online = false; errorMessage = error.localizedDescription }
+    }
+
+    func loadTools(deviceId: String) async {
+        guard let client else { return }
+        do { toolsByDevice[deviceId] = try await client.tools(deviceId: deviceId, includeUnavailable: true) }
+        catch { errorMessage = error.localizedDescription }
+    }
+
+    func setPermission(deviceId: String, tool: ToolInfo, permission: Permission) async {
+        guard let client else { return }
+        do {
+            _ = try await client.setPermission(permission, deviceId: deviceId, tool: tool.name)
+            await loadTools(deviceId: deviceId)
+        } catch { errorMessage = error.localizedDescription; await loadTools(deviceId: deviceId) }
+    }
+
+    func activity(threadId: String) -> [ThreadActivityRow] {
+        guard let conversationId = threads.first(where: { $0.id == threadId })?.conversationId else { return [] }
+        return folders[conversationId]?.activity(threadId: threadId) ?? []
+    }
+
+    private func followEvents(conversationId: String) {
+        guard let client else { return }
+        let last = folders[conversationId]?.storedEvents.last?.seq ?? 0
+        streamTask.replace(with: Task { [weak self] in
+            do {
+                for try await update in client.eventStream(conversationId: conversationId).updates(after: last) {
+                    guard let self, !Task.isCancelled else { return }
+                    switch update {
+                    case .state(let state):
+                        self.streamState = state
+                        self.online = state == .connected
+                        if state == .connected { self.scheduleApprovalRefresh() }
+                    case .stored(let event), .live(let event): self.ingest(event)
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.online = false
+                self?.errorMessage = error.localizedDescription
+            }
+        })
+    }
+
+    private func ingest(_ event: Event) {
+        var folder = folders[event.conversationId] ?? TranscriptFolder(conversationId: event.conversationId)
+        let stored = folder.ingest(event)
+        folders[event.conversationId] = folder
+        guard stored else { return }
+        // Update the thread row now: the views read status, elapsed time and
+        // existence from `threads`, and the refresh below may be slow or fail.
+        ThreadInfo.upsert(&threads, with: event)
+        #if os(iOS)
+        switch event.body {
+        case .threadStarted(let started):
+            if let threadId = event.threadId, !threadId.isEmpty {
+                let device = deviceName(started.deviceId)
+                Task { try? await LiveActivityCoordinator.start(threadId: threadId, title: started.title, device: device, status: "running", phase: "Running on \(device)") }
+            }
+        case .threadWaiting(let waiting):
+            if let threadId = event.threadId, !threadId.isEmpty {
+                let device = deviceName(waiting.deviceId)
+                Task { await LiveActivityCoordinator.update(threadId: threadId, status: "waiting_device", phase: "Waiting for \(device)", streamedLine: nil) }
+            }
+        case .threadCheckpoint:
+            if let threadId = event.threadId, !threadId.isEmpty {
+                Task { await LiveActivityCoordinator.update(threadId: threadId, status: "waiting_device", phase: "Checkpoint on the hub", streamedLine: nil) }
+            }
+        case .threadHandedOver(let handover):
+            if let threadId = event.threadId, !threadId.isEmpty {
+                let device = deviceName(handover.deviceId)
+                Task { await LiveActivityCoordinator.update(threadId: threadId, status: "running", phase: "Running on \(device)", streamedLine: nil) }
+            }
+        case .threadFinished(let status, _):
+            if let threadId = event.threadId, !threadId.isEmpty {
+                Task { await LiveActivityCoordinator.end(threadId: threadId, status: status) }
+            }
+        default: break
+        }
+        #endif
+        applyApprovalEvent(event)
+        switch event.body {
+        case .threadStarted, .threadWaiting, .threadHandedOver, .threadFinished:
+            let conversationId = event.conversationId
+            Task { [weak self] in await self?.refreshThreads(conversationId: conversationId) }
+        default: break
+        }
+    }
+
+    private func deviceName(_ id: String) -> String { devices.first { $0.id == id }?.name ?? id }
+}

@@ -6,7 +6,8 @@
 //   GROUPER_HUB=http://127.0.0.1:8080 GROUPER_TOKEN=<token> swift run grouper-mac
 //
 // It also runs subagent threads the orchestrator starts on this Mac (in the Rust core),
-// and those threads can use mac.info as the tool `mac_info`.
+// and those threads can use `mac_info`. The core serves these tools to the hub over MCP,
+// with the input schemas given below.
 import Foundation
 import GrouperKit
 
@@ -15,7 +16,7 @@ final class MacTools: ToolHandler, @unchecked Sendable {
         switch tool {
         case "echo":
             return argsJson
-        case "mac.info":
+        case "mac_info":
             let p = ProcessInfo.processInfo
             return try toolJSON([
                 "hostname": Host.current().localizedName ?? p.hostName,
@@ -70,8 +71,10 @@ do {
         hubUrl: hub,
         token: token,
         capabilities: [
-            Capability("echo", "Returns its arguments"),
-            Capability("mac.info", "Mac hostname, OS version, uptime and hardware (Swift)"),
+            Capability("echo", "Returns its arguments",
+                       schema: #"{"type":"object","additionalProperties":true}"#),
+            Capability("mac_info", "Mac hostname, OS version, uptime and hardware (Swift)",
+                       schema: #"{"type":"object","properties":{}}"#),
         ],
         workspaceRoot: workspace,
         allowShell: true,

@@ -1,0 +1,12 @@
+[package]
+name = "core-memory"
+description = "Grouper long-term memory and skills: SQLite + FTS5 storage, search and recall blocks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+core-protocol.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true

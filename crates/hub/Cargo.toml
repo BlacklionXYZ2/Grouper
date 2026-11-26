@@ -10,15 +10,24 @@ name = "grouper-hub"
 path = "src/main.rs"
 
 [dependencies]
-core-protocol.workspace = true
+core-protocol = { workspace = true, features = ["tunnel"] }
+core-registry.workspace = true
+core-memory.workspace = true
 core-agent.workspace = true
 providers.workspace = true
 async-trait.workspace = true
-rusqlite.workspace = true
+rmcp = { workspace = true, features = ["client"] }
+rusqlite = { workspace = true, features = ["backup"] }
+reqwest.workspace = true
 anyhow.workspace = true
+# Web Push crypto (ECDH, ECDSA, HMAC, AES-GCM); already built in through reqwest's rustls.
+aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
 axum.workspace = true
+base64 = "0.22"
+chacha20poly1305 = "0.10"
 clap.workspace = true
 futures-util.workspace = true
+fs2.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 serde.workspace = true
@@ -27,3 +36,9 @@ sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url = "2"
+
+[dev-dependencies]
+# A real device for the MCP tunnel test.
+core-client.workspace = true
+tokio-tungstenite.workspace = true

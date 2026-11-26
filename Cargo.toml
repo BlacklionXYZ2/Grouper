@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core-protocol", "crates/providers", "crates/core-agent", "crates/core-client", "crates/hub", "crates/ffi", "crates/cli"]
+members = ["crates/core-protocol", "crates/core-registry", "crates/core-memory", "crates/providers", "crates/core-agent", "crates/core-client", "crates/hub", "crates/core-sync", "crates/ffi", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,7 +9,10 @@ license = "UNLICENSED"
 
 [workspace.dependencies]
 core-protocol = { path = "crates/core-protocol" }
+core-registry = { path = "crates/core-registry" }
+core-memory = { path = "crates/core-memory" }
 core-client = { path = "crates/core-client" }
+core-sync = { path = "crates/core-sync" }
 providers = { path = "crates/providers" }
 core-agent = { path = "crates/core-agent" }
 anyhow = "1"
@@ -17,10 +20,13 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+fs2 = "0.4"
 getrandom = "0.4"
 hex = "0.4"
 rusqlite = { version = "0.43", features = ["bundled"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# Official MCP SDK. Pinned: 3.x is moving quickly.
+rmcp = { version = "=3.11.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
