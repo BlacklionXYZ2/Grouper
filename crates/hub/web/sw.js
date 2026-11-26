@@ -188,16 +188,19 @@ async function chatOnScreen(conversationId) {
 function ask(client, message) {
   return new Promise((resolve) => {
     const channel = new MessageChannel();
-    const timer = setTimeout(() => resolve(null), ASK_TIMEOUT_MS);
-    channel.port1.onmessage = (e) => {
+    // Close our end however this ends, so no open port is left behind.
+    const finish = (value) => {
       clearTimeout(timer);
-      resolve(e.data);
+      channel.port1.onmessage = null;
+      channel.port1.close();
+      resolve(value);
     };
+    const timer = setTimeout(() => finish(null), ASK_TIMEOUT_MS);
+    channel.port1.onmessage = (e) => finish(e.data);
     try {
       client.postMessage(message, [channel.port2]);
     } catch {
-      clearTimeout(timer);
-      resolve(null);
+      finish(null);
     }
   });
 }
