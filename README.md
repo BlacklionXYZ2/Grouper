@@ -181,6 +181,9 @@ tools) can't be confined to a folder, so on Auto each of their chat calls asks y
 - Tokens are `<device-id>.<secret>`; the hub stores only a SHA-256 of the secret.
 - Provider keys are encrypted in the hub's database (XChaCha20-Poly1305) under a master
   key kept outside the data volume (`GROUPER_MASTER_KEY_FILE`); devices hold them in memory.
+- Approval notifications use Web Push. The hub's VAPID key is sealed with the same master
+  key. Set `GROUPER_PUBLIC_URL` (e.g. `https://hub.example.com`) to name the hub to push
+  services; otherwise it uses the origin each browser subscribed from.
 - Hub threads get file tools only, until they run in sandbox containers.
 - `apple/GrouperKit` links a static library so it builds with the Command Line Tools.
   With Xcode installed, switch to an XCFramework for iOS.
