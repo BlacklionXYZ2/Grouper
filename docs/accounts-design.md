@@ -12,6 +12,47 @@ Status: design, 26 November 2026. Owner decisions so far:
   design leaves room for it (same flow, another issuer).
 - Later: the owner picks which device is the hub during setup and can move it.
 
+## Owner decision: Google is the only way you sign in (26 November 2026, evening)
+
+> "Sign in works through Google sign in. Device ids are used internally and the devices all
+> link up to the one Google based account. The user only has to log in with Google to access
+> their Grouper account regardless of platform and the device id is synced with the account."
+
+So:
+
+- **Every platform signs in with Google:** web, iPhone, Mac, and the CLI on PCs that run
+  threads (Windows, Linux). No sign-in screen offers token pasting. Token sign-in survives only
+  as an unlinked recovery route (`#/token-signin` on the web, `GROUPER_TOKEN` for automation and
+  tests), documented in the README, never shown on a sign-in screen.
+- **Device ids and tokens are internal.** Each app install or CLI install keeps a random
+  `install_id` (Keychain / CLI config). Signing in again from the same install reuses that
+  install's device (same device id, fresh token, old token revoked) instead of adding a new one.
+- **All devices link to the one Google account** that owns the hub; Devices shows them under
+  that account from any platform.
+- **The CLI signs in like `gh auth login`:** `grouper login` shows a short code and a link; you
+  open it in a browser where you're signed in to Grouper with Google, check the device's name
+  and platform, and approve; the CLI receives its own (non-admin) device token and saves it.
+
+### Contract (hub ↔ clients)
+
+- `POST /v1/auth/google` takes an optional `install_id` (16–64 chars, `[A-Za-z0-9_-]`). If a
+  live device with that `install_id` and the same client kind exists, the hub issues a fresh
+  token for that device (revoking the old one) and returns the same device; otherwise it
+  creates one.
+- `POST /v1/devices` (admin; the Mac's node registration) takes the same optional
+  `install_id` with the same reuse rule.
+- Device link (CLI and any future headless device):
+  - `POST /v1/auth/link/start` `{name, platform, install_id?}` (no auth, rate-limited) →
+    `{code: "ABCD-EFGH", poll_secret, verify_url: "<hub>/#/link?code=ABCD-EFGH", expires_in: 600,
+    interval: 3}`.
+  - The web route `#/link?code=…` (signed in, admin) shows the request via
+    `GET /v1/auth/link/{code}` and approves or denies with `POST /v1/auth/link/{code}/approve`
+    or `/deny` (CSRF as usual). Approving makes (or, by `install_id`, reuses) a non-admin device.
+  - `POST /v1/auth/link/poll` `{poll_secret}` → `{"status":"pending"}`, `{"status":"denied"}`,
+    `{"status":"expired"}` or, exactly once, `{"status":"approved", token, device}`.
+  - Codes are single-use, expire after 10 minutes, and use an unambiguous alphabet; the poll
+    secret is long and random; both are stored hashed.
+
 ## Goals
 
 1. No token pasting for normal use: the owner signs in with Google on the web client, the
@@ -19,7 +60,8 @@ Status: design, 26 November 2026. Owner decisions so far:
    token is already automatic: see the Mac auto-registration change).
 2. No server run by the Grouper project is required for sign-in. A self-hosted hub on any
    domain works without the owner creating their own Google OAuth client.
-3. Tokens stay as the fallback and for automation (`grouper-hub device add`, the CLI).
+3. Tokens are internal: users never see or paste them. They remain for automation, tests
+   and recovery (see the owner decision above).
 
 ## How it works
 
