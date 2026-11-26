@@ -193,6 +193,44 @@ export function sentenceSpeaker() {
   };
 }
 
+// ---- one shared one-second tick for live elapsed times
+
+const tickers = new Set();
+let tickTimer = 0;
+
+function runTick() {
+  if (document.hidden) return; // nothing to see; the next visible tick catches up
+  for (const fn of [...tickers]) {
+    try {
+      fn();
+    } catch (e) {
+      console.error('tick listener failed', e);
+    }
+  }
+}
+
+/**
+ * Call `fn` once a second while anything is subscribed. One interval serves every
+ * subscriber (the threads panel, the thread view) and stops when the last one
+ * leaves. Returns the unsubscribe function.
+ */
+export function onTick(fn) {
+  tickers.add(fn);
+  if (!tickTimer) tickTimer = setInterval(runTick, 1000);
+  return () => {
+    tickers.delete(fn);
+    if (!tickers.size && tickTimer) {
+      clearInterval(tickTimer);
+      tickTimer = 0;
+    }
+  };
+}
+
+/** True while the shared tick is running (for checks in the browser console). */
+export function tickRunning() {
+  return Boolean(tickTimer);
+}
+
 // ---- mobile drawer
 
 const narrow = typeof matchMedia === 'function' ? matchMedia('(max-width: 760px)') : null;

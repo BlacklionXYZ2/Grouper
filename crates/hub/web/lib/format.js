@@ -47,6 +47,35 @@ export function duration(secs) {
   return `${(secs / 3600).toFixed(1)}h`;
 }
 
+/**
+ * Elapsed time with seconds while it's short: "42s", "4m 05s", "1h 12m", "2d 3h".
+ * For live timers (the threads panel and the thread view tick it every second).
+ */
+export function elapsed(secs) {
+  if (secs === null || secs === undefined || Number.isNaN(secs)) return '—';
+  const s = Math.max(0, Math.floor(secs));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+}
+
+/** The same span as an ISO 8601 duration, for <time datetime>. */
+export function isoDuration(secs) {
+  return `PT${Math.max(0, Math.floor(secs || 0))}S`;
+}
+
+/**
+ * How long a thread has run: live (now - created) while it runs or waits, the
+ * total (finished - created) once it's over. `live` says which.
+ */
+export function threadElapsed(t, now = Date.now() / 1000) {
+  if (!t?.created) return { secs: null, live: false };
+  if (isActive(t.status)) return { secs: Math.max(0, now - t.created), live: true };
+  if (t.finished) return { secs: Math.max(0, t.finished - t.created), live: false };
+  return { secs: null, live: false };
+}
+
 export function pct(x) {
   return x === null || x === undefined ? '—' : `${Math.round(x * 100)}%`;
 }

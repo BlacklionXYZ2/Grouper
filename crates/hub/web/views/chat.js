@@ -6,15 +6,17 @@
 // until the stored AssistantMessage replaces it. ThreadStarted inserts a card that
 // later thread events update in place; ThreadActivity stays off the transcript.
 
-import { h, icon, setChildren, setText, throttle } from '../lib/dom.js';
+import { h, icon, setChildren, setText, setAttr, srOnly, throttle } from '../lib/dom.js';
 import { get, post, qs, enc, describe, isAbort } from '../lib/api.js';
 import { renderMarkdown } from '../lib/md.js';
 import { store, on, conv, liveOf, deviceName, deviceOnline, threadsIn, approvalsFor, approvalsIn, isAdmin } from '../lib/store.js';
 import { loadConversation, loadConversations } from '../lib/live.js';
 import { bar, navigate, statusPill, skeleton, toast, announce, sentenceSpeaker, autoGrow, toastError } from '../lib/ui.js';
 import { isActive, num, plural, usd } from '../lib/format.js';
+import { familyOfId, familyMark, familyLabel } from '../lib/family.js';
 import { openApproval } from './approvals.js';
 import { mountThreadsPanel } from './threads-panel.js';
+import { openModelPicker } from './model-picker.js';
 
 const MODE_KEY = 'grouper.newMode';
 
@@ -419,7 +421,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     setChildren(
       entry.el,
       h('div', { class: 'chip-head' }, h('span', { class: 'chip-title' }, t.title || s.title), pill),
-      h('div', { class: 'chip-meta' }, `${device} · ${t.model || s.model}`),
+      h('div', { class: 'chip-meta' }, `${device} · `, familyMark(familyOfId(t.model || s.model)), srOnly(`${familyLabel(familyOfId(t.model || s.model))}: `), t.model || s.model),
       h(
         'div',
         { class: 'chip-line' },
@@ -496,7 +498,24 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     const sendBtn = h('button', { class: 'send-btn', type: 'submit', 'aria-label': 'Send', disabled: true }, icon('send'));
     const error = h('div', { class: 'composer-error', role: 'alert', hidden: true });
     const seg = h('div', { class: 'seg', role: 'radiogroup', 'aria-label': 'Chat mode' });
-    const modelSelect = h('select', { class: 'model-select', 'aria-label': 'Model' });
+    // The model: a button that opens the covering picker. A new chat keeps its
+    // choice here until the first send; an existing chat changes it on the hub.
+    let selected = '';
+    const modelMark = h('span', { class: 'model-btn-mark' });
+    const modelLabel = h('span', { class: 'model-btn-label' });
+    const modelBtn = h(
+      'button',
+      {
+        class: 'model-btn',
+        type: 'button',
+        'aria-haspopup': 'dialog',
+        onclick: () => pickModel(),
+      },
+      modelMark,
+      h('span', { class: 'visually-hidden' }, 'Model: '),
+      modelLabel,
+      icon('down'),
+    );
     const note = h('p', { class: 'composer-note' });
 
     function renderSeg() {
@@ -527,22 +546,49 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       seg.hidden = !isNew;
     }
 
+    function role() {
+      return (info()?.mode || mode) === 'standard' ? 'standard' : 'orchestrator';
+    }
+
+    function currentModel() {
+      const value = isNew ? selected : info()?.model || '';
+      return store.models.some((x) => x.id === value) ? value : '';
+    }
+
     function renderModels() {
-      const c = info();
-      const m = c?.mode || mode;
-      const role = m === 'standard' ? 'standard' : 'orchestrator';
-      const models = [...store.models].sort((a, b) => Number(b.roles.includes(role)) - Number(a.roles.includes(role)) || a.id.localeCompare(b.id));
-      const current = isNew ? modelSelect.value : c?.model || '';
-      setChildren(
-        modelSelect,
-        h('option', { value: '' }, 'Default model'),
-        models.map((x) =>
-          h('option', { value: x.id }, `${x.id}${x.free ? ' · free' : ''}${x.local ? ' · local' : ''}${x.roles.includes(role) ? ' · default' : ''}`),
-        ),
-      );
-      modelSelect.value = models.some((x) => x.id === current) ? current : '';
-      modelSelect.disabled = !admin || (!isNew && !store.online);
-      modelSelect.hidden = !store.models.length;
+      selected = isNew ? currentModel() : selected;
+      const value = currentModel();
+      const fam = value ? familyOfId(value) : null;
+      const key = `${value}|${fam}`;
+      if (modelBtn.dataset.key !== key) {
+        modelBtn.dataset.key = key;
+        setChildren(modelMark, fam ? familyMark(fam) : null);
+        modelMark.hidden = !fam;
+        setText(modelLabel, value || 'Default model');
+        setAttr(modelBtn, 'title', value ? `${value} (${familyLabel(fam)})` : 'Default model for this chat’s role');
+      }
+      modelBtn.disabled = !admin || (!isNew && !store.online);
+      modelBtn.hidden = !store.models.length;
+    }
+
+    async function pickModel() {
+      if (modelBtn.disabled) return;
+      const before = currentModel();
+      const value = await openModelPicker({ role: role(), current: before, opener: modelBtn });
+      if (value === undefined || value === before) return;
+      if (isNew) {
+        selected = value;
+        renderModels();
+        return;
+      }
+      try {
+        await post(`/v1/conversations/${encodeURIComponent(cid)}/model`, { model: value || null });
+        await loadConversations();
+        toast(value ? `This conversation now uses ${value}.` : 'This conversation uses the default model again.');
+      } catch (err) {
+        toastError(err);
+      }
+      renderModels();
     }
 
     function renderNote() {
@@ -552,19 +598,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
           ? 'Standard chat: one model answers. Memory is shared.'
           : 'Project chat: the orchestrator can start threads on your devices or the hub.';
     }
-
-    modelSelect.addEventListener('change', async () => {
-      if (isNew) return;
-      const value = modelSelect.value || null;
-      try {
-        await post(`/v1/conversations/${encodeURIComponent(cid)}/model`, { model: value });
-        await loadConversations();
-        toast(value ? `This conversation now uses ${value}.` : 'This conversation uses the default model again.');
-      } catch (err) {
-        toastError(err);
-        renderModels();
-      }
-    });
 
     function updateSend() {
       sendBtn.disabled = !admin || !textarea.value.trim() || sending || (!store.online && store.everOnline);
@@ -581,7 +614,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       },
       textarea,
       error,
-      h('div', { class: 'composer-row' }, seg, modelSelect, h('span', { class: 'spacer' }), sendBtn),
+      h('div', { class: 'composer-row' }, seg, modelBtn, h('span', { class: 'spacer' }), sendBtn),
     );
     const wrap = h('div', { class: 'composer-wrap' }, form, note);
     renderSeg();
@@ -593,7 +626,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       textarea,
       error,
       mode: () => mode,
-      model: () => modelSelect.value,
+      model: () => currentModel(),
       updateSend,
       renderModels,
       setOffline(offline) {
@@ -747,7 +780,10 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       composer.renderModels();
       if (!isNew && rendered && !info()) missing();
     }),
-    on('models', () => composer.renderModels()),
+    on('models', () => {
+      composer.renderModels();
+      for (const tid of chipEls.keys()) scheduleChip(tid);
+    }),
     on('online', (online) => composer.setOffline(!online)),
     on('route', (r) => {
       if (r.view !== 'chat' || r.conversation !== cid) return;

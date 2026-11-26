@@ -2,12 +2,18 @@
 // screens, and a modal bottom sheet on phones. The chat view owns the URL
 // (`#/chat/<id>/threads`); this module only shows, hides and fills the panel.
 // Live updates go through syncList so focus and the panel's scroll stay put.
+//
+// Thread rows show the title, the model (text plus a family colour stripe and
+// glyph), the device, the status and the elapsed time. Running and waiting rows
+// tick through the shared one-second timer (`onTick`), which only rewrites the
+// time text and runs only while the panel is open and a row is live.
 
 import { h, icon, setChildren, setText, setAttr, syncList } from '../lib/dom.js';
 import { enc } from '../lib/api.js';
 import { store, on, deviceName, threadsIn, approvalsIn } from '../lib/store.js';
-import { isNarrow, statusPill, skeletonBlocks } from '../lib/ui.js';
-import { ago, isActive } from '../lib/format.js';
+import { isNarrow, statusPill, skeletonBlocks, onTick } from '../lib/ui.js';
+import { ago, isActive, elapsed, isoDuration, threadElapsed } from '../lib/format.js';
+import { familyOfId, familyMark, familyLabel, setFamilyClass } from '../lib/family.js';
 import { openApproval } from './approvals.js';
 
 const NARROW = '(max-width: 760px)';
@@ -82,6 +88,7 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
 
   function hide({ restoreFocus = false } = {}) {
     open = false;
+    syncTicker();
     const restore = restoreFocus && trigger?.isConnected ? trigger : null;
     // Close the sheet before focusing the button: a modal dialog makes the
     // rest of the page inert, so the button cannot take focus while it is open.
@@ -108,17 +115,40 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
     const pill = h('span', { class: 'tp-pill' });
     const a = h(
       'a',
-      { class: 'list-row' },
+      { class: 'list-row thread-row has-fam fam-unknown' },
       h(
         'div',
         { class: 'grow' },
         h('div', { class: 'row-title' }),
+        h(
+          'div',
+          { class: 'meta tp-meta' },
+          h('span', { class: 'tp-model' }, h('span', { class: 'tp-mark' }), h('span', { class: 'visually-hidden tp-fam' }), h('span', { class: 'mono tp-model-name' })),
+          h('span', { class: 'tp-device' }),
+          h(
+            'span',
+            { class: 'tp-time' },
+            icon('clock'),
+            h('span', { class: 'visually-hidden tp-time-label' }),
+            h('time', { class: 'tp-elapsed' }),
+          ),
+          h('span', { class: 'tp-ago', hidden: true }),
+        ),
         h('div', { class: 'row-sub', hidden: true }),
-        h('div', { class: 'meta' }, h('span', { class: 'tp-device' }), h('span', { class: 'mono tp-model' }), h('span', { class: 'tp-time' })),
       ),
       pill,
     );
     return h('li', null, a);
+  }
+
+  /** Paint one row's elapsed time. Live rows keep `data-live` (their start) for the tick. */
+  function paintElapsed(el, label, t) {
+    const { secs, live } = threadElapsed(t);
+    if (live) el.dataset.live = String(t.created);
+    else delete el.dataset.live;
+    setText(label, live ? 'Elapsed ' : ''); // finished rows already read "took …"
+    setText(el, secs === null ? '—' : live ? elapsed(secs) : `took ${elapsed(secs)}`);
+    setAttr(el, 'datetime', secs === null ? null : isoDuration(secs));
   }
 
   function updateThread(li, t) {
@@ -131,8 +161,18 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
     sub.hidden = !summary;
     setText(sub, summary);
     setText(a.querySelector('.tp-device'), deviceName(t.device_id));
-    setText(a.querySelector('.tp-model'), t.model || '');
-    setText(a.querySelector('.tp-time'), ago(t.finished || t.created));
+    const fam = familyOfId(t.model);
+    if (a.dataset.fam !== fam) {
+      a.dataset.fam = fam;
+      setFamilyClass(a, fam);
+      setChildren(a.querySelector('.tp-mark'), familyMark(fam));
+      setText(a.querySelector('.tp-fam'), `${familyLabel(fam)}: `);
+    }
+    setText(a.querySelector('.tp-model-name'), t.model || 'model not recorded');
+    paintElapsed(a.querySelector('.tp-elapsed'), a.querySelector('.tp-time-label'), t);
+    const agoEl = a.querySelector('.tp-ago');
+    agoEl.hidden = isActive(t.status) || !t.finished;
+    setText(agoEl, agoEl.hidden ? '' : ago(t.finished));
     const pill = a.querySelector('.tp-pill');
     const key = `${t.status}|${t.checkpoint ? 1 : 0}|${needs ? 1 : 0}`;
     if (pill.dataset.key !== key) {
@@ -237,7 +277,44 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
       setText(emptyTitle, msg.title);
       setText(emptyBody, msg.body);
     }
+    syncTicker();
   }
+
+  // ---- the live elapsed times: one shared tick, only while open with a live row
+
+  let offTick = null;
+
+  function tick() {
+    const now = Date.now() / 1000;
+    for (const el of body.querySelectorAll('.tp-elapsed[data-live]')) {
+      const secs = now - Number(el.dataset.live);
+      setText(el, elapsed(secs));
+      setAttr(el, 'datetime', isoDuration(secs));
+    }
+  }
+
+  function syncTicker() {
+    const want = open && Boolean(body.querySelector('.tp-elapsed[data-live]'));
+    if (want && !offTick) offTick = onTick(tick);
+    else if (!want && offTick) {
+      offTick();
+      offTick = null;
+    }
+  }
+
+  // Arrow keys move between rows across the sections; Home and End jump to the ends.
+  function onRowKey(e) {
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
+    const row = e.target.closest?.('.list-row');
+    if (!row || !body.contains(row) || e.altKey || e.ctrlKey || e.metaKey) return;
+    const rows = [...body.querySelectorAll('section:not([hidden]) .list-row')];
+    const i = rows.indexOf(row);
+    if (i < 0) return;
+    const next = e.key === 'Home' ? 0 : e.key === 'End' ? rows.length - 1 : e.key === 'ArrowDown' ? Math.min(rows.length - 1, i + 1) : Math.max(0, i - 1);
+    e.preventDefault();
+    rows[next].focus();
+  }
+  body.addEventListener('keydown', onRowKey);
 
   function onKey(e) {
     if (e.key !== 'Escape' || !open || narrow()) return;
@@ -269,7 +346,7 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
   dialog.addEventListener('cancel', onCancel);
   dialog.addEventListener('click', onBackdrop);
   document.addEventListener('keydown', onKey);
-  const offs = [on('threads', render), on('approvals', render), on('devices', render), on('conversations', render)];
+  const offs = [on('threads', render), on('approvals', render), on('devices', render), on('conversations', render), on('models', render)];
   syncTrigger();
   render();
 
@@ -294,7 +371,10 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
       dialog.removeEventListener('cancel', onCancel);
       dialog.removeEventListener('click', onBackdrop);
       document.removeEventListener('keydown', onKey);
+      body.removeEventListener('keydown', onRowKey);
       offs.forEach((off) => off());
+      open = false;
+      syncTicker();
       if (dialog.open) dialog.close();
       dock.remove();
       dialog.remove();
