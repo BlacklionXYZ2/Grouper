@@ -460,7 +460,13 @@ pub enum EventBody {
     /// `skipped`, with reasons) and the thread continues there with `brief`.
     ThreadHandedOver { device_id: String, files: Vec<String>, skipped: Vec<String>, brief: String },
     ApprovalRequested { approval_id: String, device_id: String, tool: String, input: Value, reason: String },
-    ApprovalResolved { approval_id: String, approved: bool },
+    ApprovalResolved {
+        approval_id: String,
+        approved: bool,
+        /// Set when resolved without an owner click: `"timeout"`, `"timeout_stop"`, or `"dropped"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// The orchestrator finished a turn; it wakes again on the next message or thread result.
     TurnFinished { running_threads: u32 },
     Error { message: String },

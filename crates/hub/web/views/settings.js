@@ -22,6 +22,8 @@ import {
   sendTest,
   showLocalTest,
   storedSubscriptionId,
+  clearStoredSubscription,
+  checkHubPushSupport,
   setHasPush,
 } from '../lib/push.js';
 
@@ -348,7 +350,7 @@ export function renderSettings(container) {
     try {
       notifyMessage = (await action()) || '';
     } catch (err) {
-      if (err?.status === 404) hubPush = 'missing';
+      if (err?.pushMissing) hubPush = 'missing';
       if (err?.status === 403) hubPush = 'forbidden';
       notifyMessage = describe(err);
     }
@@ -381,10 +383,26 @@ export function renderSettings(container) {
       await showLocalTest();
       return 'Test shown.';
     }
-    const results = await sendTest(storedSubscriptionId());
+    let results;
+    try {
+      results = await sendTest(storedSubscriptionId());
+    } catch (err) {
+      if (err?.status === 404) {
+        clearStoredSubscription();
+        return 'This browser’s push subscription is no longer registered on the hub. Enable notifications again to reconnect it.';
+      }
+      throw err;
+    }
     const list = Array.isArray(results) ? results : Array.isArray(results?.results) ? results.results : null;
     if (!list) return 'Test sent. It should arrive in a few seconds.';
-    if (!list.length) return 'The hub has no subscription for this browser. Turn notifications off and on again.';
+    if (!list.length) {
+      clearStoredSubscription();
+      return 'The hub has no subscription for this browser. Enable notifications again to reconnect it.';
+    }
+    if (list.some((x) => x && x.removed)) {
+      clearStoredSubscription();
+      return 'The push service said this browser’s subscription expired, so the hub removed it. Enable notifications again.';
+    }
     const failed = list.filter((x) => x && x.ok === false);
     if (!failed.length) return 'Test sent. It should arrive in a few seconds.';
     return `The push service refused the test: ${failed.map((x) => x.error || x.status || 'failed').join('; ')}`;
@@ -402,10 +420,15 @@ export function renderSettings(container) {
       hubPush = 'ok';
     } catch (err) {
       if (isAbort(err)) return;
-      if (err.status === 404) hubPush = 'missing';
-      else if (err.status === 403) hubPush = 'forbidden';
+      if (err.status === 404) {
+        const probe = await checkHubPushSupport({ signal });
+        if (signal.aborted) return;
+        if (probe === 'missing' || probe === 'forbidden') hubPush = probe;
+      } else if (err.status === 403) {
+        hubPush = 'forbidden';
+      }
       notifyListSlot.replaceChildren();
-      if (err.status === 404 || err.status === 403) renderNotify();
+      if (hubPush === 'missing' || hubPush === 'forbidden') renderNotify();
       return;
     }
     if (signal.aborted) return;
@@ -462,7 +485,8 @@ export function renderSettings(container) {
       await removeSubscription(row.id);
       toast(`Notifications removed for ${row.label || 'that browser'}.`);
     } catch (err) {
-      toastError(err);
+      if (err?.status === 404) toast('That push subscription was already removed.');
+      else toastError(err);
     }
     loadNotifyList();
   }
@@ -553,6 +577,7 @@ export function renderSettings(container) {
     }
     toast('Session revoked.');
     loadSessions();
+    loadNotifyList();
   }
 
   // ---- providers

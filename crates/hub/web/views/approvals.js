@@ -50,9 +50,22 @@ const COUNTDOWN_MS = 15000; // the timeout line is refreshed this often
 const acknowledged = new Set(); // approval ids whose exact input was expanded
 const outcomes = new Map(); // approval id -> what was done here ("Approved.")
 const announcedIds = new Set(); // approval ids already announced as new
+const inFlight = new Set(); // approval ids with an answer or stop request in flight
 let dockUid = 0;
 let limitsCache = null; // {secs, action} from /v1/limits, for live requests
 let limitsLoading = null;
+
+/** Forget all dock state on sign-out / store reset. */
+export function resetApprovalDockState() {
+  acknowledged.clear();
+  outcomes.clear();
+  announcedIds.clear();
+  inFlight.clear();
+  limitsCache = null;
+  limitsLoading = null;
+}
+
+on('reset', resetApprovalDockState);
 
 /**
  * The hub's reason for a Manual tool is "<tool> is set to Manual", maybe followed
@@ -136,11 +149,12 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
   let lastIndex = 0;
   let shown = null; // {a, settled: null | text}
   let shownKey = '';
-  let busy = false;
+  const statuses = new Map(); // approval id -> status message scoped to that request
   let reconciling = false; // after a reconnect or a failed write, until the hub's list is back
   let reconcileError = null;
-  let status = '';
   let settleTimer = 0;
+  let pendingDeepLink = null; // deep-link id waiting on retry/reconnect after a load error
+  let selectSeq = 0;
   let active = false;
   let wasOffline = false;
   let destroyed = false;
@@ -152,11 +166,18 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
   // ---- elements (the card's content is rebuilt per request; these persist)
 
   const noticeText = h('span', { class: 'grow' });
+  let noticeRetryFn = null;
+  const noticeRetry = h(
+    'button',
+    { class: 'btn btn-sm', type: 'button', hidden: true, onclick: () => noticeRetryFn?.() },
+    'Try again',
+  );
   const notice = h(
     'div',
     { class: 'banner info dock-notice', role: 'status', hidden: true },
     icon('shield'),
     noticeText,
+    noticeRetry,
     h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: () => setNotice('') }, 'Dismiss'),
   );
   // In a thread view: the chat's other requests (they don't block this thread).
@@ -177,14 +198,33 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
     return !store.online && store.everOnline;
   }
 
+  function isBusy(id = shown?.a?.approval_id) {
+    return Boolean(id && inFlight.has(id));
+  }
+
+  function setStatus(id, text) {
+    if (!id) return;
+    if (text) statuses.set(id, text);
+    else statuses.delete(id);
+  }
+
   function canWrite() {
-    return isAdmin() && !offline() && !reconciling && !busy && Boolean(shown) && !shown.settled;
+    return isAdmin() && !offline() && !reconciling && Boolean(shown) && !shown.settled && !isBusy(shown.a.approval_id);
   }
 
   // ---- what to show
 
   function settledText(a) {
     if (outcomes.has(a.approval_id)) return outcomes.get(a.approval_id);
+    const res = store.resolutions.get(a.approval_id);
+    if (res?.reason === 'timeout_stop') return 'Timed out: denied and thread stopped.';
+    if (res?.reason === 'timeout') return 'Timed out: denied.';
+    if (res?.reason === 'dropped') {
+      const t = store.threads.get(a.thread_id);
+      if (t && !isActive(t.status)) return 'Thread ended; this request can’t run.';
+      if (t && t.status === 'waiting_device') return 'Device disconnected; this request can’t run.';
+      return 'This request is no longer waiting.';
+    }
     if (store.answered.has(a.approval_id)) return 'Answered on another device.';
     const t = store.threads.get(a.thread_id);
     if (t && !isActive(t.status)) return 'Thread ended; this request can’t run.';
@@ -193,7 +233,7 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
 
   function settle(a, text) {
     shown = { a, settled: text };
-    busy = false;
+    statuses.delete(a.approval_id);
     clearTimeout(settleTimer);
     const here = outcomes.has(a.approval_id);
     settleTimer = setTimeout(() => {
@@ -222,20 +262,40 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
 
   function render({ focus = false } = {}) {
     if (destroyed || !started) return;
+    // Capture focus BEFORE draw() mutates or empties `card` (removing a focused
+    // element drops activeElement to document.body).
+    const hadCardFocus = card.contains(document.activeElement);
     items = currentItems();
     // The request on screen went away (answered, here or elsewhere, or its thread ended).
-    if (shown && !shown.settled && !items.some((x) => x.approval_id === shown.a.approval_id)) {
+    // While our own POST for this request is still in flight, keep it on screen until
+    // the POST finishes so we never claim "Approved." before the write succeeds or
+    // misattribute a live timeout/other-device answer.
+    if (shown && !shown.settled && !items.some((x) => x.approval_id === shown.a.approval_id) && !isBusy(shown.a.approval_id)) {
       settle(shown.a, settledText(shown.a));
     }
-    if (!shown?.settled) {
+    const holdInFlight = shown && !shown.settled && isBusy(shown.a.approval_id) && (!selectedId || selectedId === shown.a.approval_id);
+    if (!shown?.settled && !holdInFlight) {
       const a = pick();
       shown = a ? { a, settled: null } : null;
     }
     announceArrivals();
-    draw(focus);
+    const wantFocus = draw(focus, hadCardFocus);
     renderOthers();
-    setActive(Boolean(shown));
+    const nextActive = Boolean(shown);
+    // Unhide card and wrapper BEFORE notifying the owner or moving focus: calling
+    // .focus() inside a hidden element is a no-op.
+    card.hidden = !nextActive;
     syncWrap();
+    if (nextActive !== active) {
+      const hadFocus = !nextActive && (hadCardFocus || (focusOwed && document.activeElement === document.body));
+      if (!nextActive) focusOwed = false;
+      active = nextActive;
+      onActiveChange(active, { hadFocus });
+    }
+    if (shown && wantFocus && !card.hidden && !el.hidden) {
+      refs?.heading.focus({ preventScroll: true });
+      focusOwed = false;
+    }
   }
 
   /** The wrapper takes no room when it shows nothing. */
@@ -255,40 +315,30 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
     else if (fresh.length > 1) announce(`${fresh.length} tool calls need review.`, { force: true });
   }
 
-  function setActive(next) {
-    const hadFocus = card.contains(document.activeElement) || document.activeElement === document.body;
-    card.hidden = !next;
-    if (next === active) return;
-    active = next;
-    onActiveChange(active, { hadFocus });
-  }
-
   // ---- drawing
 
-  function draw(focus) {
+  function draw(focus, hadCardFocus) {
     const key = shown ? `${shown.a.approval_id}|${shown.settled || ''}` : '';
-    const hadFocus = card.contains(document.activeElement) || (focusOwed && document.activeElement === document.body);
+    const hadFocus = hadCardFocus || (focusOwed && document.activeElement === document.body);
+    let wantFocus = false;
     if (key !== shownKey) {
       shownKey = key;
       if (shown) {
-        status = '';
         buildCard();
       } else {
         card.replaceChildren();
         refs = null;
       }
-      if (shown && (hadFocus || focus)) {
-        refs?.heading.focus({ preventScroll: true });
-        focusOwed = false;
-      }
+      if (shown && (hadFocus || focus)) wantFocus = true;
     } else if (focus && refs) {
-      refs.heading.focus({ preventScroll: true });
+      wantFocus = true;
     }
     if (shown) {
       paintContext();
       updateQueue();
       sync();
     }
+    return wantFocus;
   }
 
   function buildCard() {
@@ -441,7 +491,7 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
   }
 
   function updateQueue() {
-    if (!refs || shown.settled) return;
+    if (!refs || !shown || shown.settled) return;
     const i = items.findIndex((x) => x.approval_id === shown.a.approval_id);
     const n = items.length;
     refs.queue.hidden = n < 2;
@@ -452,7 +502,7 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
 
   /** Buttons follow who may answer, the connection, the gate and the write in flight. */
   function sync() {
-    if (!refs || shown.settled) return;
+    if (!refs || !shown || shown.settled) return;
     const a = shown.a;
     const writable = canWrite();
     const seen = acknowledged.has(a.approval_id);
@@ -460,7 +510,7 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
     refs.deny.disabled = refs.change.disabled = refs.stopBtn.disabled = !writable;
     setText(refs.gate, seen ? '' : 'Approve turns on once you open “Review exact input”.');
     refs.gate.hidden = seen;
-    let text = status;
+    let text = statuses.get(a.approval_id) || '';
     if (!isAdmin()) text = 'This session uses a device token, which can’t answer approvals. Sign in with an admin token to answer.';
     else if (offline()) text = 'Offline. The request is shown as last synced; reconnect to answer it.';
     else if (reconciling) text = reconcileError ? `Couldn’t check this request with the hub: ${reconcileError}` : 'Checking this request with the hub…';
@@ -482,6 +532,7 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
     const i = items.findIndex((x) => x.approval_id === shown.a.approval_id);
     const j = i + delta;
     if (i < 0 || j < 0 || j >= items.length) return;
+    focusOwed = false;
     selectedId = items[j].approval_id;
     lastIndex = j;
     const focusOn = delta < 0 ? 'prev' : 'next';
@@ -526,43 +577,46 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
   async function answer(approved, thenChange = false) {
     if (!canWrite() || (approved && !acknowledged.has(shown.a.approval_id))) return;
     const a = shown.a;
+    const id = a.approval_id;
     const device = deviceName(a.device_id);
     focusOwed = card.contains(document.activeElement);
-    busy = true; // both buttons go off at once: no duplicate writes
-    status = approved ? 'Approving…' : 'Denying…';
-    // Recorded before the write: the hub's live "resolved" event can arrive before
-    // its HTTP reply, and this answer must not read as "answered on another device".
-    outcomes.set(a.approval_id, approved ? `Approved. ${a.tool} runs on ${device}.` : `Denied. ${a.tool} won’t run.`);
-    sync();
+    inFlight.add(id); // buttons & queue nav turn off for this request only
+    setStatus(id, 'Sending…');
+    emit('approval_inflight');
     try {
-      await post(`/v1/approvals/${enc(a.approval_id)}`, { approve: approved });
+      await post(`/v1/approvals/${enc(id)}`, { approve: approved });
+      // Only record the local outcome once the hub confirms the POST succeeded.
+      outcomes.set(id, approved ? `Approved. ${a.tool} runs on ${device}.` : `Denied. ${a.tool} won’t run.`);
+      setStatus(id, '');
+      inFlight.delete(id);
+      emit('approval_inflight');
       alertOnce(approved ? `Approved ${a.tool} on ${device}.` : `Denied ${a.tool} on ${device}.`);
-      store.answered.add(a.approval_id);
-      store.approvals.delete(a.approval_id);
-      busy = false;
+      store.answered.add(id);
+      store.approvals.delete(id);
       emit('approvals'); // every view (this dock included) settles it
       if (thenChange) (onChangeIt || defaultChangeIt)(a);
     } catch (err) {
-      outcomes.delete(a.approval_id);
-      if (shown?.settled && shown.a.approval_id === a.approval_id) {
-        // Settled by a live event while the write failed: it wasn't this answer.
-        shown = { a, settled: settledText(a) };
-        draw(false);
-      }
+      inFlight.delete(id);
+      emit('approval_inflight');
       if (err.status === 404) {
-        // Already answered (or dropped) on the hub.
-        busy = false;
-        store.answered.add(a.approval_id);
-        store.approvals.delete(a.approval_id);
+        // Already answered, timed out, or dropped on the hub.
+        setStatus(id, '');
+        store.approvals.delete(id);
+        emit('approvals');
+        return;
+      }
+      // If a live event already removed the request while the POST failed, settle with its actual outcome.
+      if (!store.approvals.has(id)) {
+        setStatus(id, '');
         emit('approvals');
         return;
       }
       // The answer may or may not have landed: ask the hub before offering it again.
-      status = `${describe(err)} Checking with the hub before you try again…`;
-      busy = false;
+      setStatus(id, `${describe(err)} Checking with the hub before you try again…`);
       await reconcile();
-      if (shown && !shown.settled && shown.a.approval_id === a.approval_id) {
-        status = reconcileError ? status : 'The hub didn’t record an answer. You can answer again.';
+      if (shown && !shown.settled && shown.a.approval_id === id) {
+        focusOwed = false;
+        setStatus(id, reconcileError ? statuses.get(id) : 'The hub didn’t record an answer. You can answer again.');
         sync();
       }
     }
@@ -576,24 +630,31 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
   async function stopIt() {
     if (!canWrite()) return;
     const a = shown.a;
+    const id = a.approval_id;
     focusOwed = card.contains(document.activeElement);
-    busy = true;
-    status = '';
-    sync();
+    inFlight.add(id);
+    setStatus(id, '');
+    emit('approval_inflight');
     try {
       const stopped = await stopThread(a.thread_id);
-      busy = false;
+      inFlight.delete(id);
+      emit('approval_inflight');
       if (stopped) {
-        outcomes.set(a.approval_id, 'Thread stopped; this request can’t run.');
-        store.approvals.delete(a.approval_id);
+        outcomes.set(id, 'Thread stopped; this request can’t run.');
+        store.approvals.delete(id);
         emit('approvals');
       } else {
+        focusOwed = false;
+        updateQueue();
         sync();
-        refs?.stopBtn.focus({ preventScroll: true });
+        if (shown?.a.approval_id === id) refs?.stopBtn.focus({ preventScroll: true });
       }
     } catch (err) {
-      busy = false;
-      status = describe(err);
+      inFlight.delete(id);
+      emit('approval_inflight');
+      focusOwed = false;
+      setStatus(id, describe(err));
+      updateQueue();
       sync();
     }
   }
@@ -612,6 +673,10 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
     if (destroyed) return;
     render();
     sync();
+    if (!reconciling && pendingDeepLink) {
+      const retryId = pendingDeepLink;
+      select(retryId, { focus: false });
+    }
   }
 
   // ---- the chat's other requests, from a thread view
@@ -631,26 +696,54 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
 
   // ---- deep links
 
-  function setNotice(text) {
+  function setNotice(text, { retry = null } = {}) {
+    if (!text) pendingDeepLink = null;
     setText(noticeText, text);
+    noticeRetryFn = retry;
+    noticeRetry.hidden = !retry;
     notice.hidden = !text;
     syncWrap();
   }
 
   async function select(id, { focus }) {
+    const seq = ++selectSeq;
     setNotice('');
     let a = store.approvals.get(id);
     if (!a) {
       // Push and links are best effort: ask the hub for its current list first.
-      await loadApprovals().catch(() => {});
-      if (destroyed) return;
+      try {
+        await loadApprovals({ strict: true });
+      } catch (err) {
+        if (destroyed || seq !== selectSeq) return;
+        // Keep `?approval=<id>` so a retry or reconnect can open it once reachable.
+        pendingDeepLink = id;
+        const msg = offline()
+          ? 'Offline. Couldn’t check this request with the hub.'
+          : `Couldn’t check this request with the hub: ${describe(err)}`;
+        setNotice(msg, { retry: () => select(id, { focus: true }) });
+        render({ focus });
+        if (focus && !shown) noticeRetry.focus({ preventScroll: true });
+        return;
+      }
+      if (destroyed || seq !== selectSeq) return;
       a = store.approvals.get(id);
     }
     if (!a) {
-      setNotice(store.answered.has(id) ? 'That request was already answered.' : 'This request is no longer waiting.');
+      const res = store.resolutions.get(id);
+      const msg =
+        res?.reason === 'timeout_stop'
+          ? 'That request timed out and the thread was stopped.'
+          : res?.reason === 'timeout'
+            ? 'That request timed out and was denied.'
+            : res?.reason === 'dropped'
+              ? 'This request is no longer waiting.'
+              : store.answered.has(id)
+                ? 'That request was already answered.'
+                : 'This request is no longer waiting.';
+      setNotice(msg);
       dropDeepLink(id);
       render({ focus });
-      if (focus && !shown) notice.querySelector('button')?.focus({ preventScroll: true });
+      if (focus && !shown) notice.querySelector('button:not([hidden])')?.focus({ preventScroll: true });
       return;
     }
     const inScope = threadId ? a.thread_id === threadId : a.conversation_id === cid;
@@ -682,6 +775,10 @@ export function mountApprovalDock({ conversationId, threadId = null, onActiveCha
       }
     }),
     on('approvals', () => render()),
+    on('approval_inflight', () => {
+      updateQueue();
+      sync();
+    }),
     on('threads', () => {
       const t = threadId ? store.threads.get(threadId) : null;
       if (t?.conversation_id) cid = t.conversation_id;

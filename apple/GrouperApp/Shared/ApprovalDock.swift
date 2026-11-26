@@ -293,6 +293,7 @@ struct ApprovalDock: View {
         case .answeredHere(let approved): return approved ? "checkmark.circle.fill" : "xmark.circle.fill"
         case .answeredElsewhere: return "checkmark.circle"
         case .threadEnded: return "stop.circle"
+        case .timedOut: return "timer"
         case .noLongerWaiting: return "clock.badge.xmark"
         }
     }

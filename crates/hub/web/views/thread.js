@@ -25,9 +25,19 @@ import { familyOfId, familyMark, familyInfo, setFamilyClass } from '../lib/famil
 import { mountApprovalDock, CHANGE_DRAFT } from './approvals.js';
 
 const drafts = new Map();
+const draftListeners = new Map(); // threadId -> (text) => void for mounted thread views
+
+on('reset', () => {
+  drafts.clear();
+});
 
 /** Put text in a thread's step-in field (used by the approval dock's "Change it"). */
 export function setStepInDraft(threadId, text) {
+  const apply = draftListeners.get(threadId);
+  if (apply) {
+    apply(text);
+    return;
+  }
   drafts.set(threadId, text);
 }
 
@@ -162,6 +172,20 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     drafts.delete(threadId);
     focusDraft = true;
   }
+  function applyStepInDraft(text) {
+    const raw = stepText.value;
+    const kept = raw.trim();
+    stepText.value = !kept ? text : kept.startsWith(text.trim()) ? raw : `${text}${kept}`;
+    stepSel = null;
+    focusDraft = true;
+    updateSendBtn();
+    if (loaded && !loadError && !foot.hidden && !stepForm.hidden && !stepText.disabled) {
+      focusDraft = false;
+      stepText.focus({ preventScroll: true });
+      stepText.setSelectionRange(stepText.value.length, stepText.value.length);
+    }
+  }
+  draftListeners.set(threadId, applyStepInDraft);
   const stepBtn = h('button', { class: 'send-btn', type: 'submit', 'aria-label': 'Send to thread', disabled: true }, icon('send'));
   const stopBtn = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => stop() }, icon('stop'), 'Stop thread');
   const stepError = h('div', { class: 'composer-error', role: 'alert', hidden: true });
@@ -207,11 +231,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     },
     // "Change it" here: the draft goes straight into this thread's step-in field.
     onChangeIt: () => {
-      const kept = stepText.value.trim();
-      stepText.value = kept ? `${CHANGE_DRAFT}${kept}` : CHANGE_DRAFT;
-      stepSel = null;
-      focusDraft = true;
-      updateSendBtn();
+      applyStepInDraft(CHANGE_DRAFT);
     },
   });
   dock.el.classList.add('sheet-foot', 'thread-dock');
@@ -535,7 +555,13 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     } else if (e.kind === 'thread_handed_over') {
       addItem(h('div', { class: 'msg msg-note' }, icon('check'), `Continued on ${deviceName(e.device_id)}.`));
     } else if (e.kind === 'approval_resolved') {
-      addItem(h('div', { class: 'msg msg-note' }, icon('shield'), e.approved ? 'You approved a tool call.' : 'A tool call was denied.'));
+      const note =
+        e.reason === 'timeout' || e.reason === 'timeout_stop'
+          ? 'A tool call timed out and was denied.'
+          : e.approved
+            ? 'You approved a tool call.'
+            : 'A tool call was denied.';
+      addItem(h('div', { class: 'msg msg-note' }, icon('shield'), note));
     } else if (e.kind === 'error') {
       addItem(h('div', { class: 'msg msg-error' }, icon('warning'), h('div', null, e.message)));
     }
@@ -894,6 +920,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
   });
 
   return () => {
+    if (draftListeners.get(threadId) === applyStepInDraft) draftListeners.delete(threadId);
     dock.destroy();
     for (const off of subs) off();
     offTick?.();

@@ -286,7 +286,16 @@ export function renderInbox(container) {
   function trackApprovals() {
     for (const [id, a] of known) {
       if (store.approvals.has(id) || settled.has(id)) continue;
-      settled.set(id, { approval: a, text: store.answered.has(id) ? 'Answered' : 'No longer waiting', at: Date.now() });
+      const res = store.resolutions.get(id);
+      const text =
+        res?.reason === 'timeout' || res?.reason === 'timeout_stop'
+          ? 'Timed out'
+          : res?.reason === 'dropped'
+            ? 'No longer waiting'
+            : store.answered.has(id)
+              ? 'Answered'
+              : 'No longer waiting';
+      settled.set(id, { approval: a, text, at: Date.now() });
     }
     known.clear();
     for (const [id, a] of store.approvals) {
