@@ -31,6 +31,18 @@ time, `ProviderInfo.viaDevice`) are built and tested, on the Windows toolchain.
   models, then other models, grouped by provider with key status.
 - Family colours (`Shared/ModelFamilyStyle.swift`) match the web `--fam-*` tokens
   for light, dark and Increase Contrast.
+- **Approval dock** (`Shared/ApprovalDock.swift`, spec 5.13) replaces the chat
+  composer while the chat has pending requests, and a thread's step-in composer
+  for that thread's own request. There is no approval sheet or banner any more.
+  The pending list is `GET /v1/approvals` plus approval events from an
+  account-wide event stream (`AppModel.approvalBook`, `GrouperAPI.ApprovalBook`).
+- **Approval notifications** (`Shared/ApprovalNotifications.swift`, spec 5.14) on
+  iPhone and Mac: local only, while the app runs, after the Settings >
+  Notifications opt-in. They have no actions, and tapping one opens the chat's dock.
+  APNs is a TODO that needs a paid Apple Developer account.
+- **Mac command palette** (`macOS/CommandPaletteView.swift`, spec 5.15): Edit >
+  Search… (⌘K) or the sidebar's search button. It has local results only.
+  Matching and ranking live in `GrouperAPI.CommandPalette`, which has unit tests.
 
 ## Build on a Mac
 

@@ -3,9 +3,10 @@ import GrouperAPI
 
 struct DevicesView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var path: [String] = []
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             List(model.devices) { device in
                 NavigationLink(value: device.id) {
                     VStack(alignment: .leading, spacing: 5) {
@@ -22,6 +23,12 @@ struct DevicesView: View {
                 if let device = model.devices.first(where: { $0.id == id }) { DeviceDetailView(device: device) }
             }
             .refreshable { await model.refreshDevices() }
+            // A device chosen elsewhere (the Mac command palette) opens its detail.
+            .onChange(of: model.selectedDeviceId, initial: true) { _, id in
+                guard let id else { return }
+                path = [id]
+                model.selectedDeviceId = nil
+            }
             .task {
                 while !Task.isCancelled {
                     await model.refreshDevices()

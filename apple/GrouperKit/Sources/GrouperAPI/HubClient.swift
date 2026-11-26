@@ -97,6 +97,12 @@ public actor HubClient {
 
     public func thread(id: String) async throws -> ThreadInfo { try await get(["v1", "threads", id]) }
 
+    /// Pending approvals across every chat (admin only), oldest first.
+    public func approvals(conversationId: String? = nil) async throws -> [HubApproval] {
+        let query = conversationId.map { [URLQueryItem(name: "conversation", value: $0)] } ?? []
+        return try await get(["v1", "approvals"], query: query)
+    }
+
     public func tools(deviceId: String? = nil, includeUnavailable: Bool = false) async throws -> [ToolInfo] {
         var query: [URLQueryItem] = []
         if let deviceId { query.append(URLQueryItem(name: "device", value: deviceId)) }

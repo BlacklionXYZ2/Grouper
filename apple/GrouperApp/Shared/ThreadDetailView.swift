@@ -5,9 +5,10 @@ import GrouperAPI
 /// thread model's text is the assistant's (labelled with the model), tool calls are
 /// collapsible rows with the exact input and output, and step-ins and the
 /// orchestrator's answers are messages. The fixed header shows status, device,
-/// elapsed time and the model the orchestrator chose (no picker). Approvals, the
+/// elapsed time and the model the orchestrator chose (no picker). The
 /// waiting/checkpoint card, the result and rating sit around the transcript; the
-/// step-in composer with Stop sits at the bottom.
+/// step-in composer with Stop sits at the bottom, replaced by the approval dock
+/// while this thread has a pending request.
 ///
 /// The view has no NavigationStack of its own: the iPhone chat wraps it in one for
 /// its sheet, and the threads panel pushes it.
@@ -20,7 +21,6 @@ struct ThreadDetailView: View {
     @State private var stopping = false
     @State private var sending = false
     @State private var showStopConfirmation = false
-    @State private var reviewing: PendingApproval?
     @State private var openCalls: Set<String> = []
 
     private var liveThread: ThreadInfo {
@@ -34,7 +34,6 @@ struct ThreadDetailView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
-                    ForEach(approvals) { approval in approvalBanner(approval) }
                     attention(rows)
                     ForEach(transcript.messages) { item in messageView(item) }
                     if !draft.isEmpty {
@@ -66,7 +65,6 @@ struct ThreadDetailView: View {
         } message: {
             Text("Its current tool or model turn will be stopped, and work it hasn’t saved is lost. The orchestrator is told you stopped it.")
         }
-        .sheet(item: $reviewing) { ApprovalSheet(approval: $0) }
         .task(id: thread.id) { message = model.threadMessageDrafts[thread.id] ?? "" }
         .onChange(of: message) { _, value in model.threadMessageDrafts[thread.id] = value }
         // "Change it" on an approval puts a prefixed draft here.
@@ -104,26 +102,14 @@ struct ThreadDetailView: View {
 
     // MARK: - Attention: approvals, waiting, checkpoint, hand-over
 
+    /// This thread's pending requests, oldest first.
     private var approvals: [PendingApproval] {
-        model.pendingApprovals.filter { $0.threadId == liveThread.id }
+        model.approvals(in: liveThread.conversationId).filter { $0.threadId == liveThread.id }
     }
 
-    private func approvalBanner(_ approval: PendingApproval) -> some View {
-        Button { reviewing = approval } label: {
-            HStack(alignment: .top) {
-                Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(approval.tool) on \(model.deviceDisplayName(approval.deviceId)) is waiting for your approval.").font(.subheadline.weight(.semibold))
-                    if !approval.reason.isEmpty { Text(approval.reason).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
-                }
-                Spacer()
-                Text("Review").font(.callout.weight(.semibold)).foregroundStyle(.tint)
-            }
-            .padding().background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 14))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Approval needed for \(approval.tool) on \(model.deviceDisplayName(approval.deviceId))")
+    /// Pending requests from the chat's other threads; they don't block this thread.
+    private var otherApprovalsInChat: Int {
+        model.approvals(in: liveThread.conversationId).filter { $0.threadId != liveThread.id }.count
     }
 
     @ViewBuilder private func attention(_ rows: [ThreadActivityRow]) -> some View {
@@ -291,11 +277,19 @@ struct ThreadDetailView: View {
         }
     }
 
-    // MARK: - Footer: step in, Stop
+    // MARK: - Footer: step in, Stop (or the approval dock)
+
+    private var showsDock: Bool {
+        if !approvals.isEmpty { return true }
+        return model.settledApproval?.approval.threadId == liveThread.id
+    }
 
     private var footer: some View {
         Group {
-            if liveThread.isTerminal {
+            if showsDock {
+                ApprovalDock(queue: approvals, scope: .thread(liveThread.id),
+                             otherInChat: otherApprovalsInChat, onShowChatQueue: onClose)
+            } else if liveThread.isTerminal {
                 Text("This thread has finished. Ask about it in the chat.")
                     .font(.callout).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)

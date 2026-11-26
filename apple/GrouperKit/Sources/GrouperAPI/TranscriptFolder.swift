@@ -46,6 +46,11 @@ public struct PendingApproval: Equatable, Identifiable, Sendable {
     public let reason: String
     public let seq: Int64
     public let ts: UInt64
+    /// From `GET /v1/approvals` when the hub has an approval timeout set; nil otherwise
+    /// (and on requests folded from events, which do not carry it).
+    public var timeoutSecs: UInt64? = nil
+    public var timeoutAt: UInt64? = nil
+    public var timeoutAction: ApprovalTimeoutAction? = nil
     public var id: String { approvalId }
 }
 

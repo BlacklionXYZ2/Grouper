@@ -20,7 +20,7 @@ struct ChatView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
                     if !model.online { offlineBanner }
-                    if let approval = scopedApprovals.first { approvalBanner(approval) }
+                    if let notice = visibleNotice { noticeBanner(notice) }
                     if model.selectedConversationId == nil { newConversationIntro }
                     ForEach(model.transcript) { row in transcriptRow(row) }
                     if let draft = model.selectedFolder?.assistantDraft, !draft.isEmpty {
@@ -35,7 +35,9 @@ struct ChatView: View {
             .onChange(of: model.transcript.count) { _, _ in withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end") } }
             // VERIFY ON MAC: Confirm safeAreaBar(edge: .bottom) scroll-edge blur and Reduce Transparency
             // with GlassSurface + .glassProminent Send button on both iOS 26 and macOS 26.
-            .safeAreaBar(edge: .bottom) { composer }
+            // While the chat has a pending approval the dock takes the composer's place;
+            // `message` lives on this view, so the draft comes back afterwards.
+            .safeAreaBar(edge: .bottom) { bottomBar }
         }
         .navigationTitle(model.selectedConversation?.title ?? "New chat")
         .toolbar {
@@ -48,25 +50,53 @@ struct ChatView: View {
         .sheet(item: $sheet, onDismiss: sheetDismissed) { item in sheetContent(item) }
         .onChange(of: requestedSheet, initial: true) { _, wanted in route(wanted) }
         .onChange(of: model.selectedConversationId) { _, _ in showThreads = false }
+        .onAppear { model.chatViewsOnScreen += 1 }
+        .onDisappear { model.chatViewsOnScreen = max(0, model.chatViewsOnScreen - 1) }
+    }
+
+    // MARK: - Approval dock
+
+    @ViewBuilder private var bottomBar: some View {
+        if let conversationId = model.selectedConversationId, showsDock(conversationId) {
+            ApprovalDock(queue: model.approvals(in: conversationId), scope: .chat)
+        } else {
+            composer
+        }
+    }
+
+    private func showsDock(_ conversationId: String) -> Bool {
+        if !model.approvals(in: conversationId).isEmpty { return true }
+        return model.settledApproval?.approval.conversationId == conversationId
+    }
+
+    private var visibleNotice: ChatNotice? {
+        guard let notice = model.chatNotice else { return nil }
+        guard let id = notice.conversationId else { return notice }
+        return id == model.selectedConversationId ? notice : nil
+    }
+
+    private func noticeBanner(_ notice: ChatNotice) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Label(notice.text, systemImage: "info.circle").font(.callout)
+            Spacer()
+            Button("Dismiss") { model.chatNotice = nil }.font(.callout).buttonStyle(.borderless)
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: - Sheets
 
     /// What the chat wants on screen, in priority order. One `.sheet` shows it, so two
-    /// requests in one turn (e.g. "Change it": approval closes, thread opens) queue
-    /// instead of one being dropped.
+    /// requests in one turn (e.g. the threads sheet closing as a thread opens) queue
+    /// instead of one being dropped. Approvals are not sheets: they use the dock.
     private var requestedSheet: ChatSheet? {
         if showModelPicker { return .modelPicker }
         #if os(iOS)
-        // While the threads sheet is up it presents its own approvals and threads.
+        // While the threads sheet is up it pushes its own threads.
         if showThreads, let id = threadsConversationId { return .threads(id) }
-        #endif
-        if let id = model.selectedApprovalId {
-            if let approval = model.pendingApprovals.first(where: { $0.id == id }) { return .approval(approval) }
-            // Answered elsewhere while open: keep the sheet so it can say so.
-            if case .approval(let shown)? = shownSheet, shown.id == id { return .approval(shown) }
-        }
-        #if os(iOS)
         if let thread = model.selectedThread { return .thread(thread.id) }
         #endif
         return nil
@@ -90,7 +120,6 @@ struct ChatView: View {
             switch dismissed {
             case .modelPicker: showModelPicker = false
             case .threads: showThreads = false
-            case .approval(let approval): if model.selectedApprovalId == approval.id { model.selectedApprovalId = nil }
             case .thread(let id): if model.selectedThreadId == id { model.selectedThreadId = nil }
             }
         }
@@ -104,8 +133,6 @@ struct ChatView: View {
             ModelPickerSheet(role: chatRole, current: currentModelId) { chooseModel($0) }
         case .threads(let conversationId):
             ThreadsPanel(conversationId: conversationId) { showThreads = false }
-        case .approval(let approval):
-            ApprovalSheet(approval: approval)
         case .thread(let id):
             NavigationStack {
                 if let thread = model.threads.first(where: { $0.id == id }) {
@@ -142,10 +169,6 @@ struct ChatView: View {
             .disabled(threadsConversationId == nil)
             .help("Threads in this chat")
         }
-    }
-
-    private var scopedApprovals: [PendingApproval] {
-        model.pendingApprovals.filter { $0.conversationId == model.selectedConversationId }
     }
 
     private var offlineBanner: some View {
@@ -196,20 +219,6 @@ struct ChatView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(streaming ? "Reply so far. \(text)" : "Grouper. \(text)")
-    }
-
-    private func approvalBanner(_ approval: PendingApproval) -> some View {
-        Button { model.selectedApprovalId = approval.id } label: {
-            HStack(alignment: .top) {
-                Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
-                VStack(alignment: .leading) {
-                    Text("Approval needed").font(.headline)
-                    Text("\(approval.tool) on \(deviceName(approval.deviceId))").font(.subheadline)
-                    Text(approval.reason).font(.callout).foregroundStyle(.secondary).lineLimit(2)
-                }
-                Spacer(); Image(systemName: "chevron.right")
-            }.padding().background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 14))
-        }.buttonStyle(.plain)
     }
 
     private var composer: some View {
@@ -297,22 +306,20 @@ struct ChatView: View {
 
 
 /// The chat's sheets. One `.sheet(item:)` shows them all, so they never compete.
+/// Approvals are not among them: they take the composer's place (`ApprovalDock`).
 ///
-/// iPhone: the Threads button opens `.threads` (which presents its own approvals and
-/// pushes its own threads); a thread card opens that thread as `.thread`.
-/// Mac: threads live in an inspector instead, so only `.approval` and
-/// `.modelPicker` are ever requested.
+/// iPhone: the Threads button opens `.threads` (which pushes its own threads); a
+/// thread card or "Change it" opens that thread as `.thread`.
+/// Mac: threads live in an inspector instead, so only `.modelPicker` is requested.
 enum ChatSheet: Identifiable, Equatable {
     case modelPicker
     case threads(String)
-    case approval(PendingApproval)
     case thread(String)
 
     var id: String {
         switch self {
         case .modelPicker: return "model-picker"
         case .threads(let conversationId): return "threads:\(conversationId)"
-        case .approval(let approval): return "approval:\(approval.id)"
         case .thread(let threadId): return "thread:\(threadId)"
         }
     }
@@ -320,7 +327,7 @@ enum ChatSheet: Identifiable, Equatable {
 
 #if os(macOS)
 /// Mac: the Threads button toggles an inspector beside the transcript, and a thread
-/// card (or "Change it" on an approval) opens the inspector on that thread. The
+/// card (or "Change it" in the approval dock) opens the inspector on that thread. The
 /// panel exists only while the inspector is shown, so nothing ticks while it is
 /// hidden and the panel always sees the thread it was opened for.
 private struct ThreadsInspector: ViewModifier {
