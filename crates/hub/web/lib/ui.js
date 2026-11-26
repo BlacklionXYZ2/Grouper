@@ -133,9 +133,12 @@ export function statusPill(status, opts) {
   const s = threadStatus(status, opts);
   const running = status === 'running' && !opts?.approval;
   const tint = running && opts?.family ? `fam-${opts.family}` : null;
+  // Done is mint (good state). Stopped and unknown stay muted. An approval
+  // wins over a finished status, so that pill stays a warning.
+  const tone = status === 'done' && !opts?.approval ? 'ok' : s.tone;
   return h(
     'span',
-    { class: ['status', tint ? 'fam-tint' : s.tone, tint] },
+    { class: ['status', tint ? 'fam-tint' : tone, tint] },
     running ? h('span', { class: 'live-dot', 'aria-hidden': 'true' }) : icon(s.icon),
     s.word,
   );

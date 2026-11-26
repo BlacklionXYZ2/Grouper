@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="Grouper glyph">
+  <defs>
+    <!-- Simplified high-contrast gradients for 16-24px legibility -->
+    <linearGradient id="glyph-head" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#58eee5"/>
+      <stop offset="100%" stop-color="#22cfd4"/>
+    </linearGradient>
+    <linearGradient id="glyph-body" x1="50%" y1="15%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#15b1cc"/>
+      <stop offset="50%" stop-color="#0d88be"/>
+      <stop offset="100%" stop-color="#166eb8"/>
+    </linearGradient>
+    <linearGradient id="glyph-teal" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#4de5dd"/>
+      <stop offset="100%" stop-color="#1cc0cb"/>
+    </linearGradient>
+    <linearGradient id="glyph-cyan" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#28d0d8"/>
+      <stop offset="100%" stop-color="#0f9bc2"/>
+    </linearGradient>
+    <linearGradient id="glyph-blue" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#22b2e0"/>
+      <stop offset="100%" stop-color="#176ed4"/>
+    </linearGradient>
+    <linearGradient id="glyph-violet-left" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#604cf2"/>
+      <stop offset="100%" stop-color="#4c31d8"/>
+    </linearGradient>
+    <linearGradient id="glyph-violet-right" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#8740f7"/>
+      <stop offset="100%" stop-color="#5d23d2"/>
+    </linearGradient>
+
+    <!-- Bold centre fish silhouette -->
+    <path id="glyph-centre-body" d="
+      M 512 48
+      C 554 58, 608 118, 630 192
+      C 644 240, 650 294, 650 364
+      C 650 444, 632 514, 602 582
+      C 574 646, 548 696, 544 742
+      C 542 778, 574 824, 588 874
+      C 596 908, 590 946, 558 978
+      C 540 954, 524 928, 512 908
+      C 500 928, 484 954, 466 978
+      C 434 946, 428 908, 436 874
+      C 450 824, 482 778, 480 742
+      C 476 696, 450 646, 422 582
+      C 392 514, 374 444, 374 364
+      C 374 294, 380 240, 394 192
+      C 416 118, 470 58, 512 48 Z"/>
+    <clipPath id="glyph-centre-clip">
+      <use href="#glyph-centre-body"/>
+    </clipPath>
+
+    <!-- Bold swept pectoral fin (left; mirrored for right) -->
+    <path id="glyph-pec" d="
+      M 352 320
+      C 314 358, 286 418, 290 470
+      C 292 488, 298 496, 308 492
+      C 324 480, 340 462, 354 448
+      C 350 406, 349 360, 352 320 Z"/>
+
+    <!-- Bold simplified school fish (clean teardrop + subtle notch, no fine barbs) -->
+    <path id="glyph-school-fish" d="
+      M 0 -132
+      C 28 -96, 50 -44, 48 10
+      C 46 50, 26 88, 14 128
+      C 6 121, 3 116, 0 112
+      C -3 116, -6 121, -14 128
+      C -26 88, -46 50, -48 10
+      C -50 -44, -28 -96, 0 -132 Z"/>
+  </defs>
+
+  <!-- Simplified 6-fish arc (3 per side) -->
+  <use href="#glyph-school-fish" fill="url(#glyph-teal)"
+       transform="translate(212, 248) rotate(32) scale(0.96)"/>
+  <use href="#glyph-school-fish" fill="url(#glyph-cyan)"
+       transform="translate(132, 520) rotate(4) scale(1.02)"/>
+  <use href="#glyph-school-fish" fill="url(#glyph-violet-left)"
+       transform="translate(232, 774) rotate(-18) scale(0.96)"/>
+
+  <use href="#glyph-school-fish" fill="url(#glyph-teal)"
+       transform="translate(812, 248) scale(-1, 1) rotate(32) scale(0.96)"/>
+  <use href="#glyph-school-fish" fill="url(#glyph-blue)"
+       transform="translate(892, 520) scale(-1, 1) rotate(4) scale(1.02)"/>
+  <use href="#glyph-school-fish" fill="url(#glyph-violet-right)"
+       transform="translate(792, 774) scale(-1, 1) rotate(-18) scale(0.96)"/>
+
+  <!-- Bold centre fish -->
+  <use href="#glyph-pec" fill="url(#glyph-teal)"/>
+  <use href="#glyph-pec" fill="url(#glyph-cyan)" transform="translate(1024, 0) scale(-1, 1)"/>
+  <use href="#glyph-centre-body" fill="url(#glyph-body)"/>
+  <path clip-path="url(#glyph-centre-clip)" fill="url(#glyph-head)" d="
+    M 360 40
+    H 664
+    V 294
+    C 618 308, 560 274, 512 238
+    C 464 274, 406 308, 360 294 Z"/>
+  <circle cx="456" cy="144" r="16.5" fill="#07152c"/>
+  <circle cx="568" cy="144" r="16.5" fill="#07152c"/>
+</svg>

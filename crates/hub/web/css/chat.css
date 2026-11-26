@@ -186,9 +186,9 @@
   }
 }
 
-/* Assistant avatar: the fish-school mark (W6 replaces logo.svg). */
+/* Assistant avatar: the 7-fish glyph, readable at 28px. Welcome keeps logo.svg. */
 .msg-avatar-assistant {
-  background: url("/app/logo.svg") center / cover no-repeat;
+  background: url("/app/logo-glyph.svg") center / contain no-repeat;
 }
 
 /* User message: left-aligned beside the avatar, surface bubble, time at row right. */

@@ -607,13 +607,13 @@ a {
   border-radius: var(--radius-sm);
 }
 
-/* The mark: logo.svg (W6 replaces the placeholder; no code change needed). */
+/* Small mark: the 7-fish glyph. Sign-in, welcome and boot keep logo.svg / icon.svg. */
 .brand-mark {
   width: 28px;
   height: 28px;
   flex: none;
   border-radius: 8px;
-  background: url("/app/logo.svg") center / contain no-repeat;
+  background: url("/app/logo-glyph.svg") center / contain no-repeat;
 }
 
 .side-new {
@@ -736,6 +736,7 @@ a {
 .side-item[aria-current="page"] {
   background: var(--surface-select);
   color: var(--text);
+  box-shadow: inset 3px 0 0 var(--purple-fill);
 }
 
 .side-item[aria-current="page"] > .icon {
@@ -1585,6 +1586,15 @@ button.list-row:hover {
   font-weight: 700;
 }
 
+/* Needs you (sidebar and the phone Chat tab). Other counts stay amber.
+   --purple on --purple-soft is 6.3:1 light and 5.7:1 dark. */
+.side-needs .count,
+.tab .count {
+  background: var(--purple-soft);
+  color: var(--purple);
+  border: 1px solid var(--purple-fill);
+}
+
 .dot {
   width: 8px;
   height: 8px;
@@ -2158,6 +2168,7 @@ button.strip:hover {
   line-height: 1.3;
   white-space: nowrap;
   padding: 2px 8px 2px 7px;
+  border: none;
   border-radius: var(--radius-sm);
   min-height: 22px;
 }
@@ -2190,6 +2201,12 @@ button.strip:hover {
 .status.danger {
   color: var(--danger);
   background: var(--danger-soft);
+}
+
+/* Done is mint (good state). --ok on --ok-soft is the same pair as .badge.ok. */
+.status.ok {
+  color: var(--ok);
+  background: var(--ok-soft);
 }
 
 .status.muted {
@@ -2609,7 +2626,6 @@ dialog.sheet-dialog::backdrop {
 
 @keyframes rise {
   from {
-    opacity: 0;
     transform: translateY(12px) scale(0.98);
   }
 }
@@ -2892,6 +2908,11 @@ dialog.sheet-dialog::backdrop {
   font-size: 14px;
 }
 
+.login-card .brand-mark,
+.login-brand .brand-mark {
+  background: url("/app/logo.svg") center / contain no-repeat;
+}
+
 .login-card .brand-mark {
   width: 40px;
   height: 40px;
@@ -3089,8 +3110,7 @@ dialog.sheet-dialog::backdrop {
 
   dialog.threads-sheet[open] {
     height: min(92dvh, 100%);
-    /* Slide only. The shared dialog fade (`rise`) leaves the sheet translucent
-       for a moment, and the status text then fails contrast against the chat. */
+    /* Own slide. `rise` is transform-only too; this sheet travels farther. */
     animation: threads-sheet-in 0.22s var(--ease);
   }
 
@@ -4425,6 +4445,10 @@ code.nowrap {
     font-weight: 700;
   }
 
+  .side-item[aria-current="page"] {
+    box-shadow: inset 3px 0 0 HighlightText;
+  }
+
   .side-item[aria-current="page"] .sub,
   .side-item[aria-current="page"] .side-icon,
   .side-item[aria-current="page"] .icon,
@@ -4460,6 +4484,7 @@ code.nowrap {
 
   /* Status pills, badges and counts. */
   .status,
+  .status.ok,
   .badge {
     background: Canvas;
     color: CanvasText;
@@ -4483,7 +4508,9 @@ code.nowrap {
     font-weight: 700;
   }
 
-  .count {
+  .count,
+  .side-needs .count,
+  .tab .count {
     forced-color-adjust: none;
     background: Highlight;
     color: HighlightText;
@@ -4835,6 +4862,12 @@ code.nowrap {
 .fam-radium { --fam: var(--fam-radium); }
 .fam-scripted { --fam: var(--fam-scripted); }
 .fam-unknown { --fam: var(--fam-unknown); }
+/* Unmatched model ids hash onto these. They follow the contrast tokens of the
+   family they point at; the mark stays the generic icon, not that family's glyph. */
+.fam-vivid-claude { --fam: var(--fam-claude); }
+.fam-vivid-nemotron { --fam: var(--fam-nemotron); }
+.fam-vivid-ernie { --fam: var(--fam-ernie); }
+.fam-vivid-radium { --fam: var(--fam-radium); }
 .fam-default { --fam: var(--text-2); }
 
 /* A small box in the family colour with the family's glyph (the non-colour cue).
@@ -5317,7 +5350,8 @@ dialog.sheet-dialog.model-picker {
 .mp-head h2 {
   flex: 1;
   margin: 0;
-  font-size: 19px;
+  font-size: 15px;
+  font-weight: 600;
   letter-spacing: -0.01em;
 }
 
@@ -6419,8 +6453,31 @@ dialog.command-palette::backdrop {
   background: var(--fam, var(--fam-unknown));
 }
 
+/* Plan count: one chip. Purple while the plan is open, mint at n/n.
+   .thread-plan is the threads card; .tp-plan is the threads panel. */
+.thread-plan,
+.tp-plan {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 6px;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: var(--purple-soft);
+  color: var(--purple);
+  font-weight: 600;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+.thread-plan.is-done,
+.tp-plan.is-complete {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
 /* A model's name as a chip: "Gemma 4 E2B". Text is the fact; the colour is the
-   dot or mark beside it (V6). Optional .fam-mark inside. */
+   dot or mark beside it (V6). Put a .fam-mark inside. */
 .model-tag {
   display: inline-flex;
   align-items: center;
@@ -6570,7 +6627,9 @@ dialog.command-palette::backdrop {
     border: 1px solid var(--border-strong);
   }
 
-  .status.fam-tint {
+  .status.fam-tint,
+  .thread-plan,
+  .tp-plan {
     border: 1px solid currentColor;
   }
 
@@ -6638,6 +6697,15 @@ dialog.command-palette::backdrop {
     background: Canvas;
     color: CanvasText;
     border: 2px solid Highlight;
+  }
+
+  .thread-plan,
+  .tp-plan,
+  .thread-plan.is-done,
+  .tp-plan.is-complete {
+    background: Canvas;
+    color: CanvasText;
+    border: 1px solid CanvasText;
   }
 
   .model-tag,
