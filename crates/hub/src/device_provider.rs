@@ -127,19 +127,31 @@ impl Hub {
         model: &str,
     ) -> Result<Arc<dyn Provider>, ProviderError> {
         let alternates = self.free_alternates(&config.id, model);
-        if config.via_device().is_none() {
-            return providers::build_with_fallbacks(config, alternates);
-        }
-        let base = self.build_provider(config)?;
-        if alternates.is_empty() {
-            return Ok(base);
-        }
-        Ok(Arc::new(Fallback::new(base, config.id.clone(), alternates)))
+        let provider = if config.via_device().is_none() {
+            providers::build_with_fallbacks(config, alternates)?
+        } else {
+            let base = self.build_base_provider(config)?;
+            if alternates.is_empty() {
+                base
+            } else {
+                Arc::new(Fallback::new(base, config.id.clone(), alternates))
+            }
+        };
+        Ok(crate::usage::watch_free_limit(self, config, provider))
     }
 
     /// Build a provider for work running on the hub. Device-hosted providers use
-    /// [`ViaDevice`]; ordinary providers keep their existing direct path.
+    /// [`ViaDevice`]; ordinary providers keep their existing direct path. OpenRouter
+    /// providers also record the daily free-model limit when a call runs into it.
     pub(crate) fn build_provider(
+        self: &Arc<Self>,
+        config: &ProviderConfig,
+    ) -> Result<Arc<dyn Provider>, ProviderError> {
+        let provider = self.build_base_provider(config)?;
+        Ok(crate::usage::watch_free_limit(self, config, provider))
+    }
+
+    fn build_base_provider(
         self: &Arc<Self>,
         config: &ProviderConfig,
     ) -> Result<Arc<dyn Provider>, ProviderError> {

@@ -481,6 +481,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/usage", get(list_usage))
         .route("/v1/usage/snapshots", get(list_usage_snapshots))
         .route("/v1/usage/refresh", post(refresh_usage))
+        .route("/v1/usage/free-requests", get(free_requests_today))
         .route("/v1/chat", post(chat))
         .route("/v1/conversations", get(list_conversations))
         .route("/v1/conversations/{id}/model", post(set_conversation_model))
@@ -658,6 +659,8 @@ struct UsageQuery {
     until: Option<String>,
     group: Option<String>,
     conversation: Option<String>,
+    /// Only calls through this provider id.
+    provider: Option<String>,
 }
 
 /// Metered totals. Dates are UTC; the end of the range is exclusive unless a
@@ -676,7 +679,8 @@ async fn list_usage(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q): Q
     if since >= until {
         return err(StatusCode::BAD_REQUEST, "since must be before until");
     }
-    match hub.db.usage_totals(since, until, q.group.as_deref().unwrap_or("day"), q.conversation.as_deref()) {
+    let provider = q.provider.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    match hub.db.usage_totals(since, until, q.group.as_deref().unwrap_or("day"), q.conversation.as_deref(), provider) {
         Ok(rows) => Json(rows).into_response(),
         Err(error) => err(StatusCode::BAD_REQUEST, error),
     }
@@ -686,6 +690,16 @@ async fn list_usage_snapshots(State(hub): State<Arc<Hub>>, headers: HeaderMap) -
     admin!(hub, headers);
     match hub.db.latest_usage_snapshots() {
         Ok(rows) => Json(rows).into_response(),
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+/// Calls Grouper sent to OpenRouter `:free` models today (UTC), per OpenRouter provider.
+/// Grouper's own count, not OpenRouter's allowance.
+async fn free_requests_today(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+    admin!(hub, headers);
+    match crate::usage::free_requests_today(&hub.db, crate::db::now()) {
+        Ok(report) => Json(report).into_response(),
         Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
 }
@@ -1217,6 +1231,9 @@ async fn handle_thread_frame(hub: &Arc<Hub>, device_id: &str, conn_id: u64, msg:
             hub.thread_event(&thread_id, event);
         }
         NodeMessage::ThreadFinished { thread_id, ok, summary } if hub.owns_thread(device_id, &thread_id) => {
+            if !ok {
+                crate::usage::note_thread_failure(hub, &thread_id, &summary);
+            }
             hub.thread_finished(&thread_id, ok, &summary).await;
             crate::usage::after_device_thread(hub, device_id, &thread_id);
         }

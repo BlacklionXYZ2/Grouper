@@ -592,7 +592,7 @@ impl Tool for ListUsage {
     }
     async fn call(&self, _input: Value) -> ToolOutput {
         let now = crate::db::now();
-        let totals = match self.0.hub.db.usage_totals(now.saturating_sub(7 * 86_400), i64::MAX as u64, "provider", None) {
+        let totals = match self.0.hub.db.usage_totals(now.saturating_sub(7 * 86_400), i64::MAX as u64, "provider", None, None) {
             Ok(rows) => rows,
             Err(error) => return ToolOutput::err(error.to_string()),
         };

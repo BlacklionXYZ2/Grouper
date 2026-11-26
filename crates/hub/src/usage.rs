@@ -1,17 +1,20 @@
 //! Metered usage queries, official provider balance collectors, and device subscription probes.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use core_protocol::tunnel::result_text;
 use core_protocol::{
     AgentEvent, EventBody, ProviderConfig, USAGE_PROBE_TOOL, UsageProbeEntry, UsageProbeResponse, UsageSnapshot,
     UsageTotal, mcp_server_of,
 };
+use providers::{OnDelta, Provider, ProviderError, Request, Response};
 use rmcp::model::CallToolRequestParams;
-use rusqlite::params;
-use serde::Serialize;
+use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::db::{Db, now};
@@ -26,18 +29,74 @@ const MAX_PROBE_STRING_BYTES: usize = 256;
 const PROBE_PROVIDERS: &[&str] = &["claude", "codex"];
 const PROBE_KINDS: &[&str] = &["window", "spend", "balance", "status"];
 
+/// OpenRouter's account-wide daily free-model allowance, as a usage snapshot.
+pub const FREE_LIMIT_KIND: &str = "requests";
+pub const FREE_LIMIT_WINDOW: &str = "free requests/day";
+pub const FREE_LIMIT_SOURCE: &str = "OpenRouter rate-limit response";
+/// Only this much of an error body (untrusted) is looked at.
+const MAX_LIMIT_TEXT_BYTES: usize = 16 * 1024;
+/// Header objects longer than this are not searched further.
+const MAX_LIMIT_HEADERS: usize = 64;
+/// A request limit above this isn't a plausible daily allowance; it is dropped.
+const MAX_FREE_LIMIT: u64 = 10_000_000;
+/// The same reading again within this many seconds isn't stored twice.
+const FREE_LIMIT_DEDUPE_SECS: u64 = 60;
+
 pub use core_registry::cost::parse_time;
 
 impl Db {
-    /// Totals in the half-open time range `[since, until)`.
+    /// Totals in the half-open time range `[since, until)`, optionally for one
+    /// conversation and/or one provider id.
     pub fn usage_totals(
         &self,
         since: u64,
         until: u64,
         group: &str,
         conversation: Option<&str>,
+        provider: Option<&str>,
     ) -> Result<Vec<UsageTotal>> {
-        core_registry::cost::usage_totals(&self.c(), since, until, group, conversation)
+        core_registry::cost::usage_totals(&self.c(), since, until, group, conversation, provider)
+    }
+
+    /// Calls to `:free` models recorded in `[since, until)`, per provider id. The usage
+    /// table holds calls that returned usage, so failed calls aren't counted.
+    pub fn free_model_calls(&self, since: u64, until: u64) -> Result<HashMap<String, u64>> {
+        let c = self.c();
+        let mut statement = c.prepare(
+            "SELECT provider_id, COUNT(*) FROM usage
+             WHERE ts >= ?1 AND ts < ?2 AND model LIKE '%:free'
+             GROUP BY provider_id",
+        )?;
+        Ok(statement
+            .query_map(params![since as i64, until as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
+    /// Store what an OpenRouter 429 said about the daily free-model allowance. The same
+    /// reading again within a minute is skipped, so a burst of failures stays one row.
+    /// Returns whether a row was stored.
+    pub fn record_free_limit(&self, provider: &str, limit: &FreeLimit, fetched_at: u64) -> Result<bool> {
+        let last: Option<(Option<f64>, Option<i64>, i64)> = self
+            .c()
+            .query_row(
+                "SELECT limit_amount, resets_at, fetched_at FROM usage_snapshots
+                 WHERE provider = ?1 AND account = ?1 AND kind = ?2 AND window = ?3 AND device_id IS NULL
+                 ORDER BY fetched_at DESC, id DESC LIMIT 1",
+                params![provider, FREE_LIMIT_KIND, FREE_LIMIT_WINDOW],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((last_limit, last_reset, last_at)) = last
+            && last_limit == limit.limit.map(|l| l as f64)
+            && last_reset == limit.resets_at.map(|r| r as i64)
+            && (last_at.max(0) as u64).saturating_add(FREE_LIMIT_DEDUPE_SECS) > fetched_at
+        {
+            return Ok(false);
+        }
+        self.add_usage_snapshots(&[free_limit_snapshot(provider, limit, fetched_at)])?;
+        Ok(true)
     }
 
     pub fn add_usage_snapshots(&self, snapshots: &[UsageSnapshot]) -> Result<()> {
@@ -544,6 +603,253 @@ fn parse_deepseek(provider: &str, balance: &Value, fetched_at: u64) -> Result<Ve
     Ok(snapshots)
 }
 
+// ---- OpenRouter's daily free-model allowance
+//
+// The allowance is account-wide and its size depends on the account, so Grouper
+// never assumes a number. Two real sources exist:
+// - When it runs out, OpenRouter answers 429 with `error.metadata.limit_source =
+//   "openrouter_free_tier_daily"` and the limit, remaining count and reset time
+//   in `error.metadata.headers`. A hook on hub-side OpenRouter providers (and on
+//   device thread failures) records that as a snapshot.
+// - Grouper's own count of calls it sent to `:free` models today (UTC), from the
+//   usage table. That is not the allowance and is labelled as Grouper's count.
+//
+// `/api/v1/key` isn't used for this: of its fields only `is_free_tier` (whether the
+// account ever bought credits) touches it, and turning that into a number would
+// mean hard-coding OpenRouter's current policy. Successful completions aren't read
+// either: the providers crate doesn't hand response headers back to the hub.
+
+/// What an OpenRouter daily free-model 429 said.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreeLimit {
+    /// `X-RateLimit-Limit`, when present and plausible.
+    pub limit: Option<u64>,
+    /// `X-RateLimit-Remaining`; 0 when absent (the 429 itself says it ran out).
+    pub remaining: u64,
+    /// `X-RateLimit-Reset` in Unix seconds, when present and within a week of now.
+    pub resets_at: Option<u64>,
+}
+
+/// Whether a provider config talks to OpenRouter.
+pub(crate) fn is_openrouter(provider: &ProviderConfig) -> bool {
+    if provider.kind != "openai" {
+        return false;
+    }
+    match provider.base_url.as_deref() {
+        Some(url) => reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.eq_ignore_ascii_case("openrouter.ai")))
+            .unwrap_or(false),
+        // `providers::openai` defaults the provider called "openrouter" to OpenRouter.
+        None => provider.id == "openrouter",
+    }
+}
+
+fn cap_str(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// A header value as a whole number: JSON numbers or short numeric strings only.
+fn header_number(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) if s.len() <= 32 => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Parse OpenRouter's daily free-model 429 from an error body, or from text with that
+/// body embedded (a device reports "<provider> returned HTTP 429: <body>"). The text is
+/// untrusted: only its first 16 KiB are read and every field is checked.
+pub fn parse_free_limit(text: &str, now: u64) -> Option<FreeLimit> {
+    let text = cap_str(text, MAX_LIMIT_TEXT_BYTES);
+    if !providers::account_wide_limit(text) {
+        return None;
+    }
+    let start = text.find('{')?;
+    let value: Value = serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>().next()?.ok()?;
+    let error = value.get("error")?;
+    let metadata = error.get("metadata");
+    let daily = metadata.and_then(|m| m.get("limit_source")).and_then(Value::as_str) == Some("openrouter_free_tier_daily")
+        || error.get("message").and_then(Value::as_str).is_some_and(|m| m.contains("free-models-per-day"));
+    if !daily {
+        return None;
+    }
+    let headers = metadata.and_then(|m| m.get("headers")).and_then(Value::as_object);
+    let header = |name: &str| {
+        headers?
+            .iter()
+            .take(MAX_LIMIT_HEADERS)
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .and_then(|(_, value)| header_number(value))
+    };
+    let limit = header("x-ratelimit-limit").filter(|l| (1..=MAX_FREE_LIMIT).contains(l));
+    let remaining = header("x-ratelimit-remaining").unwrap_or(0);
+    let remaining = limit.map_or(remaining, |l| remaining.min(l));
+    // OpenRouter sends milliseconds; accept seconds too. Anything not within a day
+    // before or a week after now is not a plausible daily reset and is dropped.
+    let resets_at = header("x-ratelimit-reset")
+        .map(|r| if r >= 100_000_000_000 { r / 1000 } else { r })
+        .filter(|r| r.saturating_add(86_400) > now && *r <= now.saturating_add(7 * 86_400));
+    Some(FreeLimit { limit, remaining, resets_at })
+}
+
+/// The free-model limit in a provider error, if that is what the error is.
+pub fn free_limit_from_error(error: &ProviderError, now: u64) -> Option<FreeLimit> {
+    match error {
+        ProviderError::Http { status: 429, body, .. } => parse_free_limit(body, now),
+        // A device-hosted provider's error comes back as text.
+        ProviderError::Unavailable(message) if message.contains("HTTP 429") => parse_free_limit(message, now),
+        _ => None,
+    }
+}
+
+pub fn free_limit_snapshot(provider: &str, limit: &FreeLimit, fetched_at: u64) -> UsageSnapshot {
+    let used = limit.limit.map(|l| l.saturating_sub(limit.remaining) as f64);
+    let used_pct = match limit.limit {
+        Some(l) => percentage(used, Some(l as f64)),
+        None if limit.remaining == 0 => Some(100.0),
+        None => None,
+    };
+    UsageSnapshot {
+        account: provider.into(),
+        provider: provider.into(),
+        kind: FREE_LIMIT_KIND.into(),
+        window: FREE_LIMIT_WINDOW.into(),
+        used_pct,
+        used_amount: used,
+        limit_amount: limit.limit.map(|l| l as f64),
+        currency: None,
+        resets_at: limit.resets_at,
+        source: FREE_LIMIT_SOURCE.into(),
+        device_id: None,
+        fetched_at,
+    }
+}
+
+fn store_free_limit(db: &Db, provider_id: &str, limit: &FreeLimit, now: u64) -> bool {
+    match db.record_free_limit(provider_id, limit, now) {
+        Ok(stored) => {
+            if stored {
+                tracing::info!(
+                    provider = %provider_id,
+                    limit = ?limit.limit,
+                    resets_at = ?limit.resets_at,
+                    "OpenRouter daily free-model limit reached"
+                );
+            }
+            stored
+        }
+        Err(error) => {
+            tracing::warn!(provider = %provider_id, "could not record the free-model limit: {error:#}");
+            false
+        }
+    }
+}
+
+/// Record the snapshot when `error` is OpenRouter's daily free-model 429.
+pub fn note_provider_error(db: &Db, provider_id: &str, error: &ProviderError) -> bool {
+    let now = crate::db::now();
+    match free_limit_from_error(error, now) {
+        Some(limit) => store_free_limit(db, provider_id, &limit, now),
+        None => false,
+    }
+}
+
+/// A device thread failed. Its summary carries the provider error as text ("Error:
+/// <provider> returned HTTP 429: <body>"); when that is OpenRouter's daily free-model
+/// limit, record it for the thread's provider.
+pub(crate) fn note_thread_failure(hub: &Hub, thread_id: &str, summary: &str) -> bool {
+    if !summary.contains("HTTP 429") || !providers::account_wide_limit(cap_str(summary, MAX_LIMIT_TEXT_BYTES)) {
+        return false;
+    }
+    let Some(thread) = hub.db.thread(thread_id) else { return false };
+    let Some(model) = hub.db.find_model(&thread.model) else { return false };
+    let Ok(Some(config)) = hub.db.provider(&model.provider_id) else { return false };
+    if !is_openrouter(&config) {
+        return false;
+    }
+    let now = crate::db::now();
+    match parse_free_limit(summary, now) {
+        Some(limit) => store_free_limit(&hub.db, &config.id, &limit, now),
+        None => false,
+    }
+}
+
+/// Wraps an OpenRouter provider used on the hub so its daily free-model 429 is recorded.
+struct WatchFreeLimit {
+    inner: Arc<dyn Provider>,
+    hub: Weak<Hub>,
+    provider_id: String,
+}
+
+impl WatchFreeLimit {
+    fn check(&self, result: Result<Response, ProviderError>) -> Result<Response, ProviderError> {
+        if let Err(error) = &result
+            && let Some(hub) = self.hub.upgrade()
+        {
+            note_provider_error(&hub.db, &self.provider_id, error);
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl Provider for WatchFreeLimit {
+    async fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
+        self.check(self.inner.complete(req).await)
+    }
+
+    async fn complete_stream(&self, req: &Request, on_delta: OnDelta<'_>) -> Result<Response, ProviderError> {
+        self.check(self.inner.complete_stream(req, on_delta).await)
+    }
+}
+
+/// `provider`, watched for OpenRouter's daily free-model 429 when `config` is OpenRouter.
+pub(crate) fn watch_free_limit(hub: &Arc<Hub>, config: &ProviderConfig, provider: Arc<dyn Provider>) -> Arc<dyn Provider> {
+    if !is_openrouter(config) {
+        return provider;
+    }
+    Arc::new(WatchFreeLimit { inner: provider, hub: Arc::downgrade(hub), provider_id: config.id.clone() })
+}
+
+/// Grouper's own count of calls to OpenRouter `:free` models in one UTC day.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FreeRequestsToday {
+    /// The UTC day, `[since, until)` in Unix seconds.
+    pub since: u64,
+    pub until: u64,
+    pub providers: Vec<FreeRequestCount>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FreeRequestCount {
+    pub provider: String,
+    /// Calls Grouper sent to `:free` models through this provider that returned usage.
+    pub sent: u64,
+}
+
+/// Calls Grouper sent to `:free` models today (UTC) on each OpenRouter provider.
+pub fn free_requests_today(db: &Db, now: u64) -> Result<FreeRequestsToday> {
+    let since = now - now % 86_400;
+    let until = since + 86_400;
+    let counts = db.free_model_calls(since, until)?;
+    let providers = db
+        .providers()?
+        .into_iter()
+        .filter(is_openrouter)
+        .map(|p| FreeRequestCount { sent: counts.get(&p.id).copied().unwrap_or(0), provider: p.id })
+        .collect();
+    Ok(FreeRequestsToday { since, until, providers })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +870,247 @@ mod tests {
         assert_eq!(rows[0].used_pct, Some(25.0));
         assert_eq!(rows[1].limit_amount, Some(100.0));
         assert_eq!(rows[1].used_amount, Some(28.25));
+    }
+
+    /// OpenRouter's 429 when the daily free-model allowance runs out, as recorded.
+    const RECORDED_FREE_429: &str = r#"{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day","code":429,"metadata":{"headers":{"X-RateLimit-Limit":"50","X-RateLimit-Remaining":"0","X-RateLimit-Reset":"1795651200000"},"limit_source":"openrouter_free_tier_daily","provider_name":null}},"user_id":"user_test"}"#;
+    /// A moment on the day before that reset (reset 2026-11-26 00:00 UTC; this is 2026-11-25 10:00 UTC).
+    const BEFORE_RESET: u64 = 1_795_651_200 - 14 * 3600;
+
+    #[test]
+    fn parses_the_recorded_free_model_429() {
+        let limit = parse_free_limit(RECORDED_FREE_429, BEFORE_RESET).unwrap();
+        assert_eq!(limit, FreeLimit { limit: Some(50), remaining: 0, resets_at: Some(1_795_651_200) });
+
+        // The same body inside a device's error text, with lower-case numeric headers.
+        let text = r#"Error: openrouter returned HTTP 429: {"error":{"message":"Rate limit exceeded: free-models-per-day","code":429,"metadata":{"headers":{"x-ratelimit-limit":1000,"x-ratelimit-remaining":3,"x-ratelimit-reset":1795651200},"limit_source":"openrouter_free_tier_daily"}}} and more"#;
+        assert_eq!(
+            parse_free_limit(text, BEFORE_RESET),
+            Some(FreeLimit { limit: Some(1000), remaining: 3, resets_at: Some(1_795_651_200) })
+        );
+
+        let snap = free_limit_snapshot("openrouter", &limit, BEFORE_RESET);
+        assert_eq!(snap.kind, FREE_LIMIT_KIND);
+        assert_eq!(snap.window, "free requests/day");
+        assert_eq!(snap.source, "OpenRouter rate-limit response");
+        assert_eq!(snap.limit_amount, Some(50.0));
+        assert_eq!(snap.used_amount, Some(50.0));
+        assert_eq!(snap.used_pct, Some(100.0));
+        assert_eq!(snap.resets_at, Some(1_795_651_200));
+        assert_eq!(snap.currency, None);
+        assert_eq!(snap.fetched_at, BEFORE_RESET);
+    }
+
+    #[test]
+    fn free_model_429_parsing_is_defensive() {
+        // Upstream per-model 429s aren't the daily allowance.
+        assert_eq!(parse_free_limit(r#"{"error":{"message":"Provider returned error","code":429}}"#, BEFORE_RESET), None);
+        // The marker without a JSON body, or with broken JSON.
+        assert_eq!(parse_free_limit("free-models-per-day", BEFORE_RESET), None);
+        assert_eq!(parse_free_limit(r#"{"error":{"message":"free-models-per-day""#, BEFORE_RESET), None);
+        // No headers: still the daily limit, with nothing invented.
+        assert_eq!(
+            parse_free_limit(r#"{"error":{"message":"Rate limit exceeded: free-models-per-day","code":429}}"#, BEFORE_RESET),
+            Some(FreeLimit { limit: None, remaining: 0, resets_at: None })
+        );
+        let no_limit = free_limit_snapshot("or", &FreeLimit { limit: None, remaining: 0, resets_at: None }, 1);
+        assert_eq!((no_limit.limit_amount, no_limit.used_amount, no_limit.used_pct), (None, None, Some(100.0)));
+        // Implausible values are dropped, not trusted.
+        let odd = r#"{"error":{"code":429,"metadata":{"limit_source":"openrouter_free_tier_daily","headers":{
+            "X-RateLimit-Limit":"99999999999","X-RateLimit-Remaining":"-4","X-RateLimit-Reset":"4102444800000"}}}}"#;
+        assert_eq!(parse_free_limit(odd, BEFORE_RESET), Some(FreeLimit { limit: None, remaining: 0, resets_at: None }));
+        let past = RECORDED_FREE_429.replace("1795651200000", "1700000000000");
+        assert_eq!(parse_free_limit(&past, BEFORE_RESET).unwrap().resets_at, None);
+        let words = RECORDED_FREE_429.replace("\"50\"", "\"fifty\"");
+        assert_eq!(parse_free_limit(&words, BEFORE_RESET).unwrap().limit, None);
+        // Remaining can't exceed the limit.
+        let over = RECORDED_FREE_429.replace("\"X-RateLimit-Remaining\":\"0\"", "\"X-RateLimit-Remaining\":\"80\"");
+        assert_eq!(parse_free_limit(&over, BEFORE_RESET).unwrap().remaining, 50);
+        // A marker past the 16 KiB that is read doesn't count.
+        let padded = format!("{}{}", "x".repeat(MAX_LIMIT_TEXT_BYTES), RECORDED_FREE_429);
+        assert_eq!(parse_free_limit(&padded, BEFORE_RESET), None);
+
+        // Only 429s (or a device's "HTTP 429" text) are looked at.
+        let http = |status| ProviderError::Http { provider: "or".into(), status, body: RECORDED_FREE_429.into() };
+        assert!(free_limit_from_error(&http(429), BEFORE_RESET).is_some());
+        assert!(free_limit_from_error(&http(402), BEFORE_RESET).is_none());
+        let relayed = ProviderError::Unavailable(format!("openrouter returned HTTP 429: {RECORDED_FREE_429}"));
+        assert!(free_limit_from_error(&relayed, BEFORE_RESET).is_some());
+        assert!(free_limit_from_error(&ProviderError::Unavailable(RECORDED_FREE_429.into()), BEFORE_RESET).is_none());
+    }
+
+    fn openrouter(id: &str) -> ProviderConfig {
+        ProviderConfig {
+            id: id.into(),
+            kind: "openai".into(),
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            api_key: None,
+            options: Value::Null,
+        }
+    }
+
+    /// Fails every call with the given error body as an HTTP 429.
+    struct Answers429(String);
+
+    #[async_trait]
+    impl Provider for Answers429 {
+        async fn complete(&self, _req: &Request) -> Result<Response, ProviderError> {
+            Err(ProviderError::Http { provider: "or".into(), status: 429, body: self.0.clone() })
+        }
+    }
+
+    fn request() -> Request {
+        Request { model: "x/y:free".into(), system: String::new(), messages: vec![], tools: vec![], max_tokens: 1 }
+    }
+
+    #[tokio::test]
+    async fn a_free_model_429_on_an_openrouter_provider_records_a_snapshot() {
+        let dir = std::env::temp_dir().join(format!("grouper-free-limit-{}", random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&openrouter("or")).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let config = hub.db.provider("or").unwrap().unwrap();
+        let reset_ms = (crate::db::now() + 3_600) * 1000;
+        let body = RECORDED_FREE_429.replace("1795651200000", &reset_ms.to_string());
+
+        let watched = watch_free_limit(&hub, &config, Arc::new(Answers429(body.clone())));
+        let error = watched.complete(&request()).await.unwrap_err();
+        assert!(matches!(error, ProviderError::Http { status: 429, .. }), "the error still reaches the caller");
+        // A second failure straight after is the same reading: still one row.
+        let _ = watched.complete_stream(&request(), &|_| {}).await;
+        let rows: Vec<_> = hub.db.latest_usage_snapshots().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!((row.provider.as_str(), row.kind.as_str(), row.window.as_str()), ("or", "requests", "free requests/day"));
+        assert_eq!((row.limit_amount, row.used_amount), (Some(50.0), Some(50.0)));
+        assert_eq!(row.resets_at, Some(reset_ms / 1000));
+        assert_eq!(row.source, "OpenRouter rate-limit response");
+        assert!(row.fetched_at > 0 && row.device_id.is_none());
+        let count = |db: &Db| -> i64 {
+            db.c().query_row("SELECT COUNT(*) FROM usage_snapshots", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(count(&hub.db), 1);
+
+        // Other errors, and providers that aren't OpenRouter, record nothing.
+        let upstream = watch_free_limit(&hub, &config, Arc::new(Answers429(r#"{"error":{"code":429}}"#.into())));
+        let _ = upstream.complete(&request()).await;
+        let mut other = openrouter("elsewhere");
+        other.base_url = Some("https://api.example.com/v1".into());
+        let unwatched = watch_free_limit(&hub, &other, Arc::new(Answers429(body)));
+        let _ = unwatched.complete(&request()).await;
+        assert_eq!(count(&hub.db), 1);
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_device_thread_failing_on_the_free_limit_records_a_snapshot() {
+        let dir = std::env::temp_dir().join(format!("grouper-free-limit-thread-{}", random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&openrouter("or")).unwrap();
+        db.upsert_model(&core_protocol::ModelEntry {
+            id: "free-one".into(),
+            provider_id: "or".into(),
+            model: "x/y:free".into(),
+            input_price: 0.0,
+            output_price: 0.0,
+            cache_read_price: None,
+            cache_write_price: None,
+            context_window: 0,
+            use_cases: String::new(),
+            free: true,
+            roles: vec![],
+            local: false,
+            modalities: vec![],
+        })
+        .unwrap();
+        let conv = db.create_conversation("project", "free").unwrap();
+        let thread = db.create_thread(&conv, "t", "d1", "free-one", None, "brief").unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let reset_ms = (crate::db::now() + 600) * 1000;
+        let summary = format!(
+            "Error: or returned HTTP 429: {}",
+            RECORDED_FREE_429.replace("1795651200000", &reset_ms.to_string())
+        );
+        assert!(!note_thread_failure(&hub, &thread.id, "Error: or returned HTTP 503: free-models-per-day"));
+        assert!(note_thread_failure(&hub, &thread.id, &summary));
+        let rows = hub.db.latest_usage_snapshots().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].provider.as_str(), rows[0].limit_amount, rows[0].resets_at), ("or", Some(50.0), Some(reset_ms / 1000)));
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn counts_free_model_calls_sent_today_per_openrouter_provider() {
+        let dir = std::env::temp_dir().join(format!("grouper-free-count-{}", random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&openrouter("or")).unwrap();
+        db.upsert_provider(&openrouter("or-idle")).unwrap();
+        let mut default_or = openrouter("openrouter");
+        default_or.base_url = None;
+        db.upsert_provider(&default_or).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "direct".into(),
+            kind: "openai".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            api_key: None,
+            options: Value::Null,
+        })
+        .unwrap();
+        for (provider, model) in [("or", "a/b:free"), ("or", "c/d:free"), ("or", "a/b"), ("openrouter", "e/f:free"), ("direct", "g:free")] {
+            db.record_usage(None, None, provider, model, 1, 1, 0, 0);
+        }
+        // One free call from yesterday doesn't count today.
+        db.record_usage(None, None, "or", "a/b:free", 1, 1, 0, 0);
+        db.c().execute("UPDATE usage SET ts = ts - 86400 WHERE id = (SELECT MAX(id) FROM usage)", []).unwrap();
+
+        let now = crate::db::now();
+        let report = free_requests_today(&db, now).unwrap();
+        assert_eq!(report.since % 86_400, 0);
+        assert!(report.since <= now && now < report.until && report.until - report.since == 86_400);
+        let sent: HashMap<_, _> = report.providers.iter().map(|p| (p.provider.as_str(), p.sent)).collect();
+        // Only OpenRouter providers are listed; a provider with none today shows 0.
+        assert_eq!(sent, HashMap::from([("or", 2), ("or-idle", 0), ("openrouter", 1)]));
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn usage_totals_filter_by_provider() {
+        let dir = std::env::temp_dir().join(format!("grouper-usage-provider-{}", random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let conversation = db.create_conversation("project", "filter").unwrap();
+        db.record_usage(Some(&conversation), None, "a", "m1", 10, 1, 0, 0);
+        db.record_usage(Some(&conversation), None, "a", "m2", 20, 2, 0, 0);
+        db.record_usage(Some(&conversation), None, "b", "m1", 40, 4, 0, 0);
+        let all = db.usage_totals(0, i64::MAX as u64, "model", None, None).unwrap();
+        assert_eq!(all.iter().map(|r| r.calls).sum::<u64>(), 3);
+        let only_a = db.usage_totals(0, i64::MAX as u64, "model", None, Some("a")).unwrap();
+        assert_eq!(only_a.iter().map(|r| (r.key.as_str(), r.input_tokens)).collect::<Vec<_>>(), vec![("m1", 10), ("m2", 20)]);
+        let b_in_chat = db.usage_totals(0, i64::MAX as u64, "provider", Some(&conversation), Some("b")).unwrap();
+        assert_eq!(b_in_chat.len(), 1);
+        assert_eq!((b_in_chat[0].key.as_str(), b_in_chat[0].calls), ("b", 1));
+        assert!(db.usage_totals(0, i64::MAX as u64, "day", None, Some("nobody")).unwrap().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn recognises_openrouter_providers() {
+        let mut p = openrouter("x");
+        assert!(is_openrouter(&p));
+        p.base_url = Some("https://OpenRouter.ai/api/v1".into());
+        assert!(is_openrouter(&p));
+        p.base_url = Some("https://openrouter.ai.example.com/v1".into());
+        assert!(!is_openrouter(&p));
+        p.base_url = None;
+        assert!(!is_openrouter(&p));
+        p.id = "openrouter".into();
+        assert!(is_openrouter(&p));
+        p.kind = "anthropic".into();
+        assert!(!is_openrouter(&p));
     }
 
     #[test]
@@ -649,14 +1196,14 @@ mod tests {
         db.record_usage(Some(&conversation), None, "p", "m", 10, 3, 4, 0);
         db.record_usage(Some(&conversation), Some("t1"), "p", "m", 20, 7, 0, 2);
 
-        let rows = db.usage_totals(0, i64::MAX as u64, "conversation", Some(&conversation)).unwrap();
+        let rows = db.usage_totals(0, i64::MAX as u64, "conversation", Some(&conversation), None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].calls, 2);
         assert_eq!(rows[0].input_tokens, 30);
         assert_eq!(rows[0].output_tokens, 10);
         assert_eq!(rows[0].cache_read_tokens, 4);
         assert_eq!(rows[0].cache_write_tokens, 2);
-        let by_thread = db.usage_totals(0, i64::MAX as u64, "thread", Some(&conversation)).unwrap();
+        let by_thread = db.usage_totals(0, i64::MAX as u64, "thread", Some(&conversation), None).unwrap();
         assert_eq!(by_thread.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(), vec!["(orchestrator)", "t1"]);
         drop(db);
         std::fs::remove_dir_all(dir).ok();

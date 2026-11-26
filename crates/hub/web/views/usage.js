@@ -3,8 +3,9 @@
 //      chosen range beside what the provider itself reports (spend, balance).
 //   2. Subscription usage: plan windows (Claude, ChatGPT/Codex) read on devices,
 //      shown as unofficial snapshots.
-// Then the metered breakdown (by provider, model, chat, thread or day) and the
-// hub's limits and budgets. `#/usage?conversation=<id>` shows one chat's usage.
+// Then the metered breakdown (by provider, model, chat, thread or day; a provider
+// card's Filter button narrows it to that provider) and the hub's limits and
+// budgets. `#/usage?conversation=<id>` shows one chat's usage.
 
 import { h, icon, setChildren, setText, keepFocus, throttle } from '../lib/dom.js';
 import { get, post, put, qs, enc, describe, isAbort } from '../lib/api.js';
@@ -130,6 +131,22 @@ function balanceApi(provider) {
   if (host === 'openrouter.ai') return { name: 'OpenRouter', source: 'OpenRouter key and credits API' };
   if (host === 'api.deepseek.com') return { name: 'DeepSeek', source: 'DeepSeek balance API' };
   return null;
+}
+
+/** Whether a provider talks to OpenRouter (see usage.rs `is_openrouter`). */
+function isOpenRouter(provider) {
+  if (!provider || provider.kind !== 'openai') return false;
+  return provider.base_url ? hostOf(provider) === 'openrouter.ai' : provider.id === 'openrouter';
+}
+
+// OpenRouter's daily free-model allowance, as the hub records it from a 429.
+const FREE_KIND = 'requests';
+const FREE_WINDOW = 'free requests/day';
+const isFreeAllowance = (s) => s.kind === FREE_KIND && s.window === FREE_WINDOW;
+
+/** Local "14:05" for a Unix time. */
+function clock(secs) {
+  return new Date(secs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 function isLocalHost(host) {
@@ -283,7 +300,9 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
   const todayIso = isoDay(new Date());
   let custom = { since: isoDay(new Date(Date.now() - 29 * 86400000)), until: todayIso };
   let group = 'model';
-  const st = { providers: null, byProvider: null, snaps: null, rows: null };
+  // A provider card's filter: the breakdown shows only that provider's calls.
+  let providerFilter = null;
+  const st = { providers: null, byProvider: null, free: null, snaps: null, rows: null };
 
   function rangeQuery() {
     const today = new Date();
@@ -395,13 +414,56 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     ),
   );
   const breakdownCaption = h('p', { class: 'section-note u-caption' });
+  const breakdownHeading = h('h2', { id: 'u-breakdown-h', tabindex: '-1' }, filterCid ? 'Breakdown' : 'API cost breakdown');
+  const filterSlot = h('div', { class: 'u-filter-slot' });
+  // Says when the provider filter changes; the card buttons' pressed state says it too.
+  const filterStatus = h('p', { class: 'visually-hidden', role: 'status' });
   const breakdown = h(
     'section',
     { class: 'section u-breakdown', 'aria-labelledby': 'u-breakdown-h' },
-    h('div', { class: 'section-head' }, h('h2', { id: 'u-breakdown-h' }, filterCid ? 'Breakdown' : 'API cost breakdown'), groupSeg),
+    h('div', { class: 'section-head' }, breakdownHeading, groupSeg),
+    filterSlot,
+    filterStatus,
     breakdownCaption,
     breakdownBody,
   );
+
+  /** Filter the breakdown to one provider, or (null, or the same one again) show all. */
+  function setProviderFilter(id) {
+    const next = id && id !== providerFilter ? id : null;
+    if (next === providerFilter) return;
+    const previous = providerFilter;
+    const chipHadFocus = filterSlot.contains(document.activeElement);
+    providerFilter = next;
+    drawFilterChip();
+    drawApi();
+    setText(filterStatus, next ? `Breakdown filtered to ${next}.` : `Filter removed: the breakdown shows all providers.`);
+    if (chipHadFocus) {
+      // The chip that had focus is gone: go back to the card it came from.
+      (document.getElementById(`u-filter-${slug(previous)}`) || breakdownHeading).focus();
+    }
+    loadRows();
+  }
+
+  function drawFilterChip() {
+    if (!providerFilter) {
+      setChildren(filterSlot);
+      filterSlot.hidden = true;
+      return;
+    }
+    filterSlot.hidden = false;
+    setChildren(
+      filterSlot,
+      h(
+        'button',
+        { class: 'u-filter-chip', type: 'button', id: 'u-filter-chip', onclick: () => setProviderFilter(null) },
+        h('span', null, 'Filtered: ', h('strong', null, providerFilter)),
+        h('span', { class: 'visually-hidden' }, ', remove filter'),
+        icon('x'),
+      ),
+    );
+  }
+  drawFilterChip();
 
   if (filterCid) {
     body.append(
@@ -456,6 +518,8 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
           h('dd', null, 'Tokens from calls made through Grouper times the registry’s current prices. Calls made elsewhere are not seen.'),
           h('dt', null, h('span', { class: 'badge' }, 'reported by provider')),
           h('dd', null, 'Read from the provider’s own API with the key Grouper holds (OpenRouter and DeepSeek). May include use outside Grouper.'),
+          h('dt', null, 'Free requests'),
+          h('dd', null, 'OpenRouter’s daily free-model limit, as its last “limit reached” answer to Grouper reported it. Unknown until a call runs into it. “Sent by Grouper today” is Grouper’s own count, not the limit.'),
           h('dt', null, h('span', { class: 'badge warn' }, 'Unofficial snapshot')),
           h('dd', null, 'Read on a device from its Claude Code or Codex sign-in, through endpoints that aren’t a published API. May change or stop working; never a guaranteed limit.'),
           h('dt', null, h('span', { class: 'badge warn' }, 'Stale')),
@@ -470,9 +534,14 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
   async function loadApi() {
     apiBody.setAttribute('aria-busy', 'true');
     try {
-      const [p, u] = await Promise.all([load('/v1/providers', signal), load(`/v1/usage${qs({ ...rangeQuery(), group: 'provider' })}`, signal)]);
+      const [p, u, f] = await Promise.all([
+        load('/v1/providers', signal),
+        load(`/v1/usage${qs({ ...rangeQuery(), group: 'provider' })}`, signal),
+        load('/v1/usage/free-requests', signal),
+      ]);
       st.providers = p;
       st.byProvider = u;
+      st.free = f;
     } catch (err) {
       if (isAbort(err)) return;
       throw err;
@@ -495,16 +564,20 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
   let rowsSeq = 0;
   async function loadRows() {
     const seq = ++rowsSeq;
+    const provider = providerFilter;
     breakdownBody.setAttribute('aria-busy', 'true');
     let res;
     try {
-      res = await load(`/v1/usage${qs({ ...rangeQuery(), group, ...(filterCid ? { conversation: filterCid } : null) })}`, signal);
+      res = await load(
+        `/v1/usage${qs({ ...rangeQuery(), group, ...(filterCid ? { conversation: filterCid } : null), ...(provider ? { provider } : null) })}`,
+        signal,
+      );
     } catch (err) {
       if (isAbort(err)) return;
       throw err;
     }
-    if (seq !== rowsSeq) return; // a newer range or grouping won
-    st.rows = { ...res, group };
+    if (seq !== rowsSeq) return; // a newer range, grouping or filter won
+    st.rows = { ...res, group, provider };
     drawBreakdown();
   }
 
@@ -547,6 +620,9 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     ids.sort((a, b) => (usageBy.get(b)?.cost || 0) - (usageBy.get(a)?.cost || 0) || (usageBy.get(b)?.calls || 0) - (usageBy.get(a)?.calls || 0) || a.localeCompare(b));
     const total = sumRows(usage);
     const usageKnown = Boolean(U.data);
+    const F = st.free;
+    // Grouper's own count of `:free` calls today, per OpenRouter provider (null: didn't load).
+    const freeSent = F?.data && Array.isArray(F.data.providers) ? new Map(F.data.providers.map((p) => [p.provider, p.sent])) : null;
 
     const summary = h(
       'div',
@@ -563,13 +639,20 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
         : h('div', { class: 'u-summary-v' }, 'Estimate unavailable'),
     );
 
-    const cards = ids.map((id) => providerCard(id, byId.get(id), usageBy.get(id), snaps.filter((s) => s.provider === id), usageKnown, P.data ? !byId.has(id) : false));
+    const cards = ids.map((id) =>
+      providerCard(id, byId.get(id), usageBy.get(id), snaps.filter((s) => s.provider === id), usageKnown, P.data ? !byId.has(id) : false, {
+        known: Boolean(freeSent),
+        listed: freeSent?.has(id) || false,
+        sent: freeSent?.get(id) || 0,
+      }),
+    );
     keepFocus(apiBody, () =>
       setChildren(
         apiBody,
         sourceProblem(P, 'the provider list', loadApi),
         sourceProblem(U, 'metered usage', loadApi),
         sourceProblem(S, 'provider snapshots', loadSnaps),
+        sourceProblem(F, 'Grouper’s free-request count', loadApi),
         summary,
         cards.length
           ? h('div', { class: 'u-cards' }, cards)
@@ -579,7 +662,7 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     apiBody.setAttribute('aria-busy', 'false');
   }
 
-  function providerCard(id, info, row, snaps, usageKnown, unlisted) {
+  function providerCard(id, info, row, snaps, usageKnown, unlisted, free) {
     const headId = `u-prov-${slug(id)}`;
     const api = balanceApi(info);
     const host = info ? hostOf(info) : '';
@@ -640,21 +723,105 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     const reportedBlock = h('div', { class: 'u-block' }, h('h4', null, 'Reported by provider'), reportedBody);
 
     // Free allowances: only what the data actually says.
+    const openRouter = free.listed || isOpenRouter(info);
+    const dailyFree = snaps.find(isFreeAllowance);
+    const otherAllowances = allowances.filter((s) => s !== dailyFree);
     let allowanceBlock = null;
-    if (allowances.length) {
-      allowanceBlock = h('div', { class: 'u-block' }, h('h4', null, 'Free allowance'), allowances.map(reportedRow), ageLine(Math.min(...allowances.map((s) => s.fetched_at))));
-    } else if (api?.name === 'OpenRouter') {
-      allowanceBlock = h('div', { class: 'u-block' }, h('h4', null, 'Free allowance'), h('p', { class: 'hint' }, 'Allowance unavailable: OpenRouter’s key API didn’t report a free-request limit for this key.'));
+    if (openRouter) {
+      allowanceBlock = h('div', { class: 'u-block' }, h('h4', null, 'Free allowance'), freeAllowance(dailyFree, free), otherAllowances.map(reportedRow));
+    } else if (otherAllowances.length) {
+      allowanceBlock = h('div', { class: 'u-block' }, h('h4', null, 'Free allowance'), otherAllowances.map(reportedRow), ageLine(Math.min(...otherAllowances.map((s) => s.fetched_at))));
     }
+
+    // Filter the breakdown to this provider: the button for keyboards and screen
+    // readers (its pressed state is announced), a click anywhere else on the card too.
+    const filtered = providerFilter === id;
+    const filterBtn = h(
+      'button',
+      {
+        class: 'btn btn-sm u-filter-btn',
+        type: 'button',
+        id: `u-filter-${slug(id)}`,
+        'aria-pressed': filtered ? 'true' : 'false',
+        onclick: () => setProviderFilter(id),
+      },
+      icon(filtered ? 'check' : 'usage'),
+      'Filter',
+      h('span', { class: 'visually-hidden' }, ` breakdown to ${id}`),
+    );
 
     return h(
       'article',
-      { class: 'card u-card u-provider', 'aria-labelledby': headId, dataset: { provider: id } },
-      h('header', { class: 'u-card-head' }, h('div', { class: 'u-card-titles' }, h('h3', { id: headId }, id), sub.length ? h('div', { class: 'u-card-sub' }, sub.join(' · ')) : null), badges.length ? h('div', { class: 'u-badges' }, badges) : null),
+      {
+        class: ['card u-card u-provider', filtered && 'is-filtered'],
+        'aria-labelledby': headId,
+        dataset: { provider: id },
+        onclick: (e) => {
+          if (e.target.closest('a, button, input, select, textarea, summary')) return;
+          if (window.getSelection?.()?.toString()) return; // selecting text isn't a click
+          setProviderFilter(id);
+        },
+      },
+      h(
+        'header',
+        { class: 'u-card-head' },
+        h('div', { class: 'u-card-titles' }, h('h3', { id: headId }, id), sub.length ? h('div', { class: 'u-card-sub' }, sub.join(' · ')) : null),
+        h('div', { class: 'u-badges' }, badges, filterBtn),
+      ),
       estimate,
       reportedBlock,
       allowanceBlock,
     );
+  }
+
+  /**
+   * OpenRouter's daily free-model allowance: what its last 429 said (never a
+   * built-in number), then Grouper's own count of free-model calls today.
+   */
+  function freeAllowance(s, free) {
+    const parts = [];
+    if (s) {
+      const limit = s.limit_amount ?? null;
+      const used = s.used_amount ?? null;
+      const left = limit !== null && used !== null ? Math.max(0, limit - used) : s.used_pct >= 100 ? 0 : null;
+      const reset = s.resets_at || null;
+      const passed = reset !== null && reset <= nowSecs();
+      if (!passed) {
+        const value = [
+          left !== null ? (limit !== null ? `${num(left)} left of ${num(limit)}` : `${num(left)} left`) : limit !== null ? `limit ${num(limit)}` : 'limit reached',
+          reset ? `resets ${clock(reset)}` : null,
+        ]
+          .filter(Boolean)
+          .join(' · ');
+        parts.push(
+          h('div', { class: 'u-rep' }, h('div', { class: 'u-rep-line' }, h('span', { class: 'u-rep-k' }, 'Free requests'), h('span', { class: 'u-rep-v' }, value))),
+          s.used_pct !== null && s.used_pct !== undefined ? meter(s.used_pct, `${Math.round(s.used_pct)}% of today’s free requests used`) : null,
+          reset ? h('div', { class: 'u-meta' }, `Resets ${inDuration(reset - nowSecs())} (${dateTime(reset)})`) : h('div', { class: 'u-meta' }, 'Reset time not reported'),
+        );
+      } else {
+        parts.push(
+          h(
+            'div',
+            { class: 'u-rep' },
+            h('div', { class: 'u-rep-line' }, h('span', { class: 'u-rep-k' }, 'Free requests'), h('span', { class: 'u-rep-v' }, limit !== null ? `${num(limit)} a day` : 'Limit not reported')),
+            h('div', { class: 'u-meta' }, `Ran out ${ago(s.fetched_at)}; it reset at ${clock(reset)} (${dateTime(reset)}), so what’s left now isn’t known.`),
+          ),
+        );
+      }
+      parts.push(h('div', { class: 'u-meta' }, icon('clock'), h('span', null, `Seen ${ago(s.fetched_at)} · ${s.source}`)));
+    } else {
+      parts.push(h('p', { class: 'hint' }, 'Allowance unavailable: OpenRouter reports its free-request limit only when a call runs into it.'));
+    }
+    const count = free.known ? num(free.sent) : 'unavailable';
+    parts.push(
+      h(
+        'div',
+        { class: 'u-rep u-free-sent' },
+        h('div', { class: 'u-rep-line' }, h('span', { class: 'u-rep-k' }, 'Sent by Grouper today'), h('span', { class: 'u-rep-v' }, count)),
+        h('div', { class: 'u-meta' }, 'Grouper’s own count of answered calls to :free models since 00:00 UTC. Not the allowance: other apps on the account aren’t seen.'),
+      ),
+    );
+    return parts;
   }
 
   function reportedRow(s) {
@@ -811,7 +978,8 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     if (g === 'day') rows.sort((a, b) => b.key.localeCompare(a.key));
     else rows.sort((a, b) => b.cost - a.cost || b.calls - a.calls || a.key.localeCompare(b.key));
     const total = sumRows(rows);
-    setText(breakdownCaption, `${filterCid ? 'This chat' : 'All provider keys'} · ${rangeLabel()} (UTC) · grouped by ${gLabel.toLowerCase()}. Costs are Grouper’s estimate.`);
+    const scope = filterCid ? 'This chat' : R.provider ? `Provider ${R.provider} only` : 'All provider keys';
+    setText(breakdownCaption, `${scope} · ${rangeLabel()} (UTC) · grouped by ${gLabel.toLowerCase()}. Costs are Grouper’s estimate.`);
 
     if (filterCid) drawChatStats(R.data ? total : null);
 
@@ -822,7 +990,7 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
       content = h(
         'div',
         { class: 'card card-pad u-empty' },
-        h('p', null, h('strong', null, `No metered calls ${inRange()}.`)),
+        h('p', null, h('strong', null, `No metered calls${R.provider ? ` through ${R.provider}` : ''} ${inRange()}.`)),
         h('p', { class: 'hint' }, 'Grouper counts only the calls it routes itself. Use outside Grouper shows up only in provider-reported figures.'),
         rangeKey !== 'all'
           ? h(
@@ -857,7 +1025,7 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
         h(
           'table',
           { class: 'table' },
-          h('caption', { class: 'visually-hidden' }, `Estimated API cost by ${gLabel.toLowerCase()}, ${rangeLabel()}`),
+          h('caption', { class: 'visually-hidden' }, `Estimated API cost by ${gLabel.toLowerCase()}${R.provider ? `, provider ${R.provider} only` : ''}, ${rangeLabel()}`),
           h(
             'thead',
             null,

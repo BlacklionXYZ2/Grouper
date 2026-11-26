@@ -66,7 +66,7 @@ impl Message {
 }
 
 pub use core_protocol::{ProviderConfig, ToolDef};
-pub use fallback::Fallback;
+pub use fallback::{Fallback, account_wide_limit};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Request {

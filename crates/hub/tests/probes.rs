@@ -331,7 +331,7 @@ async fn import_only_probes_when_explicitly_requested_and_merges_catalog_proposa
     assert!(without_probe.probe.is_none());
     assert!(without_probe.probe_error.is_none());
     assert!(hub.db.probe_stats(Some("mini"), None).is_empty(), "must never probe automatically");
-    assert!(hub.db.usage_totals(0, i64::MAX as u64, "model", None).unwrap().is_empty());
+    assert!(hub.db.usage_totals(0, i64::MAX as u64, "model", None, None).unwrap().is_empty());
     let catalog_pid = without_probe.proposal_id.unwrap();
     assert_eq!(hub.db.proposal(catalog_pid).unwrap().source, "catalog");
 

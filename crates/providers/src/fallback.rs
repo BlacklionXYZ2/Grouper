@@ -49,7 +49,9 @@ fn model_unavailable(e: &ProviderError) -> bool {
     }
 }
 
-pub(crate) fn account_wide_limit(body: &str) -> bool {
+/// Whether an error body is OpenRouter's account-wide daily free-model limit
+/// (`free-models-per-day`, `limit_source: openrouter_free_tier_daily`).
+pub fn account_wide_limit(body: &str) -> bool {
     body.contains("free-models-per-day") || body.contains("openrouter_free_tier_daily")
 }
 

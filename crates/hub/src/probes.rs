@@ -382,7 +382,7 @@ mod tests {
         assert!(all.median_duration_s.is_some());
 
         // Usage was recorded and counts toward daily spend.
-        let usage = hub.db.usage_totals(0, i64::MAX as u64, "model", None).unwrap();
+        let usage = hub.db.usage_totals(0, i64::MAX as u64, "model", None, None).unwrap();
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].calls, 5);
         assert!(usage[0].cost > 0.0);
@@ -451,11 +451,11 @@ mod tests {
         assert!(partial.stopped_reason.as_deref().unwrap().contains("daily budget of $0.03"));
 
         // Now daily budget is spent: a fresh probe call is refused before making any model call.
-        let calls_before = hub.db.usage_totals(0, i64::MAX as u64, "model", None).unwrap()[0].calls;
+        let calls_before = hub.db.usage_totals(0, i64::MAX as u64, "model", None, None).unwrap()[0].calls;
         let err = run_probes(&hub, "pricey").await.unwrap_err();
         assert!(matches!(err, ProbeError::BudgetExceeded(_)), "{err:?}");
         assert!(err.to_string().contains("daily budget of $0.03"));
-        let calls_after = hub.db.usage_totals(0, i64::MAX as u64, "model", None).unwrap()[0].calls;
+        let calls_after = hub.db.usage_totals(0, i64::MAX as u64, "model", None, None).unwrap()[0].calls;
         assert_eq!(calls_before, calls_after, "refused probe must not call provider");
 
         drop(hub);
