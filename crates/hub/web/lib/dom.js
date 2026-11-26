@@ -107,6 +107,7 @@ const ICONS = {
   trash: ['M5 7h14', 'M9 7V4h6v3', 'M7 7l1 13h8l1-13'],
   play: ['M7 5l12 7-12 7z'],
   clock: ['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z', 'M12 7v5l3 2'],
+  inbox: ['M4 13l2.5-8h11l2.5 8', 'M4 13v6h16v-6', 'M4 13h5l1.5 2.5h3L15 13h5'],
 };
 
 /** Visually hidden text for screen readers. */

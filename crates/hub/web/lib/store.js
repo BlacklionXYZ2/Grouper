@@ -101,6 +101,20 @@ export function pendingApprovals() {
   return [...store.approvals.values()].sort((a, b) => a.ts - b.ts);
 }
 
+/**
+ * Threads waiting for a device that have no pending approval of their own (a
+ * thread with an approval is counted, and listed, by that approval).
+ */
+export function waitingThreads() {
+  const approvalThreads = new Set([...store.approvals.values()].map((a) => a.thread_id));
+  return [...store.threads.values()].filter((t) => t.status === 'waiting_device' && !approvalThreads.has(t.id));
+}
+
+/** What needs the owner across all chats: pending approvals plus waiting threads. */
+export function needsYouCount() {
+  return store.approvals.size + waitingThreads().length;
+}
+
 export function isAdmin() {
   return Boolean(store.me?.admin);
 }

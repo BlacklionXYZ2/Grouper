@@ -46,6 +46,7 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "views/approvals.js",
     "views/chat.js",
     "views/devices.js",
+    "views/inbox.js",
     "views/login.js",
     "views/memory.js",
     "views/model-picker.js",

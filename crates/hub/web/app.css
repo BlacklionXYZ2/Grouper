@@ -4419,6 +4419,144 @@ code.nowrap {
   height: 13px;
 }
 
+/* ---- Needs you (#/inbox): approvals and waiting threads across chats */
+
+.inbox-section {
+  margin: 0 0 28px;
+}
+
+.inbox-h2 {
+  font-size: 15px;
+  font-weight: 650;
+  margin: 0 0 10px;
+  color: var(--text);
+}
+
+.inbox-h2-count {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.inbox-group + .inbox-group {
+  margin-top: 14px;
+}
+
+.inbox-chat {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 4px;
+  padding: 0 2px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.inbox-chat-link {
+  color: inherit;
+}
+
+.inbox-list {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.list.card.inbox-list {
+  background: var(--surface);
+  border-radius: var(--radius);
+}
+
+.inbox-row {
+  align-items: center;
+}
+
+.inbox-icon {
+  display: inline-grid;
+  flex: none;
+  color: var(--warn);
+  align-self: flex-start;
+  padding-top: 2px;
+}
+
+.inbox-approval .row-title {
+  font-weight: 600;
+}
+
+.inbox-tool {
+  font-size: 14px;
+}
+
+.inbox-reason {
+  margin-top: 2px;
+}
+
+.inbox-kind.inbox-risk {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.inbox-thread-link {
+  color: var(--text-2);
+}
+
+.inbox-action {
+  flex: none;
+}
+
+.inbox-review {
+  min-height: 36px;
+}
+
+.inbox-approval.settled .inbox-icon {
+  color: var(--text-3);
+}
+
+.inbox-approval.settled .row-title,
+.inbox-approval.settled .inbox-reason {
+  color: var(--text-2);
+}
+
+.inbox-settled,
+.inbox-settled:hover {
+  background: var(--surface-2);
+  color: var(--text-2);
+  border-color: transparent;
+  box-shadow: none;
+  cursor: default;
+}
+
+.inbox-checkpoint[hidden] {
+  display: none;
+}
+
+.inbox-toggle {
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.inbox-empty {
+  padding-top: 48px;
+}
+
+.inbox-empty p + p {
+  margin-top: 12px;
+}
+
+@media (max-width: 760px) {
+  .inbox-row {
+    flex-wrap: wrap;
+  }
+
+  .inbox-approval .inbox-action {
+    width: 100%;
+    padding-left: 36px;
+  }
+
+  .inbox-review {
+    min-height: 44px;
+    min-width: 96px;
+  }
+}
+
 /* ---- the thread view: a chat-style transcript in the inspector */
 
 .thread-meta {
