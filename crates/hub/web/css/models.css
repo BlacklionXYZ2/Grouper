@@ -25,9 +25,50 @@
   border-color: var(--border-strong);
 }
 
+/* Active row: tone plus a neutral strong edge, never the search box's blue ring.
+   The inset accent bar keeps keyboard focus visible without blue. */
 .mp-option.active {
   background: var(--surface-select);
-  border-color: var(--focus);
+  border-color: var(--border-strong);
+  box-shadow: inset 4px 0 0 var(--accent);
+}
+
+.mp-check {
+  color: var(--accent);
+}
+
+/* Family marks never read grey: the Default row and unknown families take the accent. */
+.mp-option .fam-mark.fam-default,
+.mp-option .fam-mark.fam-unknown {
+  --fam: var(--accent);
+}
+
+/* Section labels: sentence case, no tracking. */
+.mp-section {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+/* Transform-only entrance: the dialog is never see-through while it opens. */
+@keyframes mp-rise {
+  from {
+    transform: translateY(12px) scale(0.98);
+  }
+}
+
+@media (min-width: 761px) {
+  dialog.sheet-dialog.model-picker[open] {
+    animation: mp-rise 0.22s var(--ease);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  dialog.sheet-dialog.model-picker[open] {
+    animation: none;
+  }
 }
 
 .mp-opt-main {
@@ -215,6 +256,7 @@
   .mp-option.active {
     background: Canvas;
     border-color: Highlight;
+    box-shadow: none;
   }
 
   .mp-more-btn {
