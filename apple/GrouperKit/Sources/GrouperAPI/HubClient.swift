@@ -168,9 +168,12 @@ public actor HubClient {
     }
     /// Registers a plain (non-admin) device; needs an admin token. The returned token is
     /// shown only once. A hub without the route answers 404 or 405
-    /// (`DeviceRegistration.hubLacksRegistration`).
-    public func registerDevice(name: String, platform: String) async throws -> RegisteredDevice {
-        try await send(["v1", "devices"], method: "POST", body: DeviceRegistrationRequest(name: name, platform: platform))
+    /// (`DeviceRegistration.hubLacksRegistration`). With `installId`, a hub that already has a
+    /// live device for it issues that device a fresh token (revoking the old one) instead of
+    /// adding a device; older hubs ignore it. An id the hub wouldn't accept is left out.
+    public func registerDevice(name: String, platform: String, installId: String? = nil) async throws -> RegisteredDevice {
+        try await send(["v1", "devices"], method: "POST",
+                       body: DeviceRegistrationRequest(name: name, platform: platform, installId: InstallID.sendable(installId)))
     }
     /// Revokes a device's token on the hub (admin). 404 when the hub doesn't know it, or it
     /// was already revoked; 409 for the token making the request.
@@ -229,11 +232,14 @@ public actor HubClient {
     /// `POST /v1/auth/google` (no token): trades a Google ID token (with this hub's nonce) for a
     /// new admin token for this app install. An unclaimed hub needs `setupCode`. 401: bad token
     /// or nonce; 403: setup code missing or wrong, or another Google account; 409: just claimed.
+    /// With `installId` (`InstallID`), signing in again from the same install reuses its device
+    /// (same id, fresh token, old token revoked); older hubs ignore it. An id the hub wouldn't
+    /// accept is left out.
     public func signInWithGoogle(idToken: String, setupCode: String? = nil, client: GoogleSignInClient,
-                                 deviceName: String? = nil) async throws -> GoogleSignInResult {
+                                 deviceName: String? = nil, installId: String? = nil) async throws -> GoogleSignInResult {
         let code = setupCode?.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = GoogleSignInRequest(idToken: idToken, setupCode: code?.isEmpty == false ? code : nil,
-                                       client: client, deviceName: deviceName)
+                                       client: client, deviceName: deviceName, installId: InstallID.sendable(installId))
         return try await send(["v1", "auth", "google"], method: "POST", body: body, authenticated: false)
     }
 
@@ -331,6 +337,6 @@ private struct RatingRequest: Codable { let rating: String }
 private struct ApprovalDecision: Codable { let approve: Bool }
 private struct PermissionRequest: Codable { let permission: Permission }
 private struct ToolCallRequest: Codable { let tool: String; let args: JSONValue }
-private struct DeviceRegistrationRequest: Codable { let name: String; let platform: String }
+private struct DeviceRegistrationRequest: Codable { let name: String; let platform: String; let installId: String? }
 private struct ProposalDecision: Codable { let accept: Bool }
 private struct RuleEnabled: Codable { let enabled: Bool }

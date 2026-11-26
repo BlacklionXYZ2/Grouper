@@ -1,54 +1,82 @@
 import GrouperAPI
 import SwiftUI
 
+/// What the sign-in screen offers for the hub address as typed (docs/accounts-design.md,
+/// "Google is the only way you sign in").
+private enum SignInMode: Equatable {
+    /// No address yet.
+    case enterHub
+    /// Asking the hub whether it allows Google sign-in.
+    case checking
+    /// No hub answered at that address.
+    case unreachable
+    /// The hub allows Google sign-in and the app has a client ID: the only visible way in.
+    case google
+    /// The hub has no Google sign-in (or the app has no client ID): the admin-token field, as before.
+    case token
+}
+
 struct SignInView: View {
     @EnvironmentObject private var model: AppModel
     @State private var signingIn = false
     @State private var setupCode = ""
-    @State private var showTokenSignIn = false
+    /// Recovery only: the toolbar's ⋯ menu shows the token field under Google sign-in.
+    @State private var showRecovery = false
+    /// A hub address was saved when this screen opened, so the field starts collapsed.
+    @State private var hubWasSaved = !(UserDefaults.standard.string(forKey: "grouper.hubURL") ?? "").isEmpty
+    @State private var editingHub = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section { brandHeader }
                     .listRowBackground(Color.clear)
-                Section("Hub") {
-                    TextField("https://grouper.example", text: $model.hubURL)
-                        #if os(iOS)
-                        .textContentType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                        #endif
-                        .autocorrectionDisabled()
+                // First run: the address is the first thing to type. Once one is saved it's
+                // pre-filled and tucked under "Hub" below (hub discovery will replace it).
+                if !hubWasSaved {
+                    Section("Hub") { hubField }
                 }
-                if model.googleSignInAvailable {
-                    if model.authStatus?.claimed == false {
-                        Section {
-                            TextField("XXXX-XXXX-XXXX", text: $setupCode)
-                                .monospaced()
-                                .autocorrectionDisabled()
-                                #if os(iOS)
-                                .textInputAutocapitalization(.characters)
-                                #endif
-                                .accessibilityLabel("Setup code")
-                            Text("This hub has no owner yet. Enter the setup code from the hub's log (or run grouper-hub setup-code on the hub), then sign in with Google to claim it.")
-                                .font(.caption).foregroundStyle(Theme.text2)
-                        } header: {
-                            Text("Setup code")
-                        }
-                    }
+                switch mode {
+                case .enterHub:
                     Section {
-                        GoogleSignInButton(busy: model.googleBusy) {
-                            Task { await model.signInWithGoogle(setupCode: setupCode) }
-                        }
-                        .disabled(!canSignInWithGoogle)
-                        .frame(maxWidth: .infinity)
+                        Text("Enter your hub's address, then sign in with Google.")
+                            .font(.callout).foregroundStyle(Theme.text2)
                     }
+                case .checking:
                     Section {
-                        DisclosureGroup("Use a token instead", isExpanded: $showTokenSignIn) { tokenSignIn }
+                        HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Checking the hub…") }
+                            .foregroundStyle(Theme.text2)
                     }
-                } else {
+                case .unreachable:
+                    Section {
+                        Text("Couldn't reach a Grouper hub at this address. Check it, and that the hub is running.")
+                            .font(.callout).foregroundStyle(Theme.text2)
+                        Button("Try again") { Task { await model.checkAuthStatus(for: model.hubURL) } }
+                    }
+                case .google:
+                    googleSignIn
+                case .token:
                     Section("Admin token") { tokenSignIn }
+                }
+                if hubWasSaved {
+                    Section {
+                        DisclosureGroup(isExpanded: $editingHub) {
+                            hubField
+                        } label: {
+                            LabeledContent("Hub") {
+                                Text(hubHost).lineLimit(1).truncationMode(.middle)
+                            }
+                        }
+                    }
+                }
+                if showRecovery, mode != .token {
+                    Section {
+                        tokenSignIn
+                    } header: {
+                        Text("Recovery token")
+                    } footer: {
+                        Text("Only for getting back in when Google sign-in isn't working: an admin token made on the hub.")
+                    }
                 }
                 if let error = model.errorMessage {
                     Section { Text(error).foregroundStyle(Theme.danger).accessibilityLabel("Sign in failed. \(error)") }
@@ -59,6 +87,25 @@ struct SignInView: View {
             #endif
             .grouperListBackground()
             .navigationTitle("Connect to Grouper")
+            // A saved hub that's gone, or an emptied address: open the field so it can be fixed.
+            .onChange(of: mode, initial: true) { _, newMode in
+                if hubWasSaved, newMode == .unreachable || newMode == .enterHub { editingHub = true }
+            }
+            .toolbar {
+                // Token sign-in is a recovery route, kept off the main screen (owner decision).
+                if mode != .token {
+                    ToolbarItem(placement: .primaryAction) {
+                        Menu {
+                            Button(showRecovery ? "Hide recovery token" : "Sign in with a recovery token", systemImage: "key") {
+                                showRecovery.toggle()
+                            }
+                        } label: {
+                            Label("More", systemImage: "ellipsis.circle")
+                        }
+                        .accessibilityLabel("More sign-in options")
+                    }
+                }
+            }
             // Ask the hub whether it is claimed and allows Google, once typing pauses.
             .task(id: model.hubURL) {
                 try? await Task.sleep(for: .milliseconds(400))
@@ -79,6 +126,59 @@ struct SignInView: View {
         }
         .padding(.vertical, 8)
         .accessibilityElement(children: .combine)
+    }
+
+    private var hubField: some View {
+        TextField("https://grouper.example", text: $model.hubURL)
+            #if os(iOS)
+            .textContentType(.URL)
+            .textInputAutocapitalization(.never)
+            .keyboardType(.URL)
+            #endif
+            .autocorrectionDisabled()
+            .accessibilityLabel("Hub address")
+    }
+
+    /// The saved hub as a short label: its host, or the address as typed.
+    private var hubHost: String {
+        let typed = model.hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        return URL(string: typed)?.host() ?? typed
+    }
+
+    /// The setup code while the hub is unclaimed, and "Sign in with Google".
+    @ViewBuilder private var googleSignIn: some View {
+        if model.authStatus?.claimed == false {
+            Section {
+                TextField("XXXX-XXXX-XXXX", text: $setupCode)
+                    .monospaced()
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.characters)
+                    #endif
+                    .accessibilityLabel("Setup code")
+                Text("This hub has no owner yet. Enter the setup code from the hub's log (or run grouper-hub setup-code on the hub), then sign in with Google to claim it.")
+                    .font(.caption).foregroundStyle(Theme.text2)
+            } header: {
+                Text("Setup code")
+            }
+        }
+        Section {
+            GoogleSignInButton(busy: model.googleBusy) {
+                Task { await model.signInWithGoogle(setupCode: setupCode) }
+            }
+            .disabled(!canSignInWithGoogle)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var mode: SignInMode {
+        // Without a client ID this app can't sign in with Google at all: tokens, as before.
+        guard GoogleSignIn.oauth != nil else { return .token }
+        let hub = model.hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if hub.isEmpty { return .enterHub }
+        if model.authStatusCheckedFor != hub { return .checking }
+        if model.hubUnreachable { return .unreachable }
+        return model.googleSignInAvailable ? .google : .token
     }
 
     private var busy: Bool { signingIn || model.googleBusy }

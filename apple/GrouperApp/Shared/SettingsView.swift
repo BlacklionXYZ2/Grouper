@@ -25,35 +25,35 @@ struct SettingsView: View {
                 } else if model.deviceToken.isEmpty {
                     Text("This Mac isn't registered with the hub yet, so it can't run threads.")
                 } else {
-                    Text("This Mac uses a device token you entered.")
-                }
-                if let id = model.deviceId, !model.deviceToken.isEmpty {
-                    LabeledContent("Device id") { Text(id).monospaced().textSelection(.enabled) }
+                    Text("This Mac is registered with the hub.")
                 }
                 LabeledContent("Node", value: node.statusText)
                 Button(model.registeringDevice ? "Registering…" : "Register again") {
                     Task { await model.registerThisMacAgain() }
                 }
                 .disabled(model.registeringDevice || model.client == nil)
-                Text("Makes a new device token for this Mac and revokes the old one on the hub.")
+                Text("Reconnects this Mac to the hub as the same device; its old credentials stop working.")
                     .font(.caption).foregroundStyle(Theme.text2)
                 if let message = model.deviceMessage {
                     Text(message).font(.caption).foregroundStyle(Theme.danger)
                 }
-                DisclosureGroup("Use an existing device token", isExpanded: $model.showManualDeviceToken) {
-                    SecureField("Device token", text: $model.manualDeviceToken)
-                        .textContentType(.password)
-                    Button(savingDeviceToken ? "Verifying…" : "Use this token") {
-                        savingDeviceToken = true
-                        Task {
-                            _ = await model.saveManualDeviceToken()
-                            savingDeviceToken = false
+                // Recovery only: offered when automatic registration didn't work.
+                if model.deviceMessage != nil || model.showManualDeviceToken {
+                    DisclosureGroup("Use an existing device token", isExpanded: $model.showManualDeviceToken) {
+                        SecureField("Device token", text: $model.manualDeviceToken)
+                            .textContentType(.password)
+                        Button(savingDeviceToken ? "Verifying…" : "Use this token") {
+                            savingDeviceToken = true
+                            Task {
+                                _ = await model.saveManualDeviceToken()
+                                savingDeviceToken = false
+                            }
                         }
+                        .disabled(savingDeviceToken || model.client == nil
+                                  || model.manualDeviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        Text("For a plain device token made on the hub with grouper-hub device add. Never paste an admin token here.")
+                            .font(.caption).foregroundStyle(Theme.text2)
                     }
-                    .disabled(savingDeviceToken || model.client == nil
-                              || model.manualDeviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    Text("For a plain device token made on the hub with grouper-hub device add. Never paste an admin token here.")
-                        .font(.caption).foregroundStyle(Theme.text2)
                 }
             }
             #endif
@@ -65,7 +65,10 @@ struct SettingsView: View {
                     Task { await model.signOutAndRemoveThisMac() }
                 }
                 .disabled(model.registeringDevice)
-                Text("Signing out keeps this Mac's device token, so it can keep running threads. Removing this Mac also revokes its token on the hub.")
+                Text("Signing out keeps this Mac registered, so it can keep running threads, and signing in again reuses this Mac's devices. Removing this Mac also takes it off the hub.")
+                    .font(.caption).foregroundStyle(Theme.text2)
+                #else
+                Text("Signing in again on this iPhone reuses its device on the hub.")
                     .font(.caption).foregroundStyle(Theme.text2)
                 #endif
             }
@@ -78,8 +81,10 @@ struct SettingsView: View {
     }
 }
 
-/// Settings > Account (docs/accounts-design.md): the Google account that owns the hub, with
+/// Settings > Account (docs/accounts-design.md): the Google account you're signed in as (the
+/// hub's owner) as the identity, this install's device (name and platform) under it, then
 /// Unlink, or "Link your Google account" so the owner can sign in with Google instead of a token.
+/// Device ids and tokens are internal and never shown.
 struct AccountSettingsSection: View {
     @EnvironmentObject private var model: AppModel
     @State private var confirmUnlink = false
@@ -87,7 +92,7 @@ struct AccountSettingsSection: View {
     var body: some View {
         Section("Account") {
             if let account = model.linkedGoogle {
-                LabeledContent("Google account") {
+                LabeledContent("Signed in as") {
                     VStack(alignment: .trailing, spacing: 2) {
                         Text(account.email).textSelection(.enabled)
                         if !account.name.isEmpty {
@@ -95,6 +100,7 @@ struct AccountSettingsSection: View {
                         }
                     }
                 }
+                deviceDetails
                 Button(model.googleBusy ? "Unlinking…" : "Unlink", role: .destructive) { confirmUnlink = true }
                     .disabled(model.googleBusy)
                     .confirmationDialog("Unlink \(account.email)?", isPresented: $confirmUnlink, titleVisibility: .visible) {
@@ -108,25 +114,44 @@ struct AccountSettingsSection: View {
                     .font(.callout).foregroundStyle(Theme.text2)
             } else if !model.googleLinkLoaded {
                 HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Checking the linked account…") }
-            } else if GoogleSignIn.oauth == nil {
-                Text("This app has no Google client ID, so Google sign-in is off.")
-                    .font(.callout).foregroundStyle(Theme.text2)
-            } else if model.authStatus?.google != true {
-                Text("Google sign-in isn't turned on for this hub.")
-                    .font(.callout).foregroundStyle(Theme.text2)
             } else {
-                Button(model.googleBusy ? "Linking…" : "Link your Google account") {
-                    Task { await model.linkGoogle() }
+                if GoogleSignIn.oauth == nil {
+                    Text("This app has no Google client ID, so Google sign-in is off.")
+                        .font(.callout).foregroundStyle(Theme.text2)
+                } else if model.authStatus?.google != true {
+                    Text("Google sign-in isn't turned on for this hub.")
+                        .font(.callout).foregroundStyle(Theme.text2)
+                } else {
+                    Button(model.googleBusy ? "Linking…" : "Link your Google account") {
+                        Task { await model.linkGoogle() }
+                    }
+                    .disabled(model.googleBusy || model.client == nil)
+                    Text("Then you can sign in to this hub with Google.")
+                        .font(.caption).foregroundStyle(Theme.text2)
                 }
-                .disabled(model.googleBusy || model.client == nil)
-                Text("Then you can sign in to this hub with Google instead of pasting a token.")
-                    .font(.caption).foregroundStyle(Theme.text2)
+                deviceDetails
             }
             if let message = model.accountMessage {
                 Text(message).font(.caption).foregroundStyle(Theme.danger)
             }
         }
         .task(id: model.signedIn) { await model.refreshGoogleLink() }
+    }
+
+    /// This install's own device on the hub: its name and platform, never its id or token.
+    @ViewBuilder private var deviceDetails: some View {
+        if let device = model.thisAppDevice {
+            LabeledContent("This \(deviceWord)", value: device.name)
+            LabeledContent("Platform", value: device.platformName)
+        }
+    }
+
+    private var deviceWord: String {
+        #if os(iOS)
+        "iPhone"
+        #else
+        "Mac app"
+        #endif
     }
 }
 

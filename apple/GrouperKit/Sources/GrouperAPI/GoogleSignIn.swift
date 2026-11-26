@@ -69,6 +69,8 @@ struct GoogleSignInRequest: Codable, Sendable {
     let setupCode: String?
     let client: GoogleSignInClient
     let deviceName: String?
+    /// This app install's id (`InstallID`); the hub reuses the install's device when it has one.
+    let installId: String?
 }
 struct GoogleLinkRequest: Codable, Sendable { let idToken: String }
 
