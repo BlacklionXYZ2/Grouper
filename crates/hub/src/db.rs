@@ -184,9 +184,13 @@ fn migrate_provider_secrets(conn: &mut Connection, secrets: &Secrets) -> Result<
     Ok(())
 }
 
+/// Whether anything is sealed with the master key (provider keys, the Web Push VAPID key), in
+/// which case a missing master key must not be replaced by a fresh one.
 fn has_sealed_provider_keys(conn: &Connection) -> Result<bool> {
     Ok(conn
-        .prepare("SELECT 1 FROM providers WHERE api_key LIKE 'enc:v1:%' LIMIT 1")?
+        .prepare(
+            "SELECT 1 FROM providers WHERE api_key LIKE 'enc:v1:%'              UNION ALL SELECT 1 FROM hub_meta WHERE value LIKE 'enc:v1:%' LIMIT 1",
+        )?
         .exists([])?)
 }
 
@@ -201,6 +205,7 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     conn.execute_batch(crate::offline::SCHEMA)?;
     conn.execute_batch(crate::limits::SCHEMA)?;
     conn.execute_batch(crate::session::SCHEMA)?;
+    conn.execute_batch(crate::push::SCHEMA)?;
     // Databases made before admin tokens: every existing token becomes a plain
     // device token; grant admin with `grouper-hub device admin <id>`.
     let has_admin: bool = conn
@@ -288,6 +293,33 @@ impl Db {
         let id = random_hex(16);
         let _ = c.execute("INSERT OR IGNORE INTO hub_meta (key, value) VALUES ('hub_id', ?1)", [&id]);
         c.query_row("SELECT value FROM hub_meta WHERE key = 'hub_id'", [], |r| r.get(0)).unwrap_or(id)
+    }
+
+    /// The Web Push (VAPID) private key: a P-256 scalar, made on first use and kept in
+    /// `hub_meta` sealed with the master key like provider keys. `generate` makes a new one.
+    pub(crate) fn vapid_private_key(&self, generate: impl FnOnce() -> Result<Vec<u8>>) -> Result<Vec<u8>> {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        const KEY: &str = "vapid_private_key";
+        let read = |c: &Connection| -> Result<Option<String>> {
+            Ok(c.query_row("SELECT value FROM hub_meta WHERE key = ?1", [KEY], |r| r.get(0)).optional()?)
+        };
+        let c = self.c();
+        let sealed = match read(&c)? {
+            Some(sealed) => sealed,
+            None => {
+                let key = generate()?;
+                let sealed = self.secrets.seal(&URL_SAFE_NO_PAD.encode(&key))?;
+                c.execute("INSERT OR IGNORE INTO hub_meta (key, value) VALUES (?1, ?2)", params![KEY, sealed])?;
+                read(&c)?.context("VAPID key missing right after it was stored")?
+            }
+        };
+        drop(c);
+        let encoded = self
+            .secrets
+            .open(&sealed)
+            .context("cannot decrypt the Web Push VAPID key; is this the master key that sealed it?")?;
+        URL_SAFE_NO_PAD.decode(encoded.trim()).context("stored VAPID key is not valid base64url")
     }
 
     /// Milestone 1 kept devices in devices.json; bring them over once.
@@ -1249,6 +1281,28 @@ mod tests {
         assert!(message.contains("master key missing"), "{message}");
         assert!(message.contains("GROUPER_MASTER_KEY"), "{message}");
         assert!(!key_path.exists(), "must not auto-generate a new master key");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_vapid_key_is_sealed_stable_and_guards_the_master_key() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let first = db.vapid_private_key(|| Ok(vec![5; 32])).unwrap();
+        assert_eq!(first, vec![5; 32]);
+        let second = db.vapid_private_key(|| panic!("must not make a second key")).unwrap();
+        assert_eq!(second, first);
+        let stored: String =
+            db.c().query_row("SELECT value FROM hub_meta WHERE key = 'vapid_private_key'", [], |r| r.get(0)).unwrap();
+        assert!(Secrets::is_sealed(&stored), "{stored}");
+        drop(db);
+
+        // A sealed VAPID key alone is enough to refuse making a fresh master key.
+        let key_path = dir.join("master.key");
+        std::fs::remove_file(&key_path).unwrap();
+        let message = format!("{:#}", Db::open(&dir).err().unwrap());
+        assert!(message.contains("master key missing"), "{message}");
+        assert!(!key_path.exists());
         std::fs::remove_dir_all(dir).ok();
     }
 
