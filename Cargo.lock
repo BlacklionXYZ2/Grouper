@@ -939,6 +939,8 @@ dependencies = [
  "core-sync",
  "dirs",
  "futures-util",
+ "getrandom 0.4.3",
+ "hex",
  "reqwest",
  "rpassword",
  "security-framework",

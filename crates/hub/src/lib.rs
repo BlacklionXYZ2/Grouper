@@ -5,6 +5,7 @@ pub mod devices;
 pub mod files;
 pub mod google_auth;
 pub mod limits;
+pub mod link;
 pub mod mcp;
 pub mod memory;
 pub mod offline;

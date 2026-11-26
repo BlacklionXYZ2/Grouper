@@ -1,5 +1,7 @@
 // Sign in: Google (POST /v1/auth/google/start -> Google -> /v1/auth/google/return)
-// or hub token (POST /v1/session). Tokens and setup codes go to the hub once
+// whenever the hub offers it, plus the setup code on an unclaimed hub. A hub token
+// (POST /v1/session) only where the hub has no browser Google sign-in, or at the
+// unlinked recovery route #/token-signin. Tokens and setup codes go to the hub once
 // and are never kept by the browser.
 
 import { h, icon, srOnly, setChildren } from '../lib/dom.js';
@@ -37,6 +39,9 @@ export function renderLogin(onSignedIn, opts = {}) {
   const initialCode = opts.code || '';
   const initialError = opts.error || '';
   const fromClaim = Boolean(opts.claim);
+  // #/token-signin: only the token form. #/link while signed out: say why sign-in is needed.
+  const tokenOnly = Boolean(opts.tokenOnly);
+  const forLink = Boolean(opts.link);
 
   const card = h(
     'div',
@@ -173,19 +178,24 @@ export function renderLogin(onSignedIn, opts = {}) {
     }
 
     const tokenForm = buildTokenForm();
-    const heading = h(
-      'div',
-      null,
-      h('h1', null, claimMode ? 'Claim this hub' : 'Sign in to Grouper'),
-      h('p', null, claimMode ? 'Claim this hub: sign in with the Google account that will own it.' : 'Your hub, your devices, one conversation.'),
-    );
+    const [title, lead] = tokenOnly
+      ? ['Sign in with a token', 'Recovery sign-in for when Google sign-in isn’t available. Normally you sign in with Google.']
+      : claimMode
+        ? ['Claim this hub', 'Claim this hub: sign in with the Google account that will own it.']
+        : forLink
+          ? ['Sign in to approve a device', 'A device asked to join your Grouper. Sign in to check it and approve it.']
+          : ['Sign in to Grouper', 'Your hub, your devices, one conversation.'];
+    const heading = h('div', null, h('h1', null, title), h('p', null, lead));
 
-    if (!googleWeb) {
+    // Google is the way in when the hub offers it. The token form is for hubs without it, and
+    // for recovery at #/token-signin, which nothing links to (see the README).
+    if (!googleWeb || tokenOnly) {
       const note =
         fromClaim && initialCode
           ? h('div', { class: 'banner info' }, icon('warning'), h('div', { class: 'grow' }, 'Browser Google sign-in isn’t turned on for this hub. Use a token below instead.'))
           : null;
-      setChildren(card, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), heading, errorBox, note, tokenForm);
+      const back = tokenOnly && googleWeb ? h('p', { class: 'hint' }, h('a', { href: '#/' }, 'Sign in with Google instead')) : null;
+      setChildren(card, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), heading, errorBox, note, tokenForm, back);
       if (initialError) showError(initialError, { retry: true });
       requestAnimationFrame(() => {
         if (initialError) errorBox.querySelector('button')?.focus();
@@ -278,19 +288,7 @@ export function renderLogin(onSignedIn, opts = {}) {
         ? h('div', { class: 'banner info' }, h('div', { class: 'grow' }, 'This hub already has an owner. Sign in with that Google account.'))
         : null;
 
-    const disclosure = h(
-      'details',
-      {
-        class: 'login-disclosure',
-        ontoggle: () => {
-          if (disclosure.open && !disclosure.contains(document.activeElement)) tokenInput.focus();
-        },
-      },
-      h('summary', null, icon('chevron'), 'Use a token instead'),
-      tokenForm,
-    );
-
-    setChildren(card, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), heading, errorBox, alreadyClaimedNote, googleSection, disclosure);
+    setChildren(card, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), heading, errorBox, alreadyClaimedNote, googleSection);
     if (initialError) showError(initialError, { retry: true });
 
     requestAnimationFrame(() => {

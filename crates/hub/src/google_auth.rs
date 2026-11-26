@@ -81,7 +81,7 @@ const SKEW_SECS: u64 = 300;
 pub const SETUP_CODE_TTL_SECS: u64 = 3600;
 const MAX_SETUP_CODES: i64 = 20;
 /// Setup code characters: no 0/O, 1/I/L.
-const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+pub(crate) const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const CODE_LEN: usize = 12;
 const JWKS_DEFAULT_MAX_AGE: u64 = 3600;
 const JWKS_MIN_MAX_AGE: u64 = 60;
@@ -706,7 +706,7 @@ fn hub_origin(cfg: &Config, headers: &HeaderMap) -> Option<String> {
 
 /// The caller's IP for rate limiting. Behind a local proxy (Cloudflare Tunnel, Docker), the peer is
 /// loopback or private and `CF-Connecting-IP` names the real client; otherwise the peer is used.
-fn client_ip(headers: &HeaderMap, ext: &Extensions) -> IpAddr {
+pub(crate) fn client_ip(headers: &HeaderMap, ext: &Extensions) -> IpAddr {
     let peer = ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
     let local = |ip: &IpAddr| match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
@@ -795,15 +795,24 @@ struct SignInBody {
     client: String,
     #[serde(default)]
     device_name: Option<String>,
+    /// Apps: this install's random id. A live device of the same install and client gets a fresh
+    /// token (the old one is revoked) instead of a new device being made.
+    #[serde(default)]
+    install_id: Option<String>,
 }
 
 /// `POST /v1/auth/google`: sign in (or claim the hub) with a Google ID token. Web: a session cookie,
-/// answered like `POST /v1/session`. Apps: a new admin device token, shown once.
+/// answered like `POST /v1/session`. Apps: an admin device token, shown once: a new device, or the
+/// same device again for the same `install_id` and client.
 async fn sign_in(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Json<SignInBody>) -> Response {
     let platform = match body.client.as_str() {
         "web" => None,
         p @ ("ios" | "macos" | "cli") => Some(p),
         _ => return err(StatusCode::BAD_REQUEST, "client must be web, ios, macos or cli"),
+    };
+    let install_id = match crate::server::check_install_id(body.install_id.as_deref()) {
+        Ok(id) => id,
+        Err(why) => return err(StatusCode::BAD_REQUEST, why),
     };
     if platform.is_none()
         && let Some(why) = crate::session::login_csrf_refusal(&headers)
@@ -830,13 +839,17 @@ async fn sign_in(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Js
     };
     let name: String = body.device_name.as_deref().unwrap_or("").trim().chars().take(MAX_DEVICE_NAME_CHARS).collect();
     let name = if name.is_empty() { DEFAULT_DEVICE_NAME.to_string() } else { name };
-    match hub.db.add_device(&name, platform, true) {
-        Ok((d, token)) => Json(json!({
-            "token": token,
-            "device": {"id": d.id, "name": d.name, "platform": d.platform, "admin": d.admin},
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    let install = install_id.map(|id| crate::db::Install { id, kind: platform });
+    match hub.issue_device(&name, platform, true, install, None).await {
+        Ok(issued) => {
+            let d = issued.device;
+            Json(json!({
+                "token": issued.token,
+                "device": {"id": d.id, "name": d.name, "platform": d.platform, "admin": d.admin},
+            }))
+            .into_response()
+        }
+        Err(e) => crate::server::issue_error(e),
     }
 }
 
@@ -1393,6 +1406,39 @@ mod tests {
         assert!(!body.to_string().contains(&token), "errors never echo the token");
 
         let (status, _, _) = f.sign_in(&mint(&claims(&f.nonce().await, OWNER)), "tv", None).await;
+        assert_eq!(status, S::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn signing_in_again_from_the_same_install_reuses_its_device() {
+        let f = fixture().await;
+        f.claim().await;
+        let sign_in = |install: Option<&'static str>, client: &'static str| {
+            let f = &f;
+            async move {
+                let mut body = json!({"id_token": mint(&claims(&f.nonce().await, OWNER)), "client": client});
+                if let Some(id) = install {
+                    body["install_id"] = json!(id);
+                }
+                parts(f.http.post(f.url("/v1/auth/google")).json(&body).send().await.unwrap()).await
+            }
+        };
+        const INSTALL: &str = "ios-install-0123456789abcdef";
+        let (status, _, first) = sign_in(Some(INSTALL), "ios").await;
+        assert_eq!(status, S::OK, "{first}");
+        let (_, _, second) = sign_in(Some(INSTALL), "ios").await;
+        assert_eq!(second["device"]["id"], first["device"]["id"], "same device");
+        assert_eq!(second["device"]["admin"], true);
+        let old = first["token"].as_str().unwrap();
+        assert_eq!(f.http.get(f.url("/v1/limits")).bearer_auth(old).send().await.unwrap().status(), S::UNAUTHORIZED);
+        let new = second["token"].as_str().unwrap();
+        assert_eq!(f.http.get(f.url("/v1/limits")).bearer_auth(new).send().await.unwrap().status(), S::OK);
+        // Another client kind, or no install id: a new device.
+        let (_, _, mac) = sign_in(Some(INSTALL), "macos").await;
+        assert_ne!(mac["device"]["id"], first["device"]["id"]);
+        let (_, _, plain) = sign_in(None, "ios").await;
+        assert_ne!(plain["device"]["id"], first["device"]["id"]);
+        let (status, _, _) = sign_in(Some("nope"), "ios").await;
         assert_eq!(status, S::BAD_REQUEST);
     }
 

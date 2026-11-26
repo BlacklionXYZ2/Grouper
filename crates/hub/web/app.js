@@ -19,6 +19,10 @@
 //   #/usage                usage and limits; `?provider=<id>` filters the breakdown
 //   #/usage?conversation=<id>  one chat's usage (also takes `&provider=<id>`)
 //   #/devices #/devices/<id> #/memory #/skills #/settings #/more
+//   #/link?code=<c>        approve or deny a device's sign-in (`grouper login`); signed out,
+//                          it goes through sign-in and comes back here
+//   #/token-signin         recovery sign-in with a hub token (linked from nowhere; README)
+//   #/claim?code=<c>       claim an unclaimed hub (signed out)
 //
 // The shell (sidebar, tab bar) is built once per sign-in and updated in place, so
 // focus and scroll survive the live updates. Everything it subscribes to is torn
@@ -41,6 +45,7 @@ import { renderSkills } from './views/skills.js';
 import { renderSettings } from './views/settings.js';
 import { renderMore } from './views/more.js';
 import { renderInbox } from './views/inbox.js';
+import { renderLink, rememberPendingLink, takePendingLink } from './views/link.js';
 import { startNotifications, stopNotifications, forgetNotifications } from './lib/push.js';
 import { mountPalette, openPalette } from './views/palette.js';
 
@@ -101,21 +106,32 @@ function showLogin() {
   root.className = '';
   root.removeAttribute('aria-busy');
   const r = parseRoute();
+  // A device's sign-in request opened while signed out: come back to it after signing in
+  // (Google sign-in returns to #/, so the page remembers it for this tab).
+  if (r.view === 'link') rememberPendingLink(r.code);
+  const opts =
+    r.view === 'claim'
+      ? { claim: true, code: r.code, error: r.error }
+      : r.view === 'token-signin'
+        ? { tokenOnly: true }
+        : r.view === 'link'
+          ? { link: true }
+          : undefined;
   setChildren(
     root,
-    renderLogin(
-      (me) => {
-        store.me = me;
-        startApp();
-      },
-      r.view === 'claim' ? { claim: true, code: r.code, error: r.error } : undefined,
-    ),
+    renderLogin((me) => {
+      store.me = me;
+      startApp();
+    }, opts),
   );
 }
 
 function startApp() {
   root.className = '';
   root.removeAttribute('aria-busy');
+  const pending = takePendingLink();
+  if (pending && location.hash !== pending) history.replaceState(null, '', pending);
+  else if (parseRoute().view === 'token-signin') history.replaceState(null, '', '#/');
   buildShell();
   if (!started) {
     // Once per page: these outlive sign-outs and check `store.me` themselves.
@@ -517,6 +533,8 @@ export function parseRoute() {
   if (view === 'claim') {
     return { view: 'claim', code: query.get('code') || '', error: query.get('error') || '' };
   }
+  if (view === 'link') return { view: 'link', id: query.get('code') || '', code: query.get('code') || '' };
+  if (view === 'token-signin') return { view: 'token-signin' };
   return { view, id: a };
 }
 
@@ -583,6 +601,10 @@ function route() {
 
   if (r.view === 'claim') {
     if (r.error) toast(r.error, 'error');
+    location.replace('#/');
+    return;
+  }
+  if (r.view === 'token-signin') {
     location.replace('#/');
     return;
   }
@@ -673,6 +695,7 @@ function route() {
       settings: renderSettings,
       more: renderMore,
       inbox: renderInbox,
+      link: renderLink,
     };
     const render = renderers[r.view] || renderChat;
     document.title = 'Grouper';
