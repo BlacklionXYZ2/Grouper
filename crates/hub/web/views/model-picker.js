@@ -241,12 +241,16 @@ export function openModelPicker({ role, current = '', opener = null }) {
     function modelOption(m, idx, keyPrefix, provider, { roleNote = null } = {}) {
       const famKey = familyKey(m);
       const isLocal = isLocalModel(m, provider);
-      const badge = modelBadge(m, provider, { right: true });
+      // One right-aligned badge per row: the role default when there is one,
+      // otherwise Local/Free. When the role note takes the slot, Local/Free
+      // moves to line two as plain text.
+      const kindBadge = modelBadge(m, provider, { right: true });
+      const badge = roleNote ? h('span', { class: ['badge', 'mp-badge'] }, roleNote) : kindBadge;
       const pText = priceText(m, isLocal);
       const subItems = [
         h('span', { class: 'mp-opt-provider' }, m.provider_id || 'Unknown provider'),
         pText ? h('span', { class: 'mp-price' }, pText) : null,
-        roleNote ? h('span', null, roleNote) : null,
+        roleNote && kindBadge && pText !== 'Free' ? h('span', null, kindBadge.textContent) : null,
       ];
       return optionEl(
         m.id,
