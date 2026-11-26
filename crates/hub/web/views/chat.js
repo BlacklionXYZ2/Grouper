@@ -235,7 +235,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       : null;
     const newChatItem = h(
       'a',
-      { class: 'menu-item', role: 'menuitem', href: '#/chat/new', onclick: () => setOpen(false) },
+      { class: 'menu-item chat-menu-new', role: 'menuitem', href: '#/chat/new', onclick: () => setOpen(false) },
       icon('plus'),
       'New chat',
     );
@@ -399,7 +399,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       titleNode = h(
         'span',
         { class: 'chat-title-static' },
-        h('span', { class: 'brand-mark chat-bar-mark only-mobile', 'aria-hidden': 'true' }),
         h('span', { class: 'only-desktop' }, 'New chat'),
         h('span', { class: 'only-mobile' }, 'Grouper'),
       );
@@ -417,7 +416,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
             chatMenu?.toggleFrom(titleBtnEl, true);
           },
         },
-        h('span', { class: 'brand-mark chat-bar-mark only-mobile', 'aria-hidden': 'true' }),
         titleTextEl,
         icon('down'),
       );
@@ -429,8 +427,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         title: titleNode,
         actions: [
           threadsBtn,
-          // The sidebar has New chat on wide screens; the bar has it on phones.
-          h('a', { class: 'icon-btn only-mobile', href: '#/chat/new', 'aria-label': 'New chat', title: 'New chat' }, icon('plus')),
           chatMenu?.wrap || null,
         ],
       }),
@@ -456,11 +452,9 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       return;
     }
     const threads = threadsIn(cid);
-    const running = threads.filter((t) => t.status === 'running').length;
     const waiting = threads.filter((t) => t.status === 'waiting_device');
     const offline = [...new Set(threads.filter((t) => isActive(t.status) && !deviceOnline(t.device_id)).map((t) => deviceName(t.device_id)))];
     const parts = [];
-    if (running) parts.push(`${running} running`);
     if (waiting.length) parts.push(`${waiting.length} waiting`);
     for (const d of offline) parts.push(`${d} offline`);
     strip.hidden = !parts.length;
@@ -694,8 +688,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     else {
       const parts = [];
       if (approvalCount) parts.push(`${approvalCount} ${approvalCount === 1 ? 'needs' : 'need'} approval`);
-      if (running) parts.push(`${running} running`);
-      if (waiting) parts.push(`${waiting} waiting`);
+        if (waiting) parts.push(`${waiting} waiting`);
       if (done) parts.push(`${done} done`);
       if (failed) parts.push(`${failed} failed`);
       if (stopped) parts.push(`${stopped} stopped`);
@@ -724,6 +717,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     if (plan) {
       setText(entry.planEl, `${plan.done}/${plan.total}`);
       setAttr(entry.planEl, 'title', `${plan.done} of ${plan.total} plan steps done`);
+      entry.planEl.classList.toggle('is-done', plan.total > 0 && plan.done >= plan.total);
     }
     setText(entry.deviceSr, plan ? `, ${plan.done} of ${plan.total} steps, on ${device}` : `, on ${device}`);
     setText(entry.modelSr, `${familyLabel(fam)}: `);
