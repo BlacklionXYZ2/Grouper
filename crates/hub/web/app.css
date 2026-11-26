@@ -1775,11 +1775,6 @@ button.strip:hover {
   color: var(--accent);
 }
 
-.approval-banner {
-  margin: 10px auto 0;
-  width: min(760px, calc(100% - 40px));
-}
-
 .transcript {
   flex: 1;
   width: 100%;
@@ -2947,12 +2942,6 @@ dialog.sheet-dialog::backdrop {
   color: var(--warn);
 }
 
-.approval-foot {
-  width: 100%;
-  display: grid;
-  gap: 8px;
-}
-
 fieldset.plain {
   border: none;
   margin: 10px 0;
@@ -3031,18 +3020,6 @@ details > summary.list-row:hover {
 .threads-panel-body,
 .sheet-body {
   scrollbar-width: thin;
-}
-
-/* The approval banner stays in view under the bar while the transcript scrolls. */
-.approval-banner {
-  position: sticky;
-  top: calc(var(--bar-h) + 18px);
-  z-index: 18;
-}
-
-.approval-banner .banner {
-  background: color-mix(in srgb, var(--warn) 16%, var(--surface));
-  box-shadow: var(--shadow);
 }
 
 .hint code {
@@ -3220,7 +3197,7 @@ code.nowrap {
   margin-bottom: 28px;
 }
 
-/* ---- approval sheet */
+/* ---- approval dock: the reason, actions and links (more below) */
 
 .reason.risk {
   background: var(--danger-soft);
@@ -3261,6 +3238,186 @@ code.nowrap {
   opacity: 0.5;
   cursor: not-allowed;
   text-decoration: none;
+}
+
+/* ---- approval dock (views/approvals.js)
+   It takes the composer's place while requests wait (a thread view's step-in
+   field too). It's content, not navigation: opaque, never glass. The body
+   scrolls inside a capped height so the reason and the actions stay in view. */
+
+.dock-wrap {
+  display: grid;
+  gap: 8px;
+}
+
+.dock-notice {
+  margin: 0;
+}
+
+.approval-dock {
+  display: flex;
+  flex-direction: column;
+  max-height: min(70vh, 640px);
+  background: var(--surface);
+  border: 1.5px solid color-mix(in srgb, var(--warn) 45%, var(--border-strong));
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.dock-head {
+  padding: 14px 16px 2px;
+}
+
+.dock-title {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.3;
+}
+
+.dock-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px 16px 12px;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  scrollbar-width: thin;
+}
+
+.dock-body p {
+  margin: 0;
+}
+
+.dock-tool {
+  font-size: 14.5px;
+  color: var(--text-2);
+}
+
+.dock-tool-name {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.dock-thread {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  color: var(--text-2);
+}
+
+.dock-thread-title {
+  color: var(--text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.dock-model .mono {
+  font-size: 12.5px;
+}
+
+.dock-input > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+  list-style: none;
+}
+
+.dock-input > summary::-webkit-details-marker {
+  display: none;
+}
+
+.dock-input > summary .chev {
+  width: 16px;
+  height: 16px;
+  transition: rotate 0.15s var(--ease);
+}
+
+.dock-input[open] > summary .chev {
+  rotate: 90deg;
+}
+
+.dock-code {
+  max-height: 240px;
+  margin-top: 4px;
+}
+
+.dock-foot {
+  border-top: 1px solid var(--border);
+  padding: 10px 16px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.dock-queue {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dock-pos {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.dock-status,
+.dock-gate,
+.dock-notify {
+  margin: 0;
+}
+
+.dock-status {
+  font-size: 13.5px;
+  color: var(--text-2);
+}
+
+.dock-settled {
+  margin: 0;
+}
+
+.dock-others {
+  justify-self: start;
+}
+
+/* In a thread view the dock is the sheet's foot. */
+.thread-dock .approval-dock {
+  max-height: min(62vh, 560px);
+  box-shadow: none;
+}
+
+@media (max-width: 760px) {
+  .approval-dock {
+    max-height: min(62vh, 560px);
+    border-radius: var(--radius);
+  }
+
+  /* The arrows and "1 of N" say enough; the buttons keep their full names. */
+  .dock-nav-word {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dock-input > summary .chev {
+    transition: none;
+  }
 }
 
 /* ---- sign in: a solid card (the glass is for navigation only) */
@@ -3633,8 +3790,7 @@ code.nowrap {
     border: 1.5px solid var(--border-strong);
   }
 
-  .banner.warn,
-  .approval-banner .banner {
+  .banner.warn {
     border: 2px solid var(--warn);
   }
 
@@ -4049,15 +4205,14 @@ code.nowrap {
     border-color: HighlightText;
   }
 
-  /* Banners, approval banner, approval sheet reason, callouts. */
+  /* Banners, the approval dock's reason, callouts. */
   .banner {
     background: Canvas;
     color: CanvasText;
     border: 1px solid CanvasText;
   }
 
-  .banner.warn,
-  .approval-banner .banner {
+  .banner.warn {
     background: Canvas;
     color: CanvasText;
     border: 2px solid Highlight;

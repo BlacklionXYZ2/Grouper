@@ -11,10 +11,10 @@
 import { h, icon, setChildren, setText, setAttr, syncList } from '../lib/dom.js';
 import { enc } from '../lib/api.js';
 import { store, on, deviceName, threadsIn, approvalsIn } from '../lib/store.js';
-import { isNarrow, statusPill, skeletonBlocks, onTick } from '../lib/ui.js';
+import { isNarrow, statusPill, skeletonBlocks, onTick, navigate } from '../lib/ui.js';
 import { ago, isActive, elapsed, isoDuration, threadElapsed } from '../lib/format.js';
 import { familyOfId, familyMark, familyLabel, setFamilyClass } from '../lib/family.js';
-import { openApproval } from './approvals.js';
+import { approvalHref } from './approvals.js';
 
 const NARROW = '(max-width: 760px)';
 
@@ -203,7 +203,8 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
 
   function updateApproval(li, a) {
     const btn = li.querySelector('button');
-    btn.onclick = () => openApproval(a.approval_id, { conversationId: cid });
+    // Review closes the panel and opens the chat's approval dock on this request.
+    btn.onclick = () => navigate(approvalHref(a));
     setAttr(btn, 'id', `approval-row-${a.approval_id}`);
     setText(btn.querySelector('.row-title'), `${a.tool} on ${deviceName(a.device_id)}`);
     setText(btn.querySelector('.row-sub'), a.reason || '');

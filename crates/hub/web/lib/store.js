@@ -86,19 +86,28 @@ export function threadsIn(conversationId) {
   return [...store.threads.values()].filter((t) => t.conversation_id === conversationId);
 }
 
+/**
+ * Approval order everywhere (dock, inbox, every client): oldest request first,
+ * equal times by approval id, so the queue reads the same on every device.
+ */
+export function byRequestOrder(a, b) {
+  return (a.ts || 0) - (b.ts || 0) || (a.approval_id < b.approval_id ? -1 : a.approval_id > b.approval_id ? 1 : 0);
+}
+
+/** Pending approvals of one thread, oldest first. */
 export function approvalsFor(threadId) {
-  return [...store.approvals.values()].filter((a) => a.thread_id === threadId);
+  return [...store.approvals.values()].filter((a) => a.thread_id === threadId).sort(byRequestOrder);
 }
 
 /** Pending approvals in one conversation, oldest first. */
 export function approvalsIn(conversationId) {
   if (!conversationId) return [];
-  return [...store.approvals.values()].filter((a) => a.conversation_id === conversationId).sort((a, b) => a.ts - b.ts);
+  return [...store.approvals.values()].filter((a) => a.conversation_id === conversationId).sort(byRequestOrder);
 }
 
 /** Pending approvals across all conversations, oldest first. */
 export function pendingApprovals() {
-  return [...store.approvals.values()].sort((a, b) => a.ts - b.ts);
+  return [...store.approvals.values()].sort(byRequestOrder);
 }
 
 /**

@@ -2,6 +2,10 @@
 // Threads for this chat open in a panel on the chat (a sheet on a phone). The URL
 // `#/chat/<id>/threads` keeps that panel open across reloads; Back closes it.
 //
+// While the chat has pending approvals the approval dock (views/approvals.js)
+// takes the composer's place; the draft, its selection and the model/mode
+// controls are kept and come back once the last request is resolved.
+//
 // Stored events render in seq order. AssistantDelta fills a memory-only draft
 // until the stored AssistantMessage replaces it. ThreadStarted inserts a card that
 // later thread events update in place; ThreadActivity stays off the transcript.
@@ -14,7 +18,7 @@ import { loadConversation, loadConversations } from '../lib/live.js';
 import { bar, navigate, statusPill, skeleton, toast, announce, sentenceSpeaker, autoGrow, toastError } from '../lib/ui.js';
 import { isActive, num, plural, usd } from '../lib/format.js';
 import { familyOfId, familyMark, familyLabel } from '../lib/family.js';
-import { openApproval } from './approvals.js';
+import { mountApprovalDock } from './approvals.js';
 import { mountThreadsPanel } from './threads-panel.js';
 import { openModelPicker } from './model-picker.js';
 
@@ -56,7 +60,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     icon('threads'),
     stripText,
   );
-  const approvalSlot = h('div', { class: 'approval-banner', hidden: true });
   // Not a live region: the draft changes many times a second. Screen readers hear
   // the reply through the throttled #live-region instead (sentences, then "Reply
   // finished").
@@ -74,8 +77,34 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   const composer = buildComposer();
   // "New messages" floats just above the composer, whatever the composer's height.
   composer.wrap.prepend(newMessages);
+  // The approval dock sits where the composer is and replaces it while requests wait.
+  let composerSel = null; // the draft's selection when the dock took over
+  const dock = isNew
+    ? null
+    : mountApprovalDock({
+        conversationId: cid,
+        onActiveChange: (docked, { hadFocus }) => {
+          if (docked) {
+            const typing = composer.form.contains(document.activeElement);
+            composerSel = [composer.textarea.selectionStart, composer.textarea.selectionEnd];
+            composer.wrap.classList.add('docked');
+            composer.form.hidden = composer.note.hidden = true;
+            // Focus in the composer would be lost: hand it to the dock's heading (never Approve).
+            if (typing) dock.focusHeading();
+          } else {
+            composer.wrap.classList.remove('docked');
+            composer.form.hidden = composer.note.hidden = false;
+            if (hadFocus && !composer.textarea.disabled) {
+              composer.textarea.focus({ preventScroll: true });
+              if (composerSel) composer.textarea.setSelectionRange(...composerSel);
+            }
+            composerSel = null;
+          }
+        },
+      });
+  if (dock) composer.wrap.insertBefore(dock.el, composer.form);
   // The column scrolls. The threads dock sits beside it, so the view itself does not.
-  const column = h('div', { class: 'chat-column' }, barSlot, strip, stripStatus, approvalSlot, transcript, composer.wrap);
+  const column = h('div', { class: 'chat-column' }, barSlot, strip, stripStatus, transcript, composer.wrap);
   const view = h('section', { class: 'view chat-view' }, column);
   container.append(view);
 
@@ -96,7 +125,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     transcript.insertBefore(node, tail);
   }
 
-  // ---- bar, chat menu, strip, approval banner
+  // ---- bar, chat menu, strip
 
   // On a phone the word hides and the count stays; the button keeps its full name.
   const threadsCount = h('span', { class: 'threads-count' }, '0');
@@ -324,34 +353,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     setText(threadsCount, String(threads.length));
     setText(threadsNeed, need === 0 ? '' : need === 1 ? ', 1 needs you' : `, ${need} need you`);
     threadsDot.hidden = need === 0;
-  }
-
-  function renderApprovalBanner() {
-    if (isNew) {
-      approvalSlot.hidden = true;
-      return;
-    }
-    const here = approvalsIn(cid);
-    if (!here.length) {
-      approvalSlot.hidden = true;
-      return;
-    }
-    const first = here[0];
-    const text =
-      here.length === 1
-        ? `${first.tool} on ${deviceName(first.device_id)} is waiting for your approval.`
-        : `${here.length} tool calls in this chat are waiting for your approval.`;
-    approvalSlot.hidden = false;
-    setChildren(
-      approvalSlot,
-      h(
-        'div',
-        { class: 'banner warn', role: 'status' },
-        icon('shield'),
-        h('div', { class: 'grow' }, text),
-        h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => openApproval(first.approval_id, { conversationId: cid }) }, 'Review'),
-      ),
-    );
   }
 
   // ---- transcript
@@ -641,6 +642,8 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
 
     return {
       wrap,
+      form,
+      note,
       textarea,
       error,
       mode: () => mode,
@@ -657,7 +660,8 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
 
   async function send() {
     const text = composer.textarea.value.trim();
-    if (!text || sending || !isAdmin()) return;
+    // Nothing is sent past a pending approval: the dock has to be answered first.
+    if (!text || sending || !isAdmin() || dock?.isActive()) return;
     sending = true;
     composer.error.hidden = true;
     composer.textarea.value = '';
@@ -728,7 +732,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   renderBar();
   renderStrip();
   renderThreadsButton();
-  renderApprovalBanner();
+  dock?.start();
 
   if (isNew) {
     renderWelcome();
@@ -788,7 +792,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       renderStrip();
     }),
     on('approvals', () => {
-      renderApprovalBanner();
       renderThreadsButton();
       for (const tid of chipEls.keys()) scheduleChip(tid);
     }),
@@ -833,6 +836,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   }
 
   return () => {
+    dock?.destroy();
     panel?.destroy();
     for (const off of subs) off();
     for (const fn of menuCleanup) fn();

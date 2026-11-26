@@ -3,14 +3,16 @@
 // model's text is the assistant's, tool calls are compact rows in between, and
 // step-ins, questions to the orchestrator and its answers are messages. The
 // header shows the model the orchestrator chose, fixed (no picker here), with its
-// family colour. Around the transcript: approvals, the waiting/checkpoint card,
-// the result and rating, files and raw events. The composer at the bottom
-// messages the thread; Stop sits beside it.
+// family colour. Around the transcript: the waiting/checkpoint card, the result
+// and rating, files and raw events. The composer at the bottom messages the
+// thread; Stop sits beside it. While this thread has a pending approval, the
+// approval dock (views/approvals.js) takes the composer's place; the step-in
+// draft and its selection come back afterwards. The chat's other requests don't
+// block this thread: the dock shows a way to the chat's queue instead.
 //
 // The view is built once. Stored events are appended as they arrive (a tool row is
 // filled in place when its result lands); deltas only refill the streaming-draft
-// node, at most every 100 ms. The small sections (approvals, waiting, result,
-// files) are redrawn only when their own inputs change. The elapsed time in the
+// node, at most every 100 ms. The small sections (waiting, result, files) are redrawn only when their own inputs change. The elapsed time in the
 // header ticks through the shared one-second timer while the thread is live.
 
 import { h, icon, setChildren, throttle, setText, setAttr } from '../lib/dom.js';
@@ -20,11 +22,11 @@ import { store, on, liveOf, deviceName, approvalsFor, isAdmin } from '../lib/sto
 import { statusPill, skeleton, confirmAction, toast, autoGrow, errorBanner, announce, sentenceSpeaker, onTick } from '../lib/ui.js';
 import { ago, dateTime, num, pretty, isActive, elapsed, isoDuration, threadElapsed } from '../lib/format.js';
 import { familyOfId, familyMark, familyInfo, setFamilyClass } from '../lib/family.js';
-import { openApproval } from './approvals.js';
+import { mountApprovalDock, CHANGE_DRAFT } from './approvals.js';
 
 const drafts = new Map();
 
-/** Put text in a thread's step-in field (used by the approval sheet's "Change"). */
+/** Put text in a thread's step-in field (used by the approval dock's "Change it"). */
 export function setStepInDraft(threadId, text) {
   drafts.set(threadId, text);
 }
@@ -110,7 +112,6 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
 
   // ---- body: attention cards, the transcript, result, files, raw events
   const statusSlot = h('div', { class: 'sheet-status' }); // loading and errors
-  const approvalsSlot = h('div', { class: 'thread-attention', hidden: true });
   const waitingSlot = h('section', { 'aria-label': 'Waiting for device', class: 'thread-attention', hidden: true });
   // Not a live region: the draft changes many times a second. Screen readers hear
   // it through the throttled #live-region (sentences, then the finish).
@@ -137,7 +138,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     h('summary', null, chev(), rawCount),
     h('div', { class: 'tool-body' }, rawBody),
   );
-  const body = h('div', { class: 'sheet-body thread-body' }, statusSlot, approvalsSlot, waitingSlot, convo, resultSlot, filesSlot, raw);
+  const body = h('div', { class: 'sheet-body thread-body' }, statusSlot, waitingSlot, convo, resultSlot, filesSlot, raw);
 
   // ---- foot: the composer (step in) with Stop, or a note once it's over
   const stepText = h('textarea', {
@@ -153,7 +154,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     oninput: () => updateSendBtn(),
   });
   autoGrow(stepText, 140);
-  // A draft carried over from the approval sheet takes focus once the footer shows,
+  // A draft carried over from the approval dock takes focus once the footer shows,
   // after the first load (it's hidden until then, so focusing earlier does nothing).
   let focusDraft = false;
   if (drafts.has(threadId)) {
@@ -179,7 +180,43 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
   const footNote = h('p', { class: 'hint foot-note' });
   const foot = h('div', { class: 'sheet-foot thread-foot', hidden: true }, stepError, stepForm, footNote);
 
-  container.append(head, body, foot);
+  // The approval dock: replaces the foot while this thread's own request waits.
+  let stepSel = null;
+  const dock = mountApprovalDock({
+    conversationId: conversationId || initial?.conversation_id,
+    threadId,
+    onActiveChange: (docked, { hadFocus }) => {
+      if (docked) {
+        const typing = foot.contains(document.activeElement);
+        stepSel = [stepText.selectionStart, stepText.selectionEnd];
+        renderAll();
+        if (typing) dock.focusHeading();
+      } else {
+        renderAll();
+        if ((hadFocus || focusDraft) && !foot.hidden && !stepForm.hidden && !stepText.disabled) {
+          focusDraft = false;
+          stepText.focus({ preventScroll: true });
+          if (stepSel) stepText.setSelectionRange(...stepSel);
+          else stepText.setSelectionRange(stepText.value.length, stepText.value.length);
+        } else if (hadFocus && !container.contains(document.activeElement)) {
+          // The thread ended meanwhile (no step-in field): keep focus in this view.
+          titleEl.focus({ preventScroll: true });
+        }
+        stepSel = null;
+      }
+    },
+    // "Change it" here: the draft goes straight into this thread's step-in field.
+    onChangeIt: () => {
+      const kept = stepText.value.trim();
+      stepText.value = kept ? `${CHANGE_DRAFT}${kept}` : CHANGE_DRAFT;
+      stepSel = null;
+      focusDraft = true;
+      updateSendBtn();
+    },
+  });
+  dock.el.classList.add('sheet-foot', 'thread-dock');
+
+  container.append(head, body, dock.el, foot);
   container.setAttribute('aria-labelledby', 'thread-title');
 
   function t() {
@@ -261,18 +298,18 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     }
     const ready = loaded && !loadError;
     for (const el of [convo, filesSlot, raw]) el.hidden = !ready;
-    foot.hidden = !ready;
+    // While the dock is up it is this view's foot.
+    foot.hidden = !ready || dock.isActive();
     if (!ready) {
-      approvalsSlot.hidden = waitingSlot.hidden = resultSlot.hidden = true;
+      waitingSlot.hidden = resultSlot.hidden = true;
       return;
     }
-    renderApprovals();
     renderWaiting(th);
     renderResult(th);
     renderFiles();
     renderRawCount();
     renderFoot(th);
-    if (focusDraft) {
+    if (focusDraft && !foot.hidden) {
       focusDraft = false;
       if (!stepForm.hidden && !stepText.disabled) {
         stepText.focus();
@@ -358,24 +395,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     setText(tokensEl, tokensIn || tokensOut ? `${num(tokensIn)} in · ${num(tokensOut)} out tokens` : '');
   }
 
-  // ---- attention: approvals, waiting and checkpoint
-
-  function renderApprovals() {
-    const list = approvalsFor(threadId);
-    approvalsSlot.hidden = !list.length;
-    setChildren(
-      approvalsSlot,
-      list.map((a) =>
-        h(
-          'div',
-          { class: 'banner warn' },
-          icon('shield'),
-          h('div', { class: 'grow' }, h('strong', null, a.tool), ` on ${deviceName(a.device_id)} is waiting for your approval.`),
-          h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => openApproval(a.approval_id, { conversationId: cid }) }, 'Review'),
-        ),
-      ),
-    );
-  }
+  // ---- attention: waiting and checkpoint
 
   function renderWaiting(th) {
     const waiting = events.filter((e) => e.kind === 'thread_waiting').at(-1);
@@ -766,7 +786,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
 
   async function sendStepIn() {
     const text = stepText.value.trim();
-    if (!text || sendingStep || !canAct()) return;
+    if (!text || sendingStep || !canAct() || dock.isActive()) return;
     sendingStep = true;
     updateSendBtn();
     stepError.hidden = true;
@@ -859,6 +879,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
   );
 
   renderAll();
+  dock.start();
   if (initial && conversationId && initial.conversation_id && initial.conversation_id !== conversationId) {
     queueMicrotask(() => {
       if (!aborter.signal.aborted) redirectIfWrong(initial);
@@ -867,11 +888,13 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     load();
   }
   requestAnimationFrame(() => {
-    // A draft carried over from the approval sheet already took focus.
-    if (document.activeElement !== stepText) titleEl.focus();
+    // A draft carried over from the approval dock already took focus, and a deep
+    // link to a request focused the dock's heading.
+    if (document.activeElement !== stepText && !dock.el.contains(document.activeElement)) titleEl.focus();
   });
 
   return () => {
+    dock.destroy();
     for (const off of subs) off();
     offTick?.();
     offTick = null;
