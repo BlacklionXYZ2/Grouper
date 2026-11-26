@@ -169,7 +169,8 @@ impl Tool for AskOrchestrator {
     }
 }
 
-/// Start a thread. `tools` are the device's tools; `ask_orchestrator` is added here.
+/// Start a thread. `tools` are the device's tools; `ask_orchestrator` and `update_plan`
+/// are added here, so hub and device threads get the same ones.
 /// `workspace` is the thread's folder: the permission gate uses it to keep CLI agents in it.
 pub fn spawn_thread(
     spec: ThreadSpec,
@@ -208,6 +209,7 @@ pub fn spawn_thread(
         state: state.clone(),
         timeout: ask_timeout,
     }));
+    tools.push(Arc::new(crate::plan::UpdatePlan));
     let hooks = ThreadHooks {
         thread_id: spec.thread_id.clone(),
         permissions: spec.permissions.clone(),
@@ -419,6 +421,41 @@ mod tests {
         assert!(outputs[0].contains("the user denied this call"), "{outputs:?}");
         assert!(outputs[0].contains("don't retry it or ask anyone to allow it"), "{outputs:?}");
         assert_eq!(outputs[1], "(empty)");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `update_plan` is in every thread and never asks, even set to Manual.
+    #[tokio::test]
+    async fn update_plan_runs_without_approval() {
+        let dir = std::env::temp_dir().join(format!("grouper-update-plan-{}", std::process::id()));
+        let ws = Workspace::create(dir.clone()).unwrap();
+        let host = Arc::new(Rec { events: Mutex::new(Vec::new()), decision: ApprovalDecision::Denied });
+        let mut spec = spec(Some(10));
+        spec.permissions.insert("update_plan".into(), Permission::Manual);
+        let script = json!({"rules": [
+            {"last": "1 of 2 done", "reply": [{"type": "text", "text": "Planned."}]},
+            {"last": "steps are in_progress", "reply": [{"type": "tool_use", "name": "update_plan", "input": {"items": [
+                {"content": "Read", "status": "completed"},
+                {"content": "Write", "status": "in_progress", "active_form": "Writing"}]}}]},
+            {"reply": [{"type": "tool_use", "name": "update_plan", "input": {"items": [
+                {"content": "Read", "status": "in_progress"}, {"content": "Write", "status": "in_progress"}]}}]}
+        ]});
+        let (_control, handle) = spawn_thread(spec, provider(script), vec![], host.clone(), ws);
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
+        assert_eq!(result.summary, "Planned.");
+        let results: Vec<(bool, String)> = host
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { name, ok, output, .. } if name == "update_plan" => Some((*ok, output.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(!results[0].0 && results[0].1.contains("at most one in_progress"), "{results:?}");
+        assert_eq!(results[1], (true, "Plan updated: 1 of 2 done.".to_string()));
         std::fs::remove_dir_all(dir).ok();
     }
 

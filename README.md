@@ -99,6 +99,10 @@ target/debug/grouper chat "Write two haiku, one on my Mac and one in the cloud"
 
 The Mac thread's shell command waits for approval: run the `grouper approve …` it prints.
 
+`grouper chat "Show me a plan demo"` starts a hub thread that posts a four-step plan with
+`update_plan` and ticks it off about every 1.5 seconds (no device needed). Threads' plans are
+ordinary `update_plan` tool calls in their activity; clients show the latest one as a checklist.
+
 ## End-to-end test
 
 Run the full smoke test against the real `grouper-hub` and `grouper` binaries (no API keys needed):

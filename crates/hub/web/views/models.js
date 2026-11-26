@@ -8,6 +8,8 @@ import { store, isAdmin, deviceName } from '../lib/store.js';
 import { loadModels } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { num, usd, pct, duration, ago, plural } from '../lib/format.js';
+import { familyKey, familyMark } from '../lib/family.js';
+import { isLocalModel, modelBadge, price } from './model-picker.js';
 
 const CONSTRAINTS = ['local', 'remote', 'free', 'paid'];
 const PREFERS = ['cheapest', 'local', 'free'];
@@ -163,21 +165,37 @@ export function renderModels(container, { id: targetId = null } = {}) {
   }
 
   function narrowCard(m) {
+    const famKey = familyKey(m);
+    const provider = providersById.get(m.provider_id) || null;
+    const badge = modelBadge(m, provider, { right: true });
+    const known = m.input_price > 0 || m.output_price > 0;
+    const priceText = !m.free
+      ? (known ? `$${price(m.input_price)} in · $${price(m.output_price)} out / 1M` : 'No price set')
+      : isLocalModel(m, provider) ? 'Free' : null;
     return h(
       'li',
       { class: 'list-row model-row', dataset: { modelId: m.id } },
       h(
         'div',
-        { class: 'grow' },
-        h('div', { class: 'row-title' }, m.id),
-        h('div', { class: 'row-sub mono' }, `${m.provider_id} / ${m.model}`),
+        { class: ['model-row-main', 'has-fam', `fam-${famKey}`] },
+        familyMark(famKey),
         h(
           'div',
-          { class: 'meta' },
-          h('span', null, m.roles.length ? m.roles.join(', ') : 'No roles'),
-          h('span', null, `$${m.input_price.toFixed(2)} in / $${m.output_price.toFixed(2)} out`),
-          m.free ? h('span', { class: 'badge accent' }, 'Free') : null,
-          m.local ? h('span', { class: 'badge' }, 'Local') : null,
+          { class: 'grow' },
+          h('div', { class: 'model-row-head' }, h('div', { class: 'row-title' }, m.id), badge),
+          h(
+            'div',
+            { class: 'row-sub model-row-sub' },
+            h('span', { class: 'mono' }, `${m.provider_id} / ${m.model}`),
+            priceText ? h('span', null, priceText) : null,
+          ),
+          h(
+            'div',
+            { class: 'meta' },
+            h('span', null, m.roles.length ? m.roles.join(', ') : 'No roles'),
+            m.context_window ? h('span', null, `${num(m.context_window)} ctx`) : null,
+            m.use_cases ? h('span', null, m.use_cases) : null,
+          ),
         ),
       ),
       admin ? modelActions(m, true) : null,
@@ -194,14 +212,22 @@ export function renderModels(container, { id: targetId = null } = {}) {
   }
 
   function wideRow(m) {
+    const famKey = familyKey(m);
+    const provider = providersById.get(m.provider_id) || null;
+    const badge = modelBadge(m, provider);
     const note = cacheNote(m);
     return h(
       'tr',
       { class: 'model-row', dataset: { modelId: m.id } },
-      h('td', { class: 'wrap' }, h('strong', null, m.id), m.use_cases ? h('div', { class: 'row-sub' }, m.use_cases) : null),
+      h(
+        'td',
+        { class: 'wrap' },
+        h('div', { class: ['model-id-cell', 'has-fam', `fam-${famKey}`] }, familyMark(famKey), h('strong', null, m.id)),
+        m.use_cases ? h('div', { class: 'row-sub model-use-cases' }, m.use_cases) : null,
+      ),
       h('td', { class: 'mono' }, `${m.provider_id} / ${m.model}`, note ? h('div', { class: 'hint' }, note) : null),
       h('td', null, m.roles.length ? m.roles.join(', ') : '—'),
-      h('td', null, m.free ? h('span', { class: 'badge accent' }, 'Free') : null, ' ', m.local ? h('span', { class: 'badge' }, 'Local') : null),
+      h('td', null, badge || h('span', { class: 'hint' }, '—')),
       h('td', { class: 'num' }, m.context_window ? num(m.context_window) : '—'),
       h('td', { class: 'num' }, m.input_price.toFixed(2)),
       h('td', { class: 'num' }, m.output_price.toFixed(2)),
@@ -240,7 +266,7 @@ export function renderModels(container, { id: targetId = null } = {}) {
           { class: 'provider-meta' },
           provider?.kind ? h('span', { class: 'badge' }, provider.kind) : null,
           place ? h('span', { class: 'badge muted' }, place) : null,
-          keyLabel ? h('span', { class: ['badge', provider.has_key ? 'accent' : 'muted'] }, keyLabel) : null,
+          keyLabel ? h('span', { class: ['badge', provider.has_key ? 'ok' : 'muted'] }, keyLabel) : null,
           h('span', { class: 'badge muted' }, plural(group.models.length, 'model')),
         ),
       ),

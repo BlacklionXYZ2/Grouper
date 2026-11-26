@@ -34,6 +34,9 @@ targets:
       base:
         INFOPLIST_FILE: iOS/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.ios
+        # Shared/Assets.xcassets (a resource via the Shared source folder). iOS uses the
+        # single 1024 opaque square; the system masks the corners.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SUPPORTS_MACCATALYST: NO
         TARGETED_DEVICE_FAMILY: "1"
   GrouperWidgets:
@@ -71,6 +74,9 @@ targets:
       base:
         INFOPLIST_FILE: macOS/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.macos
+        # Shared/Assets.xcassets: docs/brand/app-icon-1024.png as is (rounded tile,
+        # transparent corners) at every mac size.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         MACOSX_DEPLOYMENT_TARGET: "26.0"
 
 # Shared schemes, so `xcodebuild -scheme ...` (and CI) can resolve the local Swift package.

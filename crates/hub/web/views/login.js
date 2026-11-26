@@ -44,7 +44,26 @@ export function renderLogin(onSignedIn, opts = {}) {
     h('span', { class: 'brand-mark', 'aria-hidden': 'true' }),
     h('div', null, h('h1', null, fromClaim ? 'Claim this hub' : 'Sign in to Grouper'), h('p', null, 'Checking sign-in options…')),
   );
-  const wrap = h('div', { class: 'login' }, card);
+  // Brand panel (desktop left column, compact header on phones). The mark is
+  // .brand-mark, i.e. /app/logo.svg: replacing that file re-brands this too.
+  const values = [
+    ['thread-tree', 'Coordinate multiple models'],
+    ['devices', 'Across all your devices'],
+    ['bolt', 'Get more done, together'],
+  ];
+  const brandPanel = h(
+    'section',
+    { class: 'login-brand', 'aria-label': 'About Grouper' },
+    h(
+      'div',
+      { class: 'login-brand-head' },
+      h('span', { class: 'brand-mark', 'aria-hidden': 'true' }),
+      h('p', { class: 'login-wordmark' }, 'Grouper'),
+      h('p', { class: 'login-tagline' }, 'Together stronger.'),
+    ),
+    h('ul', { class: 'login-values' }, ...values.map(([ic, text]) => h('li', null, h('span', { class: 'value-ico' }, icon(ic)), h('span', null, text)))),
+  );
+  const wrap = h('div', { class: 'login login-split' }, brandPanel, h('div', { class: 'login-main' }, card));
 
   function buildBody(status) {
     card.removeAttribute('aria-busy');
@@ -255,7 +274,7 @@ export function renderLogin(onSignedIn, opts = {}) {
       : googleBtn;
 
     const alreadyClaimedNote =
-      fromClaim && initialCode
+      claimed && fromClaim && initialCode
         ? h('div', { class: 'banner info' }, h('div', { class: 'grow' }, 'This hub already has an owner. Sign in with that Google account.'))
         : null;
 
