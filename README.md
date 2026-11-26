@@ -93,7 +93,8 @@ register itself when you sign in, so you never paste a device token for it.
   that brings its setup code (logged at start, or `grouper-hub setup-code`); after that only the
   owner's Google account gets in. Apps send a random per-install `install_id`, so signing in
   again from the same install reuses its device (same id, fresh token, old token revoked).
-- **CLI (computers that run threads):** `grouper login --hub <url> [--name <name>]` prints a code
+- **CLI (computers that run threads):** `grouper login [--name <name>]` (the hub is
+  `https://grouper.clockmillbarn.uk` unless you pass `--hub <url>` or set `GROUPER_HUB`) prints a code
   and a link (and tries to open it). Open it where you're signed in to Grouper, check the code
   and the device name, and approve; the CLI gets its own non-admin device token and saves it with
   the hub URL and its install id (see the CLI table). `grouper connect` and the other commands then
