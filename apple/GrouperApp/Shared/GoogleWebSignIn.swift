@@ -106,8 +106,7 @@ private final class GoogleWebAuthSession: NSObject {
     }
 }
 
-// @preconcurrency: the SDK may declare this requirement nonisolated; AuthenticationServices
-// always asks for the anchor on the main thread.
-extension GoogleWebAuthSession: @preconcurrency ASWebAuthenticationPresentationContextProviding {
+// The SDK (Xcode 27) already declares this requirement main-actor isolated.
+extension GoogleWebAuthSession: ASWebAuthenticationPresentationContextProviding {
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor { anchor }
 }
