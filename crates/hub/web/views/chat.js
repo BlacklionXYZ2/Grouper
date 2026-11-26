@@ -1,10 +1,12 @@
 // Chat: one conversation's transcript, live streaming, thread cards and the composer.
+// Threads for this chat open in a panel on the chat (a sheet on a phone). The URL
+// `#/chat/<id>/threads` keeps that panel open across reloads; Back closes it.
 //
 // Stored events render in seq order. AssistantDelta fills a memory-only draft
 // until the stored AssistantMessage replaces it. ThreadStarted inserts a card that
 // later thread events update in place; ThreadActivity stays off the transcript.
 
-import { h, icon, setChildren, throttle } from '../lib/dom.js';
+import { h, icon, setChildren, setText, throttle } from '../lib/dom.js';
 import { get, post, qs, enc, describe, isAbort } from '../lib/api.js';
 import { renderMarkdown } from '../lib/md.js';
 import { store, on, conv, liveOf, deviceName, deviceOnline, threadsIn, approvalsFor, approvalsIn, isAdmin } from '../lib/store.js';
@@ -12,6 +14,7 @@ import { loadConversation, loadConversations } from '../lib/live.js';
 import { bar, navigate, statusPill, skeleton, toast, announce, sentenceSpeaker, autoGrow, toastError } from '../lib/ui.js';
 import { isActive, num, plural, usd } from '../lib/format.js';
 import { openApproval } from './approvals.js';
+import { mountThreadsPanel } from './threads-panel.js';
 
 const MODE_KEY = 'grouper.newMode';
 
@@ -29,8 +32,28 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   const info = () => store.conversations.find((c) => c.id === cid);
 
   // ---- layout
+  // The panel is created once the view exists. The strip and the Threads button
+  // close over it; both are only clicked after this function has assigned it.
+  let panel = null;
   const barSlot = h('div', { class: 'bar-slot' });
-  const strip = h('div', { class: 'strip', role: 'status', hidden: true });
+  const stripText = h('span', { class: 'strip-text' });
+  const stripStatus = h('span', { class: 'visually-hidden', role: 'status' });
+  const strip = h(
+    'button',
+    {
+      class: 'strip',
+      type: 'button',
+      hidden: true,
+      onclick: () => {
+        if (!cid) return;
+        if (panel?.isOpen()) panel.focus();
+        else navigate(`#/chat/${enc(cid)}/threads`);
+      },
+    },
+    h('span', { class: 'visually-hidden' }, 'Open threads, '),
+    icon('threads'),
+    stripText,
+  );
   const approvalSlot = h('div', { class: 'approval-banner', hidden: true });
   // Not a live region: the draft changes many times a second. Screen readers hear
   // the reply through the throttled #live-region instead (sentences, then "Reply
@@ -49,20 +72,22 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   const composer = buildComposer();
   // "New messages" floats just above the composer, whatever the composer's height.
   composer.wrap.prepend(newMessages);
-  const view = h('section', { class: 'view chat-view' }, barSlot, strip, approvalSlot, transcript, composer.wrap);
+  // The column scrolls. The threads dock sits beside it, so the view itself does not.
+  const column = h('div', { class: 'chat-column' }, barSlot, strip, stripStatus, approvalSlot, transcript, composer.wrap);
+  const view = h('section', { class: 'view chat-view' }, column);
   container.append(view);
 
-  view.addEventListener('scroll', () => {
+  column.addEventListener('scroll', () => {
     if (nearBottom()) newMessages.hidden = true;
   });
 
   function nearBottom() {
-    return view.scrollHeight - view.scrollTop - view.clientHeight < 140;
+    return column.scrollHeight - column.scrollTop - column.clientHeight < 140;
   }
 
   function scrollToEnd(smooth = false) {
     newMessages.hidden = true;
-    view.scrollTo({ top: view.scrollHeight, behavior: smooth && !matchMedia('(prefers-reduced-motion: reduce)').matches ? 'smooth' : 'auto' });
+    column.scrollTo({ top: column.scrollHeight, behavior: smooth && !matchMedia('(prefers-reduced-motion: reduce)').matches ? 'smooth' : 'auto' });
   }
 
   function add(node) {
@@ -70,6 +95,28 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   }
 
   // ---- bar, chat menu, strip, approval banner
+
+  const threadsLabel = h('span', { class: 'threads-label' }, 'Threads 0');
+  const threadsNeed = h('span', { class: 'visually-hidden' });
+  const threadsDot = h('span', { class: 'threads-dot', 'aria-hidden': 'true', hidden: true });
+  const threadsBtn = isNew
+    ? null
+    : h(
+        'button',
+        {
+          class: 'btn btn-sm threads-btn',
+          type: 'button',
+          'aria-expanded': 'false',
+          onclick: () => {
+            if (panel?.isOpen()) navigate(`#/chat/${enc(cid)}`);
+            else navigate(`#/chat/${enc(cid)}/threads`);
+          },
+        },
+        icon('threads'),
+        threadsLabel,
+        threadsNeed,
+        threadsDot,
+      );
 
   const menuCleanup = [];
   const chatMenu = isNew ? null : buildChatMenu();
@@ -84,12 +131,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     const summaryBlock = isAdmin()
       ? h('div', { class: 'menu-summary', tabindex: '0' }, h('div', { class: 'field-label' }, 'Estimated chat usage'), usageLine, usageSub)
       : null;
-    const threadsItem = h(
-      'a',
-      { class: 'menu-item', role: 'menuitem', href: `#/chat/${enc(cid)}/threads`, onclick: () => setOpen(false) },
-      icon('threads'),
-      'Threads in this chat',
-    );
     const usageItem = isAdmin()
       ? h(
           'a',
@@ -104,7 +145,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       icon('plus'),
       'New chat',
     );
-    const menuList = h('div', { class: 'menu-list', role: 'menu', 'aria-label': 'Chat menu' }, usageItem, threadsItem, newChatItem);
+    const menuList = h('div', { class: 'menu-list', role: 'menu', 'aria-label': 'Chat menu' }, usageItem, newChatItem);
     const panel = h(
       'div',
       { class: 'menu-pop', hidden: true },
@@ -129,10 +170,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       icon('more'),
     );
     const wrap = h('div', { class: 'menu-wrap' }, trigger, panel);
-
-    function syncItems() {
-      threadsItem.hidden = info()?.mode === 'standard';
-    }
 
     async function refreshMenuUsage() {
       if (!isAdmin()) return;
@@ -176,7 +213,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       panel.hidden = !open;
       trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
       if (open) {
-        syncItems();
         refreshMenuUsage();
         // Usage total first, then the actions. The total is not a menuitem.
         menuStops()[0]?.focus();
@@ -213,7 +249,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       document.removeEventListener('click', onDocClick);
       document.removeEventListener('keydown', onKeyDown, true);
     });
-    return { wrap, syncItems };
+    return { wrap };
   }
 
   function renderBar() {
@@ -221,7 +257,6 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     const mode = c?.mode || composer.mode();
     const title = isNew ? 'New chat' : c?.title || 'Conversation';
     const caption = isNew ? null : `${mode === 'standard' ? 'Standard' : 'Project'} · ${c?.model || 'Default model'}`;
-    chatMenu?.syncItems();
     setChildren(
       barSlot,
       bar({
@@ -230,6 +265,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         actions: [
           // The sidebar has New chat on wide screens; the bar has it where the sidebar is a drawer.
           h('a', { class: 'icon-btn only-mobile', href: '#/chat/new', 'aria-label': 'New chat', title: 'New chat' }, icon('plus')),
+          threadsBtn,
           chatMenu?.wrap || null,
         ],
       }),
@@ -240,6 +276,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   function renderStrip() {
     if (isNew || info()?.mode === 'standard') {
       strip.hidden = true;
+      setText(stripStatus, '');
       return;
     }
     const threads = threadsIn(cid);
@@ -251,7 +288,22 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     if (waiting.length) parts.push(`${waiting.length} waiting`);
     for (const d of offline) parts.push(`${d} offline`);
     strip.hidden = !parts.length;
-    setChildren(strip, icon('threads'), parts.join(' · '));
+    const text = parts.join(' · ');
+    setText(stripText, text);
+    setText(stripStatus, strip.hidden ? '' : text);
+  }
+
+  // Visible text is one node ("Threads N") so the accessible name contains it.
+  // The "needs you" count is a visually hidden suffix; the dot is decorative.
+  function renderThreadsButton() {
+    if (!threadsBtn) return;
+    const threads = threadsIn(cid);
+    const approvals = approvalsIn(cid);
+    const claimed = new Set(approvals.map((a) => a.thread_id));
+    const need = approvals.length + threads.filter((t) => t.status === 'waiting_device' && !claimed.has(t.id)).length;
+    setText(threadsLabel, `Threads ${threads.length}`);
+    setText(threadsNeed, need === 0 ? '' : need === 1 ? ', 1 needs you' : `, ${need} need you`);
+    threadsDot.hidden = need === 0;
   }
 
   function renderApprovalBanner() {
@@ -614,8 +666,17 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
 
   // ---- wiring
 
+  if (!isNew) {
+    panel = mountThreadsPanel(view, {
+      cid,
+      trigger: threadsBtn,
+      onRequestClose: () => navigate(`#/chat/${enc(cid)}`),
+    });
+  }
+
   renderBar();
   renderStrip();
+  renderThreadsButton();
   renderApprovalBanner();
 
   if (isNew) {
@@ -669,6 +730,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     on('threads', () => {
       for (const tid of chipEls.keys()) scheduleChip(tid);
       renderStrip();
+      renderThreadsButton();
     }),
     on('devices', () => {
       for (const tid of chipEls.keys()) scheduleChip(tid);
@@ -676,6 +738,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     }),
     on('approvals', () => {
       renderApprovalBanner();
+      renderThreadsButton();
       for (const tid of chipEls.keys()) scheduleChip(tid);
     }),
     on('conversations', () => {
@@ -687,9 +750,16 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     on('models', () => composer.renderModels()),
     on('online', (online) => composer.setOffline(!online)),
     on('route', (r) => {
-      if (r.view === 'chat' && r.conversation === cid) {
-        openThread = r.thread;
-        for (const tid of chipEls.keys()) updateChip(tid);
+      if (r.view !== 'chat' || r.conversation !== cid) return;
+      openThread = r.thread;
+      for (const tid of chipEls.keys()) updateChip(tid);
+      const wasOpen = panel?.isOpen() ?? false;
+      const want = Boolean(r.threadsPanel) && !r.thread;
+      panel?.setOpen(want, { moveFocus: want && !wasOpen, restoreFocus: wasOpen && !r.thread });
+      // dialog.close() can hand focus back to the Threads button after the inspector
+      // has focused its title. Put the title last when a thread takes over the panel.
+      if (wasOpen && r.thread) {
+        requestAnimationFrame(() => document.getElementById('thread-title')?.focus({ preventScroll: true }));
       }
     }),
   );
@@ -705,6 +775,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   }
 
   return () => {
+    panel?.destroy();
     for (const off of subs) off();
     for (const fn of menuCleanup) fn();
     scheduleTail.cancel();

@@ -1,17 +1,49 @@
-// Model registry: models (edit, refresh catalog prices, run probes, delete),
+// Model registry: models grouped by provider (edit, refresh catalog prices, run probes, delete),
 // what threads and probes taught it (stats), proposals waiting for you,
 // priority rules, and importing a model from a provider's catalog.
 
-import { h, icon, setChildren } from '../lib/dom.js';
+import { h, icon, setChildren, keepFocus } from '../lib/dom.js';
 import { get, post, put, del, qs, enc, describe, isAbort } from '../lib/api.js';
-import { store, isAdmin } from '../lib/store.js';
+import { store, isAdmin, deviceName } from '../lib/store.js';
 import { loadModels } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
-import { num, usd, pct, duration, ago } from '../lib/format.js';
+import { num, usd, pct, duration, ago, plural } from '../lib/format.js';
 
 const CONSTRAINTS = ['local', 'remote', 'free', 'paid'];
 const PREFERS = ['cheapest', 'local', 'free'];
 const ROLES = ['orchestrator', 'standard', 'thread'];
+const COLLAPSED_KEY = 'grouper.models.collapsed';
+
+function collapsedProviders() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || '[]');
+    return new Set(Array.isArray(raw) ? raw.filter((id) => typeof id === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function rememberCollapsed(id, isOpen) {
+  try {
+    const set = collapsedProviders();
+    if (isOpen) set.delete(id);
+    else set.add(id);
+    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...set]));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function providerPlace(provider) {
+  if (!provider) return '';
+  if (provider.via_device) return `via ${deviceName(provider.via_device)}`;
+  if (!provider.base_url) return '';
+  try {
+    return new URL(provider.base_url).host;
+  } catch {
+    return '';
+  }
+}
 
 function isOpenRouterProvider(provider) {
   if (!provider?.base_url) return false;
@@ -33,7 +65,7 @@ export function renderModels(container) {
     models: h('section', { class: 'section', 'aria-labelledby': 'm-models' }),
     stats: h('section', { class: 'section', 'aria-labelledby': 'm-stats' }),
     rules: h('section', { class: 'section', 'aria-labelledby': 'm-rules' }),
-    import: h('section', { class: 'section', 'aria-labelledby': 'm-import' }),
+    import: h('section', { class: 'section', id: 'model-import', 'aria-labelledby': 'm-import' }),
   };
   body.append(slots.proposals, slots.models, slots.stats, slots.rules, slots.import);
 
@@ -43,16 +75,218 @@ export function renderModels(container) {
   const { signal } = aborter;
   const unguard = guardWrites(body);
   let providersById = new Map();
+  // Unknown is only for a provider id missing from a list we actually loaded.
+  // A failed or non-admin fetch must not file every model under Unknown.
+  let providersLoaded = false;
 
   async function ensureProviders() {
     if (!admin) return [];
     try {
       const list = (await get('/v1/providers', { signal })) || [];
       providersById = new Map(list.map((p) => [p.id, p]));
+      providersLoaded = true;
       return list;
-    } catch {
+    } catch (err) {
+      if (isAbort(err)) throw err;
       return [...providersById.values()];
     }
+  }
+
+  function groupModels(models) {
+    const buckets = new Map();
+    for (const m of models) {
+      const id = m.provider_id || '';
+      if (!buckets.has(id)) buckets.set(id, []);
+      buckets.get(id).push(m);
+    }
+    for (const list of buckets.values()) list.sort((a, b) => a.id.localeCompare(b.id));
+
+    if (!providersLoaded) {
+      return [...buckets.keys()].sort((a, b) => a.localeCompare(b)).map((id) => ({
+        key: id || '__unknown__',
+        title: id || 'Unknown provider',
+        provider: null,
+        models: buckets.get(id),
+        unknown: !id,
+      }));
+    }
+
+    const groups = [...providersById.keys()]
+      .sort((a, b) => a.localeCompare(b))
+      .filter((id) => buckets.has(id))
+      .map((id) => ({
+        key: id,
+        title: id,
+        provider: providersById.get(id),
+        models: buckets.get(id),
+        unknown: false,
+      }));
+    const unknown = [];
+    for (const [id, list] of buckets) {
+      if (!providersById.has(id)) unknown.push(...list);
+    }
+    unknown.sort((a, b) => a.id.localeCompare(b.id));
+    if (unknown.length) {
+      groups.push({ key: '__unknown__', title: 'Unknown provider', provider: null, models: unknown, unknown: true });
+    }
+    return groups;
+  }
+
+  async function deleteModel(m) {
+    if (!(await confirmAction({ title: `Delete ${m.id}?`, body: 'It leaves the registry. Conversations pinned to it fall back to the default.', confirmLabel: 'Delete', danger: true }))) return;
+    try {
+      await del(`/v1/models/${enc(m.id)}`);
+      toast(`Deleted ${m.id}.`);
+      renderModelList();
+    } catch (err) {
+      toastError(err);
+    }
+  }
+
+  function modelActions(m, withText) {
+    const isCatalog = isOpenRouterProvider(providersById.get(m.provider_id));
+    const btn = (visible, label, ic, title, onclick) =>
+      withText
+        ? h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, 'aria-label': label, onclick }, icon(ic), visible)
+        : h('button', { class: 'icon-btn', type: 'button', 'data-write': true, 'aria-label': label, title, onclick }, icon(ic));
+    return h(
+      'div',
+      { class: withText ? 'bar-actions' : 'table-actions' },
+      btn('Edit', `Edit ${m.id}`, 'edit', 'Edit model', () => openEditModelSheet(m)),
+      isCatalog ? btn('Refresh prices', `Refresh prices for ${m.id}`, 'refresh', 'Refresh prices from catalog', (e) => refreshModelPrices(m, e.currentTarget)) : null,
+      btn('Run probes', `Run probes for ${m.id}`, 'play', 'Run probes', () => openProbeSheet(m)),
+      btn('Delete', `Delete ${m.id}`, 'trash', 'Delete', () => deleteModel(m)),
+    );
+  }
+
+  function narrowCard(m) {
+    return h(
+      'li',
+      { class: 'list-row' },
+      h(
+        'div',
+        { class: 'grow' },
+        h('div', { class: 'row-title' }, m.id),
+        h('div', { class: 'row-sub mono' }, `${m.provider_id} / ${m.model}`),
+        h(
+          'div',
+          { class: 'meta' },
+          h('span', null, m.roles.length ? m.roles.join(', ') : 'No roles'),
+          h('span', null, `$${m.input_price.toFixed(2)} in / $${m.output_price.toFixed(2)} out`),
+          m.free ? h('span', { class: 'badge accent' }, 'Free') : null,
+          m.local ? h('span', { class: 'badge' }, 'Local') : null,
+        ),
+      ),
+      admin ? modelActions(m, true) : null,
+    );
+  }
+
+  function cacheNote(m) {
+    if (m.cache_read_price !== null && m.cache_read_price !== undefined) {
+      const write = m.cache_write_price !== null && m.cache_write_price !== undefined ? ` / ${m.cache_write_price.toFixed(2)}` : '';
+      return `cache ${m.cache_read_price.toFixed(2)}${write}`;
+    }
+    if (m.cache_write_price !== null && m.cache_write_price !== undefined) return `cache write ${m.cache_write_price.toFixed(2)}`;
+    return '';
+  }
+
+  function wideRow(m) {
+    const note = cacheNote(m);
+    return h(
+      'tr',
+      null,
+      h('td', { class: 'wrap' }, h('strong', null, m.id), m.use_cases ? h('div', { class: 'row-sub' }, m.use_cases) : null),
+      h('td', { class: 'mono' }, `${m.provider_id} / ${m.model}`, note ? h('div', { class: 'hint' }, note) : null),
+      h('td', null, m.roles.length ? m.roles.join(', ') : '—'),
+      h('td', null, m.free ? h('span', { class: 'badge accent' }, 'Free') : null, ' ', m.local ? h('span', { class: 'badge' }, 'Local') : null),
+      h('td', { class: 'num' }, m.context_window ? num(m.context_window) : '—'),
+      h('td', { class: 'num' }, m.input_price.toFixed(2)),
+      h('td', { class: 'num' }, m.output_price.toFixed(2)),
+      h('td', null, admin ? modelActions(m, false) : null),
+    );
+  }
+
+  function providerSection(group, narrow, collapsed) {
+    const provider = group.provider;
+    const place = providerPlace(provider);
+    const keyLabel = provider ? (provider.has_key ? 'key set' : 'no key') : '';
+    const add = admin && !group.unknown
+      ? h(
+          'button',
+          {
+            class: 'btn btn-sm provider-add',
+            type: 'button',
+            'data-write': true,
+            'aria-label': `Add model for ${group.title}`,
+            onclick: () => focusImport(group.key),
+          },
+          'Add model',
+        )
+      : null;
+    const summaryId = `provider-summary-${group.key}`;
+    const summary = h(
+      'summary',
+      { id: summaryId },
+      icon('chevron'),
+      h(
+        'span',
+        { class: 'grow' },
+        h('span', { class: 'provider-id' }, group.title),
+        h(
+          'span',
+          { class: 'provider-meta' },
+          provider?.kind ? h('span', { class: 'badge' }, provider.kind) : null,
+          place ? h('span', { class: 'badge muted' }, place) : null,
+          keyLabel ? h('span', { class: ['badge', provider.has_key ? 'accent' : 'muted'] }, keyLabel) : null,
+          h('span', { class: 'badge muted' }, plural(group.models.length, 'model')),
+        ),
+      ),
+    );
+    const body = narrow
+      ? h('ul', { class: 'list' }, group.models.map(narrowCard))
+      : h(
+          'div',
+          { class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': `${group.title} models` },
+          h(
+            'table',
+            { class: 'table' },
+            h(
+              'thead',
+              null,
+              h(
+                'tr',
+                null,
+                ['Id', 'Provider model', 'Roles', 'Flags', 'Context', 'In $/M', 'Out $/M', admin ? 'Actions' : ''].map((t, i) =>
+                  h('th', { class: i >= 4 && i <= 6 ? 'num' : null, scope: 'col' }, t),
+                ),
+              ),
+            ),
+            h('tbody', null, group.models.map(wideRow)),
+          ),
+        );
+    const details = h('details', { class: 'provider-group' }, summary, h('div', { class: 'provider-body' }, body));
+    details.open = !collapsed.has(group.key);
+    // Save on click, not toggle. In Chrome the toggle event is queued after the
+    // click returns, so a reload can win, and connecting an open <details> also
+    // fires toggle and was erasing the stored id. During the click, `open` is
+    // still the old state; the summary's default action flips it afterwards.
+    summary.addEventListener('click', () => rememberCollapsed(group.key, !details.open));
+    return h('div', { class: add ? 'provider-shell has-add' : 'provider-shell' }, add, details);
+  }
+
+  function focusImport(providerId) {
+    const form = slots.import.querySelector('form');
+    const field = form?.elements?.provider;
+    if (field && providerId) {
+      if (field.tagName === 'SELECT') {
+        const has = [...field.options].some((opt) => opt.value === providerId);
+        if (has) field.value = providerId;
+      } else {
+        field.value = providerId;
+      }
+    }
+    (form || slots.import).scrollIntoView({ block: 'nearest' });
+    field?.focus({ preventScroll: true });
   }
 
   // ---- models
@@ -75,200 +309,22 @@ export function renderModels(container) {
       );
       return;
     }
-    // A wide table hides Edit / Refresh prices / Run probes / Delete past the
-    // first columns. On a narrow window those actions are buttons on the card.
-    if (matchMedia('(max-width: 760px)').matches) {
+    const narrow = matchMedia('(max-width: 760px)').matches;
+    const groups = groupModels(models);
+    const collapsed = collapsedProviders();
+    const unavailable =
+      admin && !providersLoaded
+        ? h('p', { class: 'hint' }, 'Provider details are unavailable, so groups are named by the provider id stored on each model.')
+        : null;
+    keepFocus(slots.models, () => {
       setChildren(
         slots.models,
         head('m-models', 'Models'),
-        h(
-          'ul',
-          { class: 'list card' },
-          models.map((m) => {
-            const isCatalog = isOpenRouterProvider(providersById.get(m.provider_id));
-            return h(
-              'li',
-              { class: 'list-row' },
-              h(
-                'div',
-                { class: 'grow' },
-                h('div', { class: 'row-title' }, m.id),
-                h('div', { class: 'row-sub mono' }, `${m.provider_id} / ${m.model}`),
-                h(
-                  'div',
-                  { class: 'meta' },
-                  h('span', null, m.roles.length ? m.roles.join(', ') : 'No roles'),
-                  h('span', null, `$${m.input_price.toFixed(2)} in / $${m.output_price.toFixed(2)} out`),
-                  m.free ? h('span', { class: 'badge accent' }, 'Free') : null,
-                  m.local ? h('span', { class: 'badge' }, 'Local') : null,
-                ),
-              ),
-              admin
-                ? h(
-                    'div',
-                    { class: 'bar-actions' },
-                    h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, 'aria-label': `Edit ${m.id}`, onclick: () => openEditModelSheet(m) }, icon('edit'), 'Edit'),
-                    isCatalog
-                      ? h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, 'aria-label': `Refresh prices for ${m.id}`, onclick: (e) => refreshModelPrices(m, e.currentTarget) }, icon('refresh'), 'Refresh prices')
-                      : null,
-                    h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, 'aria-label': `Run probes for ${m.id}`, onclick: () => openProbeSheet(m) }, icon('play'), 'Run probes'),
-                    h(
-                      'button',
-                      {
-                        class: 'btn btn-sm',
-                        type: 'button',
-                        'data-write': true,
-                        'aria-label': `Delete ${m.id}`,
-                        onclick: async () => {
-                          if (!(await confirmAction({ title: `Delete ${m.id}?`, body: 'It leaves the registry. Conversations pinned to it fall back to the default.', confirmLabel: 'Delete', danger: true }))) return;
-                          try {
-                            await del(`/v1/models/${enc(m.id)}`);
-                            toast(`Deleted ${m.id}.`);
-                            renderModelList();
-                          } catch (err) {
-                            toastError(err);
-                          }
-                        },
-                      },
-                      icon('trash'),
-                      'Delete',
-                    ),
-                  )
-                : null,
-            );
-          }),
-        ),
+        unavailable,
+        ...groups.map((group) => providerSection(group, narrow, collapsed)),
         h('p', { class: 'hint' }, 'Prices are USD per million tokens. Edit a model to change roles, prices (including cache prices), context window, use cases or local flag.'),
       );
-      return;
-    }
-    setChildren(
-      slots.models,
-      head('m-models', 'Models'),
-      h(
-        'div',
-        { class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': 'Models table' },
-        h(
-          'table',
-          { class: 'table' },
-          h(
-            'thead',
-            null,
-            h(
-              'tr',
-              null,
-              ['Id', 'Provider model', 'Roles', 'Flags', 'Context', 'In $/M', 'Out $/M', admin ? 'Actions' : ''].map((t, i) =>
-                h('th', { class: i >= 4 && i <= 6 ? 'num' : null, scope: 'col' }, t),
-              ),
-            ),
-          ),
-          h(
-            'tbody',
-            null,
-            models.map((m) => {
-              const isCatalog = isOpenRouterProvider(providersById.get(m.provider_id));
-              const cacheNote =
-                m.cache_read_price !== null && m.cache_read_price !== undefined
-                  ? `cache ${m.cache_read_price.toFixed(2)}${m.cache_write_price !== null && m.cache_write_price !== undefined ? ` / ${m.cache_write_price.toFixed(2)}` : ''}`
-                  : m.cache_write_price !== null && m.cache_write_price !== undefined
-                    ? `cache write ${m.cache_write_price.toFixed(2)}`
-                    : null;
-              return h(
-                'tr',
-                null,
-                h(
-                  'td',
-                  { class: 'wrap' },
-                  h('strong', null, m.id),
-                  m.use_cases ? h('div', { class: 'row-sub' }, m.use_cases) : null,
-                ),
-                h(
-                  'td',
-                  { class: 'mono' },
-                  `${m.provider_id} / ${m.model}`,
-                  cacheNote ? h('div', { class: 'hint' }, cacheNote) : null,
-                ),
-                h('td', null, m.roles.length ? m.roles.join(', ') : '—'),
-                h('td', null, m.free ? h('span', { class: 'badge accent' }, 'Free') : null, ' ', m.local ? h('span', { class: 'badge' }, 'Local') : null),
-                h('td', { class: 'num' }, m.context_window ? num(m.context_window) : '—'),
-                h('td', { class: 'num' }, m.input_price.toFixed(2)),
-                h('td', { class: 'num' }, m.output_price.toFixed(2)),
-                h(
-                  'td',
-                  null,
-                  admin
-                    ? h(
-                        'div',
-                        { class: 'table-actions' },
-                        h(
-                          'button',
-                          {
-                            class: 'icon-btn',
-                            'data-write': true,
-                            type: 'button',
-                            'aria-label': `Edit ${m.id}`,
-                            title: 'Edit model',
-                            onclick: () => openEditModelSheet(m),
-                          },
-                          icon('edit'),
-                        ),
-                        isCatalog
-                          ? h(
-                              'button',
-                              {
-                                class: 'icon-btn',
-                                'data-write': true,
-                                type: 'button',
-                                'aria-label': `Refresh prices for ${m.id}`,
-                                title: 'Refresh prices from catalog',
-                                onclick: (e) => refreshModelPrices(m, e.currentTarget),
-                              },
-                              icon('refresh'),
-                            )
-                          : null,
-                        h(
-                          'button',
-                          {
-                            class: 'icon-btn',
-                            'data-write': true,
-                            type: 'button',
-                            'aria-label': `Run probes for ${m.id}`,
-                            title: 'Run probes',
-                            onclick: () => openProbeSheet(m),
-                          },
-                          icon('play'),
-                        ),
-                        h(
-                          'button',
-                          {
-                            class: 'icon-btn',
-                            'data-write': true,
-                            type: 'button',
-                            'aria-label': `Delete ${m.id}`,
-                            title: 'Delete',
-                            onclick: async () => {
-                              if (!(await confirmAction({ title: `Delete ${m.id}?`, body: 'It leaves the registry. Conversations pinned to it fall back to the default.', confirmLabel: 'Delete', danger: true }))) return;
-                              try {
-                                await del(`/v1/models/${enc(m.id)}`);
-                                toast(`Deleted ${m.id}.`);
-                                renderModelList();
-                              } catch (err) {
-                                toastError(err);
-                              }
-                            },
-                          },
-                          icon('trash'),
-                        ),
-                      )
-                    : null,
-                ),
-              );
-            }),
-          ),
-        ),
-      ),
-      h('p', { class: 'hint' }, 'Prices are USD per million tokens. Edit a model to change roles, prices (including cache prices), context window, use cases or local flag.'),
-    );
+    });
   }
 
   async function refreshModelPrices(m, btn) {
