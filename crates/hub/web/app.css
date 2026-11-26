@@ -4861,6 +4861,12 @@ code.nowrap {
 .fam-radium { --fam: var(--fam-radium); }
 .fam-scripted { --fam: var(--fam-scripted); }
 .fam-unknown { --fam: var(--fam-unknown); }
+/* Unmatched model ids hash onto these. They follow the contrast tokens of the
+   family they point at; the mark stays the generic icon, not that family's glyph. */
+.fam-vivid-claude { --fam: var(--fam-claude); }
+.fam-vivid-nemotron { --fam: var(--fam-nemotron); }
+.fam-vivid-ernie { --fam: var(--fam-ernie); }
+.fam-vivid-radium { --fam: var(--fam-radium); }
 .fam-default { --fam: var(--text-2); }
 
 /* A small box in the family colour with the family's glyph (the non-colour cue).
