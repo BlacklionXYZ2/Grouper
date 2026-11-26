@@ -10,7 +10,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use core_agent::thread::ThreadControl;
 use core_protocol::{
@@ -41,6 +41,8 @@ pub const HUB_DEVICE: &str = "hub";
 pub(crate) enum CloseReason {
     Replaced,
     Overflow,
+    /// The device's token was revoked (`DELETE /v1/devices/{id}`).
+    Revoked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -511,7 +513,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/hub", get(hub_info))
         .route(core_protocol::CONNECT_PATH, any(connect))
         .route("/v1/events", any(events_ws))
-        .route("/v1/devices", get(list_devices))
+        .route("/v1/devices", get(list_devices).post(register_device))
+        .route("/v1/devices/{id}", delete(revoke_device))
         .route("/v1/devices/{id}/call", post(call_device))
         .route("/v1/devices/{id}/tools/{tool}", put(set_permission))
         .route("/v1/tools", get(list_tools))
@@ -579,6 +582,70 @@ macro_rules! admin {
 async fn list_devices(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     authed!(hub, headers);
     Json(hub.devices().await).into_response()
+}
+
+/// Most devices `POST /v1/devices` lets one hub keep registered (revoked devices don't count).
+pub const MAX_DEVICES: usize = 100;
+const REVOKED_MESSAGE: &str = "this device's token was revoked on the hub";
+
+#[derive(Deserialize)]
+struct NewDevice {
+    name: String,
+    #[serde(default)]
+    platform: Option<String>,
+}
+
+/// `POST /v1/devices` (admin): register a plain device and return its token, which is shown only
+/// here. The Mac app calls it so the owner never pastes a device token. Admin tokens are made only
+/// on the hub's CLI. The body is read after the admin check, so a device token always gets 403.
+async fn register_device(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let caller = admin!(hub, headers).device_id;
+    let Ok(req) = serde_json::from_slice::<NewDevice>(&body) else {
+        return err(StatusCode::BAD_REQUEST, r#"body must be {"name": "...", "platform": "macos"}"#);
+    };
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return err(StatusCode::BAD_REQUEST, "name must be 1 to 64 characters, without control characters");
+    }
+    let platform = req.platform.as_deref().map(str::trim).filter(|p| !p.is_empty()).unwrap_or("unknown");
+    if platform.len() > 32 || !platform.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return err(StatusCode::BAD_REQUEST, "platform must be one short word, such as macos, windows, linux or ios");
+    }
+    if hub.db.devices().iter().filter(|d| !d.revoked).count() >= MAX_DEVICES {
+        return err(StatusCode::CONFLICT, format!("this hub already has {MAX_DEVICES} devices; revoke one first"));
+    }
+    let (device, token) = match hub.db.add_device(name, platform, false) {
+        Ok(created) => created,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    tracing::info!(%caller, device = %device.id, name = %device.name, platform = %device.platform, "device registered");
+    let info = hub.devices().await.into_iter().find(|d| d.id == device.id);
+    hub.broadcast_presence(&device.id).await;
+    Json(json!({ "device": info, "token": token })).into_response()
+}
+
+/// `DELETE /v1/devices/{id}` (admin): revoke a device's token. Its web sessions stop working at
+/// once and its live connection, if any, is closed. The caller can't revoke its own token here.
+async fn revoke_device(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let caller = admin!(hub, headers).device_id;
+    if !hub.db.devices().iter().any(|d| d.id == id && !d.revoked) {
+        return err(StatusCode::NOT_FOUND, "no such device");
+    }
+    if id == caller {
+        return err(
+            StatusCode::CONFLICT,
+            "that is the token making this request; revoke it from another admin client or the hub's CLI",
+        );
+    }
+    if let Err(e) = hub.db.revoke_device(&id) {
+        return err(StatusCode::NOT_FOUND, e);
+    }
+    tracing::info!(%caller, device = %id, "device revoked");
+    if let Some(live) = hub.live.lock().await.get(&id) {
+        live.close.trigger(CloseReason::Revoked);
+    }
+    hub.broadcast_presence(&id).await;
+    Json(json!({ "revoked": id })).into_response()
 }
 
 async fn call_device(
@@ -1146,6 +1213,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                 break Err(match r {
                     CloseReason::Replaced => "replaced by a newer connection".to_string(),
                     CloseReason::Overflow => "connection queue full".to_string(),
+                    CloseReason::Revoked => REVOKED_MESSAGE.to_string(),
                 });
             }
             next = tokio::time::timeout(Duration::from_secs(IDLE_TIMEOUT_SECS), stream.next()) => match next {
@@ -1238,6 +1306,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     let final_error = match close_reason {
         Some(CloseReason::Replaced) => Some(HubMessage::Error { message: "replaced by a newer connection".into() }),
         Some(CloseReason::Overflow) => Some(HubMessage::Error { message: "connection queue full".into() }),
+        Some(CloseReason::Revoked) => Some(HubMessage::Error { message: REVOKED_MESSAGE.into() }),
         None => None,
     };
     let _ = writer_close_tx.send(final_error);

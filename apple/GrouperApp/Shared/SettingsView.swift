@@ -16,33 +16,57 @@ struct SettingsView: View {
             }
             #if os(macOS)
             Section("This Mac") {
-                SecureField("Device token", text: $model.deviceToken)
-                    .textContentType(.password)
-                Button(savingDeviceToken ? "Verifying…" : "Save device token") {
-                    savingDeviceToken = true
-                    Task {
-                        let saved = await model.saveDeviceToken()
-                        savingDeviceToken = false
-                        if saved {
-                            node.stop()
-                            node.start(hubURL: model.hubURL, token: model.deviceToken)
+                if model.registeringDevice {
+                    HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Registering this Mac with the hub…") }
+                } else if let name = model.thisMacName {
+                    Text("This Mac is registered as \(name)")
+                } else if model.deviceToken.isEmpty {
+                    Text("This Mac isn't registered with the hub yet, so it can't run threads.")
+                } else {
+                    Text("This Mac uses a device token you entered.")
+                }
+                if let id = model.deviceId, !model.deviceToken.isEmpty {
+                    LabeledContent("Device id") { Text(id).monospaced().textSelection(.enabled) }
+                }
+                LabeledContent("Node", value: node.statusText)
+                Button(model.registeringDevice ? "Registering…" : "Register again") {
+                    Task { await model.registerThisMacAgain() }
+                }
+                .disabled(model.registeringDevice || model.client == nil)
+                Text("Makes a new device token for this Mac and revokes the old one on the hub.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let message = model.deviceMessage {
+                    Text(message).font(.caption).foregroundStyle(.red)
+                }
+                DisclosureGroup("Use an existing device token", isExpanded: $model.showManualDeviceToken) {
+                    SecureField("Device token", text: $model.manualDeviceToken)
+                        .textContentType(.password)
+                    Button(savingDeviceToken ? "Verifying…" : "Use this token") {
+                        savingDeviceToken = true
+                        Task {
+                            _ = await model.saveManualDeviceToken()
+                            savingDeviceToken = false
                         }
                     }
+                    .disabled(savingDeviceToken || model.client == nil
+                              || model.manualDeviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Text("For a plain device token made on the hub with grouper-hub device add. Never paste an admin token here.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-                .disabled(savingDeviceToken || model.deviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                Button("Forget device token", role: .destructive) {
-                    node.stop()
-                    model.forgetDeviceToken()
-                }
-                if let error = model.errorMessage {
-                    Text(error).font(.caption).foregroundStyle(.red)
-                }
-                Text("Forgetting removes the token from this Mac. The hub continues to accept it until that device is revoked there.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
             #endif
             NotificationSettingsSection()
-            Section { Button("Sign out on this device", role: .destructive) { model.signOut() } }
+            Section {
+                Button("Sign out on this device", role: .destructive) { model.signOut() }
+                #if os(macOS)
+                Button("Sign out and remove this Mac", role: .destructive) {
+                    Task { await model.signOutAndRemoveThisMac() }
+                }
+                .disabled(model.registeringDevice)
+                Text("Signing out keeps this Mac's device token, so it can keep running threads. Removing this Mac also revokes its token on the hub.")
+                    .font(.caption).foregroundStyle(.secondary)
+                #endif
+            }
         }
         #if os(macOS)
         .formStyle(.grouped)

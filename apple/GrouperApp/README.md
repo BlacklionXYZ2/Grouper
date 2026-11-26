@@ -3,7 +3,26 @@
 The iPhone and Mac apps share the Foundation-only `GrouperAPI` package and the
 SwiftUI sources in `Shared/`. The Mac target also links `GrouperKit` for its local
 device node. Tokens are stored in the Keychain as `grouper.admin` and
-`grouper.device`; they are never written to defaults or logs.
+`grouper.device` (with the device's id in `grouper.device.id`); they are never written
+to defaults or logs.
+
+## This Mac as a device
+
+Sign-in asks only for the hub URL and an admin token. The admin token powers the
+window; the local node never gets it. On Connect, and at launch with saved
+credentials, the Mac checks its saved device token. With none (or one the hub rejects
+with 401) it registers itself through `POST /v1/devices` under the Mac's computer
+name with platform `macos`, keeps the new token in the Keychain and starts the node. A
+rejected token's old device is revoked, best effort. The node also reports a 401 while
+running; the app confirms it with the hub and registers again.
+
+Settings > This Mac shows the name and device id it is registered as, **Register
+again** (a new device, then the old one revoked), and **Use an existing device token**
+for a plain token made with `grouper-hub device add`. A hub too old for
+`POST /v1/devices` (404 or 405) gets a plain message and the manual field opens.
+**Sign out on this device** keeps the device token, so the node keeps serving;
+**Sign out and remove this Mac** revokes it on the hub first. The iPhone app runs no
+node and has no device token.
 
 ## Status: GUI decisions of 25 November (unbuilt)
 

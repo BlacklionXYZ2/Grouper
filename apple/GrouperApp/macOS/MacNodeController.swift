@@ -6,16 +6,46 @@ import SystemConfiguration
 final class MacNodeController: ObservableObject {
     @Published private(set) var statusText = "Paused"
     @Published private(set) var running = false
+    /// The hub refused the node's token (401). Cleared when the node starts again.
+    @Published private(set) var tokenRejected = false
+    /// The hub and device token last applied; Pause and Resume keep it.
+    private(set) var target: NodeTarget?
     private var client: GrouperClient?
     private var bridge: MacNodeBridge?
+    /// Bumped on every start and stop, so status from an earlier client can't change this one's.
+    private var generation = 0
 
-    func start(hubURL: String, token: String) {
+    /// This Mac's name as System Settings > General > Sharing shows it, if available.
+    nonisolated static func computerName() -> String? {
+        SCDynamicStoreCopyComputerName(nil, nil) as String?
+    }
+
+    /// Follows the app's node target: restarts the node when the hub or token changes and stops
+    /// it when there is none. Applying the same target again does nothing (a paused node stays paused).
+    func apply(_ newTarget: NodeTarget?) {
+        guard newTarget != target else { return }
+        target = newTarget
+        stop()
+        if let newTarget { start(hubURL: newTarget.hubURL, token: newTarget.token) }
+    }
+
+    /// Menu bar > Resume this Mac.
+    func resume() {
+        guard let target, !running else { return }
+        stop()
+        start(hubURL: target.hubURL, token: target.token)
+    }
+
+    private func start(hubURL: String, token: String) {
         guard !token.isEmpty, client == nil else { return }
+        tokenRejected = false
+        generation += 1
+        let current = self.generation
         do {
             let workspace = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Grouper/workspaces").path
             let createdBridge = MacNodeBridge { [weak self] status in
                 Task { @MainActor [weak self] in
-                    self?.received(status: status)
+                    self?.received(status: status, generation: current)
                 }
             }
             let created = try GrouperClient(
@@ -38,6 +68,7 @@ final class MacNodeController: ObservableObject {
     }
 
     func stop() {
+        generation += 1 // late status from the stopped client is ignored
         client?.stop()
         client = nil
         bridge = nil
@@ -45,7 +76,8 @@ final class MacNodeController: ObservableObject {
         statusText = "Paused"
     }
 
-    private func received(status: ConnectionStatus) {
+    private func received(status: ConnectionStatus, generation: Int) {
+        guard generation == self.generation else { return }
         switch status {
         case .connecting:
             statusText = "Connecting"
@@ -56,6 +88,7 @@ final class MacNodeController: ObservableObject {
         case .unauthorized:
             statusText = "Token rejected"
             running = false
+            tokenRejected = true
         }
     }
 }
