@@ -394,7 +394,8 @@ function newestNeed() {
 /** The footer's words: "All systems online" only when it's true (Q8). */
 function systemStatus() {
   if (!store.online) return { text: store.everOnline ? 'Offline · reconnecting' : 'Connecting…', state: 'offline' };
-  const devices = store.devices || [];
+  // Only devices that run threads count; browsers and phones never connect as nodes.
+  const devices = (store.devices || []).filter((d) => d.platform !== 'web' && d.platform !== 'ios');
   const up = devices.filter((d) => d.online).length;
   if (!devices.length) return { text: 'Hub online', state: 'online' };
   if (up === devices.length) return { text: 'All systems online', state: 'online' };
