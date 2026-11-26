@@ -66,22 +66,28 @@ Status: design, 26 November 2026. Owner decisions so far:
 - `GET /v1/auth/status` (unauthenticated) -> `{claimed: bool, google: bool}` so sign-in
   pages know whether to ask for a setup code and whether Google sign-in is enabled.
 
-### The web client on any domain (needs a decision)
+### The web client on any domain (decided 26 Nov: a hidden return page)
 
-A Google "Web application" client only works from registered JavaScript origins and
-redirect URIs, and every self-hosted hub has its own domain. Options:
+The owner sees ordinary Google sign-in: "Sign in with Google" opens Google's page and comes
+back signed in. Behind the scenes: Google only returns to redirect URIs registered on the
+Grouper web client, and every self-hosted hub has its own address, so all browsers return
+to one registered **return page**, which forwards the result to the hub that started the
+sign-in (named in the OAuth `state`, alongside a value that hub checks).
 
-1. **Sign in from your phone (recommended):** the web sign-in page shows a short code and
-   QR; the signed-in iPhone or Mac app approves it ("Sign in to Grouper on Chrome on
-   Windows?"), and the hub gives that browser a session. No Google step in the browser, no
-   project-run service, works on any domain and on LANs. Like a TV sign-in.
-2. **A static relay page run by the project** (for example on GitHub Pages) registered as the
-   web client's redirect URI: the hub sends the browser to Google with the relay as
-   redirect and its own origin in `state`; the relay posts the ID token back to that origin.
-   Safe because of the nonce check, but it's project-run infrastructure and every hub's
-   sign-in depends on it.
-3. **Per-hub web client:** owners who want Google in the browser create their own web
-   client and set `GROUPER_GOOGLE_WEB_CLIENT_ID`. Advanced, optional, can coexist with 1.
+- Flow: the hub's sign-in page gets a nonce and a signed `state` from its hub, then sends
+  the browser to Google (response type `id_token`, `response_mode=form_post` or fragment,
+  `redirect_uri` = the return page). The return page reads the hub origin from `state` and
+  forwards the ID token to `https://<hub>/v1/auth/google/return` with a form POST. The hub
+  checks `state` (it made it, unused, unexpired), then verifies the ID token and its nonce as
+  above and sets the session.
+- Safe because a token is bound to the nonce of the hub that asked for it; the return page
+  stores nothing.
+- Every hub serves the same static return page at `/oauth/google/return`. The registered
+  one is Oscar's hub (`https://grouper.clockmillbarn.uk/oauth/google/return`) for now; it can
+  move to its own static site (for example Cloudflare Pages) later without changing hubs,
+  because the return URL is configuration (`GROUPER_GOOGLE_RETURN_URL`).
+- A hub owner can still register their own web client (`GROUPER_GOOGLE_WEB_CLIENT_ID`) and
+  skip the shared return page.
 
 ### Finding your hub
 
@@ -100,7 +106,8 @@ In Google Cloud Console, in a project for Grouper:
    - iOS, bundle ID `uk.clockmillbarn.grouper.ios`.
    - iOS type again for the Mac app, bundle ID `uk.clockmillbarn.grouper.macos` (Google's
      iOS client type covers macOS apps).
-   - Only if web option 2 or 3 is chosen: a Web application client.
+   - Web application, authorized redirect URI
+     `https://grouper.clockmillbarn.uk/oauth/google/return`.
 3. Send the client IDs (they are public identifiers, not secrets; they go in the apps and the
    hub config).
 
