@@ -9,6 +9,20 @@ Owner direction: no hub URL and no admin token in any app. You sign in with Goog
 device becomes the hub (a local node); other devices sign in with the same Google account and
 sync with it. The cloud deployment stays in the docs until it can be justified as a business.
 
+## Owner answers (26 November 2026, late)
+
+- **Remote access:** move the Cloudflare tunnel from the VM to the hub PC. "Everything will still
+  go through my domain by default (that should be how the app is configured) but the user could
+  also change the domain in the settings." So the apps ship with `grouper.clockmillbarn.uk` as
+  their default hub address (not shown at sign-in), changeable in Settings.
+- **Picking the hub:** "could you have Fable come up with a way for a user to pick which device is
+  the hub?" (design below, section 4a).
+- **Windows app:** Tauri, as recommended.
+- **Hub device to start:** the Windows PC.
+- **Drive app-data record:** the owner asked what it is; not decided. With a default domain the
+  apps can reach the hub without it, so the first build skips the extra Google scope and uses the
+  domain plus mDNS at home; the Drive record stays an option for users without a domain.
+
 ## 1. The model
 
 - **Account = one Google identity** (`sub`). There is no Grouper-run account database.
