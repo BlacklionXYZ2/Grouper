@@ -467,7 +467,13 @@ function closePalette({ restore = true, discardQuery = false } = {}) {
   nested = false;
   dialog.close();
   setLaunchExpanded(false);
-  if (restore && target?.isConnected && !dialog.contains(target)) target.focus({ preventScroll: true });
+  if (!restore) return;
+  if (target?.isConnected && target !== document.body && !dialog.contains(target)) {
+    target.focus({ preventScroll: true });
+  } else if (dialog.contains(document.activeElement) || document.activeElement === document.body) {
+    // Opened with nothing focused: don't leave focus in the closed dialog.
+    document.querySelector('.palette-launch')?.focus({ preventScroll: true });
+  }
 }
 
 function focusDestination(kind) {
