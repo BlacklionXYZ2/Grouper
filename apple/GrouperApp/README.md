@@ -87,8 +87,8 @@ expiry and background push (APNs) need the paid Apple Developer Program.
 
 ## CI
 
-`.github/workflows/apple.yml` runs on a `macos-26` runner with the newest stable Xcode
-there. It builds the host Mac library with `scripts/build-apple.sh`, runs `swift build`
+`.github/workflows/apple.yml` runs on GitHub's `xcode-27` preview runner (macOS 27) with the
+newest stable Xcode there (27.x). It builds the host Mac library with `scripts/build-apple.sh`, runs `swift build`
 and `swift test` in `apple/GrouperKit` (live hub tests skip), then builds
 `Grouper-macOS` and the iOS Simulator `Grouper-iOS` without code signing, and uploads
 the ad-hoc signed Mac app. xcodebuild logs are kept when that build fails. CI does not build an iOS
