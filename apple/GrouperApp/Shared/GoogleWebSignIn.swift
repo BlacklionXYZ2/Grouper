@@ -45,7 +45,7 @@ enum GoogleSignIn {
         if (error as? GoogleOAuthError) == .google("access_denied") { return nil }
         switch error as? HubClientError {
         case .notFound?:
-            return "This hub doesn't support Google sign-in, or it's turned off. Use a token instead."
+            return "This hub doesn't support Google sign-in, or it's turned off."
         case .unauthorized(let message)?:
             return "The hub didn't accept that Google sign-in: \(message)"
         case .forbidden(let message)?:

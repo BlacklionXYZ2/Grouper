@@ -8,11 +8,24 @@ to defaults or logs.
 
 ## Sign in with Google
 
-`docs/accounts-design.md` has the design. The sign-in screen asks for the hub address,
-then checks `GET /v1/auth/status`. When the hub has Google sign-in on and the app has a
-client ID, it shows **Sign in with Google**, with the admin-token field under **Use a token
-instead**. An unclaimed hub first asks for its setup code (`XXXX-XXXX-XXXX`, from the hub's
-log or `grouper-hub setup-code`). The app gets a nonce from the hub
+`docs/accounts-design.md` has the design. The sign-in screen asks for the hub address
+(on later visits it's pre-filled and collapsed under **Hub**, since hub discovery will
+replace it), then checks `GET /v1/auth/status`. When the hub has Google sign-in on and the
+app has a client ID, **Sign in with Google** is the only way in on screen. Token sign-in is
+a recovery route: the toolbar's ⋯ menu > **Sign in with a recovery token**. A hub without
+Google sign-in (or an app without a client ID) shows the admin-token field as before; an
+unreachable address says so and offers **Try again**. An unclaimed hub first asks for its
+setup code (`XXXX-XXXX-XXXX`, from the hub's log or `grouper-hub setup-code`).
+
+Each install keeps a random 32-character `install_id` in the Keychain
+(`grouper.install.id`), made on first use and kept across sign-outs. It goes with
+`POST /v1/auth/google`, so signing in again from the same install reuses its device on the
+hub. The Mac's node registration (`POST /v1/devices`) sends `<install_id>-node`, so the
+node and the app's own admin device are never confused. Older hubs ignore the field.
+Settings > Account shows the Google account you're signed in as, with this install's
+device name and platform under it; device ids and tokens aren't shown.
+
+The app gets a nonce from the hub
 (`POST /v1/auth/google/nonce`) and opens Google in `ASWebAuthenticationSession`, using an
 authorization code with PKCE (S256) and no client secret. It exchanges the code at Google's
 token endpoint for an ID token, then sends that to `POST /v1/auth/google` with `client`
@@ -58,9 +71,10 @@ name with platform `macos`, keeps the new token in the Keychain and starts the n
 rejected token's old device is revoked, best effort. The node also reports a 401 while
 running; the app confirms it with the hub and registers again.
 
-Settings > This Mac shows the name and device id it is registered as, **Register
-again** (a new device, then the old one revoked), and **Use an existing device token**
-for a plain token made with `grouper-hub device add`. A hub too old for
+Settings > This Mac shows the name it is registered as and **Register again** (on a hub
+with install ids, the same device with a fresh token; on an older hub, a new device, then
+the old one revoked). When registration fails, **Use an existing device token** appears for
+a plain token made with `grouper-hub device add`. A hub too old for
 `POST /v1/devices` (404 or 405) gets a plain message and the manual field opens.
 **Sign out on this device** keeps the device token, so the node keeps serving;
 **Sign out and remove this Mac** revokes it on the hub first. The iPhone app runs no

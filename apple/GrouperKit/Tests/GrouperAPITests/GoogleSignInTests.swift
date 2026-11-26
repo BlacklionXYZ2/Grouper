@@ -204,7 +204,8 @@ final class GoogleSignInTests: XCTestCase {
         let nonce = try await hub.googleNonce()
         XCTAssertEqual(nonce, GoogleNonce(nonce: "abc123", expires: 1_795_000_000))
         let result = try await hub.signInWithGoogle(idToken: "eyJ.id.token", setupCode: " K7PM-3XQR-T9WD ",
-                                                    client: .ios, deviceName: "Grouper on iPhone")
+                                                    client: .ios, deviceName: "Grouper on iPhone",
+                                                    installId: "Ab3_-xYz0123456789abcdefghijKLMN")
         XCTAssertEqual(result.token, "dev1.secret")
         XCTAssertEqual(result.device.id, "dev1")
         XCTAssertTrue(result.device.admin)
@@ -214,7 +215,49 @@ final class GoogleSignInTests: XCTestCase {
         let post = try XCTUnwrap(GoogleStub.requests.first { $0.path == "/v1/auth/google" })
         let body = try XCTUnwrap(JSONSerialization.jsonObject(with: post.body) as? [String: String])
         XCTAssertEqual(body, ["id_token": "eyJ.id.token", "setup_code": "K7PM-3XQR-T9WD", "client": "ios",
-                              "device_name": "Grouper on iPhone"])
+                              "device_name": "Grouper on iPhone", "install_id": "Ab3_-xYz0123456789abcdefghijKLMN"])
+    }
+
+    func testSignInLeavesOutAnInstallIdTheHubWouldRefuse() async throws {
+        let session = GoogleStub.session { _ in
+            (200, #"{"token":"dev1.secret","device":{"id":"dev1","name":"Grouper on Mac","platform":"macos","admin":true}}"#)
+        }
+        let hub = try HubClient(baseURL: "http://hub.test", session: session)
+        for bad in ["short", "has space in it 0123456789", "dots.are.not.allowed.0123456789", String(repeating: "a", count: 65)] {
+            _ = try await hub.signInWithGoogle(idToken: "t", client: .macos, installId: bad)
+        }
+        XCTAssertEqual(GoogleStub.requests.count, 4)
+        for request in GoogleStub.requests {
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request.body) as? [String: String])
+            XCTAssertEqual(body, ["id_token": "t", "client": "macos"])
+        }
+    }
+
+    // MARK: Install ids
+
+    func testInstallIDs() {
+        let first = InstallID.generate()
+        let second = InstallID.generate()
+        XCTAssertEqual(first.count, 32)
+        XCTAssertNotEqual(first, second)
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+        XCTAssertTrue(first.allSatisfy { allowed.contains($0) })
+        XCTAssertTrue(InstallID.isValid(first))
+        // URL-safe as it is: no percent-encoding needed in a query.
+        XCTAssertEqual(first.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed), first)
+
+        XCTAssertTrue(InstallID.isValid(String(repeating: "a", count: 16)))
+        XCTAssertTrue(InstallID.isValid(String(repeating: "_", count: 64)))
+        XCTAssertFalse(InstallID.isValid(String(repeating: "a", count: 15)))
+        XCTAssertFalse(InstallID.isValid(String(repeating: "a", count: 65)))
+        XCTAssertFalse(InstallID.isValid("abcdefghijklmnop.q"))
+        XCTAssertFalse(InstallID.isValid("abcdefghijklmnopé"), "ASCII only")
+        XCTAssertFalse(InstallID.isValid(""))
+
+        let node = InstallID.node(first)
+        XCTAssertNotEqual(node, first)
+        XCTAssertTrue(InstallID.isValid(node))
+        XCTAssertEqual(InstallID.node(first), node, "stable per install")
     }
 
     func testSignInLeavesOutAnEmptySetupCodeAndMapsRefusals() async throws {

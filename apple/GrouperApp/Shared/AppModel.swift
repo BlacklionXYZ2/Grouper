@@ -33,6 +33,26 @@ struct NodeTarget: Equatable, Sendable {
     let token: String
 }
 
+/// The name and platform of a device, for Settings > Account (never its id or token).
+struct AppDeviceSummary: Equatable {
+    let name: String
+    /// As the hub reports it: `ios`, `macos`, ….
+    let platform: String
+
+    /// The platform as people say it.
+    var platformName: String {
+        switch platform.lowercased() {
+        case "ios": return "iOS"
+        case "macos": return "macOS"
+        case "windows": return "Windows"
+        case "linux": return "Linux"
+        case "web": return "Web"
+        case "cli": return "Command line"
+        default: return platform
+        }
+    }
+}
+
 /// How a device token fared against the hub.
 private enum DeviceTokenCheck {
     case usable
@@ -77,6 +97,11 @@ final class AppModel: ObservableObject {
     @Published var errorMessage: String?
     /// `GET /v1/auth/status` for the hub: claimed, and whether Google sign-in is on. Nil while unknown.
     @Published private(set) var authStatus: AuthStatus?
+    /// The hub address (trimmed) `authStatus` was last checked for, so the sign-in screen can
+    /// tell "still checking" from "this hub has no Google sign-in".
+    @Published private(set) var authStatusCheckedFor: String?
+    /// The last check couldn't reach a hub at that address (or it isn't a valid address).
+    @Published private(set) var hubUnreachable = false
     /// A Google sign-in or link is running (Google's page may be open).
     @Published private(set) var googleBusy = false
     /// Settings > Account: the Google account that owns the hub, once `googleLinkLoaded`.
@@ -127,6 +152,10 @@ final class AppModel: ObservableObject {
     /// The hub the saved device token belongs to, and the name it was registered under.
     private static let deviceHubKey = "grouper.deviceHubURL"
     private static let deviceNameKey = "grouper.deviceName"
+    /// The name and platform of this app install's own device, from the last Google sign-in
+    /// (Settings > Account shows them when the devices list doesn't have the device).
+    private static let appDeviceNameKey = "grouper.appDeviceName"
+    private static let appDevicePlatformKey = "grouper.appDevicePlatform"
     private var deviceHubURL = ""
     private var handlingRejectedToken = false
     private let streamTask = TaskBox()
@@ -265,23 +294,40 @@ final class AppModel: ObservableObject {
     /// Whether this app has a Google client ID and the hub at `hubURL` allows Google sign-in.
     var googleSignInAvailable: Bool { GoogleSignIn.oauth != nil && authStatus?.google == true }
 
-    /// Sign-in screen: `GET /v1/auth/status` for the address as typed. Unreachable hubs and hubs
-    /// without the route leave it nil, which hides Google sign-in.
+    /// Sign-in screen: `GET /v1/auth/status` for the address as typed. A hub that answers without
+    /// the route (one from before Google sign-in) leaves it nil, which means token sign-in. A
+    /// hub that can't be reached (or an invalid address) also leaves it nil and sets
+    /// `hubUnreachable`, so the screen says so instead of falling back to the token field.
     func checkAuthStatus(for typed: String) async {
         let hub = typed.trimmingCharacters(in: .whitespacesAndNewlines)
         var status: AuthStatus?
-        if !hub.isEmpty, let api = try? HubClient(baseURL: hub) {
-            status = try? await api.authStatus()
+        var unreachable = false
+        if !hub.isEmpty {
+            do {
+                status = try await HubClient(baseURL: hub).authStatus()
+            } catch {
+                switch error as? HubClientError {
+                case .transport?, .invalidBaseURL?:
+                    unreachable = true
+                case .server(let code, _)? where code >= 500:
+                    unreachable = true // e.g. the tunnel is up but the hub behind it isn't
+                default:
+                    break // the hub answered, but not with an auth status: no Google sign-in there
+                }
+            }
         }
         // Typed on since: a newer check owns the result.
         guard hub == hubURL.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
         authStatus = status
+        hubUnreachable = unreachable
+        authStatusCheckedFor = hub
     }
 
     /// Signs in with Google: the hub's nonce, Google's page, then `POST /v1/auth/google` for an
     /// admin token for this install. The token is saved like a pasted one and the app connects
     /// exactly as a token sign-in does (on the Mac that also registers this Mac's node).
-    /// `setupCode` is sent only while the hub is unclaimed.
+    /// `setupCode` is sent only while the hub is unclaimed. The install's `install_id` goes
+    /// with it, so signing in again from this install reuses its device on the hub.
     func signInWithGoogle(setupCode: String) async {
         guard let oauth = GoogleSignIn.oauth, !googleBusy else { return }
         googleBusy = true
@@ -294,20 +340,37 @@ final class AppModel: ObservableObject {
             let idToken = try await GoogleSignIn.idToken(oauth: oauth, nonce: nonce.nonce)
             let code = authStatus?.claimed == false ? (SetupCode.normalized(setupCode) ?? setupCode) : nil
             let result = try await api.signInWithGoogle(idToken: idToken, setupCode: code, client: .current,
-                                                        deviceName: GoogleSignIn.deviceName)
+                                                        deviceName: GoogleSignIn.deviceName, installId: AppInstall.id)
             // Kept now, so a connection hiccup below doesn't lose the new token.
             UserDefaults.standard.set(trimmedHub, forKey: "grouper.hubURL")
             try KeychainStore.save(result.token, as: .admin)
+            UserDefaults.standard.set(result.device.name, forKey: Self.appDeviceNameKey)
+            UserDefaults.standard.set(result.device.platform, forKey: Self.appDevicePlatformKey)
             hubURL = trimmedHub
             adminToken = result.token
         } catch {
             errorMessage = GoogleSignIn.message(for: error)
-            if let hubError = error as? HubClientError, case .conflict = hubError {
-                await checkAuthStatus(for: trimmedHub) // claimed a moment ago
+            switch error as? HubClientError {
+            case .conflict?, .notFound?:
+                // Claimed a moment ago, or Google sign-in was turned off: show what the hub allows now.
+                await checkAuthStatus(for: trimmedHub)
+            default:
+                break
             }
             return
         }
         await connect()
+    }
+
+    /// Settings > Account: this app install's own device on the hub (the one its admin token
+    /// belongs to), from the devices list, else as the last Google sign-in named it.
+    var thisAppDevice: AppDeviceSummary? {
+        if let id = DeviceRegistration.deviceId(ofToken: adminToken), let device = devices.first(where: { $0.id == id }) {
+            return AppDeviceSummary(name: device.name, platform: device.platform)
+        }
+        guard let name = UserDefaults.standard.string(forKey: Self.appDeviceNameKey) else { return nil }
+        let platform = UserDefaults.standard.string(forKey: Self.appDevicePlatformKey) ?? GoogleSignInClient.current.rawValue
+        return AppDeviceSummary(name: name, platform: platform)
     }
 
     /// Settings > Account: the Google account linked to this hub, and whether the hub allows Google.
@@ -457,6 +520,12 @@ final class AppModel: ObservableObject {
 
     /// Registers this Mac as a plain device and saves its token, then revokes `old` (best
     /// effort). On failure the manual token field opens with a plain explanation.
+    ///
+    /// The registration carries this install's node id (`InstallID.node`), so a hub that
+    /// supports install ids hands back the same node device with a fresh token (revoking the
+    /// old one) instead of adding a second device for this Mac; `old` is then that same device
+    /// and is not revoked. The node id differs from the app's own sign-in id, so the node can
+    /// never be handed the app's admin device.
     @discardableResult
     private func registerThisMac(api: HubClient, hubURL: String, revoking old: String?) async -> Bool {
         // Launch can race the node's own 401 report; only one registration runs.
@@ -466,7 +535,8 @@ final class AppModel: ObservableObject {
         let name = DeviceRegistration.name(MacNodeController.computerName())
         let registered: RegisteredDevice
         do {
-            registered = try await api.registerDevice(name: name, platform: "macos")
+            registered = try await api.registerDevice(name: name, platform: "macos",
+                                                      installId: AppInstall.id.map(InstallID.node))
         } catch {
             if DeviceRegistration.hubLacksRegistration(error) {
                 deviceMessage = "This hub can't register devices yet; paste a device token instead."
@@ -574,7 +644,10 @@ final class AppModel: ObservableObject {
         selectedApprovalId = nil
         streamState = .disconnected
         KeychainStore.delete(.admin)
+        UserDefaults.standard.removeObject(forKey: Self.appDeviceNameKey)
+        UserDefaults.standard.removeObject(forKey: Self.appDevicePlatformKey)
         // This Mac's device token stays (see signOutAndRemoveThisMac), so its node keeps serving.
+        // The install id stays too, so signing in again reuses this install's devices on the hub.
     }
 
     func loadInitial() async {
