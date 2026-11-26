@@ -184,6 +184,12 @@ tools) can't be confined to a folder, so on Auto each of their chat calls asks y
 - Approval notifications use Web Push. The hub's VAPID key is sealed with the same master
   key. Set `GROUPER_PUBLIC_URL` (e.g. `https://hub.example.com`) to name the hub to push
   services; otherwise it uses the origin each browser subscribed from.
+- Sign in with Google (hub side; [docs/accounts-design.md](docs/accounts-design.md)): a hub has one
+  owner. Trusted app client IDs come from `GROUPER_GOOGLE_CLIENT_IDS` (comma-separated), the
+  browser client from `GROUPER_GOOGLE_WEB_CLIENT_ID` and its shared return page from
+  `GROUPER_GOOGLE_RETURN_URL`; with none set, Google sign-in is off. An unclaimed hub logs a
+  one-hour setup code at start (`grouper-hub setup-code` prints another); `grouper-hub owner
+  show|reset` shows or unlinks the owner (tokens keep working).
 - Hub threads get file tools only, until they run in sandbox containers.
 - `apple/GrouperKit` links a static library so it builds with the Command Line Tools.
   With Xcode installed, switch to an XCFramework for iOS.

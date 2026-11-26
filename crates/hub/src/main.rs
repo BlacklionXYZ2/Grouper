@@ -29,6 +29,11 @@ enum Cmd {
     /// Manage registered devices.
     #[command(subcommand)]
     Device(DeviceCmd),
+    /// Print a fresh one-time code for claiming this hub with Google (valid 1 hour).
+    SetupCode,
+    /// The Google account that owns this hub.
+    #[command(subcommand)]
+    Owner(OwnerCmd),
     /// Add or update a model provider (keys can also be set from any device: `grouper keys set`).
     Provider {
         id: String,
@@ -110,6 +115,14 @@ enum DeviceCmd {
     Revoke { id: String },
 }
 
+#[derive(Subcommand)]
+enum OwnerCmd {
+    /// Show the linked Google account.
+    Show,
+    /// Unlink the owner (if the Google account is lost). Device tokens and sessions keep working.
+    Reset,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -144,7 +157,9 @@ async fn main() -> Result<()> {
             tokio::spawn(hub::usage::collector_loop(hub.clone()));
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!("grouper-hub listening on {bind}, data in {}", cli.data.display());
-            axum::serve(listener, server::router(hub))
+            hub::google_auth::announce_setup_code(&hub);
+            // Peer addresses let sign-in rate limits tell clients apart.
+            axum::serve(listener, server::router(hub).into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;
                 })
@@ -175,6 +190,25 @@ async fn main() -> Result<()> {
             db.revoke_device(&id)?;
             println!("Revoked {id}. Restart the hub to drop any live connection, and rotate any API keys it held.");
         }
+        Cmd::SetupCode => {
+            if let Some(o) = db.owner() {
+                anyhow::bail!("this hub is already claimed by {}; `grouper-hub owner reset` unlinks it first", o.email);
+            }
+            let (code, _) = db.new_setup_code()?;
+            println!("Setup code (valid 1 hour, once): {code}");
+            println!("Claim the hub: open <hub address>{}", hub::google_auth::claim_path(&code));
+        }
+        Cmd::Owner(OwnerCmd::Show) => match db.owner() {
+            Some(o) => println!("{} {} ({} account {}), since {}", o.email, o.name, o.provider, o.sub, o.claimed_at),
+            None => println!("No owner: this hub hasn't been claimed or linked."),
+        },
+        Cmd::Owner(OwnerCmd::Reset) => match db.reset_owner()? {
+            Some(o) => println!(
+                "Unlinked {}. Device tokens and sessions keep working; `grouper-hub setup-code` lets a Google account claim the hub again.",
+                o.email
+            ),
+            None => println!("No owner to unlink."),
+        },
         Cmd::Provider { id, kind, base_url, key, options } => {
             let options = match options {
                 Some(o) => serde_json::from_str(&o)?,

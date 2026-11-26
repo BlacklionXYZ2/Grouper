@@ -3,6 +3,7 @@ pub mod db;
 mod device_provider;
 pub mod devices;
 pub mod files;
+pub mod google_auth;
 pub mod limits;
 pub mod mcp;
 pub mod memory;
