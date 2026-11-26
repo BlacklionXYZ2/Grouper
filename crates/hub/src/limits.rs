@@ -1065,6 +1065,7 @@ mod tests {
                 requested_at: crate::db::now(),
                 timeout_secs: None,
                 local,
+                device_approval_id: None,
                 generation: 1,
                 timer: None,
             };

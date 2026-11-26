@@ -549,8 +549,15 @@ fn print_event(e: &Event) {
             println!("  ! approval {approval_id} on {device_id}: {tool} {} — {reason}", short(input, 160));
             println!("    run `grouper approve {approval_id}` or `grouper deny {approval_id}`");
         }
-        EventBody::ApprovalResolved { approval_id, approved } => {
-            println!("  · approval {approval_id} {}", if *approved { "approved" } else { "denied" })
+        EventBody::ApprovalResolved { approval_id, approved, reason } => {
+            let label = match reason.as_deref() {
+                Some("timeout") => "timed out (denied)",
+                Some("timeout_stop") => "timed out (denied, thread stopped)",
+                Some("dropped") => "dropped",
+                _ if *approved => "approved",
+                _ => "denied",
+            };
+            println!("  · approval {approval_id} {label}")
         }
         EventBody::TurnFinished { running_threads } => {
             if *running_threads > 0 {

@@ -194,7 +194,7 @@ function store_(c, e) {
   return true;
 }
 
-function applyDerived(e) {
+function applyDerived(e, { replay = false } = {}) {
   const cid = e.conversation_id;
   const tid = e.thread_id;
   switch (e.kind) {
@@ -244,9 +244,18 @@ function applyDerived(e) {
       else if (a.type === 'tool_result') l.tool = null;
       break;
     }
-    case 'thread_waiting':
+    case 'thread_waiting': {
       upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: 'waiting_device', checkpoint: false });
+      let pruned = false;
+      for (const [id, a] of store.approvals) {
+        if (a.thread_id === tid) {
+          store.approvals.delete(id);
+          pruned = true;
+        }
+      }
+      if (pruned) emit('approvals');
       break;
+    }
     case 'thread_checkpoint':
       upsertThread(tid, { id: tid, ...(cid ? { conversation_id: cid } : null), status: 'waiting_device', checkpoint: true });
       break;
@@ -261,7 +270,10 @@ function applyDerived(e) {
       emit('approvals');
       break;
     case 'approval_requested':
-      if (!store.answered.has(e.approval_id)) {
+      // Reconnect catch-up replays stored history; `loadApprovals()` is the source of truth
+      // so dropped approvals are never resurrected.
+      if (replay) break;
+      if (!store.answered.has(e.approval_id) && !store.resolutions.has(e.approval_id)) {
         store.approvals.set(e.approval_id, {
           approval_id: e.approval_id,
           device_id: e.device_id,
@@ -276,11 +288,14 @@ function applyDerived(e) {
         emit('approvals');
       }
       break;
-    case 'approval_resolved':
-      store.answered.add(e.approval_id);
+    case 'approval_resolved': {
+      const reason = e.reason || null;
+      store.resolutions.set(e.approval_id, { approved: Boolean(e.approved), reason });
+      if (reason !== 'dropped') store.answered.add(e.approval_id);
       if (store.approvals.delete(e.approval_id)) emit('approvals');
       emit('approval_resolved', e);
       break;
+    }
     case 'device_presence':
       applyDevicePresence(e);
       break;
@@ -428,7 +443,7 @@ async function catchUp(id) {
     const events = (await get(`/v1/conversations/${enc(id)}/events${qs({ after: c.lastSeq })}`)) || [];
     for (const e of events) {
       if (e.seq > c.lastSeq) {
-        applyDerived(e);
+        applyDerived(e, { replay: true });
         store_(c, e);
         emit('event', e);
       }
@@ -452,6 +467,7 @@ async function catchUp(id) {
  */
 export async function loadApprovals({ strict = false } = {}) {
   if (!store.me?.admin) {
+    store.approvalsLoaded = true;
     if (store.approvals.size) {
       store.approvals.clear();
       emit('approvals');
@@ -468,7 +484,7 @@ export async function loadApprovals({ strict = false } = {}) {
   }
   const next = new Map();
   for (const a of list) {
-    if (store.answered.has(a.approval_id)) continue;
+    if (store.answered.has(a.approval_id) || store.resolutions.has(a.approval_id)) continue;
     next.set(a.approval_id, {
       approval_id: a.approval_id,
       device_id: a.device_id,
@@ -485,10 +501,11 @@ export async function loadApprovals({ strict = false } = {}) {
   }
   // Keep any approval that arrived on the socket while the HTTP fetch was in flight.
   for (const [id, a] of store.approvals) {
-    if (!next.has(id) && !store.answered.has(id) && (a.arrivedAt || 0) >= startedAt) {
+    if (!next.has(id) && !store.answered.has(id) && !store.resolutions.has(id) && (a.arrivedAt || 0) >= startedAt) {
       next.set(id, a);
     }
   }
   store.approvals = next;
+  store.approvalsLoaded = true;
   emit('approvals');
 }

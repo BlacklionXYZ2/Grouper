@@ -18,7 +18,9 @@ export const store = {
   replying: new Set(), // conversation ids waiting for the orchestrator
   live: new Map(), // thread id -> {draft, lastText, tool}
   approvals: new Map(), // approval id -> {approval_id, device_id, tool, input, reason, thread_id, conversation_id, ts}
-  answered: new Set(), // approval ids already resolved
+  approvalsLoaded: false,
+  answered: new Set(), // approval ids already answered (not dropped)
+  resolutions: new Map(), // approval id -> {approved, reason}
   pendingProposals: 0,
 };
 
@@ -34,11 +36,13 @@ export function resetStore() {
     conversations: [],
     currentConversation: null,
     threadsLoaded: false,
+    approvalsLoaded: false,
     models: [],
     pendingProposals: 0,
   });
-  for (const key of ['threads', 'convs', 'drafts', 'live', 'approvals']) store[key].clear();
+  for (const key of ['threads', 'convs', 'drafts', 'live', 'approvals', 'resolutions']) store[key].clear();
   for (const key of ['replying', 'answered']) store[key].clear();
+  emit('reset');
 }
 
 const subs = new Map();

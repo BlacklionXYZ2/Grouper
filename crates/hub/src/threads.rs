@@ -272,6 +272,35 @@ impl Hub {
         .await;
     }
 
+    /// Register an approval requested by a remote device. Validates the device's
+    /// scoped id, assigns a fresh random hub id so client state never collides across
+    /// restarts or reconnects, and remembers the device's id for the reply.
+    pub(crate) async fn request_device_approval(
+        self: &Arc<Self>,
+        device_id: &str,
+        thread_id: &str,
+        device_approval_id: &str,
+        tool: &str,
+        input: Value,
+        reason: &str,
+    ) -> bool {
+        if !device_approval_id.starts_with(&format!("{thread_id}-")) {
+            return false;
+        }
+        let hub_approval_id = Hub::new_approval_id();
+        self.request_approval_inner(
+            device_id,
+            thread_id,
+            &hub_approval_id,
+            Some(device_approval_id.to_string()),
+            tool,
+            input,
+            reason,
+            None,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_approval(
         self: &Arc<Self>,
@@ -287,6 +316,22 @@ impl Hub {
         if !internal && !approval_id.starts_with(&format!("{thread_id}-")) {
             return false;
         }
+        self.request_approval_inner(device_id, thread_id, approval_id, None, tool, input, reason, local).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_approval_inner(
+        self: &Arc<Self>,
+        device_id: &str,
+        thread_id: &str,
+        approval_id: &str,
+        device_approval_id: Option<String>,
+        tool: &str,
+        input: Value,
+        reason: &str,
+        local: Option<oneshot::Sender<ApprovalAnswer>>,
+    ) -> bool {
+        let internal = local.is_some();
         let generation = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut approvals = self.approvals.lock().await;
         // Re-read status while holding the route lock. If a finisher changed it
@@ -296,6 +341,11 @@ impl Hub {
             return false;
         }
         if approvals.contains_key(approval_id) {
+            return false;
+        }
+        if let Some(dev_id) = device_approval_id.as_deref()
+            && approvals.values().any(|r| r.device_id == device_id && r.device_approval_id.as_deref() == Some(dev_id))
+        {
             return false;
         }
         // The user already denied this exact call in this conversation (perhaps to
@@ -327,6 +377,7 @@ impl Hub {
                 requested_at,
                 timeout_secs,
                 local,
+                device_approval_id,
                 generation,
                 timer: None,
             },
@@ -389,10 +440,11 @@ impl Hub {
                 let _ = tx.send(ApprovalAnswer::TimedOut { secs });
             }
             None => {
+                let device_approval_id = route.device_approval_id.clone().unwrap_or_else(|| approval_id.clone());
                 self.send_to(
                     &route.device_id,
                     HubMessage::ApprovalResult {
-                        approval_id: approval_id.clone(),
+                        approval_id: device_approval_id,
                         approved: false,
                         timeout_secs: Some(secs),
                     },
@@ -400,10 +452,15 @@ impl Hub {
                 .await;
             }
         }
+        let reason = if action == ApprovalTimeoutAction::Stop { "timeout_stop" } else { "timeout" };
         self.emit(
             &route.conversation_id,
             Some(&route.thread_id),
-            EventBody::ApprovalResolved { approval_id: approval_id.clone(), approved: false },
+            EventBody::ApprovalResolved {
+                approval_id: approval_id.clone(),
+                approved: false,
+                reason: Some(reason.into()),
+            },
         );
         let text = if action == ApprovalTimeoutAction::Stop {
             format!("No answer within {phrase}; stopping the thread.")
@@ -533,7 +590,7 @@ impl Hub {
     }
 
     /// Drop pending approvals without answering them (their thread or device is gone),
-    /// stopping their timers and clearing their push notifications.
+    /// stopping their timers and telling live clients they are no longer pending.
     pub(crate) async fn drop_approvals(&self, drop: impl Fn(&ApprovalRoute) -> bool) {
         let mut dropped = Vec::new();
         self.approvals.lock().await.retain(|id, r| {
@@ -541,14 +598,18 @@ impl Hub {
                 if let Some(timer) = r.timer.take() {
                     timer.abort();
                 }
-                dropped.push((r.conversation_id.clone(), id.clone()));
+                dropped.push((r.conversation_id.clone(), r.thread_id.clone(), id.clone()));
                 false
             } else {
                 true
             }
         });
-        for (conversation_id, approval_id) in dropped {
-            self.push_approval_cleared(&conversation_id, &approval_id);
+        for (conversation_id, thread_id, approval_id) in dropped {
+            self.emit_live(
+                &conversation_id,
+                Some(&thread_id),
+                EventBody::ApprovalResolved { approval_id, approved: false, reason: Some("dropped".into()) },
+            );
         }
     }
 
@@ -577,7 +638,7 @@ impl ThreadHost for HubHost {
 
     async fn approve(&self, thread_id: &str, tool: &str, input: &Value, reason: &str) -> ApprovalDecision {
         let Some(hub) = self.hub.upgrade() else { return ApprovalDecision::Denied };
-        let approval_id = format!("a{}", hub.next_id.fetch_add(1, Ordering::Relaxed));
+        let approval_id = Hub::new_approval_id();
         let (tx, rx) = oneshot::channel();
         hub.request_approval(HUB_DEVICE, thread_id, &approval_id, tool, input.clone(), reason, Some(tx)).await;
         drop(hub);

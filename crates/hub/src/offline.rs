@@ -28,7 +28,6 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -526,7 +525,7 @@ impl Hub {
         let level =
             self.db.permissions(&t.device_id).get("write_file").copied().unwrap_or(Permission::default_for("write_file"));
         if !files.is_empty() && level == Permission::Manual {
-            let approval_id = format!("a{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+            let approval_id = Hub::new_approval_id();
             let (tx, rx) = oneshot::channel();
             let reason = format!("copy {} file(s) the hub prepared into this thread's workspace on {device}", files.len());
             let input = json!({"files": names, "bytes": total});

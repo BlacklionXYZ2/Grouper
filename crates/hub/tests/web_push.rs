@@ -1,14 +1,14 @@
 //! Web Push in process: a real hub served over HTTP, a hub thread that asks for approval, and
 //! a fake push service on 127.0.0.1 that records what the hub sends.
 //!
-//! The test subscribes with its own P-256 key pair, decrypts the approval push (RFC 8291) and
-//! checks the VAPID header (RFC 8292), then answers the approval and expects the matching
-//! `approval_cleared` push. A 410 from the push service removes the subscription.
+//! Verifies RFC 8291 encryption, RFC 8292 VAPID signing, random approval ids, no silent
+//! `approval_cleared` pushes, live `dropped` events on stop, non-blocking per-subscription
+//! delivery, and push subscription cleanup when sessions or devices are revoked.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aws_lc_rs::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::agreement::{self, ECDH_P256, UnparsedPublicKey};
@@ -19,11 +19,14 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use core_protocol::{ChatRequest, EventBody, ModelEntry, Permission, ProviderConfig, ToolDef};
+use core_protocol::{ChatRequest, Event, EventBody, ModelEntry, Permission, ProviderConfig, ToolDef};
+use futures_util::StreamExt;
 use hub::db::Db;
 use hub::server::{HUB_DEVICE, Hub};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as WsMsg;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const WAIT: Duration = Duration::from_secs(60);
 const ORCH: &str = "orchestrator of Grouper";
@@ -90,9 +93,13 @@ struct Received {
 struct Fake {
     tx: mpsc::UnboundedSender<Received>,
     status: Arc<AtomicU16>,
+    slow_delay: Duration,
 }
 
 async fn fake_push(State(f): State<Fake>, Path(name): Path<String>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    if name == "slow" && !f.slow_delay.is_zero() {
+        tokio::time::sleep(f.slow_delay).await;
+    }
     let _ = f.tx.send(Received { path: name, headers, body: body.to_vec() });
     StatusCode::from_u16(f.status.load(Ordering::SeqCst)).unwrap()
 }
@@ -170,15 +177,25 @@ async fn next(rx: &mut mpsc::UnboundedReceiver<Received>, what: &str) -> Receive
     tokio::time::timeout(WAIT, rx.recv()).await.unwrap_or_else(|_| panic!("timed out waiting for {what}")).unwrap()
 }
 
+fn sub_json(endpoint: String, ua_private: &agreement::PrivateKey, auth_secret: [u8; 16], label: &str) -> Value {
+    let ua_public = URL_SAFE_NO_PAD.encode(ua_private.compute_public_key().unwrap().as_ref());
+    json!({
+        "endpoint": endpoint,
+        "expirationTime": null,
+        "keys": {"p256dh": ua_public, "auth": URL_SAFE_NO_PAD.encode(auth_secret)},
+        "label": label,
+    })
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn approvals_are_pushed_encrypted_and_cleared() {
+async fn approvals_are_pushed_encrypted_without_silent_clear_pushes() {
     let (dir, hub, admin, plain) = setup("flow");
     hub.set_push_allow_local_http(true);
     let (base, hub_task) = serve(hub::server::router(hub.clone())).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let status = Arc::new(AtomicU16::new(201));
-    let fake = Fake { tx, status: status.clone() };
+    let fake = Fake { tx, status: status.clone(), slow_delay: Duration::ZERO };
     let (push_base, push_task) =
         serve(axum::Router::new().route("/push/{name}", axum::routing::post(fake_push)).with_state(fake)).await;
 
@@ -197,15 +214,8 @@ async fn approvals_are_pushed_encrypted_and_cleared() {
 
     // The subscriber: our own key pair and auth secret, as a browser would make them.
     let ua_private = agreement::PrivateKey::generate(&ECDH_P256).unwrap();
-    let ua_public = URL_SAFE_NO_PAD.encode(ua_private.compute_public_key().unwrap().as_ref());
     let auth_secret = [9u8; 16];
-    let endpoint = format!("{push_base}/push/one");
-    let subscription = json!({
-        "endpoint": endpoint,
-        "expirationTime": null,
-        "keys": {"p256dh": ua_public, "auth": URL_SAFE_NO_PAD.encode(auth_secret)},
-        "label": "Test browser",
-    });
+    let subscription = sub_json(format!("{push_base}/push/one"), &ua_private, auth_secret, "Test browser");
     let r = http
         .post(format!("{base}/v1/push/subscriptions"))
         .header("authorization", &bearer)
@@ -235,7 +245,7 @@ async fn approvals_are_pushed_encrypted_and_cleared() {
         .unwrap();
     assert_eq!(again["id"], sub_id.as_str());
 
-    // An approval request is pushed.
+    // An approval request is pushed with a random approval_id.
     let conv = hub
         .chat(ChatRequest { conversation_id: None, mode: Some("project".into()), text: "please".into(), model: None })
         .await
@@ -251,6 +261,10 @@ async fn approvals_are_pushed_encrypted_and_cleared() {
             _ => None,
         })
         .unwrap();
+    assert!(
+        approval_id.starts_with("a_") && approval_id.len() == 26 && approval_id[2..].bytes().all(|b| b.is_ascii_hexdigit()),
+        "expected random 12-byte hex approval id, got {approval_id}"
+    );
     let thread = hub.db.threads(Some(&conv)).remove(0);
 
     assert_eq!(header(&request.headers, "content-encoding"), "aes128gcm");
@@ -281,7 +295,7 @@ async fn approvals_are_pushed_encrypted_and_cleared() {
     assert!(payload["ts"].as_u64().is_some());
     assert!(payload.get("input").is_none() && payload.get("reason").is_none());
 
-    // Answering it pushes a clear with the same topic.
+    // Answering it must NOT send a silent `approval_cleared` push (violates userVisibleOnly).
     let r = http
         .post(format!("{base}/v1/approvals/{approval_id}"))
         .header("authorization", &bearer)
@@ -290,13 +304,10 @@ async fn approvals_are_pushed_encrypted_and_cleared() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    let clear = next(&mut rx, "the approval_cleared push").await;
-    assert_eq!(header(&clear.headers, "topic"), topic);
-    assert_eq!(header(&clear.headers, "urgency"), "normal");
-    assert_eq!(header(&clear.headers, "ttl"), "60");
-    check_vapid(&clear.headers, &vapid_key);
-    let payload: Value = serde_json::from_slice(&decrypt(&clear.body, &ua_private, &auth_secret)).unwrap();
-    assert_eq!(payload, json!({"type": "approval_cleared", "approval_id": approval_id}));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), rx.recv()).await.is_err(),
+        "answering an approval must not send an approval_cleared push"
+    );
 
     let list = get_json(&http, format!("{base}/v1/push/subscriptions"), &bearer).await;
     let rows = list.as_array().unwrap();
@@ -362,28 +373,28 @@ async fn approvals_are_pushed_encrypted_and_cleared() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stopping_the_thread_clears_its_approval_notification() {
+async fn stopping_the_thread_emits_live_dropped_event_and_no_clear_push() {
     let (dir, hub, admin, _) = setup("stop");
     hub.set_push_allow_local_http(true);
     let (base, hub_task) = serve(hub::server::router(hub.clone())).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let fake = Fake { tx, status: Arc::new(AtomicU16::new(201)) };
+    let fake = Fake { tx, status: Arc::new(AtomicU16::new(201)), slow_delay: Duration::ZERO };
     let (push_base, push_task) =
         serve(axum::Router::new().route("/push/{name}", axum::routing::post(fake_push)).with_state(fake)).await;
     let http = reqwest::Client::new();
     let bearer = format!("Bearer {admin}");
+
+    let mut ws_req = format!("{}/v1/events", base.replacen("http://", "ws://", 1)).into_client_request().unwrap();
+    ws_req.headers_mut().insert("authorization", bearer.parse().unwrap());
+    let (mut ev_ws, _) = tokio_tungstenite::connect_async(ws_req).await.unwrap();
 
     let ua_private = agreement::PrivateKey::generate(&ECDH_P256).unwrap();
     let auth_secret = [3u8; 16];
     let r = http
         .post(format!("{base}/v1/push/subscriptions"))
         .header("authorization", &bearer)
-        .json(&json!({
-            "endpoint": format!("{push_base}/push/stop"),
-            "expirationTime": null,
-            "keys": {"p256dh": URL_SAFE_NO_PAD.encode(ua_private.compute_public_key().unwrap().as_ref()),
-                     "auth": URL_SAFE_NO_PAD.encode(auth_secret)},
-        }))
+        .header("origin", "http://localhost:8080")
+        .json(&sub_json(format!("{push_base}/push/stop"), &ua_private, auth_secret, "Local dev"))
         .send()
         .await
         .unwrap();
@@ -394,6 +405,11 @@ async fn stopping_the_thread_clears_its_approval_notification() {
         .await
         .unwrap();
     let request = next(&mut rx, "the approval_requested push").await;
+    // Loopback http:// subscribe origin is accepted as the VAPID sub claim.
+    let key = get_json(&http, format!("{base}/v1/push/vapid-key"), &bearer).await;
+    let claims = check_vapid(&request.headers, key["public_key"].as_str().unwrap());
+    assert_eq!(claims["sub"], "http://localhost:8080");
+
     let payload: Value = serde_json::from_slice(&decrypt(&request.body, &ua_private, &auth_secret)).unwrap();
     let approval_id = payload["approval_id"].as_str().unwrap().to_string();
     let thread = hub.db.threads(Some(&conv)).remove(0);
@@ -401,13 +417,215 @@ async fn stopping_the_thread_clears_its_approval_notification() {
     let r = http.post(format!("{base}/v1/threads/{}/stop", thread.id)).header("authorization", &bearer);
     let r = r.send().await.unwrap();
     assert_eq!(r.status(), 200);
-    let clear = next(&mut rx, "the approval_cleared push after the stop").await;
-    assert_eq!(header(&clear.headers, "topic"), header(&request.headers, "topic"));
-    let payload: Value = serde_json::from_slice(&decrypt(&clear.body, &ua_private, &auth_secret)).unwrap();
-    assert_eq!(payload, json!({"type": "approval_cleared", "approval_id": approval_id}));
+
+    // Live clients receive a live-only (seq 0) `approval_resolved` with reason "dropped".
+    let dropped_ev: Event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Ok(WsMsg::Text(t))) = ev_ws.next().await
+                && let Ok(e) = serde_json::from_str::<Event>(&t)
+                && matches!(
+                    &e.body,
+                    EventBody::ApprovalResolved { approval_id: id, approved: false, reason }
+                        if id == &approval_id && reason.as_deref() == Some("dropped")
+                )
+            {
+                break e;
+            }
+        }
+    })
+    .await
+    .expect("live dropped approval event");
+    assert_eq!(dropped_ev.seq, 0);
+    assert_eq!(dropped_ev.conversation_id, conv);
+    assert_eq!(dropped_ev.thread_id.as_deref(), Some(thread.id.as_str()));
+
+    // And no silent `approval_cleared` push is sent.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), rx.recv()).await.is_err(),
+        "stopping a thread must not send an approval_cleared push"
+    );
+
+    let _ = ev_ws.close(None).await;
+    hub_task.abort();
+    push_task.abort();
+    drop(hub);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_push_endpoint_does_not_block_healthy_endpoint() {
+    let (dir, hub, admin, _) = setup("hol");
+    hub.set_push_allow_local_http(true);
+    let (base, hub_task) = serve(hub::server::router(hub.clone())).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let fake = Fake { tx, status: Arc::new(AtomicU16::new(201)), slow_delay: Duration::from_secs(4) };
+    let (push_base, push_task) =
+        serve(axum::Router::new().route("/push/{name}", axum::routing::post(fake_push)).with_state(fake)).await;
+
+    let http = reqwest::Client::new();
+    let bearer = format!("Bearer {admin}");
+    let ua_private = agreement::PrivateKey::generate(&ECDH_P256).unwrap();
+
+    for name in ["slow", "fast"] {
+        let r = http
+            .post(format!("{base}/v1/push/subscriptions"))
+            .header("authorization", &bearer)
+            .json(&sub_json(format!("{push_base}/push/{name}"), &ua_private, [5u8; 16], name))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    let start = Instant::now();
+    // Two separate approvals back-to-back.
+    let _c1 = hub
+        .chat(ChatRequest { conversation_id: None, mode: Some("project".into()), text: "please".into(), model: None })
+        .await
+        .unwrap();
+    let _c2 = hub
+        .chat(ChatRequest { conversation_id: None, mode: Some("project".into()), text: "please".into(), model: None })
+        .await
+        .unwrap();
+
+    // The healthy endpoint must receive BOTH pushes long before the 4s slow endpoint responds once.
+    let mut fast_count = 0;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fast_count < 2 {
+            let rec = rx.recv().await.unwrap();
+            if rec.path == "fast" {
+                fast_count += 1;
+            }
+        }
+    })
+    .await
+    .expect("healthy endpoint must receive both pushes without waiting on slow endpoint");
+    assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
 
     hub_task.abort();
     push_task.abort();
+    drop(hub);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_session_or_device_deletes_push_subscriptions() {
+    let (dir, hub, admin, _) = setup("revoke");
+    hub.set_push_allow_local_http(true);
+    let (base, hub_task) = serve(hub::server::router(hub.clone())).await;
+    let http = reqwest::Client::new();
+    let bearer = format!("Bearer {admin}");
+
+    let login = || async {
+        let r = http
+            .post(format!("{base}/v1/session"))
+            .header("x-grouper", "1")
+            .header("origin", &base)
+            .json(&json!({"token": admin}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        r.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string()
+    };
+
+    let cookie1 = login().await;
+    let cookie2 = login().await;
+    let ua_private = agreement::PrivateKey::generate(&ECDH_P256).unwrap();
+
+    let sub1: Value = http
+        .post(format!("{base}/v1/push/subscriptions"))
+        .header("cookie", &cookie1)
+        .header("x-grouper", "1")
+        .header("origin", &base)
+        .json(&sub_json("http://127.0.0.1:9/push/s1".into(), &ua_private, [1u8; 16], "Browser 1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sub2: Value = http
+        .post(format!("{base}/v1/push/subscriptions"))
+        .header("cookie", &cookie2)
+        .header("x-grouper", "1")
+        .header("origin", &base)
+        .json(&sub_json("http://127.0.0.1:9/push/s2".into(), &ua_private, [2u8; 16], "Browser 2"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hub.db.push_subscription_count(), 2);
+
+    // Find session 1's hash via GET /v1/sessions authenticated with cookie1.
+    let sessions: Value =
+        http.get(format!("{base}/v1/sessions")).header("cookie", &cookie1).send().await.unwrap().json().await.unwrap();
+    let s1_id = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["current"] == true)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Revoking session 1 deletes only Browser 1's push subscription.
+    let r = http
+        .delete(format!("{base}/v1/sessions/{s1_id}"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let remaining = hub.db.push_subscription_list();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, sub2["id"].as_str().unwrap());
+    assert_ne!(remaining[0].id, sub1["id"].as_str().unwrap());
+
+    // Signing out session 2 deletes Browser 2's push subscription.
+    let r = http
+        .delete(format!("{base}/v1/session"))
+        .header("cookie", &cookie2)
+        .header("x-grouper", "1")
+        .header("origin", &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(hub.db.push_subscription_count(), 0);
+
+    // Removing admin rights or revoking a device deletes its push subscriptions.
+    let r = http
+        .post(format!("{base}/v1/push/subscriptions"))
+        .header("authorization", &bearer)
+        .json(&sub_json("http://127.0.0.1:9/push/dev".into(), &ua_private, [3u8; 16], "CLI"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(hub.db.push_subscription_count(), 1);
+    let admin_id = admin.split('.').next().unwrap();
+    hub.db.set_admin(admin_id, false).unwrap();
+    assert_eq!(hub.db.push_subscription_count(), 0);
+
+    hub.db.set_admin(admin_id, true).unwrap();
+    let r = http
+        .post(format!("{base}/v1/push/subscriptions"))
+        .header("authorization", &bearer)
+        .json(&sub_json("http://127.0.0.1:9/push/dev2".into(), &ua_private, [4u8; 16], "CLI 2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(hub.db.push_subscription_count(), 1);
+    hub.db.revoke_device(admin_id).unwrap();
+    assert_eq!(hub.db.push_subscription_count(), 0);
+
+    hub_task.abort();
     drop(hub);
     std::fs::remove_dir_all(dir).ok();
 }

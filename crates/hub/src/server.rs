@@ -109,6 +109,8 @@ pub(crate) struct ApprovalRoute {
     pub(crate) timeout_secs: Option<u64>,
     /// Set for threads running on the hub itself (and for the hub's hand-over copy).
     pub(crate) local: Option<oneshot::Sender<ApprovalAnswer>>,
+    /// The approval id the remote device sent, when the hub assigned its own random id.
+    pub(crate) device_approval_id: Option<String>,
     /// Distinguishes this route from any later request that happens to use the same id.
     pub(crate) generation: u64,
     /// Cancelled whenever the request is answered or cleared.
@@ -151,6 +153,7 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(db: Db, data_dir: PathBuf) -> Arc<Self> {
+        let initial_push_subs = db.push_subscription_count();
         Arc::new_cyclic(|hub| Self {
             db,
             data_dir,
@@ -171,8 +174,13 @@ impl Hub {
             emit_order: std::sync::Mutex::new(()),
             next_id: AtomicU64::new(1),
             limits: Default::default(),
-            push: crate::push::PushState::new(hub.clone()),
+            push: crate::push::PushState::new(hub.clone(), initial_push_subs),
         })
+    }
+
+    /// A globally unique approval id that never collides across hub restarts.
+    pub(crate) fn new_approval_id() -> String {
+        format!("a_{}", crate::db::random_hex(12))
     }
 
     /// Override how long a hand-over waits for `WorkspaceFileResult` acknowledgements.
@@ -186,12 +194,9 @@ impl Hub {
 
     /// Store an event and send it to everyone watching.
     pub fn emit(&self, conversation_id: &str, thread_id: Option<&str>, body: EventBody) -> Event {
-        let e = {
-            let _order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
-            let e = self.db.add_event(conversation_id, thread_id, body);
-            let _ = self.events.send(e.clone());
-            e
-        };
+        let _order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
+        let e = self.db.add_event(conversation_id, thread_id, body);
+        let _ = self.events.send(e.clone());
         self.push_on_event(&e);
         e
     }
@@ -481,9 +486,10 @@ impl Hub {
                 let _ = tx.send(if approved { ApprovalAnswer::Allow } else { ApprovalAnswer::Deny });
             }
             None => {
+                let device_id_to_send = route.device_approval_id.as_deref().unwrap_or(approval_id);
                 self.send_to(
                     &route.device_id,
-                    HubMessage::ApprovalResult { approval_id: approval_id.into(), approved, timeout_secs: None },
+                    HubMessage::ApprovalResult { approval_id: device_id_to_send.into(), approved, timeout_secs: None },
                 )
                 .await;
             }
@@ -491,7 +497,7 @@ impl Hub {
         self.emit(
             &route.conversation_id,
             Some(&route.thread_id),
-            EventBody::ApprovalResolved { approval_id: approval_id.into(), approved },
+            EventBody::ApprovalResolved { approval_id: approval_id.into(), approved, reason: None },
         );
     }
 }
@@ -1273,7 +1279,7 @@ async fn handle_thread_frame(hub: &Arc<Hub>, device_id: &str, conn_id: u64, msg:
         NodeMessage::ApprovalRequest { approval_id, thread_id, tool, input, reason }
             if hub.owns_thread(device_id, &thread_id) =>
         {
-            if !hub.request_approval(device_id, &thread_id, &approval_id, &tool, input, &reason, None).await {
+            if !hub.request_device_approval(device_id, &thread_id, &approval_id, &tool, input, &reason).await {
                 hub.send_to(
                     device_id,
                     HubMessage::ApprovalResult { approval_id, approved: false, timeout_secs: None },
@@ -2041,7 +2047,7 @@ mod tests {
             .events(&c1, 0, None)
             .into_iter()
             .filter_map(|e| match e.body {
-                EventBody::ApprovalResolved { approval_id, approved: false } => Some(approval_id),
+                EventBody::ApprovalResolved { approval_id, approved: false, .. } => Some(approval_id),
                 _ => None,
             })
             .collect();
@@ -2408,6 +2414,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.rating, None);
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn device_approval_gets_random_hub_id_and_replies_with_device_id() {
+        let dir = std::env::temp_dir().join(format!("grouper-dev-approval-id-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (worker, _) = db.add_device("Laptop", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let (tx, mut dev_rx) = mpsc::channel(8);
+        let (close, _close_rx) = CloseHandle::new();
+        let (_closed_tx, closed_rx) = watch::channel(false);
+        hub.live.lock().await.insert(
+            worker.id.clone(),
+            Live { conn_id: 7, tx, tools: Vec::new(), mcp: None, usage_probes: false, close, closed: closed_rx },
+        );
+        let conv = hub.db.create_conversation("project", "dev-approval").unwrap();
+        let thread = hub.db.create_thread(&conv, "T", &worker.id, "m", None, "b").unwrap();
+        let device_id = format!("{}-a1", thread.id);
+
+        handle_thread_frame(
+            &hub,
+            &worker.id,
+            7,
+            NodeMessage::ApprovalRequest {
+                approval_id: device_id.clone(),
+                thread_id: thread.id.clone(),
+                tool: "run_shell".into(),
+                input: json!({"command": "echo hi"}),
+                reason: "manual".into(),
+            },
+        )
+        .await;
+
+        let pending = hub.pending_approvals(Some(&conv)).await;
+        assert_eq!(pending.len(), 1);
+        let hub_id = pending[0].approval_id.clone();
+        assert_ne!(hub_id, device_id);
+        assert!(hub_id.starts_with("a_") && hub_id.len() == 26, "{hub_id}");
+
+        // Duplicate device_approval_id while pending is rejected with an immediate denial.
+        handle_thread_frame(
+            &hub,
+            &worker.id,
+            7,
+            NodeMessage::ApprovalRequest {
+                approval_id: device_id.clone(),
+                thread_id: thread.id.clone(),
+                tool: "run_shell".into(),
+                input: json!({"command": "echo hi"}),
+                reason: "manual".into(),
+            },
+        )
+        .await;
+        match dev_rx.try_recv() {
+            Ok(HubMessage::ApprovalResult { approval_id, approved: false, timeout_secs: None }) => {
+                assert_eq!(approval_id, device_id);
+            }
+            other => panic!("expected duplicate rejection, got {other:?}"),
+        }
+        assert_eq!(hub.pending_approvals(Some(&conv)).await.len(), 1);
+
+        // Resolving by hub_id sends the device's original approval_id back to the device.
+        assert!(hub.resolve_approval(&hub_id, true).await);
+        match dev_rx.try_recv() {
+            Ok(HubMessage::ApprovalResult { approval_id, approved: true, timeout_secs: None }) => {
+                assert_eq!(approval_id, device_id);
+            }
+            other => panic!("expected approval reply with device id, got {other:?}"),
+        }
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn device_disconnect_emits_live_only_dropped_approval_event() {
+        let dir = std::env::temp_dir().join(format!("grouper-drop-event-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (worker, _) = db.add_device("Laptop", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let conv = hub.db.create_conversation("project", "drop").unwrap();
+        let thread = hub.db.create_thread(&conv, "T", &worker.id, "m", None, "b").unwrap();
+        let (tx, _rx) = oneshot::channel();
+        let approval_id = Hub::new_approval_id();
+        assert!(
+            hub.request_approval(&worker.id, &thread.id, &approval_id, "run_shell", json!({}), "manual", Some(tx)).await
+        );
+
+        let mut ev_rx = hub.events.subscribe();
+        hub.device_gone(&worker.id).await;
+
+        let ev = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let e = ev_rx.recv().await.unwrap();
+                if matches!(
+                    &e.body,
+                    EventBody::ApprovalResolved { approval_id: id, approved: false, reason }
+                        if id == &approval_id && reason.as_deref() == Some("dropped")
+                ) {
+                    break e;
+                }
+            }
+        })
+        .await
+        .expect("live dropped event on device disconnect");
+        assert_eq!(ev.seq, 0);
+        assert_eq!(ev.conversation_id, conv);
+        assert_eq!(ev.thread_id.as_deref(), Some(thread.id.as_str()));
+        // Live-only: not stored in SQLite events.
+        assert!(
+            hub.db.events(&conv, 0, None).iter().all(|e| !matches!(e.body, EventBody::ApprovalResolved { .. })),
+            "dropped approval event must be live-only"
+        );
 
         drop(hub);
         std::fs::remove_dir_all(dir).ok();

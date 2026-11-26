@@ -227,6 +227,8 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
     ensure_column(&conn, "devices", "folders", "ALTER TABLE devices ADD COLUMN folders TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(&conn, "push_subscriptions", "session_id", "ALTER TABLE push_subscriptions ADD COLUMN session_id TEXT")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS push_subscriptions_session ON push_subscriptions (session_id);")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
     Ok(conn)
 }
@@ -373,16 +375,22 @@ impl Db {
 
     /// Grant or remove admin rights for a device's token.
     pub fn set_admin(&self, id: &str, admin: bool) -> Result<()> {
-        if self.c().execute("UPDATE devices SET admin = ?1 WHERE id = ?2", params![admin, id])? == 0 {
+        let c = self.c();
+        if c.execute("UPDATE devices SET admin = ?1 WHERE id = ?2", params![admin, id])? == 0 {
             bail!("no such device");
+        }
+        if !admin {
+            let _ = c.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [id]);
         }
         Ok(())
     }
 
     pub fn revoke_device(&self, id: &str) -> Result<()> {
-        if self.c().execute("UPDATE devices SET revoked = 1 WHERE id = ?1", [id])? == 0 {
+        let c = self.c();
+        if c.execute("UPDATE devices SET revoked = 1 WHERE id = ?1", [id])? == 0 {
             bail!("no such device");
         }
+        let _ = c.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [id]);
         Ok(())
     }
 

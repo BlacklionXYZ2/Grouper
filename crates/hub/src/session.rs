@@ -108,9 +108,15 @@ impl Db {
         Some(Auth { device_id, admin: admin != 0 })
     }
 
-    /// End a session. Returns whether it existed.
+    /// End a session. Returns whether it existed. Also removes any push subscriptions owned by it.
     pub fn delete_session(&self, id: &str) -> bool {
-        well_formed(id) && self.c().execute("DELETE FROM sessions WHERE id_hash = ?1", [hash(id)]).unwrap_or(0) > 0
+        if !well_formed(id) {
+            return false;
+        }
+        let key = hash(id);
+        let c = self.c();
+        let _ = c.execute("DELETE FROM push_subscriptions WHERE session_id = ?1", [&key]);
+        c.execute("DELETE FROM sessions WHERE id_hash = ?1", [&key]).unwrap_or(0) > 0
     }
 
     /// Active, non-expired browser sessions for non-revoked devices, most recently used first.
@@ -146,13 +152,15 @@ impl Db {
     }
 
     /// Revoke a session by its stored hash (`SessionInfo::id`). Returns whether it existed.
+    /// Also removes any push subscriptions owned by it.
     pub fn delete_session_by_hash(&self, id_hash: &str) -> bool {
-        well_formed(id_hash)
-            && self
-                .c()
-                .execute("DELETE FROM sessions WHERE id_hash = ?1", [id_hash.to_ascii_lowercase()])
-                .unwrap_or(0)
-                > 0
+        if !well_formed(id_hash) {
+            return false;
+        }
+        let key = id_hash.to_ascii_lowercase();
+        let c = self.c();
+        let _ = c.execute("DELETE FROM push_subscriptions WHERE session_id = ?1", [&key]);
+        c.execute("DELETE FROM sessions WHERE id_hash = ?1", [&key]).unwrap_or(0) > 0
     }
 }
 
@@ -321,7 +329,7 @@ async fn whoami(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
 }
 
 /// The hash of the session cookie authenticating this request, if any (Bearer requests have none).
-fn current_session_hash(hub: &Hub, headers: &HeaderMap) -> Option<String> {
+pub(crate) fn current_session_hash(hub: &Hub, headers: &HeaderMap) -> Option<String> {
     if headers.contains_key(header::AUTHORIZATION) {
         return None;
     }
@@ -340,6 +348,9 @@ async fn logout(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
             hub.invalidate_session(&hash(id));
             ended = true;
         }
+    }
+    if ended {
+        hub.sync_push_sub_count();
     }
     let mut response = Json(json!({"signed_out": ended})).into_response();
     let secure = is_https(&headers);
@@ -369,6 +380,7 @@ async fn revoke_session(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id
     if !hub.db.delete_session_by_hash(&target) {
         return err(StatusCode::NOT_FOUND, "no such session");
     }
+    hub.sync_push_sub_count();
     hub.invalidate_session(&target);
     let mut response = Json(json!({"revoked": target, "current": is_current})).into_response();
     if is_current {

@@ -55,6 +55,25 @@ export function storedSubscriptionId() {
   return readKey(SUB_ID);
 }
 
+/** Forget the locally stored subscription id and opt-in (e.g. when the hub dropped this browser's row). */
+export function clearStoredSubscription() {
+  writeKey(SUB_ID, null);
+  writeKey(OPT_IN, null);
+  hasPush = false;
+}
+
+/** Check whether this hub exposes Web Push (`GET /v1/push/vapid-key`). Returns 'ok' | 'missing' | 'forbidden' | 'error'. */
+export async function checkHubPushSupport(opts) {
+  try {
+    await get('/v1/push/vapid-key', opts);
+    return 'ok';
+  } catch (err) {
+    if (err?.status === 404) return 'missing';
+    if (err?.status === 403) return 'forbidden';
+    return 'error';
+  }
+}
+
 export function isIos() {
   const ua = navigator.userAgent || '';
   return /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -138,7 +157,14 @@ export function browserLabel() {
 async function subscribeAndRegister() {
   const reg = await navigator.serviceWorker.register(SW_URL, { scope: '/' });
   await navigator.serviceWorker.ready;
-  const { public_key: publicKey } = (await get('/v1/push/vapid-key')) || {};
+  let keyResp;
+  try {
+    keyResp = (await get('/v1/push/vapid-key')) || {};
+  } catch (err) {
+    if (err?.status === 404) err.pushMissing = true;
+    throw err;
+  }
+  const { public_key: publicKey } = keyResp;
   if (!publicKey) throw new Error('The hub has no notification key yet.');
   const key = base64UrlBytes(publicKey);
   let sub = await reg.pushManager.getSubscription();
@@ -182,6 +208,9 @@ export async function disableNotifications() {
   if (!sub) return;
   try {
     await del(`/v1/push/subscriptions${qs({ endpoint: sub.endpoint })}`);
+  } catch (err) {
+    // Already gone on the hub: finish unsubscribing locally without treating it as an error.
+    if (err?.status !== 404) throw err;
   } finally {
     // Even if the hub couldn't be told, this browser stops receiving: the hub
     // drops the endpoint when the push service reports it gone.
@@ -196,6 +225,7 @@ export async function disableNotifications() {
 export async function forgetNotifications({ server = true } = {}) {
   writeKey(OPT_IN, null);
   writeKey(SUB_ID, null);
+  hasPush = false;
   closeAll();
   const work = (async () => {
     const sub = await currentSubscription();
@@ -263,6 +293,26 @@ async function closeTagged(approvalId) {
   } catch {
     /* nothing to close */
   }
+}
+
+function closeStaleNotifications() {
+  const prefix = 'grouper-approval-';
+  for (const tag of pageNotes.keys()) {
+    const id = tag.slice(prefix.length);
+    if (id && id !== 'test' && !store.approvals.has(id)) closeTagged(id);
+  }
+  if (!store.approvalsLoaded) return;
+  existingRegistration()
+    .then((reg) => reg?.getNotifications())
+    .then((list) => {
+      for (const n of list || []) {
+        const tag = String(n.tag || '');
+        if (!tag.startsWith(prefix)) continue;
+        const id = tag.slice(prefix.length);
+        if (id && id !== 'test' && !store.approvals.has(id)) n.close();
+      }
+    })
+    .catch(() => {});
 }
 
 function closeAll() {
@@ -345,11 +395,8 @@ export function startNotifications() {
       else if (e.kind === 'approval_resolved') closeTagged(e.approval_id);
     }),
     on('approvals', () => {
-      // A thread that ended drops its requests: close their notifications too.
-      for (const tag of pageNotes.keys()) {
-        const id = tag.slice('grouper-approval-'.length);
-        if (!store.approvals.has(id)) closeTagged(id);
-      }
+      // Close any OS/page notifications whose approval is no longer pending.
+      closeStaleNotifications();
     }),
   );
   off = () => subs.forEach((fn) => fn());
@@ -362,7 +409,7 @@ export function stopNotifications() {
 
 /** Browsers without push: the open page notifies, unless that chat is on screen and focused. */
 function maybeShowFromPage(e) {
-  if (hasPush || !optedIn() || permission() !== 'granted' || store.answered.has(e.approval_id)) return;
+  if (hasPush || !optedIn() || permission() !== 'granted' || !store.approvals.has(e.approval_id) || store.answered.has(e.approval_id)) return;
   const here = document.visibilityState === 'visible' && document.hasFocus() && store.currentConversation === e.conversation_id;
   if (here) return;
   const hash = e.conversation_id ? `#/chat/${enc(e.conversation_id)}?approval=${enc(e.approval_id)}` : '#/inbox';
