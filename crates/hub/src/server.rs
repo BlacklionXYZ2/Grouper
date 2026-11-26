@@ -145,11 +145,13 @@ pub struct Hub {
     emit_order: std::sync::Mutex<()>,
     pub(crate) next_id: AtomicU64,
     pub(crate) limits: crate::limits::LimitState,
+    /// Web Push notifications for approvals ([`crate::push`]).
+    pub(crate) push: crate::push::PushState,
 }
 
 impl Hub {
     pub fn new(db: Db, data_dir: PathBuf) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|hub| Self {
             db,
             data_dir,
             live: Mutex::new(HashMap::new()),
@@ -169,6 +171,7 @@ impl Hub {
             emit_order: std::sync::Mutex::new(()),
             next_id: AtomicU64::new(1),
             limits: Default::default(),
+            push: crate::push::PushState::new(hub.clone()),
         })
     }
 
@@ -183,9 +186,13 @@ impl Hub {
 
     /// Store an event and send it to everyone watching.
     pub fn emit(&self, conversation_id: &str, thread_id: Option<&str>, body: EventBody) -> Event {
-        let _order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
-        let e = self.db.add_event(conversation_id, thread_id, body);
-        let _ = self.events.send(e.clone());
+        let e = {
+            let _order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
+            let e = self.db.add_event(conversation_id, thread_id, body);
+            let _ = self.events.send(e.clone());
+            e
+        };
+        self.push_on_event(&e);
         e
     }
 
@@ -535,6 +542,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::limits::routes())
         .merge(crate::files::routes())
         .merge(crate::session::routes())
+        .merge(crate::push::routes())
         .merge(crate::web::routes())
         .with_state(hub)
         .layer(axum::middleware::from_fn(crate::session::guard))
@@ -1058,16 +1066,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
             drop(live);
             old.close.trigger(CloseReason::Replaced);
             let _ = tokio::time::timeout(Duration::from_secs(2), old.closed.wait_for(|done| *done)).await;
-            hub.approvals.lock().await.retain(|_, r| {
-                if r.device_id == device_id {
-                    if let Some(timer) = r.timer.take() {
-                        timer.abort();
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
+            hub.drop_approvals(|r| r.device_id == device_id).await;
             continue;
         }
         let conn_id = hub.next_id.fetch_add(1, Ordering::Relaxed);

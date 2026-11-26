@@ -529,31 +529,33 @@ impl Hub {
 
     /// Pending approvals die with their thread (a hub thread waiting on one gets "denied").
     async fn clear_approvals(&self, thread_id: &str) {
-        self.approvals.lock().await.retain(|_, r| {
-            if r.thread_id == thread_id {
+        self.drop_approvals(|r| r.thread_id == thread_id).await;
+    }
+
+    /// Drop pending approvals without answering them (their thread or device is gone),
+    /// stopping their timers and clearing their push notifications.
+    pub(crate) async fn drop_approvals(&self, drop: impl Fn(&ApprovalRoute) -> bool) {
+        let mut dropped = Vec::new();
+        self.approvals.lock().await.retain(|id, r| {
+            if drop(r) {
                 if let Some(timer) = r.timer.take() {
                     timer.abort();
                 }
+                dropped.push((r.conversation_id.clone(), id.clone()));
                 false
             } else {
                 true
             }
         });
+        for (conversation_id, approval_id) in dropped {
+            self.push_approval_cleared(&conversation_id, &approval_id);
+        }
     }
 
     /// A device disconnected: its approvals are moot, and its threads wait for it to
     /// come back while the hub works towards a checkpoint (see `offline.rs`).
     pub(crate) async fn device_gone(self: &Arc<Self>, device_id: &str) {
-        self.approvals.lock().await.retain(|_, r| {
-            if r.device_id == device_id {
-                if let Some(timer) = r.timer.take() {
-                    timer.abort();
-                }
-                false
-            } else {
-                true
-            }
-        });
+        self.drop_approvals(|r| r.device_id == device_id).await;
         for t in self.db.running_threads_on(device_id) {
             self.wait_for_device(&t.id, "the device disconnected while the thread was running", true).await;
         }

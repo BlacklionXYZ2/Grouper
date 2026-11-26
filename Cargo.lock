@@ -1044,6 +1044,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "chacha20poly1305",
@@ -1068,6 +1069,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
