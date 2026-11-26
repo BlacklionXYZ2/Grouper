@@ -68,65 +68,17 @@ enum LiveActivityCoordinator {
     }
 }
 
-enum ApprovalNotificationCoordinator {
-    static func post(_ request: ApprovalRequest, threadTitle: String, deviceName: String) async {
-        let center = UNUserNotificationCenter.current()
-        let allowed = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
-        guard allowed else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "Run \(request.tool)?"
-        content.subtitle = "\(threadTitle) · \(deviceName)"
-        content.body = request.reason
-        content.categoryIdentifier = "grouper.approval"
-        // VERIFY ON MAC: Time-sensitive Focus breakthrough requires the com.apple.developer.usernotifications.time-sensitive entitlement when signing for device.
-        content.interruptionLevel = .timeSensitive
-        content.userInfo = ["approval_id": request.approvalId]
-        try? await center.add(UNNotificationRequest(identifier: "approval-\(request.approvalId)", content: content, trigger: nil))
-    }
-
-    static func remove(approvalId: String) {
-        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["approval-\(approvalId)"])
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ["approval-\(approvalId)"])
-    }
-}
-
-final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+/// Approval notifications live in `Shared/ApprovalNotifications.swift`, shared with
+/// the Mac. They have no actions: a notification can't show the exact input, so it
+/// only opens the chat with the request in its approval dock.
+final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        // Approving runs a tool on one of your devices: never from a locked phone.
-        let approve = UNNotificationAction(identifier: "GROUPER_APPROVE", title: "Approve", options: .authenticationRequired)
-        let deny = UNNotificationAction(identifier: "GROUPER_DENY", title: "Deny", options: .destructive)
-        let edit = UNNotificationAction(identifier: "GROUPER_EDIT", title: "Edit", options: .foreground)
-        let category = UNNotificationCategory(identifier: "grouper.approval", actions: [approve, deny, edit], intentIdentifiers: [])
-        let center = UNUserNotificationCenter.current()
-        center.setNotificationCategories([category])
-        center.delegate = self
+        // Set before launch finishes, so a tap that launched the app is delivered.
+        UNUserNotificationCenter.current().delegate = ApprovalNotificationDelegate.shared
         return true
-    }
-
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        let actionIdentifier = response.actionIdentifier
-        guard let approvalId = response.notification.request.content.userInfo["approval_id"] as? String else { return }
-        if actionIdentifier == "GROUPER_EDIT" || actionIdentifier == UNNotificationDefaultActionIdentifier {
-            await MainActor.run { NotificationCenter.default.post(name: .grouperOpenApproval, object: approvalId) }
-            return
-        }
-        guard ["GROUPER_APPROVE", "GROUPER_DENY"].contains(actionIdentifier),
-              let hub = UserDefaults.standard.string(forKey: "grouper.hubURL"),
-              let token = KeychainStore.read(.admin) else { return }
-        do {
-            let client = try HubClient(baseURL: hub, token: token)
-            _ = try await client.resolveApproval(id: approvalId, approve: actionIdentifier == "GROUPER_APPROVE")
-        } catch {
-            // A 404 means another device answered first; the notification can disappear quietly.
-        }
-    }
-
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
-        [.banner, .list, .sound]
     }
 }
 
 extension Notification.Name {
-    static let grouperOpenApproval = Notification.Name("grouper.openApproval")
     static let grouperOpenTab = Notification.Name("grouper.openTab")
 }

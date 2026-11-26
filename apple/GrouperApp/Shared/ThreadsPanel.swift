@@ -10,11 +10,10 @@ struct ThreadsPanel: View {
     let conversationId: String
     let onClose: () -> Void
     @State private var path: [String] = []
-    @State private var reviewing: PendingApproval?
 
     var body: some View {
         NavigationStack(path: $path) {
-            ThreadsList(conversationId: conversationId, reviewing: $reviewing, onClose: onClose)
+            ThreadsList(conversationId: conversationId, onClose: onClose)
                 .navigationTitle("Threads")
                 #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
@@ -37,17 +36,9 @@ struct ThreadsPanel: View {
                     #endif
                 }
         }
-        // Approvals reviewed from the panel present from the panel, so they never
-        // compete with the chat's own sheets.
-        .sheet(item: $reviewing) { ApprovalSheet(approval: $0) }
-        // A thread chosen elsewhere (a chat card on Mac, "Change it" in an approval)
-        // opens here when the panel is showing.
+        // A thread chosen elsewhere (a chat card on Mac, "Change it" in the approval
+        // dock) opens here when the panel is showing.
         .onChange(of: model.selectedThreadId, initial: true) { _, id in open(id) }
-        #if os(iOS)
-        // On iPhone the chat's own approval sheet waits while this sheet is up, so an
-        // approval opened from a notification or banner is shown here instead.
-        .onChange(of: model.selectedApprovalId, initial: true) { _, id in review(id) }
-        #endif
     }
 
     #if os(macOS)
@@ -63,14 +54,6 @@ struct ThreadsPanel: View {
         }
         .padding(.horizontal).padding(.vertical, 6)
         .background(.bar)
-    }
-    #endif
-
-    #if os(iOS)
-    private func review(_ id: String?) {
-        guard let id, let approval = model.approvals(in: conversationId).first(where: { $0.id == id }) else { return }
-        reviewing = approval
-        model.selectedApprovalId = nil
     }
     #endif
 
@@ -99,7 +82,7 @@ struct ThreadGroups {
                 return l != r ? l : lhs.created > rhs.created
             }
         let needsIds = Set(needs.map(\.id))
-        self.approvals = approvals.sorted { $0.seq > $1.seq }
+        self.approvals = ApprovalQueue.ordered(approvals) // oldest first, like the dock
         self.needsYou = needs
         self.running = threads.filter { $0.status == "running" && !needsIds.contains($0.id) }.sorted { $0.created > $1.created }
         self.finished = threads.filter { !$0.isActive && !needsIds.contains($0.id) }
@@ -114,7 +97,6 @@ struct ThreadGroups {
 private struct ThreadsList: View {
     @EnvironmentObject private var model: AppModel
     let conversationId: String
-    @Binding var reviewing: PendingApproval?
     let onClose: () -> Void
     @State private var showAllFinished = false
 
@@ -193,8 +175,15 @@ private struct ThreadsList: View {
         }
     }
 
+    /// Review never answers here: it shows the request in the chat's approval dock.
     private func approvalRow(_ approval: PendingApproval) -> some View {
-        Button { reviewing = approval } label: {
+        Button {
+            model.selectedApprovalId = approval.id
+            model.dockFocusRequest = approval.id
+            #if os(iOS)
+            onClose() // the dock is in the chat, under this sheet
+            #endif
+        } label: {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 3) {
@@ -216,7 +205,7 @@ private struct ThreadsList: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Approval needed for \(approval.tool) on \(model.deviceDisplayName(approval.deviceId))")
-        .accessibilityHint("Opens the approval")
+        .accessibilityHint("Shows the request in the chat's approval dock")
     }
 
     private func threadTitle(_ id: String?) -> String {

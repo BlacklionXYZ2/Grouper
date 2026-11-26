@@ -20,6 +20,20 @@ private final class TaskBox {
     }
 }
 
+/// A one-line status in a chat, e.g. a tapped notification whose request is gone.
+struct ChatNotice: Equatable {
+    let conversationId: String?
+    let text: String
+}
+
+/// How an answer from the approval dock went.
+enum ApprovalAnswer: Equatable {
+    case done
+    /// Someone else answered first (the hub returned 404).
+    case settledElsewhere
+    case failed(String)
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var hubURL = ""
@@ -27,7 +41,9 @@ final class AppModel: ObservableObject {
     @Published var deviceToken = ""
     @Published private(set) var client: HubClient?
     @Published private(set) var signedIn = false
-    @Published private(set) var online = false
+    @Published private(set) var online = false {
+        didSet { if !online { approvalsReconciled = false } }
+    }
     @Published var errorMessage: String?
 
     @Published private(set) var conversations: [ConversationInfo] = []
@@ -51,7 +67,31 @@ final class AppModel: ObservableObject {
     /// chat changes, so a choice never carries into another chat.
     @Published var newChatModel: String?
 
+    /// Pending approvals across every chat: `GET /v1/approvals` plus approval events.
+    @Published private(set) var approvalBook = ApprovalBook()
+    /// False after going offline (or a failed answer) until the pending list has been
+    /// fetched again; the dock keeps its actions off until then.
+    @Published private(set) var approvalsReconciled = false
+    /// The request that just left the open chat's dock, shown briefly with why.
+    @Published private(set) var settledApproval: SettledApproval?
+    /// Set when a notification opened the dock: the dock moves VoiceOver focus to its heading.
+    @Published var dockFocusRequest: String?
+    @Published var chatNotice: ChatNotice?
+    /// Bumped when something outside the chat (a notification) needs the chat shown.
+    @Published private(set) var chatRevealRequest = 0
+    /// Ids of palette rows the owner opened, most recent first (command palette).
+    @Published private(set) var paletteRecents: [String] = UserDefaults.standard.stringArray(forKey: "grouper.paletteRecents") ?? []
+    /// Chat views on screen. With one up and the app frontmost, that chat's
+    /// approvals show in its dock instead of as notifications.
+    var chatViewsOnScreen = 0
+
+    private static let recentsKey = "grouper.paletteRecents"
     private let streamTask = TaskBox()
+    private let accountStreamTask = TaskBox()
+    private let settleTask = TaskBox()
+    private var approvalRefreshQueued = false
+    private var pendingRoute: ApprovalRoute?
+    private var initialLoadDone = false
 
     init() {
         hubURL = UserDefaults.standard.string(forKey: "grouper.hubURL") ?? ""
@@ -80,14 +120,26 @@ final class AppModel: ObservableObject {
         selectedFolder?.transcript(threads: conversationThreads) ?? []
     }
 
+    /// Every pending approval, oldest first (ties by id). The hub's list once it has
+    /// loaded; before that (or on a hub without `GET /v1/approvals`) the requests
+    /// folded from loaded chats, merged with any that arrived as events.
     var pendingApprovals: [PendingApproval] {
-        folders.values.flatMap { folder in
-            folder.pendingApprovals(threads: threads.filter { $0.conversationId == folder.conversationId })
-        }.sorted { $0.seq < $1.seq }
+        if approvalBook.loaded { return approvalBook.ordered }
+        var byId: [String: PendingApproval] = approvalBook.pending
+        for folder in folders.values {
+            let folded = folder.pendingApprovals(threads: threads.filter { $0.conversationId == folder.conversationId })
+            for approval in folded where byId[approval.id] == nil && approvalBook.outcome(of: approval.id) == nil {
+                byId[approval.id] = approval
+            }
+        }
+        return ApprovalQueue.ordered(Array(byId.values))
     }
 
     var selectedThread: ThreadInfo? { threads.first { $0.id == selectedThreadId } }
-    var selectedApproval: PendingApproval? { pendingApprovals.first { $0.id == selectedApprovalId } }
+
+    /// Approve, Deny, Change it and Stop need a connection that has checked the
+    /// pending list since it was last offline.
+    var canAnswerApprovals: Bool { client != nil && online && approvalsReconciled }
 
     /// Threads belong to their chat: there is no global thread list.
     func threads(in conversationId: String) -> [ThreadInfo] {
@@ -118,6 +170,16 @@ final class AppModel: ObservableObject {
     func family(ofModel id: String) -> ModelFamily { ModelFamily.of(registryId: id, in: models) }
 
     func deviceDisplayName(_ id: String) -> String { deviceName(id) }
+
+    func threadTitle(_ id: String?) -> String {
+        guard let id, let title = threads.first(where: { $0.id == id })?.title, !title.isEmpty else { return "Thread" }
+        return title
+    }
+
+    func chatTitle(_ id: String) -> String {
+        guard let title = conversations.first(where: { $0.id == id })?.title, !title.isEmpty else { return "Chat" }
+        return title
+    }
 
     func connect(save: Bool = true) async {
         errorMessage = nil
@@ -181,6 +243,17 @@ final class AppModel: ObservableObject {
 
     func signOut() {
         streamTask.cancel()
+        accountStreamTask.cancel()
+        settleTask.cancel()
+        ApprovalNotifications.remove(approvalIds: Array(approvalBook.pending.keys))
+        approvalBook.reset()
+        settledApproval = nil
+        chatNotice = nil
+        dockFocusRequest = nil
+        pendingRoute = nil
+        initialLoadDone = false
+        paletteRecents = []
+        UserDefaults.standard.removeObject(forKey: Self.recentsKey)
         client = nil
         signedIn = false
         online = false
@@ -218,6 +291,10 @@ final class AppModel: ObservableObject {
             online = true
             if selectedConversationId == nil { selectedConversationId = conversations.first?.id }
             if let id = selectedConversationId { await selectConversation(id) }
+            await loadApprovals()
+            followAccountEvents()
+            initialLoadDone = true
+            await processPendingRoute()
         } catch {
             online = false
             errorMessage = error.localizedDescription
@@ -226,8 +303,15 @@ final class AppModel: ObservableObject {
 
     func selectConversation(_ id: String) async {
         guard let client else { return }
+        if selectedConversationId != id {
+            // Back in a chat, its dock starts at the oldest request again.
+            selectedApprovalId = nil
+            settledApproval = nil
+            if chatNotice?.conversationId != id { chatNotice = nil }
+        }
         selectedConversationId = id
         newChatModel = nil
+        rememberRecent(PaletteItem(target: .chat(id: id), title: "", subtitle: "").id)
         streamTask.cancel()
         do {
             async let events = client.events(conversationId: id)
@@ -312,6 +396,9 @@ final class AppModel: ObservableObject {
         streamTask.cancel()
         selectedConversationId = nil
         selectedThreadId = nil
+        selectedApprovalId = nil
+        settledApproval = nil
+        chatNotice = nil
         newChatMode = mode
         newChatModel = nil
     }
@@ -322,10 +409,11 @@ final class AppModel: ObservableObject {
         catch { errorMessage = error.localizedDescription; return false }
     }
 
-    func stopThread(_ id: String) async {
-        guard let client else { return }
-        do { _ = try await client.stopThread(id: id) }
-        catch { errorMessage = error.localizedDescription }
+    @discardableResult
+    func stopThread(_ id: String) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.stopThread(id: id); return true }
+        catch { errorMessage = error.localizedDescription; return false }
     }
 
     func rateThread(_ id: String, rating: String) async {
@@ -334,21 +422,209 @@ final class AppModel: ObservableObject {
         catch { errorMessage = error.localizedDescription }
     }
 
-    @discardableResult
-    func resolveApproval(_ id: String, approve: Bool) async -> Bool {
-        guard let client else { return false }
+    // MARK: - Approvals
+
+    /// Answers one request. Never retried automatically: on a network error the
+    /// pending list is fetched again before the dock offers the buttons again.
+    func answerApproval(_ id: String, approve: Bool) async -> ApprovalAnswer {
+        guard let client else { return .failed("Not connected to the hub.") }
+        approvalBook.beginAnswer(id)
         do {
             _ = try await client.resolveApproval(id: id, approve: approve)
-            selectedApprovalId = nil
-            return true
+            updateApprovals { $0.settle(id, as: .answeredHere(approved: approve)) }
+            return .done
         } catch HubClientError.notFound(_) {
-            selectedApprovalId = nil
-            errorMessage = "Answered on another device."
-            return true
+            updateApprovals { $0.settle(id, as: .answeredElsewhere) }
+            return .settledElsewhere
         } catch {
-            errorMessage = error.localizedDescription
-            return false
+            approvalBook.cancelAnswer(id)
+            let message = error.localizedDescription
+            approvalsReconciled = false
+            await loadApprovals()
+            return .failed(message)
         }
+    }
+
+    /// `GET /v1/approvals`: the hub's pending list is the source of truth.
+    func loadApprovals() async {
+        guard let client else { return }
+        let mark = approvalBook.fetchMark()
+        do {
+            let fetched = try await client.approvals()
+            let pending = fetched.map { $0.pending }
+            updateApprovals { $0.finishFetch(pending, since: mark) }
+            approvalsReconciled = true
+        } catch HubClientError.notFound(_) {
+            // A hub without the route: events and loaded chats still keep the list.
+            approvalsReconciled = online
+        } catch {
+            // Keep what we have; the dock waits for a successful check before answering.
+        }
+    }
+
+    func dismissSettledApproval() {
+        settleTask.cancel()
+        settledApproval = nil
+    }
+
+    /// A tapped notification: open its chat with that request in the dock. The
+    /// request is looked up in the hub's current list, never rebuilt from the
+    /// notification's text.
+    func openApprovalRoute(_ route: ApprovalRoute) {
+        pendingRoute = route
+        guard client != nil, initialLoadDone else { return } // loadInitial picks it up
+        Task { await processPendingRoute() }
+    }
+
+    private func processPendingRoute() async {
+        guard let route = pendingRoute else { return }
+        pendingRoute = nil
+        await loadApprovals()
+        if let approval = pendingApprovals.first(where: { $0.id == route.approvalId }) {
+            if selectedConversationId != approval.conversationId { await selectConversation(approval.conversationId) }
+            if selectedThreadId != nil, selectedThreadId != approval.threadId { selectedThreadId = nil }
+            selectedApprovalId = approval.id
+            settledApproval = nil
+            chatNotice = nil
+            dockFocusRequest = approval.id
+        } else {
+            if let id = route.conversationId, conversations.contains(where: { $0.id == id }), selectedConversationId != id {
+                await selectConversation(id)
+            }
+            let text: String
+            switch approvalBook.outcome(of: route.approvalId) {
+            case .answeredHere?: text = "You already answered this request."
+            case .some(let outcome): text = outcome.message
+            case nil: text = ApprovalOutcome.noLongerWaiting.message
+            }
+            chatNotice = ChatNotice(conversationId: route.conversationId ?? selectedConversationId, text: text)
+        }
+        chatRevealRequest += 1
+    }
+
+    /// Applies a change to the pending list and keeps the open chat's dock in step:
+    /// when the request it showed leaves, the dock says why and moves to the next.
+    private func updateApprovals(_ mutate: (inout ApprovalBook) -> ApprovalBook.Change) {
+        let conversationId = selectedConversationId
+        let queueBefore: [PendingApproval] = conversationId.map { approvals(in: $0) } ?? []
+        let shownBefore = ApprovalQueue.displayed(selected: selectedApprovalId, in: queueBefore)
+        var book = approvalBook
+        let change = mutate(&book)
+        approvalBook = book
+        switch change {
+        case .none:
+            break
+        case .added(let approval):
+            notify(approval)
+        case .removed(let ids):
+            ApprovalNotifications.remove(approvalIds: ids)
+            let removed = Set(ids)
+            if let shown = shownBefore, removed.contains(shown.id) {
+                let remaining: [PendingApproval] = conversationId.map { approvals(in: $0) } ?? []
+                selectedApprovalId = ApprovalQueue.successor(of: shown.id, previousOrder: queueBefore.map { $0.id }, remaining: remaining)
+                showSettled(SettledApproval(approval: shown, outcome: approvalBook.outcome(of: shown.id) ?? .noLongerWaiting))
+            } else if let selected = selectedApprovalId, removed.contains(selected) {
+                selectedApprovalId = nil
+            }
+        }
+    }
+
+    private func showSettled(_ settled: SettledApproval) {
+        settledApproval = settled
+        var seconds = 4.0
+        if case .answeredHere = settled.outcome { seconds = 1.5 }
+        let id = settled.id
+        settleTask.replace(with: Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled, let self, self.settledApproval?.id == id else { return }
+            self.settledApproval = nil
+        })
+    }
+
+    private func applyApprovalEvent(_ event: Event) {
+        guard event.seq > 0 else { return }
+        switch event.body {
+        case .approvalRequested, .approvalResolved, .threadFinished:
+            updateApprovals { $0.apply(event) }
+        default:
+            break
+        }
+    }
+
+    /// Fetches the pending list soon (coalesced): after a reconnect, and after a new
+    /// request so its timeout, which events don't carry, is known.
+    private func scheduleApprovalRefresh() {
+        guard !approvalRefreshQueued else { return }
+        approvalRefreshQueued = true
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard let self else { return }
+            self.approvalRefreshQueued = false
+            await self.loadApprovals()
+        }
+    }
+
+    /// A local notification for a new request, unless its chat is on screen in the
+    /// foreground (the dock is the notice there). Names only, never input or reason.
+    private func notify(_ approval: PendingApproval) {
+        scheduleApprovalRefresh()
+        if chatViewsOnScreen > 0, selectedConversationId == approval.conversationId, ApprovalNotifications.appIsActive() { return }
+        guard ApprovalNotifications.optedIn else { return }
+        let id = approval.id
+        let conversationId = approval.conversationId
+        let threadId = approval.threadId
+        let tool = approval.tool
+        let deviceId = approval.deviceId
+        Task { [weak self] in
+            guard let self else { return }
+            if !self.conversations.contains(where: { $0.id == conversationId }) { await self.refreshConversations() }
+            let body = ApprovalNotificationText.body(tool: tool, device: self.deviceName(deviceId),
+                                                     thread: self.threadTitle(threadId), chat: self.chatTitle(conversationId))
+            await ApprovalNotifications.post(approvalId: id, conversationId: conversationId, threadId: threadId, body: body)
+            // Answered while the notification was being posted: take it back down.
+            if self.approvalBook.pending[id] == nil { ApprovalNotifications.remove(approvalIds: [id]) }
+        }
+    }
+
+    /// Every chat's events, for approvals in chats that aren't open (the open chat
+    /// has its own stream) and thread rows. There is no account-wide catch-up route,
+    /// so each (re)connect re-fetches the pending list instead.
+    private func followAccountEvents() {
+        guard let client else { return }
+        accountStreamTask.replace(with: Task { [weak self] in
+            do {
+                for try await update in client.eventStream().updates() {
+                    guard let self, !Task.isCancelled else { return }
+                    switch update {
+                    case .state(let state):
+                        if state == .connected { self.scheduleApprovalRefresh() }
+                    case .stored(let event):
+                        self.handleAccountEvent(event)
+                    case .live:
+                        break
+                    }
+                }
+            } catch {
+                // The open chat's stream reports connection problems.
+            }
+        })
+    }
+
+    private func handleAccountEvent(_ event: Event) {
+        switch event.body {
+        case .threadStarted, .threadWaiting, .threadHandedOver, .threadFinished:
+            ThreadInfo.upsert(&threads, with: event)
+        default:
+            break
+        }
+        applyApprovalEvent(event)
+    }
+
+    // MARK: - Command palette
+
+    func rememberRecent(_ id: String) {
+        paletteRecents = CommandPalette.remember(id, in: paletteRecents)
+        UserDefaults.standard.set(paletteRecents, forKey: Self.recentsKey)
     }
 
     func refreshDevices() async {
@@ -384,7 +660,10 @@ final class AppModel: ObservableObject {
                 for try await update in client.eventStream(conversationId: conversationId).updates(after: last) {
                     guard let self, !Task.isCancelled else { return }
                     switch update {
-                    case .state(let state): self.streamState = state; self.online = state == .connected
+                    case .state(let state):
+                        self.streamState = state
+                        self.online = state == .connected
+                        if state == .connected { self.scheduleApprovalRefresh() }
                     case .stored(let event), .live(let event): self.ingest(event)
                     }
                 }
@@ -429,15 +708,10 @@ final class AppModel: ObservableObject {
             if let threadId = event.threadId, !threadId.isEmpty {
                 Task { await LiveActivityCoordinator.end(threadId: threadId, status: status) }
             }
-        case .approvalRequested(let request):
-            let threadTitle = threads.first { $0.id == event.threadId }?.title ?? "Thread"
-            let device = deviceName(request.deviceId)
-            Task { await ApprovalNotificationCoordinator.post(request, threadTitle: threadTitle, deviceName: device) }
-        case .approvalResolved(let approvalId, _):
-            ApprovalNotificationCoordinator.remove(approvalId: approvalId)
         default: break
         }
         #endif
+        applyApprovalEvent(event)
         switch event.body {
         case .threadStarted, .threadWaiting, .threadHandedOver, .threadFinished:
             let conversationId = event.conversationId

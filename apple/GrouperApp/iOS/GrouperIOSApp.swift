@@ -13,7 +13,15 @@ struct GrouperIOSApp: App {
             .environmentObject(model)
             .tint(.teal)
             .onOpenURL { url in handle(url) }
+            // A tapped approval notification. Taken here, not in the tab view, so a tap
+            // that launched the app is kept while it signs in.
+            .onAppear { takeApprovalRoute() }
+            .onReceive(NotificationCenter.default.publisher(for: .grouperApprovalRoute)) { _ in takeApprovalRoute() }
         }
+    }
+
+    private func takeApprovalRoute() {
+        if let route = ApprovalRouteInbox.take() { model.openApprovalRoute(route) }
     }
 
     private func handle(_ url: URL) {
@@ -74,15 +82,8 @@ struct PhoneRootView: View {
         }
         // VERIFY ON MAC: Confirm tabBarMinimizeBehavior(.onScrollDown) coordinates cleanly with ChatView's .safeAreaBar(edge: .bottom) composer on iOS 26.
         .tabBarMinimizeBehavior(.onScrollDown)
-        .onReceive(NotificationCenter.default.publisher(for: .grouperOpenApproval)) { note in
-            guard let id = note.object as? String else { return }
-            selection = PhoneTab.chat
-            // The approval sheet presents from its chat; open that chat when it is known.
-            if let approval = model.pendingApprovals.first(where: { $0.id == id }), approval.conversationId != model.selectedConversationId {
-                Task { await model.selectConversation(approval.conversationId) }
-            }
-            model.selectedApprovalId = id
-        }
+        // A notification opened a chat's approval dock: show the Chat tab.
+        .onChange(of: model.chatRevealRequest) { _, _ in selection = PhoneTab.chat }
         .onReceive(NotificationCenter.default.publisher(for: .grouperOpenTab)) { note in
             guard let tab = note.object as? Int else { return }
             selection = tab
