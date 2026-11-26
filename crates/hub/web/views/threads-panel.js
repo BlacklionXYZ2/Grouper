@@ -3,18 +3,22 @@
 // (`#/chat/<id>/threads`); this module only shows, hides and fills the panel.
 // Live updates go through syncList so focus and the panel's scroll stay put.
 //
-// Thread rows show the title, the model (text plus a family colour stripe and
-// glyph), the device, the status and the elapsed time. Running and waiting rows
-// tick through the shared one-second timer (`onTick`), which only rewrites the
-// time text and runs only while the panel is open and a row is live.
+// Each section is a card like the chat's threads card (W1's .thread-group), and a
+// thread row is a .thread-line: family dot, title (with device, time and plan
+// progress under it), model chip, status pill tinted by family while it runs, and
+// a chevron. Running and waiting rows tick through the shared one-second timer
+// (`onTick`), which only rewrites the time text and runs only while the panel is
+// open and a row is live. Plan progress ("2/5") comes from the thread's latest
+// update_plan call in the chat's stored events (see views/thread.js).
 
 import { h, icon, setChildren, setText, setAttr, syncList } from '../lib/dom.js';
 import { enc } from '../lib/api.js';
 import { store, on, deviceName, threadsIn, approvalsIn } from '../lib/store.js';
 import { isNarrow, statusPill, skeletonBlocks, onTick, navigate } from '../lib/ui.js';
 import { ago, isActive, elapsed, isoDuration, threadElapsed } from '../lib/format.js';
-import { familyOfId, familyMark, familyLabel, setFamilyClass } from '../lib/family.js';
+import { familyOfId, familyLabel, setFamilyClass } from '../lib/family.js';
 import { approvalHref } from './approvals.js';
+import { isPlanEvent, plansIn, planProgress } from './thread.js';
 
 const NARROW = '(max-width: 760px)';
 
@@ -39,12 +43,19 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
   const emptyBody = h('p', null, '');
   const emptyEl = h('div', { class: 'empty', hidden: true }, emptyTitle, emptyBody);
 
-  const needsList = h('ul', { class: 'list' });
-  const runningList = h('ul', { class: 'list' });
-  const finishedList = h('ul', { class: 'list' });
-  const needsSec = h('section', { 'aria-labelledby': 'threads-needs', hidden: true }, h('h3', { class: 'sub-title', id: 'threads-needs' }, 'Needs you'), needsList);
-  const runningSec = h('section', { 'aria-labelledby': 'threads-running', hidden: true }, h('h3', { class: 'sub-title', id: 'threads-running' }, 'Running'), runningList);
-  const finishedSec = h('section', { 'aria-labelledby': 'threads-finished', hidden: true }, h('h3', { class: 'sub-title', id: 'threads-finished' }, 'Finished'), finishedList);
+  const needsList = h('ul', { class: 'thread-group-list' });
+  const runningList = h('ul', { class: 'thread-group-list' });
+  const finishedList = h('ul', { class: 'thread-group-list' });
+  const group = (id, label, iconName, list) => {
+    const count = h('span', { class: 'tp-count' });
+    const sec = h('section', { class: 'thread-group tp-group', 'aria-labelledby': id, hidden: true }, h('h3', { class: 'thread-group-head', id }, icon(iconName), label, count), list);
+    sec.count = count;
+    return sec;
+  };
+  const needsSec = group('threads-needs', 'Needs you', 'shield', needsList);
+  needsSec.classList.add('tp-needs');
+  const runningSec = group('threads-running', 'Running', 'thread-tree', runningList);
+  const finishedSec = group('threads-finished', 'Finished', 'check', finishedList);
 
   const body = h('div', { class: 'threads-panel-body' }, skeleton, emptyEl, needsSec, runningSec, finishedSec);
   const inner = h('div', { id: 'threads-panel', class: 'threads-panel', role: 'region', 'aria-labelledby': 'threads-panel-title' }, head, body);
@@ -112,33 +123,44 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
   }
 
   function threadRow() {
-    const pill = h('span', { class: 'tp-pill' });
     const a = h(
       'a',
-      { class: 'list-row thread-row has-fam fam-unknown' },
+      { class: 'thread-line tp-row fam-unknown' },
+      // The row's fam-<key> class colours the dot (and the running pill).
+      h('span', { class: 'fam-dot tp-dot', 'aria-hidden': 'true' }),
       h(
-        'div',
-        { class: 'grow' },
-        h('div', { class: 'row-title' }),
+        'span',
+        { class: 'tp-main' },
+        h('span', { class: 'thread-line-title' }),
         h(
-          'div',
-          { class: 'meta tp-meta' },
-          h('span', { class: 'tp-model' }, h('span', { class: 'tp-mark' }), h('span', { class: 'visually-hidden tp-fam' }), h('span', { class: 'mono tp-model-name' })),
+          'span',
+          { class: 'tp-meta' },
+          h('span', { class: 'tp-plan', hidden: true }, icon('check'), h('span', { class: 'visually-hidden' }, 'Plan: '), h('span', { class: 'tp-plan-n' }), h('span', { class: 'visually-hidden tp-plan-words' })),
           h('span', { class: 'tp-device' }),
-          h(
-            'span',
-            { class: 'tp-time' },
-            icon('clock'),
-            h('span', { class: 'visually-hidden tp-time-label' }),
-            h('time', { class: 'tp-elapsed' }),
-          ),
+          h('span', { class: 'tp-time' }, icon('clock'), h('span', { class: 'visually-hidden tp-time-label' }), h('time', { class: 'tp-elapsed' })),
           h('span', { class: 'tp-ago', hidden: true }),
         ),
-        h('div', { class: 'row-sub', hidden: true }),
+        h('span', { class: 'tp-sub', hidden: true }),
       ),
-      pill,
+      h('span', { class: 'model-tag tp-model' }, h('span', { class: 'visually-hidden tp-fam' }), h('span', { class: 'tp-model-name' })),
+      h('span', { class: 'tp-pill' }),
+      icon('chevron'),
     );
     return h('li', null, a);
+  }
+
+  // Plan progress per thread: the latest update_plan call in the chat's stored
+  // events. Rebuilt only when the stored log grew.
+  let plans = new Map();
+  let plansAt = -1;
+  function planOf(threadId) {
+    const c = store.convs.get(cid);
+    const at = c?.loaded ? c.lastSeq : -1;
+    if (at !== plansAt) {
+      plansAt = at;
+      plans = plansIn(c?.events || []);
+    }
+    return plans.get(threadId) || null;
   }
 
   /** Paint one row's elapsed time. Live rows keep `data-live` (their start) for the tick. */
@@ -155,9 +177,9 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
     const a = li.querySelector('a');
     const needs = approvalsIn(cid).some((x) => x.thread_id === t.id);
     setAttr(a, 'href', `#/chat/${enc(cid)}/thread/${enc(t.id)}`);
-    setText(a.querySelector('.row-title'), t.title || 'Thread');
+    setText(a.querySelector('.thread-line-title'), t.title || 'Thread');
     const summary = !isActive(t.status) && t.summary ? clip(t.summary) : '';
-    const sub = a.querySelector('.row-sub');
+    const sub = a.querySelector('.tp-sub');
     sub.hidden = !summary;
     setText(sub, summary);
     setText(a.querySelector('.tp-device'), deviceName(t.device_id));
@@ -165,19 +187,27 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
     if (a.dataset.fam !== fam) {
       a.dataset.fam = fam;
       setFamilyClass(a, fam);
-      setChildren(a.querySelector('.tp-mark'), familyMark(fam));
       setText(a.querySelector('.tp-fam'), `${familyLabel(fam)}: `);
     }
     setText(a.querySelector('.tp-model-name'), t.model || 'model not recorded');
+    const plan = planOf(t.id);
+    const planEl = a.querySelector('.tp-plan');
+    planEl.hidden = !plan;
+    if (plan) {
+      const { done, total } = planProgress(plan);
+      setText(a.querySelector('.tp-plan-n'), `${done}/${total}`);
+      setText(a.querySelector('.tp-plan-words'), ` (${done} of ${total} steps done)`);
+      planEl.classList.toggle('is-complete', done === total);
+    }
     paintElapsed(a.querySelector('.tp-elapsed'), a.querySelector('.tp-time-label'), t);
     const agoEl = a.querySelector('.tp-ago');
     agoEl.hidden = isActive(t.status) || !t.finished;
     setText(agoEl, agoEl.hidden ? '' : ago(t.finished));
     const pill = a.querySelector('.tp-pill');
-    const key = `${t.status}|${t.checkpoint ? 1 : 0}|${needs ? 1 : 0}`;
+    const key = `${t.status}|${t.checkpoint ? 1 : 0}|${needs ? 1 : 0}|${fam}`;
     if (pill.dataset.key !== key) {
       pill.dataset.key = key;
-      setChildren(pill, statusPill(t.status, { checkpoint: t.checkpoint, approval: needs }));
+      setChildren(pill, statusPill(t.status, { checkpoint: t.checkpoint, approval: needs, family: fam }));
     }
   }
 
@@ -187,14 +217,14 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
       null,
       h(
         'button',
-        { class: 'list-row', type: 'button' },
+        { class: 'thread-line tp-approval', type: 'button' },
         icon('shield'),
         h(
-          'div',
-          { class: 'grow' },
-          h('div', { class: 'row-title' }),
-          h('div', { class: 'row-sub' }),
-          h('div', { class: 'meta' }, h('span', { class: 'tp-thread' }), h('span', { class: 'tp-time' })),
+          'span',
+          { class: 'tp-main' },
+          h('span', { class: 'thread-line-title' }),
+          h('span', { class: 'tp-sub' }),
+          h('span', { class: 'tp-meta' }, h('span', { class: 'tp-thread' }), h('span', { class: 'tp-time' })),
         ),
         h('span', { class: 'btn btn-sm btn-primary' }, 'Review'),
       ),
@@ -206,8 +236,10 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
     // Review closes the panel and opens the chat's approval dock on this request.
     btn.onclick = () => navigate(approvalHref(a));
     setAttr(btn, 'id', `approval-row-${a.approval_id}`);
-    setText(btn.querySelector('.row-title'), `${a.tool} on ${deviceName(a.device_id)}`);
-    setText(btn.querySelector('.row-sub'), a.reason || '');
+    setText(btn.querySelector('.thread-line-title'), `${a.tool} on ${deviceName(a.device_id)}`);
+    const sub = btn.querySelector('.tp-sub');
+    sub.hidden = !a.reason;
+    setText(sub, a.reason || '');
     const t = store.threads.get(a.thread_id);
     setText(btn.querySelector('.tp-thread'), t?.title || 'Thread');
     setText(btn.querySelector('.tp-time'), ago(a.ts));
@@ -271,6 +303,9 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
     needsSec.hidden = needsItems.length === 0;
     runningSec.hidden = running.length === 0;
     finishedSec.hidden = finished.length === 0;
+    setText(needsSec.count, needsCount ? String(needsCount) : '');
+    setText(runningSec.count, running.length ? String(running.length) : '');
+    setText(finishedSec.count, finished.length ? String(finished.length) : '');
     const any = needsItems.length || running.length || finished.length;
     emptyEl.hidden = Boolean(any);
     if (!any) {
@@ -306,9 +341,9 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
   // Arrow keys move between rows across the sections; Home and End jump to the ends.
   function onRowKey(e) {
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
-    const row = e.target.closest?.('.list-row');
+    const row = e.target.closest?.('.thread-line');
     if (!row || !body.contains(row) || e.altKey || e.ctrlKey || e.metaKey) return;
-    const rows = [...body.querySelectorAll('section:not([hidden]) .list-row')];
+    const rows = [...body.querySelectorAll('section:not([hidden]) .thread-line')];
     const i = rows.indexOf(row);
     if (i < 0) return;
     const next = e.key === 'Home' ? 0 : e.key === 'End' ? rows.length - 1 : e.key === 'ArrowDown' ? Math.min(rows.length - 1, i + 1) : Math.max(0, i - 1);
@@ -347,7 +382,17 @@ export function mountThreadsPanel(host, { cid, trigger, onRequestClose }) {
   dialog.addEventListener('cancel', onCancel);
   dialog.addEventListener('click', onBackdrop);
   document.addEventListener('keydown', onKey);
-  const offs = [on('threads', render), on('approvals', render), on('devices', render), on('conversations', render), on('models', render)];
+  const offs = [
+    on('threads', render),
+    on('approvals', render),
+    on('devices', render),
+    on('conversations', render),
+    on('models', render),
+    // A thread updated its plan: its row's progress changes.
+    on('stored', (e) => {
+      if (open && e.conversation_id === cid && isPlanEvent(e)) render();
+    }),
+  ];
   syncTrigger();
   render();
 
