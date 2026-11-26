@@ -28,7 +28,9 @@ struct GrouperMacApp: App {
     private var menuIcon: String { model.pendingApprovals.isEmpty ? (node.running ? "circle.hexagongrid.fill" : "pause.circle") : "exclamationmark.circle.fill" }
 }
 
-private enum MacSection: Hashable { case chat, threads, devices, settings }
+/// No Threads destination: threads belong to their chat and open in the chat's
+/// inspector (Threads button in the chat toolbar, or a thread card).
+private enum MacSection: Hashable { case chat, devices, settings }
 
 struct MacRootView: View {
     @EnvironmentObject private var model: AppModel
@@ -49,22 +51,17 @@ struct MacRootView: View {
                     Button { section = .chat; model.beginNewChat(mode: "project") } label: { Label("New project", systemImage: "plus") }
                 }
                 Section {
-                    Label("Threads", systemImage: "point.3.connected.trianglepath.dotted").tag(MacSection.threads)
                     Label("Devices", systemImage: "desktopcomputer").tag(MacSection.devices)
                     Label("Settings", systemImage: "gear").tag(MacSection.settings)
                 }
             }
             .navigationSplitViewColumnWidth(min: 210, ideal: 260)
-        } content: {
+        } detail: {
             switch section ?? .chat {
             case .chat: NavigationStack { ChatView() }
-            case .threads: ThreadsView()
             case .devices: DevicesView()
             case .settings: NavigationStack { SettingsView() }
             }
-        } detail: {
-            if let thread = model.selectedThread { ThreadDetailView(thread: thread) }
-            else { ContentUnavailableView("Select a thread", systemImage: "sidebar.right") }
         }
     }
 }

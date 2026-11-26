@@ -35,6 +35,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var folders: [String: TranscriptFolder] = [:]
     @Published private(set) var threads: [ThreadInfo] = []
     @Published private(set) var models: [ModelEntry] = []
+    /// `GET /v1/providers` (admin), for the model picker's provider groups and key status.
+    @Published private(set) var providers: [ProviderInfo] = []
+    @Published private(set) var providersLoaded = false
+    @Published private(set) var providersFailed = false
     @Published private(set) var devices: [DeviceInfo] = []
     @Published private(set) var toolsByDevice: [String: [ToolInfo]] = [:]
     @Published private(set) var streamState: EventStreamState = .disconnected
@@ -81,6 +85,36 @@ final class AppModel: ObservableObject {
 
     var selectedThread: ThreadInfo? { threads.first { $0.id == selectedThreadId } }
     var selectedApproval: PendingApproval? { pendingApprovals.first { $0.id == selectedApprovalId } }
+
+    /// Threads belong to their chat: there is no global thread list.
+    func threads(in conversationId: String) -> [ThreadInfo] {
+        threads.filter { $0.conversationId == conversationId }
+    }
+
+    func approvals(in conversationId: String) -> [PendingApproval] {
+        pendingApprovals.filter { $0.conversationId == conversationId }
+    }
+
+    /// Pending approvals plus threads waiting for a device, in one chat.
+    func needsYouCount(in conversationId: String) -> Int {
+        let pending = self.approvals(in: conversationId)
+        let withApproval = Set(pending.compactMap(\.threadId))
+        let waiting = self.threads(in: conversationId).filter { $0.status == "waiting_device" && !withApproval.contains($0.id) }
+        return pending.count + waiting.count
+    }
+
+    /// The thread's streamed text that no stored event has replaced yet.
+    func threadDraft(_ threadId: String) -> String {
+        guard let conversationId = threads.first(where: { $0.id == threadId })?.conversationId else { return "" }
+        return folders[conversationId]?.threadDrafts[threadId] ?? ""
+    }
+
+    func modelEntry(_ id: String) -> ModelEntry? { models.first { $0.id == id } }
+
+    /// The family of a registry id as the hub reports it on a thread or chat.
+    func family(ofModel id: String) -> ModelFamily { ModelFamily.of(registryId: id, in: models) }
+
+    func deviceDisplayName(_ id: String) -> String { deviceName(id) }
 
     func connect(save: Bool = true) async {
         errorMessage = nil
@@ -152,6 +186,9 @@ final class AppModel: ObservableObject {
         conversations.removeAll()
         threads.removeAll()
         folders.removeAll()
+        providers.removeAll()
+        providersLoaded = false
+        providersFailed = false
         selectedConversationId = nil
         selectedThreadId = nil
         selectedApprovalId = nil
@@ -233,6 +270,31 @@ final class AppModel: ObservableObject {
             if let index = conversations.firstIndex(where: { $0.id == updated.id }) {
                 conversations[index] = updated
             }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Reloads the registry and the providers behind it, for the model picker.
+    func loadProviders() async {
+        guard let client else { return }
+        if let loaded = try? await client.models() { models = loaded }
+        do {
+            providers = try await client.providers().sorted { $0.id < $1.id }
+            providersLoaded = true
+            providersFailed = false
+        } catch {
+            // The picker still groups by provider id; it just cannot show kind or key status.
+            providersFailed = true
+        }
+    }
+
+    func refreshThreads(conversationId: String) async {
+        guard let client else { return }
+        do {
+            let updated = try await client.threads(conversationId: conversationId)
+            threads.removeAll { $0.conversationId == conversationId }
+            threads.append(contentsOf: updated)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -372,13 +434,8 @@ final class AppModel: ObservableObject {
         #endif
         switch event.body {
         case .threadStarted, .threadWaiting, .threadHandedOver, .threadFinished:
-            Task { [weak self] in
-                guard let self, let client = self.client else { return }
-                if let updated = try? await client.threads(conversationId: event.conversationId) {
-                    self.threads.removeAll { $0.conversationId == event.conversationId }
-                    self.threads.append(contentsOf: updated)
-                }
-            }
+            let conversationId = event.conversationId
+            Task { [weak self] in await self?.refreshThreads(conversationId: conversationId) }
         default: break
         }
     }

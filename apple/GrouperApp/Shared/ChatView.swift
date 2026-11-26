@@ -7,6 +7,9 @@ struct ChatView: View {
     @State private var selectedModel: String?
     @State private var sending = false
     @State private var lastAnnouncement = Date.distantPast
+    /// The chat-scoped threads list: a sheet on iPhone, an inspector on Mac.
+    @State private var showThreads = false
+    @State private var showModelPicker = false
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -31,10 +34,54 @@ struct ChatView: View {
             .safeAreaBar(edge: .bottom) { composer }
         }
         .navigationTitle(model.selectedConversation?.title ?? "New chat")
-        .toolbar { chatMenu }
-        .modifier(ThreadPresentation())
-        .sheet(item: Binding(get: { model.selectedApproval }, set: { if $0 == nil { model.selectedApprovalId = nil } })) { approval in
+        .toolbar {
+            threadsButton
+            chatMenu
+        }
+        .modifier(ThreadPresentation(showThreads: $showThreads, conversationId: threadsConversationId))
+        // While the iPhone threads sheet is up it presents its own approvals and threads.
+        .sheet(item: Binding(get: { threadsSheetUp ? nil : model.selectedApproval }, set: { if $0 == nil { model.selectedApprovalId = nil } })) { approval in
             ApprovalSheet(approval: approval)
+        }
+        .sheet(isPresented: $showModelPicker) {
+            ModelPickerSheet(role: chatRole, current: currentModelId) { chooseModel($0) }
+        }
+        .onChange(of: model.selectedConversationId) { _, _ in showThreads = false }
+    }
+
+    /// On iPhone the threads list is a sheet, which the chat's other sheets must not cover.
+    private var threadsSheetUp: Bool {
+        #if os(iOS)
+        return showThreads && threadsConversationId != nil
+        #else
+        return false
+        #endif
+    }
+
+    /// The open project chat, if it can have threads (standard chats cannot).
+    private var threadsConversationId: String? {
+        guard let conversation = model.selectedConversation, conversation.mode != "standard" else { return nil }
+        return conversation.id
+    }
+
+    @ToolbarContentBuilder private var threadsButton: some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            Button { showThreads.toggle() } label: {
+                let id = threadsConversationId ?? ""
+                let count = model.threads(in: id).count
+                let needs = model.needsYouCount(in: id)
+                HStack(spacing: 4) {
+                    Image(systemName: "point.3.connected.trianglepath.dotted")
+                    Text("\(count)").monospacedDigit()
+                    if needs > 0 {
+                        Circle().fill(Color.orange).frame(width: 8, height: 8)
+                    }
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(needs > 0 ? "Threads, \(count), \(needs) need you" : "Threads, \(count)")
+            }
+            .disabled(threadsConversationId == nil)
+            .help("Threads in this chat")
         }
     }
 
@@ -106,12 +153,21 @@ struct ChatView: View {
             HStack(alignment: .bottom, spacing: 10) {
                 TextField("Message", text: $message, axis: .vertical)
                     .lineLimit(1...4).textFieldStyle(.plain).padding(.horizontal, 8).grouperMinimumControlSize()
-                Menu {
-                    Button("Default") { chooseModel(nil) }
-                    ForEach(availableModels) { entry in
-                        Button(entry.free ? "\(entry.id) · Free" : entry.id) { chooseModel(entry.id) }
+                // A covering picker, not a small menu: there are many models.
+                Button { showModelPicker = true } label: {
+                    Group {
+                        if let id = currentModelId {
+                            FamilyMark(family: model.family(ofModel: id))
+                        } else {
+                            Image(systemName: "cpu")
+                        }
                     }
-                } label: { Image(systemName: "cpu").grouperMinimumControlSize().accessibilityLabel("Choose model") }
+                    .grouperMinimumControlSize()
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Choose model")
+                .accessibilityValue(currentModelId ?? "Default model")
+                .help(currentModelId.map { "Model: \($0)" } ?? "Model: default")
                 Button { send() } label: {
                     if sending { ProgressView().frame(width: 22, height: 22) } else { Image(systemName: "arrow.up") }
                 }
@@ -122,9 +178,16 @@ struct ChatView: View {
         }.padding(.horizontal).padding(.bottom, 6)
     }
 
-    private var availableModels: [ModelEntry] {
-        let role = (model.selectedConversation?.mode ?? model.newChatMode) == "standard" ? "standard" : "orchestrator"
-        return model.models.filter { $0.roles.contains(role) }
+    /// Project chats pick an orchestrator model; standard chats a standard one.
+    private var chatRole: String {
+        (model.selectedConversation?.mode ?? model.newChatMode) == "standard" ? "standard" : "orchestrator"
+    }
+
+    /// The chat's pinned model, or the one chosen for a chat not yet started. Nil is the default.
+    private var currentModelId: String? {
+        let id = model.selectedConversationId == nil ? selectedModel : model.selectedConversation?.model
+        guard let id, !id.isEmpty else { return nil }
+        return id
     }
 
     @ToolbarContentBuilder private var chatMenu: some ToolbarContent {
@@ -167,15 +230,48 @@ struct ChatView: View {
     private func deviceName(_ id: String) -> String { model.devices.first { $0.id == id }?.name ?? id }
 }
 
+/// How threads open from a chat.
+///
+/// iPhone: the Threads button opens a sheet with this chat's threads; a thread card
+/// opens that thread as its own full-height sheet (unless the threads sheet is up,
+/// which then pushes it instead).
+///
+/// Mac: the Threads button toggles an inspector beside the transcript, and a thread
+/// card opens the inspector on that thread.
 private struct ThreadPresentation: ViewModifier {
     @EnvironmentObject private var model: AppModel
+    @Binding var showThreads: Bool
+    let conversationId: String?
+
     @ViewBuilder func body(content: Content) -> some View {
         #if os(iOS)
-        content.sheet(item: Binding(get: { model.selectedThread }, set: { if $0 == nil { model.selectedThreadId = nil } })) { thread in
-            ThreadDetailView(thread: thread)
-        }
+        content
+            .sheet(isPresented: Binding(get: { showThreads && conversationId != nil }, set: { showThreads = $0 })) {
+                if let conversationId {
+                    ThreadsPanel(conversationId: conversationId) { showThreads = false }
+                        .id(conversationId)
+                }
+            }
+            .sheet(item: Binding(get: { showThreads ? nil : model.selectedThread }, set: { if $0 == nil { model.selectedThreadId = nil } })) { thread in
+                NavigationStack {
+                    ThreadDetailView(thread: thread) { model.selectedThreadId = nil }
+                }
+            }
         #else
         content
+            .inspector(isPresented: Binding(get: { showThreads && conversationId != nil }, set: { showThreads = $0 })) {
+                Group {
+                    if let conversationId {
+                        ThreadsPanel(conversationId: conversationId) { showThreads = false }
+                            .id(conversationId)
+                    }
+                }
+                .inspectorColumnWidth(min: 320, ideal: 400, max: 520)
+            }
+            .onChange(of: model.selectedThreadId) { _, id in
+                guard let id, let conversationId, model.threads.contains(where: { $0.id == id && $0.conversationId == conversationId }) else { return }
+                showThreads = true
+            }
         #endif
     }
 }

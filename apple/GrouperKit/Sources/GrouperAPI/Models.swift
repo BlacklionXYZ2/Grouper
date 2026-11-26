@@ -85,6 +85,8 @@ public struct ProviderInfo: Codable, Equatable, Identifiable, Sendable {
     public let kind: String
     public let baseUrl: String?
     public let hasKey: Bool
+    /// Device id or name that hosts the provider (`options.via_device`), if any.
+    public let viaDevice: String?
 }
 
 public struct ProviderConfig: Codable, Equatable, Identifiable, Sendable {

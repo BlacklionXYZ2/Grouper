@@ -5,6 +5,33 @@ SwiftUI sources in `Shared/`. The Mac target also links `GrouperKit` for its loc
 device node. Tokens are stored in the Keychain as `grouper.admin` and
 `grouper.device`; they are never written to defaults or logs.
 
+## Status: GUI decisions of 25 November (unbuilt)
+
+The SwiftUI sources follow the owner decisions in `docs/gui-spec.md`, with the web
+client as the reference. **They have not been compiled or run.** Treat them as
+unverified until they build in Xcode 26 and are checked on an iPhone and a Mac.
+Only the `GrouperAPI` parts (model family rules, the thread-as-chat fold, elapsed
+time, `ProviderInfo.viaDevice`) are built and tested, on the Windows toolchain.
+
+- **No Threads tab or Threads destination.** Threads belong to their chat. The
+  phone keeps Chat, Devices and More (the tab set is still an owner decision; see
+  the `TODO(owner decision: phone tabs)` in `iOS/GrouperIOSApp.swift`). The Chat
+  tab carries the needs-you badge.
+- **Threads button in the chat toolbar** (count, orange dot when something needs
+  you) opens the chat's threads: a sheet on iPhone, an inspector on Mac
+  (`Shared/ThreadsPanel.swift`). Rows show the title, live elapsed time, the model
+  name with a family colour and glyph, the device and status, grouped as Needs
+  you / Running / Finished.
+- **Thread view reads like a chat** (`Shared/ThreadDetailView.swift`): the brief
+  first, the model's text labelled with the model, collapsible tool rows with the
+  exact input and output, step-ins and orchestrator answers as messages, a fixed
+  model chip in the header, and the step-in composer with Stop at the bottom.
+- **Covering model picker** (`Shared/ModelPickerSheet.swift`): a full-height sheet
+  on iPhone, a large sheet on Mac, searchable, Default first, then the chat role's
+  models, then other models, grouped by provider with key status.
+- Family colours (`Shared/ModelFamilyStyle.swift`) match the web `--fam-*` tokens
+  for light, dark and Increase Contrast.
+
 ## Build on a Mac
 
 Requirements: macOS 26, Xcode 26, Swift 6, and XcodeGen.
