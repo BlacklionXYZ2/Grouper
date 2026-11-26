@@ -42,6 +42,7 @@ import { renderSettings } from './views/settings.js';
 import { renderMore } from './views/more.js';
 import { renderInbox } from './views/inbox.js';
 import { startNotifications, stopNotifications, forgetNotifications } from './lib/push.js';
+import { mountPalette, openPalette, paletteShortcut } from './views/palette.js';
 
 const root = document.getElementById('app');
 const LAST_CONV = 'grouper.lastConversation';
@@ -211,6 +212,11 @@ function buildShell() {
     },
     { signal },
   );
+  // Remount #/chat/new so the composer reads a mode the palette just stored.
+  window.addEventListener('grouper-palette-remount-chat', () => {
+    mainKey = '';
+  }, { signal });
+  mountPalette(signal);
 }
 
 function focusMain() {
@@ -282,6 +288,22 @@ function buildNav() {
       { class: 'sidebar-head' },
       h('a', { class: 'brand', href: '#/chat' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), 'Grouper'),
       h('a', { class: 'icon-btn', href: '#/chat/new', 'aria-label': 'New chat', title: 'New chat' }, icon('plus')),
+      h(
+        'button',
+        {
+          type: 'button',
+          class: 'palette-launch only-desktop',
+          'aria-label': 'Search chats, threads, models, devices, pages, actions',
+          'aria-haspopup': 'dialog',
+          'aria-controls': 'command-palette',
+          'aria-expanded': 'false',
+          'aria-keyshortcuts': paletteShortcut().keys,
+          onclick: () => openPalette(),
+        },
+        icon('search'),
+        h('span', { class: 'palette-launch-label' }, 'Search'),
+        h('kbd', { class: 'palette-kbd', 'aria-hidden': 'true' }, paletteShortcut().label),
+      ),
     ),
     h(
       'div',
