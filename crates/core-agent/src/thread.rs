@@ -1,7 +1,7 @@
 //! Runs one subagent thread: the loop, its tools, approvals, `ask_orchestrator`,
 //! messages from the user or orchestrator, and stopping. Used on devices and on the hub.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -83,18 +83,13 @@ struct State {
     queue: Mutex<Vec<String>>,
     pending_asks: Mutex<VecDeque<(u64, oneshot::Sender<String>)>>,
     next_ask: AtomicU64,
-    /// Calls (tool + input) the user denied. Asking again is refused without a new
-    /// approval request until the user next messages the thread: a model must not be
-    /// able to talk its way past a denial (e.g. "the orchestrator says it's allowed").
-    denied: Mutex<HashSet<String>>,
 }
 
+/// Also what a retry of a denied call gets: the hub remembers denials per conversation
+/// (until the user next speaks in it) and refuses a repeat without asking.
 const DENIED: &str = "the user denied this call. Only the user can approve tool calls (the orchestrator can't), \
                       so don't retry it or ask anyone to allow it. Finish and report that it was declined, or do \
                       the task another way";
-const DENIED_AGAIN: &str = "the user already denied this exact call. Only the user can approve tool calls (the \
-                            orchestrator can't). Don't retry it: finish and report that it was declined, or do \
-                            the task another way";
 
 struct ThreadHooks {
     thread_id: String,
@@ -116,16 +111,9 @@ impl Hooks for ThreadHooks {
         let Some(reason) = check_call(level, tool, input, &self.workspace) else {
             return Gate::Allow;
         };
-        let key = format!("{tool}\0{input}");
-        if self.state.denied.lock().unwrap().contains(&key) {
-            return Gate::Deny(DENIED_AGAIN.into());
-        }
         match self.host.approve(&self.thread_id, tool, input, &reason).await {
             ApprovalDecision::Approved => Gate::Allow,
-            ApprovalDecision::Denied => {
-                self.state.denied.lock().unwrap().insert(key);
-                Gate::Deny(DENIED.into())
-            }
+            ApprovalDecision::Denied => Gate::Deny(DENIED.into()),
             ApprovalDecision::TimedOut { secs } => Gate::Deny(approval_timeout_reason(secs)),
         }
     }
@@ -196,7 +184,6 @@ pub fn spawn_thread(
         queue: Mutex::new(Vec::new()),
         pending_asks: Mutex::new(VecDeque::new()),
         next_ask: AtomicU64::new(1),
-        denied: Mutex::new(HashSet::new()),
     });
 
     // Route incoming messages: an orchestrator reply answers a pending ask, everything
@@ -209,10 +196,6 @@ pub fn spawn_thread(
             {
                 let _ = tx.send(text);
                 continue;
-            }
-            if from == "user" {
-                // The user may have changed their mind: their next approval request decides.
-                st.denied.lock().unwrap().clear();
             }
             st.queue.lock().unwrap().push(format!("[Message from the {from}]\n{text}"));
         }
@@ -371,11 +354,14 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// The thread keeps no memory of denials: every call goes to the host, which (on the
+    /// hub) remembers them per conversation and forgets them when the user next speaks in
+    /// the chat. So a retry the orchestrator relays after the user said yes is asked again.
+    /// The hub side is covered in `hub/tests/denials.rs`.
     #[tokio::test]
-    async fn a_denied_call_is_not_asked_again_until_the_user_speaks() {
-        #[derive(Default)]
+    async fn a_denied_call_is_asked_again_and_the_host_decides() {
         struct Count {
-            asked: Mutex<u32>,
+            decisions: Mutex<Vec<ApprovalDecision>>,
             events: Mutex<Vec<AgentEvent>>,
         }
         #[async_trait]
@@ -384,35 +370,55 @@ mod tests {
                 self.events.lock().unwrap().push(event);
             }
             async fn approve(&self, _: &str, _: &str, _: &Value, _: &str) -> ApprovalDecision {
-                *self.asked.lock().unwrap() += 1;
-                ApprovalDecision::Denied
+                self.decisions.lock().unwrap().remove(0)
             }
             fn ask_orchestrator(&self, _: &str, _: &str) {}
         }
         let dir = std::env::temp_dir().join(format!("grouper-denied-again-{}", std::process::id()));
         let ws = Workspace::create(dir.clone()).unwrap();
-        let host = Arc::new(Count::default());
+        let host = Arc::new(Count {
+            decisions: Mutex::new(vec![ApprovalDecision::Denied, ApprovalDecision::Approved]),
+            events: Mutex::new(Vec::new()),
+        });
         let script = json!({"rules": [
-            {"last": "already denied", "reply": [{"type": "text", "text": "Declined."}]},
-            {"reply": [{"type": "tool_use", "name": "list_files", "input": {}}]}
+            {"last": "(empty)", "reply": [{"type": "text", "text": "Listed."}]},
+            {"last": "user denied this call", "reply": [
+                {"type": "tool_use", "name": "ask_orchestrator", "input": {"question": "May I retry?"}}]},
+            {"last": "user says go ahead", "reply": [{"type": "tool_use", "name": "list_files", "input": {}}]},
+            {"last": "go", "reply": [{"type": "tool_use", "name": "list_files", "input": {}}]}
         ]});
-        let (_control, handle) = spawn_thread(spec(Some(1800)), provider(script), file_tools(&ws), host.clone(), ws);
+        let (control, handle) = spawn_thread(spec(Some(10)), provider(script), file_tools(&ws), host.clone(), ws);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let asked = host.events.lock().unwrap().iter().any(|e| {
+                    matches!(e, AgentEvent::ToolCall { name, .. } if name == "ask_orchestrator")
+                });
+                if asked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the thread never asked after the denial");
+        control.send("orchestrator", "The user says go ahead.");
         let result = tokio::time::timeout(Duration::from_secs(5), handle).await.unwrap().unwrap();
-        assert_eq!(result.summary, "Declined.");
-        assert_eq!(*host.asked.lock().unwrap(), 1, "the repeat must not ask the user again");
+        assert_eq!(result.summary, "Listed.");
+        assert!(host.decisions.lock().unwrap().is_empty(), "the retry must go to the host");
         let outputs: Vec<_> = host
             .events
             .lock()
             .unwrap()
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::ToolResult { output, .. } => Some(output.clone()),
+                AgentEvent::ToolResult { name, output, .. } if name == "list_files" => Some(output.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(outputs.len(), 2, "{outputs:?}");
         assert!(outputs[0].contains("the user denied this call"), "{outputs:?}");
-        assert!(outputs[1].contains("already denied"), "{outputs:?}");
+        assert!(outputs[0].contains("don't retry it or ask anyone to allow it"), "{outputs:?}");
+        assert_eq!(outputs[1], "(empty)");
         std::fs::remove_dir_all(dir).ok();
     }
 

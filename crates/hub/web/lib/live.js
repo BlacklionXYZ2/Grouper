@@ -98,10 +98,11 @@ function connect() {
     if (socket !== ws) return;
     socket = null;
     clearInterval(keepAlive);
-    setOnline(false);
     // Drafts can't be finished without the socket; the stored text repairs them.
+    // Cleared before 'online' is emitted, so views redrawing on it see them gone.
     store.drafts.clear();
     for (const l of store.live.values()) l.draft = '';
+    setOnline(false);
     // Nor can "replying" end without it; catch-up works it out again.
     const replying = [...store.replying];
     store.replying.clear();

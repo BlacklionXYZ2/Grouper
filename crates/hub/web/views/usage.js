@@ -127,9 +127,9 @@ function hostOf(provider) {
 /** Which official balance API the hub reads for this provider (see usage.rs `collector`). */
 function balanceApi(provider) {
   if (!provider || provider.kind !== 'openai') return null;
-  const host = hostOf(provider);
-  if (host === 'openrouter.ai') return { name: 'OpenRouter', source: 'OpenRouter key and credits API' };
-  if (host === 'api.deepseek.com') return { name: 'DeepSeek', source: 'DeepSeek balance API' };
+  // Includes "openrouter" with no base_url, which defaults to OpenRouter.
+  if (isOpenRouter(provider)) return { name: 'OpenRouter', source: 'OpenRouter key and credits API' };
+  if (hostOf(provider) === 'api.deepseek.com') return { name: 'DeepSeek', source: 'DeepSeek balance API' };
   return null;
 }
 
@@ -531,7 +531,9 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
 
   // ---- loading
 
+  let apiSeq = 0;
   async function loadApi() {
+    const seq = ++apiSeq;
     apiBody.setAttribute('aria-busy', 'true');
     try {
       const [p, u, f] = await Promise.all([
@@ -539,6 +541,7 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
         load(`/v1/usage${qs({ ...rangeQuery(), group: 'provider' })}`, signal),
         load('/v1/usage/free-requests', signal),
       ]);
+      if (seq !== apiSeq) return; // a newer range or refresh won
       st.providers = p;
       st.byProvider = u;
       st.free = f;
@@ -785,7 +788,9 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
       const used = s.used_amount ?? null;
       const left = limit !== null && used !== null ? Math.max(0, limit - used) : s.used_pct >= 100 ? 0 : null;
       const reset = s.resets_at || null;
-      const passed = reset !== null && reset <= nowSecs();
+      // With no reset time, a reading is only trusted for the UTC day it was taken in
+      // (OpenRouter's free allowance is daily).
+      const passed = reset !== null ? reset <= nowSecs() : Math.floor(s.fetched_at / 86400) < Math.floor(nowSecs() / 86400);
       if (!passed) {
         const value = [
           left !== null ? (limit !== null ? `${num(left)} left of ${num(limit)}` : `${num(left)} left`) : limit !== null ? `limit ${num(limit)}` : 'limit reached',
@@ -804,7 +809,13 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
             'div',
             { class: 'u-rep' },
             h('div', { class: 'u-rep-line' }, h('span', { class: 'u-rep-k' }, 'Free requests'), h('span', { class: 'u-rep-v' }, limit !== null ? `${num(limit)} a day` : 'Limit not reported')),
-            h('div', { class: 'u-meta' }, `Ran out ${ago(s.fetched_at)}; it reset at ${clock(reset)} (${dateTime(reset)}), so what’s left now isn’t known.`),
+            h(
+              'div',
+              { class: 'u-meta' },
+              reset !== null
+                ? `Ran out ${ago(s.fetched_at)}; it reset at ${clock(reset)} (${dateTime(reset)}), so what’s left now isn’t known.`
+                : `Ran out ${ago(s.fetched_at)}, before today (UTC), so what’s left now isn’t known.`,
+            ),
           ),
         );
       }
@@ -1196,13 +1207,18 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
   /**
    * One limit: an On/Off state, an "Enabled" switch (off means null: no limit, or
    * the default) and the number with its unit beside it. Returns {el, set(value,
-   * report)}; `set` updates the row from a saved report without touching a field
-   * the person is typing in.
+   * report)}; `set` updates the row from a saved report without touching the
+   * controls of a row the person is editing.
    */
   function limitRow(spec, value, report) {
     const id = `limit-${spec.key}`;
     const scale = spec.scale || 1;
     const shown = (v) => (v === null || v === undefined ? '' : String(Math.round(v * scale * 1000) / 1000));
+    // Live refreshes redraw every row. While focus is in this row, or the switch was
+    // turned on here and no number is saved yet (`pending`), they leave its switch and
+    // field alone. Focus leaving the row with the field still empty cancels the switch.
+    let pending = false;
+    let last = [value, report];
     const input = h('input', {
       class: 'input',
       id,
@@ -1221,7 +1237,10 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
           return;
         }
         const stored = n / scale;
-        save({ [spec.key]: spec.step === '1' ? Math.round(stored) : stored });
+        const saved = spec.step === '1' ? Math.round(stored) : stored;
+        pending = false;
+        last = [saved, last[1]]; // until the save's report arrives
+        save({ [spec.key]: saved });
       },
     });
     const enabled = h('input', {
@@ -1231,10 +1250,13 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
       'aria-label': `${spec.label} enabled`,
       onchange: () => {
         if (enabled.checked) {
+          pending = true;
           input.disabled = false;
           input.placeholder = '';
           input.focus();
         } else {
+          pending = false;
+          last = [null, last[1]];
           input.disabled = true;
           save({ [spec.key]: null });
         }
@@ -1250,21 +1272,30 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
     const state = h('span', { class: 'badge' });
     const now = h('div', { class: 'limit-now', id: `${id}-now` });
     const set = (v, r) => {
+      last = [v, r];
       const isOn = v !== null && v !== undefined;
-      enabled.checked = isOn;
-      input.disabled = !isOn || 'offlineDisabled' in input.dataset;
-      input.placeholder = isOn ? '' : spec.off.replace(/^Off: /, '');
-      if (document.activeElement !== input) input.value = shown(v);
+      if (!pending && !el.contains(document.activeElement)) {
+        enabled.checked = isOn;
+        input.disabled = !isOn || 'offlineDisabled' in input.dataset;
+        input.placeholder = isOn ? '' : spec.off.replace(/^Off: /, '');
+        input.value = shown(v);
+      }
       state.className = isOn ? 'badge accent' : 'badge muted';
       setText(state, isOn ? 'On' : spec.off.startsWith('Default') ? 'Default' : 'Off');
       const words = r ? consumption(spec, v, r) : null;
       setText(now, words || '');
       now.hidden = !words;
     };
-    set(value, report);
     const el = h(
       'div',
-      { class: 'limit-row' },
+      {
+        class: 'limit-row',
+        onfocusout: (e) => {
+          if (el.contains(e.relatedTarget)) return;
+          if (pending && input.value === '') pending = false; // switched on, nothing entered
+          if (!pending) set(...last);
+        },
+      },
       h(
         'div',
         null,
@@ -1275,6 +1306,7 @@ export function renderUsage(container, { conversation: filterCid = null } = {}) 
       field,
       h('label', { class: 'switch' }, enabled, 'Enabled'),
     );
+    set(value, report);
     return { el, set };
   }
 

@@ -278,16 +278,17 @@ fn collector(provider: &ProviderConfig) -> Option<Collector> {
     if provider.kind != "openai" || provider.api_key.as_deref().is_none_or(str::is_empty) {
         return None;
     }
+    // Includes the provider called "openrouter" with no base_url, which `providers::openai`
+    // points at OpenRouter.
+    if is_openrouter(provider) {
+        return Some(Collector::OpenRouter);
+    }
     let host = provider
         .base_url
         .as_deref()
         .and_then(|url| reqwest::Url::parse(url).ok())
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))?;
-    match host.as_str() {
-        "openrouter.ai" => Some(Collector::OpenRouter),
-        "api.deepseek.com" => Some(Collector::DeepSeek),
-        _ => None,
-    }
+    (host == "api.deepseek.com").then_some(Collector::DeepSeek)
 }
 
 #[derive(Debug, Serialize)]
@@ -1142,6 +1143,12 @@ mod tests {
         assert_eq!(collector(&provider(Some("https://api.deepseek.com"), Some("k"))), Some(Collector::DeepSeek));
         assert_eq!(collector(&provider(Some("https://api.openai.com/v1"), Some("k"))), None);
         assert_eq!(collector(&provider(Some("https://openrouter.ai/api/v1"), None)), None);
+        assert_eq!(collector(&provider(None, Some("k"))), None);
+        // The provider called "openrouter" defaults to OpenRouter's URL, as in `providers::openai`.
+        let default_url = ProviderConfig { id: "openrouter".into(), ..provider(None, Some("k")) };
+        assert_eq!(collector(&default_url), Some(Collector::OpenRouter));
+        assert!(is_openrouter(&default_url));
+        assert_eq!(collector(&ProviderConfig { api_key: None, ..default_url }), None);
     }
 
     #[tokio::test]

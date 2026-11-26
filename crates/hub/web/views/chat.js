@@ -173,7 +173,19 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       },
       icon('more'),
     );
-    const wrap = h('div', { class: 'menu-wrap' }, trigger, panel);
+    const wrap = h(
+      'div',
+      {
+        class: 'menu-wrap',
+        // Tabbing (or otherwise moving focus) out of the menu closes it. A click on
+        // nothing focusable has no relatedTarget; the document click handles clicks.
+        onfocusout: (e) => {
+          if (open && e.relatedTarget && !wrap.contains(e.relatedTarget)) setOpen(false);
+        },
+      },
+      trigger,
+      panel,
+    );
 
     async function refreshMenuUsage() {
       if (!isAdmin()) return;
@@ -229,8 +241,9 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     const onDocClick = (e) => {
       if (open && !wrap.contains(e.target)) setOpen(false);
     };
+    // Only while focus is in the menu (or on its button): keys typed elsewhere aren't ours.
     const onKeyDown = (e) => {
-      if (!open) return;
+      if (!open || !wrap.contains(document.activeElement)) return;
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -241,8 +254,11 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         const items = menuStops();
         if (!items.length) return;
         e.preventDefault();
+        const n = items.length;
         const i = items.indexOf(document.activeElement);
-        const next = e.key === 'ArrowDown' ? (i + 1) % items.length : (i - 1 + items.length) % items.length;
+        const down = e.key === 'ArrowDown';
+        // From the button (not an item): Down goes to the first item, Up to the last.
+        const next = i < 0 ? (down ? 0 : n - 1) : (i + (down ? 1 : n - 1)) % n;
         items[next].focus();
       }
     };
@@ -795,9 +811,13 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
       const want = Boolean(r.threadsPanel) && !r.thread;
       panel?.setOpen(want, { moveFocus: want && !wasOpen, restoreFocus: wasOpen && !r.thread });
       // dialog.close() can hand focus back to the Threads button after the inspector
-      // has focused its title. Put the title last when a thread takes over the panel.
+      // has focused its title. Put the title last when a thread takes over the panel,
+      // unless a carried-over step-in draft already has focus in the thread's composer.
       if (wasOpen && r.thread) {
-        requestAnimationFrame(() => document.getElementById('thread-title')?.focus({ preventScroll: true }));
+        requestAnimationFrame(() => {
+          if (document.activeElement?.closest?.('.thread-foot')) return;
+          document.getElementById('thread-title')?.focus({ preventScroll: true });
+        });
       }
     }),
   );
