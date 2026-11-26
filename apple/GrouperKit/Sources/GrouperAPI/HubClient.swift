@@ -160,6 +160,17 @@ public actor HubClient {
     @discardableResult public func setPermission(_ permission: Permission, deviceId: String, tool: String) async throws -> JSONValue {
         try await send(["v1", "devices", deviceId, "tools", tool], method: "PUT", body: PermissionRequest(permission: permission))
     }
+    /// Registers a plain (non-admin) device; needs an admin token. The returned token is
+    /// shown only once. A hub without the route answers 404 or 405
+    /// (`DeviceRegistration.hubLacksRegistration`).
+    public func registerDevice(name: String, platform: String) async throws -> RegisteredDevice {
+        try await send(["v1", "devices"], method: "POST", body: DeviceRegistrationRequest(name: name, platform: platform))
+    }
+    /// Revokes a device's token on the hub (admin). 404 when the hub doesn't know it, or it
+    /// was already revoked; 409 for the token making the request.
+    @discardableResult public func revokeDevice(id: String) async throws -> DeviceRevocation {
+        try await delete(["v1", "devices", id])
+    }
     public func callDevice(id: String, tool: String, args: JSONValue = .object([:])) async throws -> ToolCallResponse {
         try await send(["v1", "devices", id, "call"], method: "POST", body: ToolCallRequest(tool: tool, args: args))
     }
@@ -271,5 +282,6 @@ private struct RatingRequest: Codable { let rating: String }
 private struct ApprovalDecision: Codable { let approve: Bool }
 private struct PermissionRequest: Codable { let permission: Permission }
 private struct ToolCallRequest: Codable { let tool: String; let args: JSONValue }
+private struct DeviceRegistrationRequest: Codable { let name: String; let platform: String }
 private struct ProposalDecision: Codable { let accept: Bool }
 private struct RuleEnabled: Codable { let enabled: Bool }

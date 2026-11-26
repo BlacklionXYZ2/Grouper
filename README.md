@@ -78,6 +78,12 @@ managing keys and models, chatting and steering threads need an admin token
 (`--admin`, or `grouper-hub device admin <id>` later). Keep admin tokens off devices
 that run threads with a shell. Thread shells never see `GROUPER_*` variables.
 
+Admin clients can also make plain device tokens over HTTP: `POST /v1/devices` with
+`{"name": "...", "platform": "macos"}` returns `{"device": …, "token": "…"}` (the token is shown
+only then; at most 100 devices), and `DELETE /v1/devices/{id}` revokes one and closes its
+connection. Admin tokens are only made on the hub's CLI. The Mac app uses this to register
+itself when you sign in, so you never paste a device token for it.
+
 In a second terminal, connect a device that runs threads:
 
 ```bash

@@ -26,6 +26,24 @@ struct ChatNotice: Equatable {
     let text: String
 }
 
+/// What the Mac's local node connects with: the hub and this Mac's own device token
+/// (never the admin token). `nil` stops the node.
+struct NodeTarget: Equatable, Sendable {
+    let hubURL: String
+    let token: String
+}
+
+/// How a device token fared against the hub.
+private enum DeviceTokenCheck {
+    case usable
+    /// 401: revoked, or never valid on this hub.
+    case rejected
+    /// The token can read providers, so it is an admin token.
+    case admin
+    /// Offline or an unexpected answer: keep the token and let the node retry.
+    case unknown
+}
+
 /// How an answer from the approval dock went.
 enum ApprovalAnswer: Equatable {
     case done
@@ -38,7 +56,19 @@ enum ApprovalAnswer: Equatable {
 final class AppModel: ObservableObject {
     @Published var hubURL = ""
     @Published var adminToken = ""
-    @Published var deviceToken = ""
+    /// This Mac's device token, which only the local node uses. Set from the Keychain, an
+    /// automatic registration (`POST /v1/devices`) or a verified paste; never the admin token.
+    @Published private(set) var deviceToken = ""
+    /// The hub's id for this Mac's device, when known.
+    @Published private(set) var deviceId: String?
+    /// The node's hub and token; the Mac app starts, restarts or stops the node when it changes.
+    @Published private(set) var nodeTarget: NodeTarget?
+    @Published private(set) var registeringDevice = false
+    /// A plain-language problem with this Mac's registration, shown in Settings and the menu bar.
+    @Published private(set) var deviceMessage: String?
+    /// Settings > This Mac > "Use an existing device token".
+    @Published var showManualDeviceToken = false
+    @Published var manualDeviceToken = ""
     @Published private(set) var client: HubClient?
     @Published private(set) var signedIn = false
     @Published private(set) var online = false {
@@ -86,6 +116,11 @@ final class AppModel: ObservableObject {
     var chatViewsOnScreen = 0
 
     private static let recentsKey = "grouper.paletteRecents"
+    /// The hub the saved device token belongs to, and the name it was registered under.
+    private static let deviceHubKey = "grouper.deviceHubURL"
+    private static let deviceNameKey = "grouper.deviceName"
+    private var deviceHubURL = ""
+    private var handlingRejectedToken = false
     private let streamTask = TaskBox()
     private let accountStreamTask = TaskBox()
     private let settleTask = TaskBox()
@@ -96,7 +131,14 @@ final class AppModel: ObservableObject {
     init() {
         hubURL = UserDefaults.standard.string(forKey: "grouper.hubURL") ?? ""
         adminToken = KeychainStore.read(.admin) ?? ""
+        #if os(macOS)
         deviceToken = KeychainStore.read(.device) ?? ""
+        deviceId = KeychainStore.read(.deviceId) ?? DeviceRegistration.deviceId(ofToken: deviceToken)
+        // Tokens saved before the hub was recorded belong to the saved hub.
+        deviceHubURL = UserDefaults.standard.string(forKey: Self.deviceHubKey) ?? hubURL
+        // The node serves with its own token even before (or without) an admin sign-in.
+        updateNodeTarget()
+        #endif
         if !hubURL.isEmpty, !adminToken.isEmpty {
             Task { [weak self] in await self?.connect(save: false) }
         }
@@ -185,27 +227,23 @@ final class AppModel: ObservableObject {
         errorMessage = nil
         let trimmedHub = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedAdmin = adminToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedDevice = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             let api = try HubClient(baseURL: trimmedHub, token: trimmedAdmin)
             try await api.health()
             _ = try await api.providers() // proves this is the admin token, not merely a valid device token
-            #if os(macOS)
-            if !trimmedDevice.isEmpty {
-                try await verifyDeviceToken(trimmedDevice, hubURL: trimmedHub)
-            }
-            #endif
             hubURL = trimmedHub
             adminToken = trimmedAdmin
-            deviceToken = trimmedDevice
             client = api
             signedIn = true
             online = true
             if save {
                 UserDefaults.standard.set(trimmedHub, forKey: "grouper.hubURL")
                 try KeychainStore.save(trimmedAdmin, as: .admin)
-                if !trimmedDevice.isEmpty { try KeychainStore.save(trimmedDevice, as: .device) }
             }
+            #if os(macOS)
+            // The Mac registers itself; the owner never pastes a device token.
+            await ensureThisMacRegistered(api: api, hubURL: trimmedHub)
+            #endif
             await loadInitial()
         } catch {
             signedIn = false
@@ -214,30 +252,190 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - This Mac as a device
+
     #if os(macOS)
-    func saveDeviceToken() async -> Bool {
-        errorMessage = nil
-        let trimmedDevice = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedDevice.isEmpty else { return false }
-        do {
-            try await verifyDeviceToken(trimmedDevice, hubURL: hubURL)
-            deviceToken = trimmedDevice
-            try KeychainStore.save(trimmedDevice, as: .device)
-            return true
-        } catch {
-            errorMessage = error.localizedDescription
+    /// The name this Mac is registered under on the hub.
+    var thisMacName: String? {
+        guard let deviceId, !deviceToken.isEmpty else { return nil }
+        return devices.first { $0.id == deviceId }?.name ?? UserDefaults.standard.string(forKey: Self.deviceNameKey)
+    }
+
+    /// On connect: keep a device token the hub accepts, or register this Mac and save a new one.
+    private func ensureThisMacRegistered(api: HubClient, hubURL: String) async {
+        guard !registeringDevice else { return }
+        var revoke: String?
+        let token = deviceToken
+        if !token.isEmpty, DeviceRegistration.sameHub(deviceHubURL, hubURL) {
+            switch await check(deviceToken: token, hubURL: hubURL) {
+            case .usable, .unknown:
+                deviceMessage = nil
+                updateNodeTarget()
+                return
+            case .rejected:
+                revoke = deviceId // best effort: it may already be revoked or unknown
+            case .admin:
+                // Never hand an admin token to the node. It's the owner's, so don't revoke it either.
+                break
+            }
+            // Replaced while we checked (the node's 401 report got there first).
+            guard token == deviceToken else { return }
+        }
+        await registerThisMac(api: api, hubURL: hubURL, revoking: revoke)
+    }
+
+    /// Settings > This Mac > Register again: a new device for this Mac, then the old one revoked.
+    func registerThisMacAgain() async {
+        guard let client, !registeringDevice else { return }
+        let old = DeviceRegistration.sameHub(deviceHubURL, hubURL) ? deviceId : nil
+        if await registerThisMac(api: client, hubURL: hubURL, revoking: old) { await refreshDevices() }
+    }
+
+    /// The node said the hub refused its token. If the hub confirms (401), register again.
+    func deviceTokenRejected() async {
+        guard !handlingRejectedToken, !registeringDevice, !deviceToken.isEmpty else { return }
+        handlingRejectedToken = true
+        defer { handlingRejectedToken = false }
+        let token = deviceToken
+        guard await check(deviceToken: token, hubURL: deviceHubURL) == .rejected, token == deviceToken else { return }
+        guard let client, DeviceRegistration.sameHub(deviceHubURL, hubURL) else {
+            deviceMessage = "The hub no longer accepts this Mac's device token. Sign in to register this Mac again."
+            return
+        }
+        if await registerThisMac(api: client, hubURL: hubURL, revoking: deviceId) { await refreshDevices() }
+    }
+
+    /// "Use an existing device token": verify it is a plain device token on this hub, then use it.
+    func saveManualDeviceToken() async -> Bool {
+        let token = manualDeviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return false }
+        switch await check(deviceToken: token, hubURL: hubURL) {
+        case .usable:
+            break
+        case .admin:
+            deviceMessage = "That is an admin token. The Mac node needs a plain device token (grouper-hub device add)."
             return false
+        case .rejected:
+            deviceMessage = "The hub doesn't accept that device token."
+            return false
+        case .unknown:
+            deviceMessage = "Couldn't check that token with the hub. Try again when the hub is reachable."
+            return false
+        }
+        do {
+            try storeDevice(token: token, id: DeviceRegistration.deviceId(ofToken: token), name: nil, hubURL: hubURL)
+        } catch {
+            deviceMessage = error.localizedDescription
+            return false
+        }
+        manualDeviceToken = ""
+        deviceMessage = nil
+        await refreshDevices()
+        return true
+    }
+
+    /// Revokes this Mac's device on the hub, forgets its token and signs out. Stays signed in
+    /// (with a message) if the hub can't revoke it.
+    func signOutAndRemoveThisMac() async {
+        guard !registeringDevice else { return }
+        if let client, let deviceId, DeviceRegistration.sameHub(deviceHubURL, hubURL) {
+            do {
+                try await client.revokeDevice(id: deviceId)
+            } catch HubClientError.notFound(_) {
+                // Already gone from the hub.
+            } catch {
+                deviceMessage = "Couldn't remove this Mac from the hub: \(error.localizedDescription)"
+                return
+            }
+        }
+        forgetThisMac()
+        signOut()
+    }
+
+    /// Registers this Mac as a plain device and saves its token, then revokes `old` (best
+    /// effort). On failure the manual token field opens with a plain explanation.
+    @discardableResult
+    private func registerThisMac(api: HubClient, hubURL: String, revoking old: String?) async -> Bool {
+        // Launch can race the node's own 401 report; only one registration runs.
+        guard !registeringDevice else { return false }
+        registeringDevice = true
+        defer { registeringDevice = false }
+        let name = DeviceRegistration.name(MacNodeController.computerName())
+        let registered: RegisteredDevice
+        do {
+            registered = try await api.registerDevice(name: name, platform: "macos")
+        } catch {
+            if DeviceRegistration.hubLacksRegistration(error) {
+                deviceMessage = "This hub can't register devices yet; paste a device token instead."
+            } else {
+                deviceMessage = "Couldn't register this Mac with the hub: \(error.localizedDescription)"
+            }
+            showManualDeviceToken = true
+            return false
+        }
+        do {
+            try storeDevice(token: registered.token, id: registered.device.id, name: registered.device.name, hubURL: hubURL)
+        } catch {
+            // Unusable without the Keychain: take the new device back off the hub.
+            _ = try? await api.revokeDevice(id: registered.device.id)
+            deviceMessage = "Couldn't save this Mac's device token: \(error.localizedDescription)"
+            return false
+        }
+        deviceMessage = nil
+        showManualDeviceToken = false
+        if let old, old != registered.device.id {
+            do {
+                try await api.revokeDevice(id: old)
+            } catch HubClientError.notFound(_) {
+                // Already revoked or unknown on this hub.
+            } catch {
+                deviceMessage = "This Mac has a new device token, but the old device \(old) couldn't be revoked: \(error.localizedDescription)"
+            }
+        }
+        return true
+    }
+
+    private func check(deviceToken token: String, hubURL: String) async -> DeviceTokenCheck {
+        guard let deviceAPI = try? HubClient(baseURL: hubURL, token: token) else { return .unknown }
+        do {
+            _ = try await deviceAPI.providers()
+            return .admin
+        } catch HubClientError.forbidden(_) {
+            return .usable // a device token can read, but cannot list providers
+        } catch HubClientError.unauthorized(_) {
+            return .rejected
+        } catch {
+            return .unknown
         }
     }
 
-    private func verifyDeviceToken(_ token: String, hubURL: String) async throws {
-        let deviceAPI = try HubClient(baseURL: hubURL, token: token)
-        do {
-            _ = try await deviceAPI.providers()
-            throw HubClientError.badRequest("The device field contains an admin token. Use a separate non-admin device token for the Mac node.")
-        } catch HubClientError.forbidden(_) {
-            // Expected: a device token can read, but cannot access providers.
-        }
+    private func storeDevice(token: String, id: String?, name: String?, hubURL: String) throws {
+        try KeychainStore.save(token, as: .device)
+        if let id { try KeychainStore.save(id, as: .deviceId) } else { KeychainStore.delete(.deviceId) }
+        UserDefaults.standard.set(hubURL, forKey: Self.deviceHubKey)
+        if let name { UserDefaults.standard.set(name, forKey: Self.deviceNameKey) }
+        else { UserDefaults.standard.removeObject(forKey: Self.deviceNameKey) }
+        deviceToken = token
+        deviceId = id
+        deviceHubURL = hubURL
+        updateNodeTarget()
+    }
+
+    private func forgetThisMac() {
+        KeychainStore.delete(.device)
+        KeychainStore.delete(.deviceId)
+        UserDefaults.standard.removeObject(forKey: Self.deviceHubKey)
+        UserDefaults.standard.removeObject(forKey: Self.deviceNameKey)
+        deviceToken = ""
+        deviceId = nil
+        deviceHubURL = ""
+        deviceMessage = nil
+        updateNodeTarget()
+    }
+
+    private func updateNodeTarget() {
+        let target = deviceToken.isEmpty || deviceHubURL.isEmpty ? nil : NodeTarget(hubURL: deviceHubURL, token: deviceToken)
+        if target != nodeTarget { nodeTarget = target }
     }
     #endif
 
@@ -270,11 +468,7 @@ final class AppModel: ObservableObject {
         selectedApprovalId = nil
         streamState = .disconnected
         KeychainStore.delete(.admin)
-    }
-
-    func forgetDeviceToken() {
-        deviceToken = ""
-        KeychainStore.delete(.device)
+        // This Mac's device token stays (see signOutAndRemoveThisMac), so its node keeps serving.
     }
 
     func loadInitial() async {

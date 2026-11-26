@@ -4,6 +4,8 @@ import Security
 enum GrouperSecret: String, Sendable {
     case admin = "grouper.admin"
     case device = "grouper.device"
+    /// The hub's id for this Mac's device (not secret, kept beside its token).
+    case deviceId = "grouper.device.id"
 }
 
 enum KeychainStore {

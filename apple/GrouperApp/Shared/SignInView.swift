@@ -17,9 +17,7 @@ struct SignInView: View {
                     SecureField("Admin token", text: $model.adminToken)
                         .textContentType(.password)
                     #if os(macOS)
-                    SecureField("Device token for this Mac", text: $model.deviceToken)
-                        .textContentType(.password)
-                    Text("The admin token powers the window. The separate non-admin device token is passed only to the local Rust node.")
+                    Text("The admin token stays in this app. When you connect, this Mac registers itself with the hub and gets its own non-admin device token for the local node.")
                         .font(.caption).foregroundStyle(.secondary)
                     #endif
                 }

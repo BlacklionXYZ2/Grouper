@@ -18,9 +18,12 @@ struct GrouperMacApp: App {
         WindowGroup("Grouper", id: "main") {
             Group { if model.signedIn { MacRootView() } else { SignInView() } }
                 .environmentObject(model).environmentObject(node).tint(.teal)
-                .onChange(of: model.signedIn, initial: true) { _, signedIn in
-                    if signedIn, !model.deviceToken.isEmpty { node.start(hubURL: model.hubURL, token: model.deviceToken) }
-                    else if !signedIn { node.stop() }
+                // The node runs on this Mac's own device token, whether or not the window is
+                // signed in: signing out keeps it serving; "Sign out and remove this Mac" stops it.
+                .onChange(of: model.nodeTarget, initial: true) { _, target in node.apply(target) }
+                // A revoked or unknown token: the model checks with the hub and registers again.
+                .onChange(of: node.tokenRejected) { _, rejected in
+                    if rejected { Task { await model.deviceTokenRejected() } }
                 }
                 // A tapped approval notification opens its chat's approval dock.
                 .onAppear { takeApprovalRoute() }
@@ -29,7 +32,10 @@ struct GrouperMacApp: App {
         .defaultSize(width: 1180, height: 760)
         .commands { PaletteCommands() }
 
-        MenuBarExtra { MenuBarView().environmentObject(model).environmentObject(node) } label: {
+        MenuBarExtra {
+            MenuBarView().environmentObject(model).environmentObject(node)
+                .onChange(of: model.nodeTarget, initial: true) { _, target in node.apply(target) }
+        } label: {
             Label("Grouper", systemImage: menuIcon)
         }
         .menuBarExtraStyle(.window)
@@ -194,6 +200,12 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack { Circle().fill(model.online ? Color.green : Color.red).frame(width: 8, height: 8); Text(model.online ? "Hub connected" : "Hub offline"); Spacer(); Text(node.statusText).foregroundStyle(.secondary) }
+            if let message = model.deviceMessage {
+                Text(message).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else if model.nodeTarget == nil, !model.registeringDevice {
+                Text("This Mac isn't registered with the hub. Connect in the Grouper window to register it.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             if !model.pendingApprovals.isEmpty {
                 Divider()
                 // No Approve/Deny here: the exact input must be reviewed in the dock first.
@@ -223,8 +235,8 @@ struct MenuBarView: View {
                 SettingsLink { Text("Settings") }
                 Spacer()
                 Button(node.running ? "Pause this Mac" : "Resume this Mac") {
-                    if node.running { node.stop() } else { node.start(hubURL: model.hubURL, token: model.deviceToken) }
-                }.disabled(model.deviceToken.isEmpty)
+                    if node.running { node.stop() } else { node.resume() }
+                }.disabled(model.nodeTarget == nil)
             }
         }.padding().frame(width: 390)
     }
