@@ -2168,6 +2168,7 @@ button.strip:hover {
   line-height: 1.3;
   white-space: nowrap;
   padding: 2px 8px 2px 7px;
+  border: none;
   border-radius: var(--radius-sm);
   min-height: 22px;
 }
@@ -6452,8 +6453,31 @@ dialog.command-palette::backdrop {
   background: var(--fam, var(--fam-unknown));
 }
 
+/* Plan count: one chip. Purple while the plan is open, mint at n/n.
+   .thread-plan is the threads card; .tp-plan is the threads panel. */
+.thread-plan,
+.tp-plan {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 6px;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: var(--purple-soft);
+  color: var(--purple);
+  font-weight: 600;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+.thread-plan.is-done,
+.tp-plan.is-complete {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
 /* A model's name as a chip: "Gemma 4 E2B". Text is the fact; the colour is the
-   dot or mark beside it (V6). Optional .fam-mark inside. */
+   dot or mark beside it (V6). Put a .fam-mark inside. */
 .model-tag {
   display: inline-flex;
   align-items: center;
@@ -6603,7 +6627,9 @@ dialog.command-palette::backdrop {
     border: 1px solid var(--border-strong);
   }
 
-  .status.fam-tint {
+  .status.fam-tint,
+  .thread-plan,
+  .tp-plan {
     border: 1px solid currentColor;
   }
 
@@ -6671,6 +6697,15 @@ dialog.command-palette::backdrop {
     background: Canvas;
     color: CanvasText;
     border: 2px solid Highlight;
+  }
+
+  .thread-plan,
+  .tp-plan,
+  .thread-plan.is-done,
+  .tp-plan.is-complete {
+    background: Canvas;
+    color: CanvasText;
+    border: 1px solid CanvasText;
   }
 
   .model-tag,
