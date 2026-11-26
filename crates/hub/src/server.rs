@@ -147,6 +147,8 @@ pub struct Hub {
     emit_order: std::sync::Mutex<()>,
     pub(crate) next_id: AtomicU64,
     pub(crate) limits: crate::limits::LimitState,
+    /// Sign in with Google: trusted clients, nonces, `state`s and Google's signing keys.
+    pub(crate) google: crate::google_auth::GoogleAuth,
     /// Web Push notifications for approvals ([`crate::push`]).
     pub(crate) push: crate::push::PushState,
 }
@@ -173,6 +175,7 @@ impl Hub {
             emit_order: std::sync::Mutex::new(()),
             next_id: AtomicU64::new(1),
             limits: Default::default(),
+            google: crate::google_auth::GoogleAuth::from_env(),
             push: crate::push::PushState::new(hub.clone()),
         })
     }
@@ -545,6 +548,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::limits::routes())
         .merge(crate::files::routes())
         .merge(crate::session::routes())
+        .merge(crate::google_auth::routes())
         .merge(crate::push::routes())
         .merge(crate::web::routes())
         .with_state(hub)

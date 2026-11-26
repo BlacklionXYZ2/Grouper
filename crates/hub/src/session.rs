@@ -172,7 +172,7 @@ pub(crate) fn cookie_sessions(headers: &HeaderMap) -> Vec<&str> {
 }
 
 /// Whether the request reached the hub over HTTPS (directly or via a proxy that says so).
-fn is_https(headers: &HeaderMap) -> bool {
+pub(crate) fn is_https(headers: &HeaderMap) -> bool {
     headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -199,7 +199,7 @@ fn authority(url: &str) -> Option<&str> {
 
 /// Whether `url` (an `Origin` or `Referer`) names this hub's `Host`. In particular,
 /// do not trust `X-Forwarded-Host`: Cloudflare passes client-supplied values through.
-fn same_host(headers: &HeaderMap, url: &str) -> bool {
+pub(crate) fn same_host(headers: &HeaderMap, url: &str) -> bool {
     let Some(origin) = authority(url) else { return false };
     headers.get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(|host| host.trim().eq_ignore_ascii_case(origin))
 }
@@ -215,6 +215,12 @@ fn header_has_token(headers: &HeaderMap, name: header::HeaderName, token: &str) 
 
 /// `None` when the request may go on; otherwise why not.
 fn csrf_refusal(method: &Method, path: &str, headers: &HeaderMap) -> Option<&'static str> {
+    // Google's sign-in result arrives as a cross-site form POST by design: at the shared return page, which only
+    // forwards it, and then at the hub, which accepts it only with a one-time `state` and nonce it issued itself
+    // (see `crate::google_auth`). Those two paths, and only those, skip the cookie CSRF rules.
+    if crate::google_auth::CROSS_SITE_PATHS.contains(&path) {
+        return None;
+    }
     let bearer = headers.contains_key(header::AUTHORIZATION);
     let cookie = !cookie_sessions(headers).is_empty();
     let session_route = path == "/v1/session";
@@ -283,31 +289,50 @@ fn who(hub: &Hub, auth: &Auth) -> serde_json::Value {
     json!({"signed_in": true, "device_id": auth.device_id, "name": name, "admin": auth.admin})
 }
 
-/// `POST /v1/session`: trade a token for a session cookie.
-async fn login(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Json<LoginBody>) -> Response {
-    let Some(auth) = hub.db.authenticate(&body.token) else {
-        return err(StatusCode::UNAUTHORIZED, "that token isn't valid on this hub");
-    };
-    let (id, expires) = match hub.db.create_session(&auth.device_id) {
-        Ok(s) => s,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
+/// The CSRF rules of `POST /v1/session`, for other endpoints that sign a browser in.
+pub(crate) fn login_csrf_refusal(headers: &HeaderMap) -> Option<&'static str> {
+    csrf_refusal(&Method::POST, "/v1/session", headers)
+}
+
+/// Start a browser session for `auth`: the `Set-Cookie` values to send and when it expires.
+pub(crate) fn start_session(hub: &Hub, headers: &HeaderMap, auth: &Auth) -> anyhow::Result<(Vec<HeaderValue>, u64)> {
+    let (id, expires) = hub.db.create_session(&auth.device_id)?;
     tracing::info!(device = %auth.device_id, admin = auth.admin, "web session started");
-    let mut body = who(&hub, &auth);
-    body["expires"] = json!(expires);
-    let mut response = Json(body).into_response();
-    let secure = is_https(&headers);
+    let secure = is_https(headers);
     if !secure {
         PLAIN_HTTP_WARNING.call_once(|| {
             tracing::warn!("web sessions over plain HTTP can be sniffed; use HTTPS outside a trusted LAN")
         });
     }
-    response.headers_mut().insert(header::SET_COOKIE, set_cookie(&id, SESSION_TTL_SECS, secure));
+    let mut cookies = vec![set_cookie(&id, SESSION_TTL_SECS, secure)];
     if secure {
         // Remove the old LAN-cookie name as the browser migrates to the __Host- cookie.
-        response.headers_mut().append(header::SET_COOKIE, clear_legacy_cookie());
+        cookies.push(clear_legacy_cookie());
+    }
+    Ok((cookies, expires))
+}
+
+/// Start a session and answer the way `POST /v1/session` does: who signed in, plus the cookie.
+pub(crate) fn session_response(hub: &Hub, headers: &HeaderMap, auth: &Auth) -> Response {
+    let (cookies, expires) = match start_session(hub, headers, auth) {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let mut body = who(hub, auth);
+    body["expires"] = json!(expires);
+    let mut response = Json(body).into_response();
+    for cookie in cookies {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     response
+}
+
+/// `POST /v1/session`: trade a token for a session cookie.
+async fn login(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Json<LoginBody>) -> Response {
+    let Some(auth) = hub.db.authenticate(&body.token) else {
+        return err(StatusCode::UNAUTHORIZED, "that token isn't valid on this hub");
+    };
+    session_response(&hub, &headers, &auth)
 }
 
 /// `GET /v1/session`: who this cookie (or Bearer token) belongs to. Answers 200 with
