@@ -1,6 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Grouper">
-  <!-- Placeholder mark (W1). W6 replaces this file with the fish-school mark; no code change needed. -->
-  <rect width="32" height="32" rx="8" fill="#12C4BF"/>
-  <path d="M5.5 16C8.5 10.5 15.5 9.5 20.5 13.5L26 10v12l-5.5-3.5C15.5 22.5 8.5 21.5 5.5 16z" fill="#06262A"/>
-  <circle cx="10.5" cy="15" r="1.4" fill="#12C4BF"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Grouper">
+  <!-- Stand-in mark: a big fish and a small school in the app icon's colours (teal, blue, purple),
+       on transparent. The owner's vectorised mark (docs/brand/mark.svg) replaces this file; no code change needed. -->
+  <defs>
+    <linearGradient id="g" x1="4" y1="0" x2="60" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#14D6C8"/><stop offset=".5" stop-color="#3B82F6"/><stop offset="1" stop-color="#9B5CF6"/>
+    </linearGradient>
+  </defs>
+  <path d="M4 30C11 17 29 15 40 26L52 17v26L40 34C29 45 11 43 4 30z" fill="url(#g)"/>
+  <circle cx="14" cy="28" r="2" fill="#0A1626"/>
+  <path d="M40 48c3-3 8-3 11 0l4-3v9l-4-3c-3 3-8 3-11 0z" fill="url(#g)" opacity=".85"/>
+  <path d="M20 52c2-2 5-2 7 0l3-2v6l-3-2c-2 2-5 2-7 0z" fill="url(#g)" opacity=".7"/>
 </svg>
