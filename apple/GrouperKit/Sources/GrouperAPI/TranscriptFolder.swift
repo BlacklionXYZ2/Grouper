@@ -187,9 +187,14 @@ public struct TranscriptFolder: Sendable {
         for (id, index) in cardIndex {
             guard case .thread(var card) = rows[index] else { continue }
             if let source = rowsById[id] {
-                card.status = source.status
+                // The row is usually newer, but a stored thread_finished is final: a row
+                // fetched before the thread ended must not make the card look live again.
+                let staleRow = card.status.isTerminal && !source.status.isTerminal
+                if !staleRow {
+                    card.status = source.status
+                    card.deviceId = source.deviceId
+                }
                 if card.title.isEmpty { card.title = source.title }
-                card.deviceId = source.deviceId
                 if card.model.isEmpty { card.model = source.model }
                 if card.reason == nil { card.reason = source.reason }
                 if source.summary != nil { card.summary = source.summary }

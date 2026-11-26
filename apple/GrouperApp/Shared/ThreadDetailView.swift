@@ -1,133 +1,346 @@
 import SwiftUI
 import GrouperAPI
 
+/// One thread, read like a chat: the orchestrator's brief is the first message, the
+/// thread model's text is the assistant's (labelled with the model), tool calls are
+/// collapsible rows with the exact input and output, and step-ins and the
+/// orchestrator's answers are messages. The fixed header shows status, device,
+/// elapsed time and the model the orchestrator chose (no picker). Approvals, the
+/// waiting/checkpoint card, the result and rating sit around the transcript; the
+/// step-in composer with Stop sits at the bottom.
+///
+/// The view has no NavigationStack of its own: the iPhone chat wraps it in one for
+/// its sheet, and the threads panel pushes it.
 struct ThreadDetailView: View {
     @EnvironmentObject private var model: AppModel
     let thread: ThreadInfo
-    @Environment(\.dismiss) private var dismiss
+    /// Set when the view is a sheet of its own: adds Done. A pushed view uses Back.
+    var onClose: (() -> Void)? = nil
     @State private var message = ""
     @State private var stopping = false
+    @State private var sending = false
     @State private var showStopConfirmation = false
+    @State private var reviewing: PendingApproval?
+    @State private var openCalls: Set<String> = []
 
     private var liveThread: ThreadInfo {
         model.threads.first { $0.id == thread.id } ?? thread
     }
 
     var body: some View {
-        NavigationStack {
+        let rows = model.activity(threadId: liveThread.id)
+        let transcript = ThreadTranscript(activity: rows)
+        let draft = model.threadDraft(liveThread.id)
+        ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
-                    header
-                    if liveThread.status == "waiting_device" { waitingSection }
-                    ForEach(model.activity(threadId: liveThread.id)) { row in activity(row) }
-                    if let summary = liveThread.summary, !summary.isEmpty {
-                        GroupBox("Summary") { Text(LocalizedStringKey(summary)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ForEach(approvals) { approval in approvalBanner(approval) }
+                    attention(rows)
+                    ForEach(transcript.messages) { item in messageView(item) }
+                    if !draft.isEmpty {
+                        if !transcript.threadSpokeLast { modelLabel(started: started(in: rows)) }
+                        draftView(draft)
                     }
-                    if liveThread.isTerminal { rating }
-                }.padding()
-            }
-            .safeAreaInset(edge: .bottom) { controls }
-            .navigationTitle(liveThread.title)
-            .toolbar {
-                #if os(iOS)
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                #else
-                ToolbarItem(placement: .automatic) { Button("Close") { model.selectedThreadId = nil } }
-                #endif
-            }
-            .confirmationDialog("Stop \(liveThread.title)?", isPresented: $showStopConfirmation) {
-                Button("Stop thread", role: .destructive) { stop() }
-            } message: { Text("Its current tool or model turn will be stopped.") }
-            .task(id: thread.id) { message = model.threadMessageDrafts[thread.id] ?? "" }
-            .onChange(of: message) { _, value in model.threadMessageDrafts[thread.id] = value }
-        }
-    }
-
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack { StatusLabel(status: liveThread.status); Text("· \(deviceName) · \(liveThread.model)").foregroundStyle(.secondary) }
-            if let reason = liveThread.reason { Text(reason).font(.callout).foregroundStyle(.secondary) }
-        }.frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var waitingSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Waiting for \(deviceName)", systemImage: "clock.fill").font(.headline).foregroundStyle(.orange)
-            if let device = model.devices.first(where: { $0.id == liveThread.deviceId }), let last = device.lastSeen {
-                Text("Last seen \(Date(timeIntervalSince1970: TimeInterval(last)), style: .relative) ago").font(.caption).foregroundStyle(.secondary)
-            }
-            if let checkpoint = latestCheckpoint { Text("Checkpoint").font(.subheadline.bold()); Text(checkpoint) }
-            else { Text("The hub will work to a checkpoint while this device is offline.").foregroundStyle(.secondary) }
-        }.padding().background(Color.orange.opacity(0.09), in: .rect(cornerRadius: 14))
-    }
-
-    @ViewBuilder private func activity(_ row: ThreadActivityRow) -> some View {
-        switch row {
-        case .started(_, _, let value):
-            GroupBox("Brief") { Text(LocalizedStringKey(value.brief)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
-        case .text(_, _, let text): Text(LocalizedStringKey(text)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
-        case .tool(_, _, let call, let result): ToolActivityView(call: call, result: result)
-        case .input(_, _, let from, let text): Label("\(from): \(text)", systemImage: "person.crop.circle.badge.checkmark").font(.callout)
-        case .notice(_, _, let text): Label(text, systemImage: "info.circle").font(.callout).foregroundStyle(.secondary)
-        case .waiting(_, _, let value): Label(value.reason, systemImage: "clock").foregroundStyle(.orange)
-        case .checkpoint(_, _, let value): Label(value.summary, systemImage: "flag.checkered").foregroundStyle(.teal)
-        case .handedOver(_, _, let value):
-            VStack(alignment: .leading) {
-                Label("Continued on \(value.deviceId)", systemImage: "arrow.triangle.2.circlepath")
-                if !value.files.isEmpty { Text("Copied: \(value.files.joined(separator: ", "))").font(.caption) }
-                if !value.skipped.isEmpty { Text("Skipped: \(value.skipped.joined(separator: ", "))").font(.caption).foregroundStyle(.secondary) }
-            }
-        case .approval(_, _, let request, let approved):
-            Label(approved.map { $0 ? "Approved \(request.tool)" : "Denied \(request.tool)" } ?? "Waiting to run \(request.tool)", systemImage: "exclamationmark.shield")
-                .foregroundStyle(approved == nil ? Color.orange : Color.secondary)
-        case .error(_, _, let message): ErrorBanner(message: message)
-        case .finished(_, _, let status, let summary): Label(summary.isEmpty ? status.capitalized : summary, systemImage: status == "done" ? "checkmark.circle" : "xmark.circle")
-        }
-    }
-
-    private var controls: some View {
-        VStack(spacing: 8) {
-            if !liveThread.isTerminal {
-                GlassSurface {
-                    HStack(alignment: .bottom) {
-                        TextField("Message this thread", text: $message, axis: .vertical).lineLimit(1...4).textFieldStyle(.plain).grouperMinimumControlSize()
-                        Button { stepIn() } label: { Image(systemName: "arrow.up") }
-                            .buttonStyle(.glassProminent).grouperMinimumControlSize().accessibilityLabel("Send to this thread")
-                            .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.online)
-                    }.padding(10)
+                    if transcript.messages.isEmpty && draft.isEmpty {
+                        Text(liveThread.isActive ? "Working… output appears here as it streams." : "No output.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                    if liveThread.isTerminal { result(transcript.finishedSummary) }
+                    Color.clear.frame(height: 1).id("end")
                 }
-                Button(role: .destructive) {
-                    if liveThread.status == "running" { showStopConfirmation = true } else { stop() }
-                } label: {
-                    if stopping { ProgressView() } else { Label("Stop thread", systemImage: "stop.circle") }
-                }.disabled(!model.online || stopping).grouperMinimumControlSize()
+                .padding()
             }
-        }.padding()
+            .onChange(of: transcript.messages.count) { _, _ in
+                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end") }
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) { header(started: started(in: rows)) }
+        .safeAreaInset(edge: .bottom, spacing: 0) { footer }
+        .navigationTitle(liveThread.title.isEmpty ? "Thread" : liveThread.title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .modifier(DoneToolbar(onClose: onClose))
+        .confirmationDialog("Stop \(liveThread.title)?", isPresented: $showStopConfirmation) {
+            Button("Stop thread", role: .destructive) { stop() }
+        } message: {
+            Text("Its current tool or model turn will be stopped, and work it hasn’t saved is lost. The orchestrator is told you stopped it.")
+        }
+        .sheet(item: $reviewing) { ApprovalSheet(approval: $0) }
+        .task(id: thread.id) { message = model.threadMessageDrafts[thread.id] ?? "" }
+        .onChange(of: message) { _, value in model.threadMessageDrafts[thread.id] = value }
+        // "Change it" on an approval puts a prefixed draft here.
+        .onChange(of: model.threadMessageDrafts[thread.id] ?? "") { _, value in
+            if value != message { message = value }
+        }
+    }
+
+    // MARK: - Header (fixed)
+
+    private func header(started: ThreadStarted?) -> some View {
+        let modelId = liveThread.model.isEmpty ? (started?.model ?? "") : liveThread.model
+        let reason = liveThread.reason ?? started?.reason
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                if approvals.isEmpty {
+                    StatusLabel(status: liveThread.status)
+                } else {
+                    Label("Needs approval", systemImage: "exclamationmark.shield.fill")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.orange)
+                }
+                Label(deviceName, systemImage: "desktopcomputer").lineLimit(1)
+                ElapsedText(thread: liveThread)
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            FixedModelChip(modelId: modelId, family: model.family(ofModel: modelId), providerId: model.modelEntry(modelId)?.providerId)
+            if let reason, !reason.isEmpty {
+                Text(reason).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+            }
+        }
+        .padding(.horizontal).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.bar)
+    }
+
+    // MARK: - Attention: approvals, waiting, checkpoint, hand-over
+
+    private var approvals: [PendingApproval] {
+        model.pendingApprovals.filter { $0.threadId == liveThread.id }
+    }
+
+    private func approvalBanner(_ approval: PendingApproval) -> some View {
+        Button { reviewing = approval } label: {
+            HStack(alignment: .top) {
+                Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(approval.tool) on \(model.deviceDisplayName(approval.deviceId)) is waiting for your approval.").font(.subheadline.weight(.semibold))
+                    if !approval.reason.isEmpty { Text(approval.reason).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
+                }
+                Spacer()
+                Text("Review").font(.callout.weight(.semibold)).foregroundStyle(.tint)
+            }
+            .padding().background(Color.orange.opacity(0.1), in: .rect(cornerRadius: 14))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Approval needed for \(approval.tool) on \(model.deviceDisplayName(approval.deviceId))")
+    }
+
+    @ViewBuilder private func attention(_ rows: [ThreadActivityRow]) -> some View {
+        let latest = LatestAttention(rows)
+        let waiting = latest.waiting
+        let checkpoint = latest.checkpoint
+        let handover = latest.handover
+        if liveThread.status == "waiting_device" {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("\(deviceName) is offline", systemImage: "clock.fill").font(.headline).foregroundStyle(.orange)
+                if let device = model.devices.first(where: { $0.id == liveThread.deviceId }), let last = device.lastSeen {
+                    HStack(spacing: 4) {
+                        Text("Last seen")
+                        RelativeAgeText(seconds: last)
+                    }
+                    .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("Not seen yet.").font(.caption).foregroundStyle(.secondary)
+                }
+                if let waiting, !waiting.reason.isEmpty { Text(waiting.reason).font(.callout) }
+                if checkpoint == nil {
+                    Text("Meanwhile the hub works towards a checkpoint, then waits for the device.").font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            .padding().frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.09), in: .rect(cornerRadius: 14))
+        }
+        // The checkpoint stays visible after the thread resumes, so the hand-over is clear.
+        if let checkpoint {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Checkpoint on the hub", systemImage: "flag.checkered").font(.headline).foregroundStyle(.teal)
+                Text(LocalizedStringKey(checkpoint.summary)).textSelection(.enabled)
+            }
+            .padding().frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 14))
+        }
+        if let handover {
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Handed over to \(model.deviceDisplayName(handover.deviceId))", systemImage: "arrow.triangle.2.circlepath").font(.headline)
+                Text(handover.files.isEmpty ? "No files to copy." : "Copied: \(handover.files.joined(separator: ", "))").font(.caption)
+                if !handover.skipped.isEmpty {
+                    Text("Left out: \(handover.skipped.joined(separator: "; "))").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding().frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 14))
+        }
+    }
+
+    // MARK: - Transcript
+
+    @ViewBuilder private func messageView(_ item: ThreadMessage) -> some View {
+        switch item {
+        case .inbound(_, let sender, let label, let text):
+            inboundBubble(sender: sender, label: label, text: text)
+        case .modelLabel:
+            modelLabel(started: nil)
+        case .text(_, let text):
+            Text(LocalizedStringKey(text))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .tool(_, let call, let result):
+            ToolCallRow(call: call, result: result, threadActive: liveThread.isActive, isExpanded: expanded(call.callId))
+        case .ask(_, let question):
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Asked the orchestrator", systemImage: "bubble.left.and.text.bubble.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Text(question).textSelection(.enabled)
+            }
+            .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 16))
+            .accessibilityElement(children: .combine)
+        case .notice(_, let text):
+            note(text, systemImage: "info.circle")
+        case .handedOver(_, let deviceId):
+            note("Continued on \(model.deviceDisplayName(deviceId)).", systemImage: "arrow.triangle.2.circlepath")
+        case .approvalResolved(_, let tool, let approved):
+            note(approved ? "You approved \(tool)." : "\(tool) was denied.", systemImage: "exclamationmark.shield")
+        case .askFailed(_, let text):
+            note("No answer: \(text)", systemImage: "exclamationmark.triangle")
+        case .error(_, let message):
+            ErrorBanner(message: message)
+        }
+    }
+
+    /// A message to the thread, on the right like the owner's messages in the chat.
+    private func inboundBubble(sender: ThreadMessage.Sender, label: String, text: String) -> some View {
+        HStack {
+            Spacer(minLength: 36)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Text(LocalizedStringKey(text)).textSelection(.enabled)
+            }
+            .padding(12)
+            .background(sender == .owner ? Color.grouperSecondaryBackground : Color.teal.opacity(0.1), in: .rect(cornerRadius: 16))
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    /// Who is speaking: the thread's model, with its family accent.
+    private func modelLabel(started: ThreadStarted?) -> some View {
+        let modelId = liveThread.model.isEmpty ? (started?.model ?? "") : liveThread.model
+        return HStack(spacing: 6) {
+            FamilyMark(family: model.family(ofModel: modelId))
+            Text(modelId.isEmpty ? "Thread model" : modelId).font(.caption.monospaced()).foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func draftView(_ draft: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(draft).textSelection(.enabled)
+            Label("Working", systemImage: "ellipsis").font(.caption).foregroundStyle(.teal)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Thread output so far. \(draft)")
+    }
+
+    private func note(_ text: String, systemImage: String) -> some View {
+        Label(text, systemImage: systemImage).font(.callout).foregroundStyle(.secondary)
+    }
+
+    private func expanded(_ callId: String) -> Binding<Bool> {
+        Binding(
+            get: { openCalls.contains(callId) },
+            set: { open in
+                if open { openCalls.insert(callId) } else { openCalls.remove(callId) }
+            }
+        )
+    }
+
+    private func started(in rows: [ThreadActivityRow]) -> ThreadStarted? {
+        for row in rows {
+            if case .started(_, _, let value) = row { return value }
+        }
+        return nil
+    }
+
+    // MARK: - Result and rating
+
+    private func result(_ finishedSummary: String?) -> some View {
+        let summary = liveThread.summary ?? finishedSummary
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Result").font(.headline)
+                Spacer()
+                StatusLabel(status: liveThread.status)
+            }
+            if let summary, !summary.isEmpty {
+                Text(LocalizedStringKey(summary)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            rating
+        }
+        .padding()
+        .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 14))
     }
 
     private var rating: some View {
         GlassEffectContainer(spacing: 8) {
             HStack {
-                Text("Rate this result").font(.headline); Spacer()
+                Text("Rate this result").font(.subheadline.weight(.semibold)); Spacer()
                 Button { Task { await model.rateThread(liveThread.id, rating: "up") } } label: { Image(systemName: "hand.thumbsup") }.accessibilityLabel("Rate up")
                 Button { Task { await model.rateThread(liveThread.id, rating: "down") } } label: { Image(systemName: "hand.thumbsdown") }.accessibilityLabel("Rate down")
             }.buttonStyle(.glass)
         }
     }
 
-    private var latestCheckpoint: String? {
-        model.activity(threadId: liveThread.id).reversed().compactMap { row in
-            if case .checkpoint(_, _, let value) = row { return value.summary }
-            return nil
-        }.first
+    // MARK: - Footer: step in, Stop
+
+    private var footer: some View {
+        Group {
+            if liveThread.isTerminal {
+                Text("This thread has finished. Ask about it in the chat.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+            } else {
+                GlassSurface {
+                    VStack(alignment: .leading, spacing: 6) {
+                        TextField("Message this thread", text: $message, axis: .vertical)
+                            .lineLimit(1...4).textFieldStyle(.plain).padding(.horizontal, 8).grouperMinimumControlSize()
+                        HStack {
+                            Button(role: .destructive) {
+                                if liveThread.status == "running" { showStopConfirmation = true } else { stop() }
+                            } label: {
+                                if stopping { ProgressView() } else { Label("Stop", systemImage: "stop.circle") }
+                            }
+                            .disabled(!model.online || stopping)
+                            .grouperMinimumControlSize()
+                            .accessibilityLabel("Stop thread")
+                            Spacer()
+                            Button { stepIn() } label: {
+                                if sending { ProgressView().frame(width: 22, height: 22) } else { Image(systemName: "arrow.up") }
+                            }
+                            .buttonStyle(.glassProminent).grouperMinimumControlSize()
+                            .accessibilityLabel("Send to this thread")
+                            .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.online || sending)
+                        }
+                    }
+                    .padding(10)
+                }
+                .padding(.horizontal).padding(.bottom, 6)
+            }
+        }
     }
 
-    private var deviceName: String { model.devices.first { $0.id == liveThread.deviceId }?.name ?? liveThread.deviceId }
+    private var deviceName: String { model.deviceDisplayName(liveThread.deviceId) }
 
     private func stepIn() {
         let text = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        Task { if await model.messageThread(liveThread.id, text: text) { message = "" } }
+        sending = true
+        Task {
+            // On failure (e.g. 409) the typed text stays put.
+            if await model.messageThread(liveThread.id, text: text) { message = "" }
+            sending = false
+        }
     }
 
     private func stop() {
@@ -136,18 +349,79 @@ struct ThreadDetailView: View {
     }
 }
 
-private struct ToolActivityView: View {
+/// The newest waiting, checkpoint and hand-over records of a thread.
+private struct LatestAttention {
+    var waiting: ThreadWaiting?
+    var checkpoint: ThreadCheckpoint?
+    var handover: ThreadHandedOver?
+
+    init(_ rows: [ThreadActivityRow]) {
+        for row in rows {
+            switch row {
+            case .waiting(_, _, let value): waiting = value
+            case .checkpoint(_, _, let value): checkpoint = value
+            case .handedOver(_, _, let value): handover = value
+            default: break
+            }
+        }
+    }
+}
+
+/// Adds Done when the thread view is its own sheet.
+private struct DoneToolbar: ViewModifier {
+    let onClose: (() -> Void)?
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if let onClose {
+            content.toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Done", action: onClose) }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+/// A tool call: collapsed by default, expanding to the exact input and output in
+/// monospace. The expanded state is kept by the thread view while it is mounted.
+private struct ToolCallRow: View {
     let call: ToolCall
     let result: ToolResult?
-    @State private var expanded = false
+    let threadActive: Bool
+    @Binding var isExpanded: Bool
+
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
+        DisclosureGroup(isExpanded: $isExpanded) {
             VStack(alignment: .leading, spacing: 8) {
-                Text(call.input.prettyPrinted).font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                if let result { Text(result.output).font(.system(.body, design: .monospaced)).textSelection(.enabled) }
-            }.padding(.top, 8)
+                if call.input != .null {
+                    Text("Input").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(call.input.prettyPrinted).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                }
+                if let result {
+                    Text("Output").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(result.output.isEmpty ? "(empty)" : result.output).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
         } label: {
-            HStack { Label(call.name, systemImage: "wrench.and.screwdriver"); Spacer(); Text(result.map { $0.ok ? "OK" : "Failed" } ?? "Running").foregroundStyle(result?.ok == false ? Color.red : Color.secondary) }
-        }.padding().background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 12))
+            HStack {
+                Label(call.name, systemImage: "wrench.and.screwdriver").lineLimit(1)
+                Spacer()
+                Text(state).font(.caption.weight(.semibold)).foregroundStyle(stateColor)
+            }
+        }
+        .padding(12)
+        .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 12))
+    }
+
+    private var state: String {
+        if let result { return result.ok ? "OK" : "Failed" }
+        return threadActive ? "Running" : "No result"
+    }
+
+    private var stateColor: Color {
+        if let result { return result.ok ? Color.secondary : Color.red }
+        return threadActive ? Color.teal : Color.secondary
     }
 }

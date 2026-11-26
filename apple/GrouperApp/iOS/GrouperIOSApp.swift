@@ -20,9 +20,10 @@ struct GrouperIOSApp: App {
         guard url.scheme == "grouper" else { return }
         switch url.host {
         case "approvals":
-            NotificationCenter.default.post(name: .grouperOpenTab, object: 1)
+            // No Threads tab: approvals open from the chat they belong to.
+            NotificationCenter.default.post(name: .grouperOpenTab, object: PhoneTab.chat)
         case "ask":
-            NotificationCenter.default.post(name: .grouperOpenTab, object: 0)
+            NotificationCenter.default.post(name: .grouperOpenTab, object: PhoneTab.chat)
             if let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
                let text = components.queryItems?.first(where: { $0.name == "text" })?.value, !text.isEmpty {
                 Task { _ = await model.send(text) }
@@ -37,27 +38,37 @@ struct GrouperIOSApp: App {
     }
 }
 
+/// Tab values. Threads are not a tab: they belong to their chat (Threads button in
+/// the chat's toolbar).
+enum PhoneTab {
+    static let chat = 0
+    static let devices = 2
+    static let more = 3
+}
+
 struct PhoneRootView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var selection = 0
+    @State private var selection = PhoneTab.chat
 
+    /// Approvals and waiting threads across chats, shown on the Chat tab now that
+    /// there is no Threads tab to carry it.
     private var needsYouCount: Int {
         model.pendingApprovals.count + model.threads.filter { $0.status == "waiting_device" }.count
     }
 
     var body: some View {
+        // TODO(owner decision: phone tabs): the phone tab set is still being decided
+        // (docs/gui-nav-ideas.md). The Threads tab is gone for good; Chat, Devices and
+        // More stay as they were until the owner picks a set. Do not add an inbox tab here.
         TabView(selection: $selection) {
-            Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: 0) {
+            Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: PhoneTab.chat) {
                 NavigationStack { ChatView() }
             }
-            Tab("Threads", systemImage: "point.3.connected.trianglepath.dotted", value: 1) {
-                ThreadsView()
-            }
             .badge(needsYouCount)
-            Tab("Devices", systemImage: "desktopcomputer.and.macbook", value: 2) {
+            Tab("Devices", systemImage: "desktopcomputer.and.macbook", value: PhoneTab.devices) {
                 DevicesView()
             }
-            Tab("More", systemImage: "ellipsis", value: 3) {
+            Tab("More", systemImage: "ellipsis", value: PhoneTab.more) {
                 MoreView()
             }
         }
@@ -65,7 +76,11 @@ struct PhoneRootView: View {
         .tabBarMinimizeBehavior(.onScrollDown)
         .onReceive(NotificationCenter.default.publisher(for: .grouperOpenApproval)) { note in
             guard let id = note.object as? String else { return }
-            selection = 1
+            selection = PhoneTab.chat
+            // The approval sheet presents from its chat; open that chat when it is known.
+            if let approval = model.pendingApprovals.first(where: { $0.id == id }), approval.conversationId != model.selectedConversationId {
+                Task { await model.selectConversation(approval.conversationId) }
+            }
             model.selectedApprovalId = id
         }
         .onReceive(NotificationCenter.default.publisher(for: .grouperOpenTab)) { note in

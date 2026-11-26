@@ -7,6 +7,9 @@ struct ApprovalSheet: View {
     let approval: PendingApproval
     @State private var busy = false
     @State private var answeredElsewhere = false
+    /// Set once this sheet's own answer went through, so the approval leaving the
+    /// pending list is not mistaken for an answer from another device.
+    @State private var answeredHere = false
 
     var body: some View {
         NavigationStack {
@@ -41,6 +44,7 @@ struct ApprovalSheet: View {
             .navigationTitle("Run this tool?")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
             .onChange(of: model.pendingApprovals) { _, approvals in
+                guard !busy, !answeredHere else { return }
                 if !approvals.contains(where: { $0.id == approval.id }) { answeredElsewhere = true }
             }
         }
@@ -70,6 +74,7 @@ struct ApprovalSheet: View {
         busy = true
         Task {
             let resolved = await model.resolveApproval(approval.id, approve: approve)
+            if resolved { answeredHere = true }
             busy = false
             if resolved { dismiss() }
         }
@@ -80,6 +85,7 @@ struct ApprovalSheet: View {
         busy = true
         Task {
             let resolved = await model.resolveApproval(approval.id, approve: false)
+            if resolved { answeredHere = true }
             busy = false
             if resolved {
                 model.threadMessageDrafts[threadId] = "Don’t run that. Instead: "

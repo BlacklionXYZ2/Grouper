@@ -28,43 +28,66 @@ struct GrouperMacApp: App {
     private var menuIcon: String { model.pendingApprovals.isEmpty ? (node.running ? "circle.hexagongrid.fill" : "pause.circle") : "exclamationmark.circle.fill" }
 }
 
-private enum MacSection: Hashable { case chat, threads, devices, settings }
+/// No Threads destination: threads belong to their chat and open in the chat's
+/// inspector (Threads button in the chat toolbar, or a thread card). Each chat row
+/// is tagged, so the sidebar highlights the open chat.
+private enum MacSection: Hashable {
+    case chat(String)
+    case newChat
+    case devices, settings
+
+    var isChat: Bool {
+        switch self {
+        case .chat, .newChat: return true
+        case .devices, .settings: return false
+        }
+    }
+}
 
 struct MacRootView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var section: MacSection? = .chat
+    @State private var section: MacSection?
 
     var body: some View {
         NavigationSplitView {
             List(selection: $section) {
                 Section("Chats") {
                     ForEach(model.conversations) { conversation in
-                        Button {
-                            section = .chat
-                            Task { await model.selectConversation(conversation.id) }
-                        } label: {
-                            Label(conversation.title, systemImage: conversation.mode == "standard" ? "bubble.left" : "folder")
-                        }.buttonStyle(.plain)
+                        Label(conversation.title, systemImage: conversation.mode == "standard" ? "bubble.left" : "folder")
+                            .tag(MacSection.chat(conversation.id))
                     }
-                    Button { section = .chat; model.beginNewChat(mode: "project") } label: { Label("New project", systemImage: "plus") }
+                    Label("New project", systemImage: "plus").tag(MacSection.newChat)
                 }
                 Section {
-                    Label("Threads", systemImage: "point.3.connected.trianglepath.dotted").tag(MacSection.threads)
                     Label("Devices", systemImage: "desktopcomputer").tag(MacSection.devices)
                     Label("Settings", systemImage: "gear").tag(MacSection.settings)
                 }
             }
             .navigationSplitViewColumnWidth(min: 210, ideal: 260)
-        } content: {
-            switch section ?? .chat {
-            case .chat: NavigationStack { ChatView() }
-            case .threads: ThreadsView()
+        } detail: {
+            switch section ?? .newChat {
+            case .chat, .newChat: NavigationStack { ChatView() }
             case .devices: DevicesView()
             case .settings: NavigationStack { SettingsView() }
             }
-        } detail: {
-            if let thread = model.selectedThread { ThreadDetailView(thread: thread) }
-            else { ContentUnavailableView("Select a thread", systemImage: "sidebar.right") }
+        }
+        .onChange(of: section) { _, selected in open(selected) }
+        // Keep the highlight on the open chat when it changes elsewhere (the chat
+        // menu, or the first send of a new chat).
+        .onChange(of: model.selectedConversationId, initial: true) { _, id in
+            guard section?.isChat ?? true else { return }
+            section = id.map { MacSection.chat($0) } ?? .newChat
+        }
+    }
+
+    private func open(_ selected: MacSection?) {
+        switch selected {
+        case .chat(let id)?:
+            if model.selectedConversationId != id { Task { await model.selectConversation(id) } }
+        case .newChat?:
+            if model.selectedConversationId != nil { model.beginNewChat(mode: "project") }
+        default:
+            break
         }
     }
 }

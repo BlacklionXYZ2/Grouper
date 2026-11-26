@@ -48,12 +48,11 @@ Neither secret is an environment variable. Thread shells already drop `GROUPER_*
 
 ### iPhone
 
-Four tabs on the system tab bar, which may shrink on scroll.
+Tabs on the system tab bar, which may shrink on scroll. There is no Threads tab: threads belong to their chat (owner decision, `docs/gui-spec.md`). The final phone tab set is still an owner decision (`docs/gui-nav-ideas.md`); until then the app keeps these three.
 
 | Tab | Contents |
 |---|---|
-| Chat | The pinned project conversation. The toolbar menu holds other chats, New project and New standard. |
-| Threads | Needs you, then Running, then Finished. Badge = pending approvals + `waiting_device`. |
+| Chat | The pinned project conversation. The toolbar menu holds other chats, New project and New standard. The toolbar's Threads button (count, plus a dot when an approval or a `waiting_device` thread needs you) opens this chat's threads as a sheet: Needs you, then Running, then Finished. Badge = pending approvals + `waiting_device`. |
 | Devices | Presence, and the tool registry on the detail. |
 | More | Models, Usage, Memory, Skills, Settings. |
 
@@ -63,7 +62,7 @@ The composer is on Chat only. Thread messages are typed on the thread sheet. The
 
 A `MenuBarExtra`, a `NavigationSplitView` window, and a Settings scene. The menu shows hub reachability, whether this Mac's node is connected, up to three approvals with Approve and Deny, up to five running or waiting threads, Open Chat, Pause / Resume (`GrouperClient.stop` / `start`), and Settings. Pause stops the node. It does not change permissions or sign the window out.
 
-Wide window, three columns: a glass sidebar (Chats, Threads in needs-you order, then Devices, Models, Usage, Memory, Skills); an opaque transcript; an inspector that is the iPhone thread sheet. Standard chats hide the inspector. A narrow window presents that sheet as a sheet. No Mac tab bar.
+Wide window: a glass sidebar (Chats, then Devices, Models, Usage, Memory, Skills; no Threads entry); an opaque transcript; an inspector toggled by the chat's Threads button, holding that chat's threads list and, pushed inside it, the thread view that is the iPhone thread sheet. Standard chats hide the inspector. A narrow window presents that sheet as a sheet. No Mac tab bar.
 
 ## 3. Screens
 
@@ -75,7 +74,7 @@ Navigation title is the conversation title. The caption is Project or Standard, 
 
 Stored events, in `seq` order: `UserMessage`; `AssistantMessage`, with `AssistantDelta` filling a draft until the stored text replaces it; `ThreadStarted` inserting a chip that later events update in place (`ThreadWaiting`, `ThreadCheckpoint`, `ThreadHandedOver`, `ThreadFinished`, `ApprovalRequested`); `Error` as a row. `ThreadActivity` stays off the transcript. The chip's second line is the latest model text (`Text` or the open `TextDelta`), one line, plus the open tool's name. Arguments and outputs stay in the sheet. `ThreadInput` stays in the sheet.
 
-The composer has the field, a model menu (`GET /v1/models`, filtered by role) and Send. Mode is fixed at creation (`project` or `standard` on the first `POST /v1/chat`). Changing model later is `POST /v1/conversations/{id}/model`. The hub rejects `model` on `POST /v1/chat` after the first message.
+The composer has the field, a model button and Send. The button opens a covering, searchable picker (full-height sheet on iPhone, large sheet on Mac): Default model, then the chat role's models, then other models, grouped by provider with key status (`GET /v1/models`, `GET /v1/providers`). Mode is fixed at creation (`project` or `standard` on the first `POST /v1/chat`). Changing model later is `POST /v1/conversations/{id}/model`. The hub rejects `model` on `POST /v1/chat` after the first message.
 
 **Streaming and reconnect.** Append deltas to a memory-only draft. On `AssistantMessage` or `AgentEvent::Text`, replace the draft with the stored text. `TurnFinished` clears "Replying". Send stays enabled. Reconnect with `GET /v1/conversations/{id}/events?after={lastStoredSeq}`, then `GET /v1/events?conversation={id}` (bearer token on the upgrade). Drop stored events at or below the fetched seq: the socket cursor starts at the hub's latest seq, so the HTTP catch-up is what fills the gap, and the stored text repairs missed deltas. Persist stored events only.
 
@@ -99,7 +98,7 @@ The Mac inspector is this sheet. Header: title, status word, device, model, and 
 
 `ApprovalRequested` has `approval_id`, `device_id`, `tool`, `input` and `reason`. The reason is the risk rule. It is body text, on the sheet and in the notification, and it is never a caption under a raw command.
 
-A banner on Chat and a row on Threads open the sheet: thread title, tool, device, reason, then `input` pretty-printed and selectable. Approve posts `{"approve": true}` to `POST /v1/approvals/{id}`. Deny posts false. Change does not patch arguments. `ApprovalResult` is a boolean. Change denies, then opens the step-in field with a draft ("Don't run that. Instead: "). A 404, or an `ApprovalResolved` that arrives first, replaces the buttons with "Answered on another device." The sheet says the call waits until someone answers or the thread is stopped, and it links to Stop. The notification's Edit action opens this sheet and does not POST by itself. The banner omits `input`.
+A banner on Chat and a row in the chat's threads list open the sheet: thread title, tool, device, reason, then `input` pretty-printed and selectable. Approve posts `{"approve": true}` to `POST /v1/approvals/{id}`. Deny posts false. Change does not patch arguments. `ApprovalResult` is a boolean. Change denies, then opens the step-in field with a draft ("Don't run that. Instead: "). A 404, or an `ApprovalResolved` that arrives first, replaces the buttons with "Answered on another device." The sheet says the call waits until someone answers or the thread is stopped, and it links to Stop. The notification's Edit action opens this sheet and does not POST by itself. The banner omits `input`.
 
 ### Devices
 
@@ -159,7 +158,7 @@ Also: appearance, Lock Screen thread titles (on), Lock Screen thread text (off),
 
 ## 4. iOS system integration
 
-**Action Button.** `AskGrouperIntent` is the Shortcut for the Action Button and the Lock Screen. With text, it opens the pinned project chat, fills the composer and sends. Without text, it opens the composer and starts keyboard dictation. The hub has no push channel, so the intent opens the app and keeps the socket up. `OpenApprovalsIntent` opens Threads on Needs you. `StopThreadIntent` is the island's Stop button.
+**Action Button.** `AskGrouperIntent` is the Shortcut for the Action Button and the Lock Screen. With text, it opens the pinned project chat, fills the composer and sends. Without text, it opens the composer and starts keyboard dictation. The hub has no push channel, so the intent opens the app and keeps the socket up. `OpenApprovalsIntent` opens the Chat tab, where the approval banner and the Threads button's Needs you group are. `StopThreadIntent` is the island's Stop button.
 
 **Live Activities.** One activity per `running` or `waiting_device` thread: title, device, status, and a phase line ("Running on MacBook", "Checkpoint on the hub", "Waiting for MacBook"). The streamed line is included only when Settings allows it, cut to about 80 characters, with no tool arguments. Compact island: glyph and device. Expanded: title, phase, Stop. Past two threads the island shows a count, while the Lock Screen keeps one activity per thread up to the system cap. End the activity a minute after `done`, `failed` or `stopped`.
 
@@ -167,7 +166,7 @@ Also: appearance, Lock Screen thread titles (on), Lock Screen thread text (off),
 
 **Share sheet.** Text and URLs go to the App Group and open the composer of the pinned chat. The person sends. URLs become their string. Images and files are refused: "Messages are text." A share never auto-sends.
 
-**Widgets.** After each usage fetch the app writes a non-secret App Group snapshot: today's cost, seven daily totals, running count, needs-you count, fetch time. The widget holds no token. Small: today's cost and running count, opens Usage. Medium: today, seven bars, needs-you count; opens Threads when that count is non-zero, otherwise Usage. Lock Screen circular: running count, or today's cost when nothing is running. A snapshot older than a day shows its time.
+**Widgets.** After each usage fetch the app writes a non-secret App Group snapshot: today's cost, seven daily totals, running count, needs-you count, fetch time. The widget holds no token. Small: today's cost and running count, opens Usage. Medium: today, seven bars, needs-you count; opens Chat when that count is non-zero, otherwise Usage. Lock Screen circular: running count, or today's cost when nothing is running. A snapshot older than a day shows its time.
 
 ## 5. Typography, colour, motion, accessibility, dark mode
 
@@ -206,7 +205,7 @@ Reduce Transparency turns system glass solid. Add no private blur, and check the
 ├────────────────────────────┤
 │ Message          Model  ↑  │  glass composer
 ├────────────────────────────┤
-│ Chat   Threads  Devices ·· │  glass tab bar
+│ Chat     Devices     More  │  glass tab bar
 └────────────────────────────┘
 ```
 
@@ -267,12 +266,12 @@ Reduce Transparency turns system glass solid. Add no private blur, and check the
 ┌──────────┬──────────────────┬──────────────┐
 │ Chats    │ Haiku task       │ Haiku on Mac │
 │ ▸ Haiku  │ Project · Default│ Waiting      │
-│ Threads  │                  │ Checkpoint   │
-│ ! shell  │ You              │ haiku.txt    │
-│ · Mac    │ Write two haiku… │ Output…      │
-│ Devices  │ Grouper          │ Message…     │
-│ Models   │ Started both.    │ [Stop]       │
-│ Usage    │ [Wait] [Run]     │              │
+│          │                  │ Checkpoint   │
+│ Devices  │ You              │ haiku.txt    │
+│ Models   │ Write two haiku… │ Output…      │
+│ Usage    │ Grouper          │ Message…     │
+│          │ Started both.    │ [Stop]       │
+│          │ [Wait] [Run]     │              │
 │          │ Message       ↑  │              │
 └──────────┴──────────────────┴──────────────┘
 ```
@@ -308,9 +307,9 @@ Admin token: chat, approvals, permission writes, providers, model writes, import
 
 **M0 — Client.** Keychain, hub URL, bearer header, REST, the events socket, and a reducer (draft for `seq` 0, record for `seq` > 0). Check with `GET /healthz` and `GET /v1/providers`. Cache stored events only.
 
-**M1 — Chat.** List, project and standard transcripts, composer, model menu, streaming, reconnect. `POST /v1/chat`, `GET /v1/conversations`, `GET /v1/conversations/{id}/events`, `GET /v1/events`, `POST /v1/conversations/{id}/model`, `GET /v1/models`.
+**M1 — Chat.** List, project and standard transcripts, composer, model picker, streaming, reconnect. `POST /v1/chat`, `GET /v1/conversations`, `GET /v1/conversations/{id}/events`, `GET /v1/events`, `POST /v1/conversations/{id}/model`, `GET /v1/models`.
 
-**M2 — Threads.** Chips, strip, sheet, step-in, stop, rating. `GET /v1/threads`, `GET /v1/threads/{id}`, `POST .../message`, `POST .../stop`, `POST .../rating`, and events with `thread`.
+**M2 — Threads.** Chips, strip, the chat's Threads button and list, sheet, step-in, stop, rating. `GET /v1/threads`, `GET /v1/threads/{id}`, `POST .../message`, `POST .../stop`, `POST .../rating`, and events with `thread`.
 
 **M3 — Approvals and the phone's system hooks.** Banner, sheet, notification actions, Live Activities, the three intents. `POST /v1/approvals/{id}` plus the approval events on the socket.
 
