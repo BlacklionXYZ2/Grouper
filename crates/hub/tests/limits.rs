@@ -86,7 +86,7 @@ fn said(e: &Event, text: &str) -> bool {
 }
 
 fn usage_calls(hub: &Hub, conv: &str) -> u64 {
-    hub.db.usage_totals(0, i64::MAX as u64, "conversation", Some(conv)).unwrap().iter().map(|r| r.calls).sum()
+    hub.db.usage_totals(0, i64::MAX as u64, "conversation", Some(conv), None).unwrap().iter().map(|r| r.calls).sum()
 }
 
 fn turns_finished(hub: &Hub, conv: &str) -> usize {

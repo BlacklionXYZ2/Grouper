@@ -5262,8 +5262,65 @@ dialog.sheet-dialog.model-picker {
 .u-badges {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 4px;
+}
+
+/* A provider card filters the breakdown: its Filter button is the keyboard and
+   screen-reader path, a click elsewhere on the card does the same. */
+.u-provider {
+  cursor: pointer;
+}
+
+.u-provider.is-filtered {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-sm), inset 0 0 0 1px var(--accent);
+}
+
+.u-filter-btn {
+  margin-left: 2px;
+}
+
+.u-filter-btn[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.u-filter-slot {
+  margin: 0 0 8px;
+}
+
+.u-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  max-width: 100%;
+  padding: 4px 10px 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.u-filter-chip:hover {
+  background: var(--surface-2);
+}
+
+.u-filter-chip .icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.u-free-sent {
+  margin-top: 10px;
 }
 
 .u-block {

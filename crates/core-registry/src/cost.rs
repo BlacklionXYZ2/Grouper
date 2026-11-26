@@ -44,13 +44,15 @@ pub fn usage_total(conn: &Connection, conversation_id: &str) -> (u64, u64, f64) 
     .unwrap_or((0, 0, 0.0))
 }
 
-/// Metered totals in the half-open time range `[since, until)` from the `usage` table.
+/// Metered totals in the half-open time range `[since, until)` from the `usage` table,
+/// optionally only for one conversation and/or one provider.
 pub fn usage_totals(
     conn: &Connection,
     since: u64,
     until: u64,
     group: &str,
     conversation: Option<&str>,
+    provider: Option<&str>,
 ) -> Result<Vec<UsageTotal>> {
     let key = match group {
         "day" => "strftime('%Y-%m-%d', ts, 'unixepoch')",
@@ -66,11 +68,12 @@ pub fn usage_totals(
                 COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(cost), 0)
          FROM usage
          WHERE ts >= ?1 AND ts < ?2 AND (?3 IS NULL OR conversation_id = ?3)
+           AND (?4 IS NULL OR provider_id = ?4)
          GROUP BY {key} ORDER BY {key}"
     );
     let mut statement = conn.prepare(&sql)?;
     Ok(statement
-        .query_map(params![since as i64, until as i64, conversation], |row| {
+        .query_map(params![since as i64, until as i64, conversation, provider], |row| {
             Ok(UsageTotal {
                 key: row.get(0)?,
                 calls: row.get::<_, i64>(1)? as u64,
