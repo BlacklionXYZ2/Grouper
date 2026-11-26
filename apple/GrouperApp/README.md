@@ -30,9 +30,9 @@ tests. The browser step is `Shared/GoogleWebSignIn.swift`.
 
 Each app has its own Google OAuth client ID. Both are Google's **iOS** client type: one for
 bundle ID `uk.clockmillbarn.grouper.ios` and one for `uk.clockmillbarn.grouper.macos`. Client
-IDs are public identifiers, not secrets. They aren't set yet (`TODO(owner)`), so for now the
-Google button stays hidden. To set them, edit each app's Info.plist (`iOS/Info.plist`,
-`macOS/Info.plist`):
+IDs are public identifiers, not secrets. Grouper's own clients (Google Cloud project
+`grouper-515912`) are set in each app's Info.plist (`iOS/Info.plist`, `macOS/Info.plist`); a
+fork changes them there:
 
 1. `GrouperGoogleClientID`: the full client ID, e.g.
    `1234-abcd.apps.googleusercontent.com`. If it's empty or isn't a Google client ID, the

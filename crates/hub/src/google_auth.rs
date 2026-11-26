@@ -44,11 +44,15 @@ use crate::registry::deny_unless_admin;
 use crate::server::{Hub, err};
 
 /// Grouper's own Google OAuth client IDs (iOS app, Mac app), trusted when `GROUPER_GOOGLE_CLIENT_IDS` is unset.
-// TODO(owner): Grouper's official client IDs.
-const DEFAULT_CLIENT_IDS: &[&str] = &[];
+// Grouper's official OAuth clients (project grouper-515912): iPhone app, Mac app, web. Public identifiers.
+const DEFAULT_CLIENT_IDS: &[&str] = &[
+    "998648431961-aeomun58v9i625ofsprfc5oroalv233t.apps.googleusercontent.com",
+    "998648431961-cnc9c9930iacdrs9u7b25cgtp7g26f9q.apps.googleusercontent.com",
+    "998648431961-dh13qf3a3c596iadav1vmfnljr3j0dhr.apps.googleusercontent.com",
+];
 /// Grouper's Google "Web application" client, for browsers. Empty turns browser Google sign-in off.
-// TODO(owner): Grouper's official web client ID.
-const DEFAULT_WEB_CLIENT_ID: &str = "";
+// Grouper's official web client; its only redirect URI is the shared return page on grouper.clockmillbarn.uk.
+const DEFAULT_WEB_CLIENT_ID: &str = "998648431961-dh13qf3a3c596iadav1vmfnljr3j0dhr.apps.googleusercontent.com";
 /// The return page registered on the web client.
 const DEFAULT_RETURN_URL: &str = "https://grouper.clockmillbarn.uk/oauth/google/return";
 const ENV_CLIENT_IDS: &str = "GROUPER_GOOGLE_CLIENT_IDS";

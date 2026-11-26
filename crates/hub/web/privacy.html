@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy · Grouper</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/app/privacy.css">
+</head>
+<body>
+<main>
+  <h1>Grouper privacy policy</h1>
+  <p class="updated">Last updated 26 November 2026</p>
+
+  <p>Grouper is software you run yourself. Each person who uses it runs their own Grouper hub
+  on their own hardware (a computer, a virtual machine or a server they control) and connects
+  their own devices and apps to it. This page explains what a hub stores, what leaves it, and
+  what the Grouper project itself sees.</p>
+
+  <h2>What your hub stores</h2>
+  <ul>
+    <li>Your chats, the work threads they start, their results and files, and the settings
+      you choose.</li>
+    <li>The devices you connect and their tokens (only a hash of each token's secret).</li>
+    <li>The API keys you add for AI providers, encrypted with a key kept outside the hub's
+      database.</li>
+    <li>If you sign in with Google: your Google account's unique id, email address and name,
+      so the hub recognises its owner.</li>
+    <li>If you turn on notifications: the address your browser gave for delivering them.</li>
+  </ul>
+  <p>All of this stays on the hub you run. The Grouper project has no copy of it.</p>
+
+  <h2>What leaves your hub</h2>
+  <ul>
+    <li><strong>AI providers you configure</strong> (for example OpenRouter, OpenAI or
+      Anthropic) receive the messages and files your chats and threads send them, under your
+      own account with them and their privacy terms.</li>
+    <li><strong>Google</strong>, when you choose "Sign in with Google": you sign in on
+      Google's own page, and Google tells your hub who you are (id, email, name). Grouper asks
+      only for these basic profile details, never for access to your Google data such as
+      Gmail or Drive.</li>
+    <li><strong>Browser push services</strong> (run by your browser's maker), if you turn on
+      notifications: they carry a short notice that a tool is waiting for your approval, with
+      the tool, device, thread and chat names. Notifications never include the command, its
+      contents or your messages.</li>
+  </ul>
+
+  <h2>What the Grouper project sees</h2>
+  <p>Google only returns sign-ins to addresses registered in advance, so browser sign-ins
+  pass through a fixed return page at <code>grouper.clockmillbarn.uk</code>, which immediately
+  forwards the result to your own hub. That page runs in your browser and stores and logs
+  nothing. Apart from this, the Grouper project receives no data from your hub or apps, and
+  Grouper contains no analytics, advertising or tracking.</p>
+
+  <h2>Your control</h2>
+  <ul>
+    <li>Your hub's owner can delete chats, revoke devices and sessions, remove API keys and
+      turn off notifications at any time.</li>
+    <li>You can unlink your Google account in the hub's Settings, or remove Grouper's access at
+      <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</li>
+    <li>Deleting the hub's data folder removes everything it stored.</li>
+  </ul>
+
+  <h2>Contact</h2>
+  <p>For a hub someone else runs, contact that person. For the Grouper apps and sign-in, use
+  the support email shown on Grouper's Google sign-in screen.</p>
+
+  <p><a href="/">Back to Grouper</a></p>
+</main>
+</body>
+</html>

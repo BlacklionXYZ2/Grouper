@@ -36,6 +36,8 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "app.js",
     "icon.svg",
     "manifest.webmanifest",
+    "privacy.css",
+    "privacy.html",
     "sw.js",
     "lib/api.js",
     "lib/dom.js",
@@ -131,6 +133,8 @@ pub(crate) fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/", get(index))
         .route("/sw.js", get(service_worker))
+        // The public privacy policy (linked from Grouper's Google sign-in consent screen).
+        .route("/privacy", get(|headers: HeaderMap| async move { serve("privacy.html", &headers) }))
         .route("/favicon.ico", get(|headers: HeaderMap| async move { serve("icon.svg", &headers) }))
         .route("/app", get(index))
         .route("/app/", get(index))
