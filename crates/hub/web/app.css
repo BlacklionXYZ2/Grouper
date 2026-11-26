@@ -2202,6 +2202,12 @@ button.strip:hover {
   background: var(--danger-soft);
 }
 
+/* Done is mint (good state). --ok on --ok-soft is the same pair as .badge.ok. */
+.status.ok {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+
 .status.muted {
   color: var(--text-2);
   background: var(--surface-2);
@@ -4477,6 +4483,7 @@ code.nowrap {
 
   /* Status pills, badges and counts. */
   .status,
+  .status.ok,
   .badge {
     background: Canvas;
     color: CanvasText;
