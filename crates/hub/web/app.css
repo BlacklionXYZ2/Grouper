@@ -736,6 +736,7 @@ a {
 .side-item[aria-current="page"] {
   background: var(--surface-select);
   color: var(--text);
+  box-shadow: inset 3px 0 0 var(--purple-fill);
 }
 
 .side-item[aria-current="page"] > .icon {
@@ -4426,6 +4427,10 @@ code.nowrap {
     color: HighlightText;
     border: 1px solid Highlight;
     font-weight: 700;
+  }
+
+  .side-item[aria-current="page"] {
+    box-shadow: inset 3px 0 0 HighlightText;
   }
 
   .side-item[aria-current="page"] .sub,
