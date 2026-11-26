@@ -13,6 +13,16 @@ These override anything below that disagrees.
 - **Thread rows in the threads panel** show the title, time elapsed (live while running, total once finished) and the model, with a colour accent by model family.
 - **Navigation:** no Threads tab. Phone tab design is being brainstormed separately (`docs/gui-nav-ideas.md`).
 
+## Owner decisions (26 November 2026)
+
+These override anything below that disagrees, including the 25 November list.
+
+- **Phone tabs stay Chat / Devices / More** for now. No "Needs you" tab.
+- **More opens to a plain list** of destinations (not a dashboard).
+- **"Needs you" is a system notification, not a destination you go and check.** A new approval raises an OS notification (push); tapping it opens the chat (or thread) the request came from, with the approval shown as a popup that takes the composer's place at the bottom, like Claude's permission prompts, which replace the keyboard with what's being asked and the options. The inbox page stays reachable from More and the sidebar as a list.
+- **Desktop command palette (Ctrl/⌘K):** build it. A search box that jumps to any chat, thread, model, device or page and runs common actions from the keyboard.
+- **No concept art yet;** visual details stay provisional.
+
 ## Scope and reading guide
 
 - Grouper is a single-owner, multi-device AI orchestrator. The hub owns account state; devices run threads and expose tools; the owner chats with an orchestrator in project chats or directly with one model in standard chats.

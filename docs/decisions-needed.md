@@ -5,17 +5,6 @@ built, tested and running at `https://grouper.clockmillbarn.uk` (branch `harness
 page lists what can't go further without you, with the options for each. Status as of
 2026-11-26.
 
-## Permissions
-
-### Push `harness` to GitHub
-
-- **Why it matters:** the macOS job in `.github/workflows/apple.yml` is the only way to
-  compile the SwiftUI apps without your Mac. The Rust jobs already pass locally on Windows
-  and Linux.
-- **Why it's yours:** a push publishes the code to your GitHub repository.
-- **Options:** push `harness` as a branch (nothing merges into `main`), or keep it local until
-  you're on the Mac.
-
 ## Hardware
 
 ### Build the iPhone and Mac apps on a Mac with Xcode 26
@@ -27,27 +16,23 @@ page lists what can't go further without you, with the options for each. Status 
   SwiftUI file. A static review fixed about 36 API and concurrency issues; five points only
   Xcode can settle are marked `VERIFY ON MAC` in the code.
 
-## GUI decisions (you said you'd decide these on 26 Nov)
+## GUI decisions
 
-Done and live: threads as a panel on their chat (no Threads tab), models grouped by provider,
-thread rows with elapsed time and model-family colour, the chat-style thread view with the
-model fixed, the covering model picker, the "Needs you" inbox, and the usage page as two
-tracks (API costs per key; subscription usage/quota). The research and spec are in
-`docs/gui-spec.md`; the navigation ideas are in `docs/gui-nav-ideas.md`.
+Decided on 26 Nov (recorded in `docs/gui-spec.md`, "Owner decisions (26 November 2026)"):
+phone tabs stay Chat / Devices / More; More opens to a plain list; "Needs you" becomes a
+system notification that opens an approval popup in the chat it came from (in place of the
+composer, like Claude's permission prompts); the desktop command palette is being built;
+no concept art yet. `harness` is pushed to GitHub, so `apple.yml` CI compiles the apps.
 
-1. **Phone tabs.** Fable recommends Chat / Needs you / Devices / More. Today: Chat / Devices /
-   More, with "Needs you" as the first item in More and in the desktop sidebar. On the inbox
-   page no phone tab is highlighted until this is settled.
-2. **What More opens to:** a plain list of destinations, or a dashboard with the API-cost and
-   subscription cards.
-3. **A chat's threads on phone:** the header button (built) plus thread cards in the chat
+Still open:
+
+1. **A chat's threads on phone:** the header button (built) plus thread cards in the chat
    (built); keep both, or one.
-4. **Desktop command palette** (Ctrl/⌘K): now, or later when there are more destinations.
-5. **Concept art:** colours, shapes and brand are marked provisional in the spec until it
+2. **Concept art:** colours, shapes and brand are marked provisional in the spec until it
    arrives.
-6. **Radium prices:** `radium-tycho` (your test dummy) has no prices, so its cost shows $0 and
+3. **Radium prices:** `radium-tycho` (your test dummy) has no prices, so its cost shows $0 and
    the picker says "No price set". Send prices if cost tracking on Tycho matters.
-7. **OpenRouter credits:** without them the key allows 50 free-model requests a day across
+4. **OpenRouter credits:** without them the key allows 50 free-model requests a day across
    all models; OpenRouter says adding 10 credits raises it to 1,000. Spending money is yours.
 
 ## Design decisions
