@@ -10,13 +10,15 @@ struct DevicesView: View {
             List(model.devices) { device in
                 NavigationLink(value: device.id) {
                     VStack(alignment: .leading, spacing: 5) {
-                        HStack { Circle().fill(device.online ? Color.green : Color.secondary).frame(width: 8, height: 8); Text(device.name).font(.headline) }
-                        Text(device.online ? "Online · \(device.platform)" : offlineText(device)).font(.caption).foregroundStyle(.secondary)
+                        HStack { Circle().fill(device.online ? Theme.ok : Theme.text3).frame(width: 8, height: 8).accessibilityHidden(true); Text(device.name).font(.headline).foregroundStyle(Theme.text) }
+                        Text(device.online ? "Online · \(device.platform)" : offlineText(device)).font(.caption).foregroundStyle(device.online ? Theme.ok : Theme.text3)
                         Text(device.id == "hub" ? "Hub threads have file tools only." : "\(device.capabilities.count) tools")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(Theme.text3)
                     }
                 }
+                .listRowBackground(Theme.surface)
             }
+            .grouperListBackground()
             .overlay { if model.devices.isEmpty { ContentUnavailableView("No devices", systemImage: "desktopcomputer", description: Text("Run grouper connect on a computer to make it available.")) } }
             .navigationTitle("Devices")
             .navigationDestination(for: String.self) { id in
@@ -55,14 +57,18 @@ struct DeviceDetailView: View {
         List {
             Section {
                 Text("Workspace file tools and known agent tools start on Auto; everything else starts on Manual. Only you can change these permissions.")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(Theme.text2)
                 if device.id == "hub" { Text("Hub threads have file tools only.").font(.callout) }
             }
+            .listRowBackground(Theme.surface)
             Section("Available") { toolRows(tools.filter(\.available)) }
+                .listRowBackground(Theme.surface)
             if tools.contains(where: { !$0.available }) {
                 Section("Unavailable") { toolRows(tools.filter { !$0.available }) }
+                    .listRowBackground(Theme.surface)
             }
         }
+        .grouperListBackground()
         .navigationTitle(device.name)
         .task(id: device.id) { await model.loadTools(deviceId: device.id) }
         .confirmationDialog("Always run \(bypassCandidate?.name ?? "this tool")?", isPresented: Binding(
@@ -82,15 +88,15 @@ struct DeviceDetailView: View {
     private var tools: [ToolInfo] { model.toolsByDevice[device.id] ?? [] }
 
     @ViewBuilder private func toolRows(_ tools: [ToolInfo]) -> some View {
-        if tools.isEmpty { Text("No tools").foregroundStyle(.secondary) }
+        if tools.isEmpty { Text("No tools").foregroundStyle(Theme.text3) }
         ForEach(tools) { tool in
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text(tool.name).font(.headline)
-                    if !tool.available { Text("Unavailable").font(.caption).foregroundStyle(.secondary) }
-                    if tool.permission == .bypass { Label("Bypass", systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.red) }
+                    Text(tool.name).font(.headline).foregroundStyle(Theme.text)
+                    if !tool.available { Text("Unavailable").font(.caption).foregroundStyle(Theme.text3) }
+                    if tool.permission == .bypass { Label("Bypass", systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(Theme.danger) }
                 }
-                if !tool.description.isEmpty { Text(LocalizedStringKey(tool.description)).font(.callout).foregroundStyle(.secondary) }
+                if !tool.description.isEmpty { Text(LocalizedStringKey(tool.description)).font(.callout).foregroundStyle(Theme.text2) }
                 Picker("Permission for \(tool.name)", selection: Binding(
                     get: { tool.permission },
                     set: { permission in
@@ -105,7 +111,7 @@ struct DeviceDetailView: View {
                 .pickerStyle(.segmented).disabled(!tool.available || !model.online)
                 .accessibilityHint(policy(tool: tool, permission: tool.permission))
                 Text(policy(tool: tool, permission: tool.permission)).font(.caption)
-                    .foregroundStyle(tool.permission == .bypass ? Color.red : isUnconfined(tool) ? Color.orange : Color.secondary)
+                    .foregroundStyle(tool.permission == .bypass ? Theme.danger : isUnconfined(tool) ? Theme.warn : Theme.text2)
             }.padding(.vertical, 6)
         }
     }

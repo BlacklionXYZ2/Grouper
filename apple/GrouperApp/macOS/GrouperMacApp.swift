@@ -17,7 +17,7 @@ struct GrouperMacApp: App {
     var body: some Scene {
         WindowGroup("Grouper", id: "main") {
             Group { if model.signedIn { MacRootView() } else { SignInView() } }
-                .environmentObject(model).environmentObject(node).tint(.teal)
+                .environmentObject(model).environmentObject(node).tint(Theme.accent)
                 // The node runs on this Mac's own device token, whether or not the window is
                 // signed in: signing out keeps it serving; "Sign out and remove this Mac" stops it.
                 .onChange(of: model.nodeTarget, initial: true) { _, target in node.apply(target) }
@@ -80,13 +80,29 @@ struct MacRootView: View {
 
     var body: some View {
         NavigationSplitView {
+            // The web sidebar's order: New chat, Chats, Needs you, then the pages the Mac
+            // has (Devices, Models, Settings), and the system status at the foot.
             List(selection: $section) {
-                Section("Chats") {
-                    ForEach(model.conversations) { conversation in
-                        Label(conversation.title, systemImage: conversation.mode == "standard" ? "bubble.left" : "folder")
-                            .tag(MacSection.chat(conversation.id))
+                Section {
+                    ForEach(sidebarChats) { conversation in chatRow(conversation) }
+                    if model.conversations.count > sidebarChats.count {
+                        Button { showPalette = true } label: {
+                            Label("More chats…", systemImage: "ellipsis")
+                                .foregroundStyle(Theme.text2)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Search all chats (⌘K)")
                     }
-                    Label("New project", systemImage: "plus").tag(MacSection.newChat)
+                } header: {
+                    Text("Chats").font(Theme.Typeface.sectionLabel).foregroundStyle(Theme.text)
+                }
+                Section {
+                    if needsYou.isEmpty {
+                        Text("Nothing needs you").font(Theme.Typeface.row).foregroundStyle(Theme.text3)
+                    }
+                    ForEach(needsYou.prefix(5)) { approval in needsYouRow(approval) }
+                } header: {
+                    needsYouHeader
                 }
                 Section {
                     Label("Devices", systemImage: "desktopcomputer").tag(MacSection.devices)
@@ -94,7 +110,9 @@ struct MacRootView: View {
                     Label("Settings", systemImage: "gear").tag(MacSection.settings)
                 }
             }
-            .navigationSplitViewColumnWidth(min: 210, ideal: 260)
+            .safeAreaInset(edge: .top, spacing: 0) { newChatButton }
+            .safeAreaInset(edge: .bottom, spacing: 0) { statusRow }
+            .navigationSplitViewColumnWidth(min: 210, ideal: Theme.Size.sidebarWidth)
             .toolbar {
                 ToolbarItem {
                     Button { showPalette = true } label: { Label("Search", systemImage: "magnifyingglass") }
@@ -126,6 +144,119 @@ struct MacRootView: View {
         .onChange(of: model.chatRevealRequest) { _, _ in
             section = model.selectedConversationId.map { MacSection.chat($0) } ?? .newChat
         }
+    }
+
+    // MARK: - Sidebar pieces
+
+    /// About eight chats; the open one is always listed. The rest are in the palette.
+    private var sidebarChats: [ConversationInfo] {
+        var list = Array(model.conversations.prefix(Self.sidebarChatLimit))
+        if let open = model.selectedConversationId, !list.contains(where: { $0.id == open }),
+           let chat = model.conversations.first(where: { $0.id == open }) {
+            list[list.count - 1] = chat
+        }
+        return list
+    }
+
+    private static let sidebarChatLimit = 8
+
+    private func chatRow(_ conversation: ConversationInfo) -> some View {
+        let selected = section == .chat(conversation.id)
+        let needs = model.needsYouCount(in: conversation.id)
+        let running = model.threads(in: conversation.id).filter { $0.status == "running" }.count
+        return Label {
+            Text(conversation.title).lineLimit(1)
+        } icon: {
+            Image(systemName: conversation.mode == "standard" ? "bubble.left" : "folder")
+                .foregroundStyle(selected ? Theme.brand : Theme.text2)
+        }
+        .badge(Self.badge(needs: needs, running: running))
+        .tag(MacSection.chat(conversation.id))
+        .accessibilityValue(needs > 0 ? "\(needs) need you" : running > 0 ? "\(running) running" : "")
+    }
+
+    /// A chat row's count: what needs you (in the brand purple), else what's running.
+    private static func badge(needs: Int, running: Int) -> Text? {
+        if needs > 0 { return Text("\(needs)").foregroundStyle(Theme.brand) }
+        if running > 0 { return Text("\(running)") }
+        return nil
+    }
+    /// Approvals across chats, oldest first; each opens its chat's approval dock.
+    private var needsYou: [PendingApproval] { ApprovalQueue.ordered(model.pendingApprovals) }
+
+    private var needsYouHeader: some View {
+        HStack(spacing: 6) {
+            Text("Needs you").font(Theme.Typeface.sectionLabel).foregroundStyle(Theme.text)
+            if !needsYou.isEmpty {
+                Text("\(needsYou.count)")
+                    .font(Theme.Typeface.chip.monospacedDigit())
+                    .foregroundStyle(Theme.brand)
+                    .padding(.horizontal, 6)
+                    .background(Theme.brandSoft, in: RoundedRectangle(cornerRadius: Theme.Radius.xs))
+                Spacer(minLength: 4)
+                if let newest = needsYou.map(\.ts).max() {
+                    RelativeAgeText(seconds: newest).font(Theme.Typeface.meta).foregroundStyle(Theme.text3)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func needsYouRow(_ approval: PendingApproval) -> some View {
+        Button {
+            model.openApprovalRoute(ApprovalRoute(approvalId: approval.id, conversationId: approval.conversationId, threadId: approval.threadId))
+        } label: {
+            Label {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(approval.tool) on \(model.deviceDisplayName(approval.deviceId))").lineLimit(1)
+                    Text(model.chatTitle(approval.conversationId)).font(Theme.Typeface.meta).foregroundStyle(Theme.text3).lineLimit(1)
+                }
+            } icon: {
+                Image(systemName: "exclamationmark.shield.fill").foregroundStyle(Theme.brand)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Shows the request in its chat's approval dock")
+    }
+
+    private var newChatButton: some View {
+        Button { section = .newChat } label: {
+            Label("New chat", systemImage: "square.and.pencil")
+                .font(Theme.Typeface.row.weight(.semibold))
+                .foregroundStyle(Theme.accent)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10).padding(.vertical, 7)
+                .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: Theme.Radius.sm))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 10).padding(.top, 6).padding(.bottom, 4)
+        .help("Start a new chat")
+    }
+
+    /// "All systems online" only when it's true (Q8). Only devices that run threads count.
+    private var statusRow: some View {
+        let devices = model.devices.filter { $0.platform != "web" && $0.platform != "ios" }
+        let up = devices.filter(\.online).count
+        let (text, tone): (String, Color) = {
+            if !model.online { return ("Offline · reconnecting", Theme.danger) }
+            if devices.isEmpty { return ("Hub online", Theme.ok) }
+            if up == devices.count { return ("All systems online", Theme.ok) }
+            return ("\(up) of \(devices.count) devices online", Theme.warn)
+        }()
+        return Button { section = .devices } label: {
+            HStack(spacing: 8) {
+                Circle().fill(tone).frame(width: 8, height: 8).accessibilityHidden(true)
+                Text(text).font(Theme.Typeface.chip).foregroundStyle(Theme.text2)
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption2.weight(.semibold)).foregroundStyle(Theme.text3)
+                    .accessibilityHidden(true)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens Devices")
     }
 
     private func open(_ selected: MacSection?) {
@@ -199,12 +330,12 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack { Circle().fill(model.online ? Color.green : Color.red).frame(width: 8, height: 8); Text(model.online ? "Hub connected" : "Hub offline"); Spacer(); Text(node.statusText).foregroundStyle(.secondary) }
+            HStack { Circle().fill(model.online ? Theme.ok : Theme.danger).frame(width: 8, height: 8); Text(model.online ? "Hub connected" : "Hub offline"); Spacer(); Text(node.statusText).foregroundStyle(Theme.text2) }
             if let message = model.deviceMessage {
-                Text(message).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(message).font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
             } else if model.nodeTarget == nil, !model.registeringDevice {
                 Text("This Mac isn't registered with the hub. Connect in the Grouper window to register it.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .font(.caption).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
             }
             if !model.pendingApprovals.isEmpty {
                 Divider()
@@ -214,7 +345,7 @@ struct MenuBarView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("\(approval.tool) on \(model.deviceDisplayName(approval.deviceId))").lineLimit(1)
                             Text("\(model.threadTitle(approval.threadId)) · \(model.chatTitle(approval.conversationId))")
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                .font(.caption).foregroundStyle(Theme.text2).lineLimit(1)
                         }
                         Spacer()
                         Button("Review") { review(approval) }
@@ -224,7 +355,7 @@ struct MenuBarView: View {
             let active = model.threads.filter { !$0.isTerminal }.prefix(5)
             if !active.isEmpty {
                 Divider()
-                ForEach(Array(active)) { thread in HStack { Text(thread.title).lineLimit(1); Spacer(); StatusLabel(status: thread.status) } }
+                ForEach(Array(active)) { thread in HStack { Text(thread.title).lineLimit(1); Spacer(); StatusPill(status: thread.status, family: model.family(ofModel: thread.model)) } }
             }
             Divider()
             HStack {

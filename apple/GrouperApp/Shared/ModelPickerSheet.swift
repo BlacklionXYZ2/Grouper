@@ -28,13 +28,13 @@ struct ModelPickerSheet: View {
                 Section { searchField }
                 #endif
                 Section {
-                    Text(currentLine).font(.caption).foregroundStyle(.secondary)
+                    Text(currentLine).font(.caption).foregroundStyle(Theme.text2)
                     defaultRow
                 }
                 if model.providersFailed && model.providers.isEmpty {
                     Section {
                         Label("Provider details (kind, key) could not be loaded. Models are still grouped by provider id.", systemImage: "exclamationmark.triangle")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(Theme.text2)
                     }
                 }
                 ForEach(sections) { section in
@@ -49,7 +49,7 @@ struct ModelPickerSheet: View {
                 if sections.isEmpty && !query.trimmingCharacters(in: .whitespaces).isEmpty {
                     Section {
                         Text("No models match “\(query.trimmingCharacters(in: .whitespaces))”. Default model is still available.")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Theme.text2)
                     }
                 }
             }
@@ -79,7 +79,7 @@ struct ModelPickerSheet: View {
     // VERIFY ON MAC: `.searchable` inside a sheet's NavigationStack may not show a field on macOS, so the Mac uses a plain focused field.
     private var searchField: some View {
         HStack {
-            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            Image(systemName: "magnifyingglass").foregroundStyle(Theme.text2)
             TextField("Search by name, provider, family or role", text: $query)
                 .textFieldStyle(.plain)
                 .focused($searchFocused)
@@ -102,10 +102,10 @@ struct ModelPickerSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Default model").font(.body.weight(.semibold)).foregroundStyle(.primary)
                     Text(roleDefault.map { "The \(role) default, now \($0.id)" } ?? "The hub's \(role) default")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(Theme.text2)
                 }
                 Spacer(minLength: 8)
-                if current == nil { Image(systemName: "checkmark").foregroundStyle(.tint).accessibilityHidden(true) }
+                if current == nil { Image(systemName: "checkmark").foregroundStyle(Theme.accent).accessibilityHidden(true) }
             }
             .contentShape(Rectangle())
         }
@@ -123,12 +123,12 @@ struct ModelPickerSheet: View {
                 Text(group.providerId.isEmpty ? "Unknown provider" : group.providerId).font(.subheadline.weight(.semibold))
                 if let provider = group.provider {
                     TagBadge(text: provider.kind)
-                    TagBadge(text: provider.hasKey ? "Key set" : "No key", tint: provider.hasKey ? .teal : .secondary)
+                    TagBadge(text: provider.hasKey ? "Key set" : "No key", tint: provider.hasKey ? Theme.ok : Theme.text2, fill: provider.hasKey ? Theme.okSoft : Theme.surface2)
                     if let via = provider.viaDevice, !via.isEmpty {
                         TagBadge(text: "via \(model.deviceDisplayName(via))")
                     }
                 } else if model.providersLoaded {
-                    TagBadge(text: "Unknown provider", tint: .orange)
+                    TagBadge(text: "Unknown provider", tint: Theme.warn, fill: Theme.warnSoft)
                 }
             }
         }
@@ -147,17 +147,17 @@ struct ModelPickerSheet: View {
                     HStack(spacing: 6) {
                         Text(entry.id).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
                         priceBadge(entry)
-                        if entry.local { TagBadge(text: "Local") }
+                        if entry.local { TagBadge(text: "Local", tint: Theme.ok, fill: Theme.okSoft) }
                     }
-                    Text(entry.model).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
-                    Text(Self.meta(entry, family: family)).font(.caption).foregroundStyle(.secondary)
+                    Text(entry.model).font(.caption.monospaced()).foregroundStyle(Theme.text2).lineLimit(1)
+                    Text(Self.meta(entry, family: family)).font(.caption).foregroundStyle(Theme.text2)
                 }
                 Spacer(minLength: 8)
-                if selected { Image(systemName: "checkmark").foregroundStyle(.tint).accessibilityHidden(true) }
+                if selected { Image(systemName: "checkmark").foregroundStyle(Theme.accent).accessibilityHidden(true) }
             }
             .padding(.leading, 6)
             .background(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2).fill(family.color).frame(width: 3)
+                RoundedRectangle(cornerRadius: 2).fill(family.color).frame(width: 4)
             }
             .contentShape(Rectangle())
         }
@@ -168,7 +168,7 @@ struct ModelPickerSheet: View {
 
     @ViewBuilder private func priceBadge(_ entry: ModelEntry) -> some View {
         if entry.free {
-            TagBadge(text: "Free", tint: .teal)
+            TagBadge(text: "Free", tint: Theme.ok, fill: Theme.okSoft)
         } else if entry.inputPrice > 0 || entry.outputPrice > 0 {
             TagBadge(text: "Paid")
         } else {

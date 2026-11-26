@@ -11,7 +11,7 @@ struct GrouperIOSApp: App {
                 if model.signedIn { PhoneRootView() } else { SignInView() }
             }
             .environmentObject(model)
-            .tint(.teal)
+            .tint(Theme.accent)
             .onOpenURL { url in handle(url) }
             // A tapped approval notification. Taken here, not in the tab view, so a tap
             // that launched the app is kept while it signs in.
@@ -65,9 +65,8 @@ struct PhoneRootView: View {
     }
 
     var body: some View {
-        // TODO(owner decision: phone tabs): the phone tab set is still being decided
-        // (docs/gui-nav-ideas.md). The Threads tab is gone for good; Chat, Devices and
-        // More stay as they were until the owner picks a set. Do not add an inbox tab here.
+        // Chat, Devices and More (docs/gui-concept-plan.md V10): the native tab bar
+        // (Liquid Glass), with the selected tab in the brand teal.
         TabView(selection: $selection) {
             Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: PhoneTab.chat) {
                 NavigationStack { ChatView() }
@@ -82,6 +81,7 @@ struct PhoneRootView: View {
         }
         // VERIFY ON MAC: Confirm tabBarMinimizeBehavior(.onScrollDown) coordinates cleanly with ChatView's .safeAreaBar(edge: .bottom) composer on iOS 26.
         .tabBarMinimizeBehavior(.onScrollDown)
+        .tint(Theme.accent)
         // A notification opened a chat's approval dock: show the Chat tab.
         .onChange(of: model.chatRevealRequest) { _, _ in selection = PhoneTab.chat }
         .onReceive(NotificationCenter.default.publisher(for: .grouperOpenTab)) { note in

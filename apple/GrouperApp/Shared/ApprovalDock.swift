@@ -10,10 +10,13 @@ import GrouperAPI
 /// - One request at a time, "1 of N", oldest first; Previous/Next stop at the ends.
 /// - Order: "Run this tool?", tool and device, thread with its model, the chat (in a
 ///   thread), the reason (most prominent), the exact input (collapsed), timeout, actions.
-/// - Approve stays off until "Review exact input before approving" has been opened.
+/// - Approve stays off until "View exact input" has been opened.
 ///   No keyboard shortcut approves; Return does nothing here.
 /// - A risk-rule request gives Approve and Deny equal weight; Manual makes Approve primary.
-/// - Glass only on the action buttons; reason and input sit on opaque surfaces.
+/// - Look (docs/gui-concept-plan.md V9): an opaque card in the composer's place, shield,
+///   title, tool · device, thread, reason, "View exact input" row, Deny and Approve at
+///   equal width; queue, timeout, Change it and Stop as small controls underneath.
+///   No close control, never a floating dialog.
 struct ApprovalDock: View {
     enum Scope: Equatable {
         case chat
@@ -55,10 +58,13 @@ struct ApprovalDock: View {
                 card(current)
             }
         }
-        .padding(.horizontal).padding(.vertical, 12)
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.background)
-        .overlay(alignment: .top) { Divider() }
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.card))
+        .overlay { RoundedRectangle(cornerRadius: Theme.Radius.card).strokeBorder(Theme.borderStrong, lineWidth: 1) }
+        .frame(maxWidth: Theme.Size.transcriptMax)
+        .padding(.horizontal).padding(.bottom, 6)
+        .frame(maxWidth: .infinity)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Approval request")
         .onChange(of: queue.map(\.id), initial: true) { _, ids in announceNew(ids) }
@@ -82,20 +88,25 @@ struct ApprovalDock: View {
                 ScrollView { details(approval, riskRule: riskRule) }
             }
             .frame(maxHeight: Self.detailsMaxHeight)
-            statusLine(approval)
             actions(approval, riskRule: riskRule)
+            statusLine(approval)
+            footer(approval)
         }
     }
 
     private func header(_ approval: PendingApproval) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(spacing: 10) {
+            Image(systemName: "checkmark.shield.fill")
+                .font(.title2)
+                .foregroundStyle(Theme.accent)
+                .accessibilityHidden(true)
             Text("Run this tool?")
-                .font(.headline)
+                .font(Theme.Typeface.dockTitle)
+                .foregroundStyle(Theme.text)
                 .accessibilityAddTraits(.isHeader)
                 .accessibilityLabel("Run this tool? \(approval.tool) on \(model.deviceDisplayName(approval.deviceId))")
                 .accessibilityFocused($headingFocused)
             Spacer(minLength: 8)
-            if queue.count > 1 { queueControls(approval) }
         }
     }
 
@@ -108,7 +119,7 @@ struct ApprovalDock: View {
                 .disabled(previous == nil)
                 .accessibilityLabel("Previous request")
                 .grouperMinimumControlSize()
-            Text("\(index + 1) of \(queue.count)").font(.callout.monospacedDigit())
+            Text("\(index + 1) of \(queue.count)").font(Theme.Typeface.meta.monospacedDigit()).foregroundStyle(Theme.text2)
                 .accessibilityLabel("Request \(index + 1) of \(queue.count)")
             Button { model.selectedApprovalId = next } label: { Image(systemName: "chevron.right") }
                 .disabled(next == nil)
@@ -116,40 +127,67 @@ struct ApprovalDock: View {
                 .grouperMinimumControlSize()
         }
         .buttonStyle(.borderless)
+        .foregroundStyle(Theme.accent)
     }
 
     private func details(_ approval: PendingApproval, riskRule: Bool) -> some View {
         let threadModel = model.threads.first(where: { $0.id == approval.threadId })?.model ?? ""
+        let open = inputExpanded(approval.id)
         return VStack(alignment: .leading, spacing: 8) {
-            Label("\(approval.tool) on \(model.deviceDisplayName(approval.deviceId))", systemImage: "wrench.and.screwdriver")
-                .font(.subheadline.weight(.semibold))
+            HStack(spacing: 6) {
+                Image(systemName: "wrench.and.screwdriver").foregroundStyle(Theme.text2).accessibilityHidden(true)
+                Text(approval.tool).fontWeight(.semibold).foregroundStyle(Theme.text)
+                Text("·").foregroundStyle(Theme.text3).accessibilityHidden(true)
+                Text("via \(model.deviceDisplayName(approval.deviceId))").foregroundStyle(Theme.text2)
+            }
+            .font(.subheadline)
+            .lineLimit(1)
+            .accessibilityElement(children: .combine)
             HStack(spacing: 6) {
                 FamilyMark(family: model.family(ofModel: threadModel))
-                Text(model.threadTitle(approval.threadId)).lineLimit(2)
+                Text("Thread: \(model.threadTitle(approval.threadId))").foregroundStyle(Theme.text3).lineLimit(2)
                 if !threadModel.isEmpty {
-                    Text(threadModel).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+                    Text(threadModel).font(Theme.Typeface.meta).foregroundStyle(Theme.text3).lineLimit(1)
                 }
             }
             .font(.subheadline)
             .accessibilityElement(children: .combine)
             if isThreadScope {
-                Text("In \(model.chatTitle(approval.conversationId))").font(.caption).foregroundStyle(.secondary)
+                Text("In \(model.chatTitle(approval.conversationId))").font(Theme.Typeface.meta).foregroundStyle(Theme.text3)
             }
+            Rectangle().fill(Theme.border).frame(height: 1).padding(.vertical, 2)
             reason(approval, riskRule: riskRule)
-            DisclosureGroup(isExpanded: inputExpanded(approval.id)) {
+            Button {
+                open.wrappedValue.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "eye").foregroundStyle(Theme.text2).accessibilityHidden(true)
+                    Text("View exact input").font(.callout.weight(.semibold)).foregroundStyle(Theme.text)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.text3)
+                        .rotationEffect(.degrees(open.wrappedValue ? 90 : 0))
+                        .accessibilityHidden(true)
+                }
+                .padding(.horizontal, 12)
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .background(Theme.surface2, in: RoundedRectangle(cornerRadius: Theme.Radius.sm))
+                .overlay { RoundedRectangle(cornerRadius: Theme.Radius.sm).strokeBorder(Theme.border, lineWidth: 1) }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(open.wrappedValue ? "Expanded" : "Collapsed")
+            .accessibilityHint(open.wrappedValue ? "Hides the exact input" : "Shows the exact input. Approve turns on once it has been opened.")
+            if open.wrappedValue {
                 Text(approval.input.prettyPrinted)
-                    .font(.system(.callout, design: .monospaced))
+                    .font(Theme.Typeface.mono)
+                    .foregroundStyle(Theme.text)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)
-                    .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 10))
+                    .background(Theme.surface2, in: RoundedRectangle(cornerRadius: Theme.Radius.sm))
                     .accessibilityLabel("Exact input for \(approval.tool)")
-            } label: {
-                Text("Review exact input before approving").font(.callout.weight(.semibold))
-            }
-            TimelineView(.periodic(from: .now, by: 30)) { context in
-                Text(ApprovalTimeoutText.describe(approval, now: context.date))
-                    .font(.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -159,98 +197,104 @@ struct ApprovalDock: View {
         return VStack(alignment: .leading, spacing: 4) {
             if riskRule {
                 Label("A safety rule asked", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption.weight(.semibold)).foregroundStyle(.orange)
+                    .font(.caption.weight(.semibold)).foregroundStyle(Theme.warn)
             }
             Text(text)
-                .font(.body.weight(.semibold))
+                .font(Theme.Typeface.body.weight(.medium))
+                .foregroundStyle(Theme.text)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         }
-        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 12))
         .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder private func statusLine(_ approval: PendingApproval) -> some View {
         if !model.online {
             Label("Offline. These are the last synced details; you can answer once the hub reconnects.", systemImage: "wifi.slash")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(Theme.text2)
         } else if !model.approvalsReconciled {
             HStack(spacing: 8) {
                 Label("Checking with the hub before answering…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(Theme.text2)
                 Button("Check again") { Task { await model.loadApprovals() } }.font(.caption)
             }
         } else if let failure {
-            Label(failure, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.red)
+            Label(failure, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(Theme.danger)
         } else if busyId == approval.id {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
-                Text("Sending your answer…").font(.caption).foregroundStyle(.secondary)
+                Text("Sending your answer…").font(.caption).foregroundStyle(Theme.text2)
             }
         } else if !revealed.contains(approval.id) {
-            Text("Open “Review exact input before approving” to turn on Approve.")
-                .font(.caption).foregroundStyle(.secondary)
+            Label("Open “View exact input” to turn on Approve.", systemImage: "lock.fill")
+                .font(.caption).foregroundStyle(Theme.text2)
         }
     }
 
     private func actions(_ approval: PendingApproval, riskRule: Bool) -> some View {
         let writable = model.canAnswerApprovals && busyId == nil
-        return VStack(alignment: .leading, spacing: 8) {
-            GlassEffectContainer(spacing: 10) {
-                HStack(spacing: 10) {
-                    Button { answer(approval, approve: false) } label: {
-                        Label("Deny", systemImage: "xmark").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glass)
-                    .grouperMinimumControlSize()
-                    .disabled(!writable)
-                    .accessibilityLabel("Deny \(approval.tool) on \(model.deviceDisplayName(approval.deviceId))")
-                    approveButton(approval, prominent: !riskRule)
-                        .grouperMinimumControlSize()
-                        .disabled(!writable || !revealed.contains(approval.id))
-                        .accessibilityLabel("Approve \(approval.tool) on \(model.deviceDisplayName(approval.deviceId))")
-                        .accessibilityHint(revealed.contains(approval.id) ? "" : "Open the exact input first")
-                }
+        return HStack(spacing: 10) {
+            Button { answer(approval, approve: false) } label: {
+                Label("Deny", systemImage: "xmark")
             }
+            .buttonStyle(GrouperActionButtonStyle(kind: .outline))
+            .disabled(!writable)
+            .accessibilityLabel("Deny \(approval.tool) on \(model.deviceDisplayName(approval.deviceId))")
+            approveButton(approval, prominent: !riskRule)
+                .disabled(!writable || !revealed.contains(approval.id))
+                .accessibilityLabel("Approve \(approval.tool) on \(model.deviceDisplayName(approval.deviceId))")
+                .accessibilityHint(revealed.contains(approval.id) ? "" : "Open the exact input first")
+        }
+    }
+
+    /// Never the default action: Return must not approve. A risk-rule request keeps
+    /// both buttons outline (equal weight); Manual makes Approve the teal fill.
+    private func approveButton(_ approval: PendingApproval, prominent: Bool) -> some View {
+        Button { answer(approval, approve: true) } label: {
+            Label("Approve", systemImage: revealed.contains(approval.id) ? "checkmark" : "lock.fill")
+        }
+        .buttonStyle(GrouperActionButtonStyle(kind: prominent ? .primary : .outline))
+    }
+
+    /// Small text controls under the buttons: Change it and Stop, the timeout, the
+    /// queue, and (in a thread) the chat's other requests.
+    private func footer(_ approval: PendingApproval) -> some View {
+        let writable = model.canAnswerApprovals && busyId == nil
+        return VStack(alignment: .leading, spacing: 6) {
             if approval.threadId != nil {
                 HStack {
                     Button("Change it") { answer(approval, approve: false, thenChange: true) }
                         .disabled(!writable)
+                        .foregroundStyle(Theme.accent)
                         .accessibilityHint("Denies this call, then opens the thread with a message to tell it what to do instead")
                     Spacer()
                     Button("Stop thread", role: .destructive) { stopCandidate = approval }
                         .disabled(!writable)
+                        .foregroundStyle(Theme.danger)
                 }
                 .font(.callout)
                 .buttonStyle(.borderless)
             }
+            HStack(spacing: 8) {
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    Text(ApprovalTimeoutText.describe(approval, now: context.date))
+                        .font(Theme.Typeface.meta).foregroundStyle(Theme.text3)
+                }
+                Spacer(minLength: 8)
+                if queue.count > 1 { queueControls(approval) }
+            }
             if isThreadScope, otherInChat > 0 {
                 HStack {
                     Text(otherInChat == 1 ? "1 more request in this chat" : "\(otherInChat) more requests in this chat")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(Theme.Typeface.meta).foregroundStyle(Theme.text3)
                     if let onShowChatQueue {
                         Spacer()
                         Button("Show in chat", action: onShowChatQueue).font(.caption).buttonStyle(.borderless)
+                            .foregroundStyle(Theme.accent)
                     }
                 }
             }
-        }
-    }
-
-    /// Never the default action: Return must not approve.
-    @ViewBuilder private func approveButton(_ approval: PendingApproval, prominent: Bool) -> some View {
-        if prominent {
-            Button { answer(approval, approve: true) } label: {
-                Label("Approve", systemImage: "checkmark").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.glassProminent)
-        } else {
-            Button { answer(approval, approve: true) } label: {
-                Label("Approve", systemImage: "checkmark").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.glass)
         }
     }
 
@@ -269,20 +313,22 @@ struct ApprovalDock: View {
     private func settledCard(_ settled: SettledApproval) -> some View {
         let more = !queue.isEmpty
         return VStack(alignment: .leading, spacing: 8) {
-            Text("Run this tool?").font(.headline).accessibilityAddTraits(.isHeader)
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.shield.fill").font(.title2).foregroundStyle(Theme.accent).accessibilityHidden(true)
+                Text("Run this tool?").font(Theme.Typeface.dockTitle).foregroundStyle(Theme.text).accessibilityAddTraits(.isHeader)
+            }
             Text("\(settled.approval.tool) on \(model.deviceDisplayName(settled.approval.deviceId)) · \(model.threadTitle(settled.approval.threadId))")
-                .font(.subheadline).foregroundStyle(.secondary)
+                .font(.subheadline).foregroundStyle(Theme.text2)
             HStack(alignment: .firstTextBaseline) {
                 Label(settled.outcome.message, systemImage: icon(for: settled.outcome))
-                    .font(.body.weight(.semibold))
+                    .font(.body.weight(.semibold)).foregroundStyle(Theme.text)
                 Spacer()
                 Button(more ? "Next request" : "OK") { model.dismissSettledApproval() }
                     .buttonStyle(.borderless)
+                    .foregroundStyle(Theme.accent)
             }
         }
-        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 12))
         .task(id: settled.id) {
             AccessibilityNotification.Announcement(settled.outcome.message).post()
         }

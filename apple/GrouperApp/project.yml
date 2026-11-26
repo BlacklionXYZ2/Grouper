@@ -45,6 +45,9 @@ targets:
           - Info.plist
       - path: iOS/ThreadActivityAttributes.swift
       - path: iOS/StopThreadIntent.swift
+      # The palette only (SwiftUI and UIKit, no GrouperAPI), so the Live Activity
+      # uses the same colours as the app.
+      - path: Shared/Theme.swift
     settings:
       base:
         INFOPLIST_FILE: iOSWidgets/Info.plist

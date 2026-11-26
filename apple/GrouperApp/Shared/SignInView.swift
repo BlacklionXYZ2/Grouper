@@ -10,6 +10,8 @@ struct SignInView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section { brandHeader }
+                    .listRowBackground(Color.clear)
                 Section("Hub") {
                     TextField("https://grouper.example", text: $model.hubURL)
                         #if os(iOS)
@@ -30,7 +32,7 @@ struct SignInView: View {
                                 #endif
                                 .accessibilityLabel("Setup code")
                             Text("This hub has no owner yet. Enter the setup code from the hub's log (or run grouper-hub setup-code on the hub), then sign in with Google to claim it.")
-                                .font(.caption).foregroundStyle(.secondary)
+                                .font(.caption).foregroundStyle(Theme.text2)
                         } header: {
                             Text("Setup code")
                         }
@@ -49,12 +51,13 @@ struct SignInView: View {
                     Section("Admin token") { tokenSignIn }
                 }
                 if let error = model.errorMessage {
-                    Section { Text(error).foregroundStyle(.red).accessibilityLabel("Sign in failed. \(error)") }
+                    Section { Text(error).foregroundStyle(Theme.danger).accessibilityLabel("Sign in failed. \(error)") }
                 }
             }
             #if os(macOS)
             .formStyle(.grouped)
             #endif
+            .grouperListBackground()
             .navigationTitle("Connect to Grouper")
             // Ask the hub whether it is claimed and allows Google, once typing pauses.
             .task(id: model.hubURL) {
@@ -63,6 +66,19 @@ struct SignInView: View {
                 await model.checkAuthStatus(for: model.hubURL)
             }
         }
+    }
+
+    /// The brand on the icon's gradient, with the tagline (Q2: sign-in only).
+    private var brandHeader: some View {
+        HStack(spacing: 14) {
+            GrouperAvatar(size: 56)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Grouper").font(.largeTitle.weight(.bold)).foregroundStyle(Theme.text)
+                Text("Together stronger.").font(.title3).foregroundStyle(Theme.text2)
+            }
+        }
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
     }
 
     private var busy: Bool { signingIn || model.googleBusy }
@@ -77,7 +93,7 @@ struct SignInView: View {
             .textContentType(.password)
         #if os(macOS)
         Text("The admin token stays in this app. When you connect, this Mac registers itself with the hub and gets its own non-admin device token for the local node.")
-            .font(.caption).foregroundStyle(.secondary)
+            .font(.caption).foregroundStyle(Theme.text2)
         #endif
         Button {
             signingIn = true
@@ -86,8 +102,7 @@ struct SignInView: View {
             HStack { Spacer(); if signingIn { ProgressView() } else { Text("Connect") }; Spacer() }
         }
         .disabled(busy || model.hubURL.isEmpty || model.adminToken.isEmpty)
-        .buttonStyle(.glassProminent)
-        .controlSize(.large)
+        .buttonStyle(GrouperActionButtonStyle(kind: .primary))
     }
 }
 
