@@ -43,6 +43,7 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "css/link.css",
     "icon.svg",
     "logo.svg",
+    "logo-glyph.svg",
     "manifest.webmanifest",
     "privacy.css",
     "privacy.html",

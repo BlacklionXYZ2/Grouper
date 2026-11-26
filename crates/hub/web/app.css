@@ -607,13 +607,13 @@ a {
   border-radius: var(--radius-sm);
 }
 
-/* The mark: logo.svg (W6 replaces the placeholder; no code change needed). */
+/* Small mark: the 7-fish glyph. Sign-in, welcome and boot keep logo.svg / icon.svg. */
 .brand-mark {
   width: 28px;
   height: 28px;
   flex: none;
   border-radius: 8px;
-  background: url("/app/logo.svg") center / contain no-repeat;
+  background: url("/app/logo-glyph.svg") center / contain no-repeat;
 }
 
 .side-new {
@@ -2889,6 +2889,11 @@ dialog.sheet-dialog::backdrop {
   margin: 0;
   color: var(--text-2);
   font-size: 14px;
+}
+
+.login-card .brand-mark,
+.login-brand .brand-mark {
+  background: url("/app/logo.svg") center / contain no-repeat;
 }
 
 .login-card .brand-mark {
