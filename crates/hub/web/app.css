@@ -1199,6 +1199,35 @@ a {
   min-height: 58px;
 }
 
+/* #/models/<id>: the linked row, marked for a moment and focused. The fade is a
+   colour transition, which the reduced-motion rule above cuts to nothing. */
+.model-row,
+.model-row > td {
+  transition: background-color 0.6s var(--ease), box-shadow 0.6s var(--ease);
+}
+
+li.model-row.is-target,
+tr.model-row.is-target > td {
+  background: var(--accent-soft);
+}
+
+li.model-row.is-target,
+tr.model-row.is-target > td:first-child {
+  box-shadow: inset 4px 0 0 var(--accent);
+}
+
+.model-row:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+@media (forced-colors: active) {
+  .model-row.is-target {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+}
+
 .provider-group > summary > .grow {
   flex: 1;
   min-width: 0;
