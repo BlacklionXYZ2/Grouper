@@ -52,6 +52,7 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "views/model-picker.js",
     "views/models.js",
     "views/more.js",
+    "views/palette.js",
     "views/settings.js",
     "views/skills.js",
     "views/thread.js",
