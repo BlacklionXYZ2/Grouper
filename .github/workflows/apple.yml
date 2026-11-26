@@ -20,6 +20,7 @@
 name: Apple
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - "apple/**"
@@ -55,10 +56,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Select Xcode 26
+      # The apps target macOS 27 and iOS 27 first (the deployment target stays 26),
+      # so build with the newest stable Xcode the runner has.
+      - name: Select the newest stable Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: "26"
+          xcode-version: latest-stable
 
       - name: Show Xcode
         run: xcodebuild -version
@@ -109,9 +112,32 @@ jobs:
             -project Grouper.xcodeproj \
             -scheme Grouper-macOS \
             -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath build/dd \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             2>&1 | tee build-logs/xcodebuild-macos.log
+
+      # A downloadable Mac app (Apple Silicon, debug build). Ad-hoc signed, not
+      # notarized: after unzipping, run `xattr -dr com.apple.quarantine Grouper.app`
+      # or use System Settings > Privacy & Security > Open Anyway. See the README.
+      - name: Package the Mac app
+        working-directory: apple/GrouperApp
+        run: |
+          set -euo pipefail
+          app="$(find build/dd/Build/Products -maxdepth 2 -name '*.app' -type d | head -1)"
+          test -n "$app"
+          echo "Packaging $app"
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          mkdir -p dist
+          ditto -c -k --keepParent "$app" dist/Grouper-macOS-arm64.zip
+
+      - name: Upload the Mac app
+        uses: actions/upload-artifact@v7
+        with:
+          name: Grouper-macOS-arm64
+          path: apple/GrouperApp/dist/Grouper-macOS-arm64.zip
+          retention-days: 14
 
       - name: Build the iOS app
         working-directory: apple/GrouperApp

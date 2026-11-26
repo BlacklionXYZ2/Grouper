@@ -11,7 +11,7 @@ These override anything below that disagrees.
 - **The model picker is a covering panel** (full-height sheet on phone, large overlay panel on desktop) with search and provider groups, because there are many candidates. Not a small popover.
 - **A thread opens as a chat-style view:** the same transcript layout as a chat, with the model fixed to the one the orchestrator chose (shown in the header, not changeable), so the owner can see which model is doing what.
 - **Thread rows in the threads panel** show the title, time elapsed (live while running, total once finished) and the model, with a colour accent by model family.
-- **Navigation:** no Threads tab. Phone tab design is being brainstormed separately (`docs/gui-nav-ideas.md`).
+- **Navigation:** no Threads tab. Phone tabs are Chat / Devices / More; More is a plain destination list.
 
 ## Owner decisions (26 November 2026)
 
@@ -134,9 +134,9 @@ These override anything below that disagrees, including the 25 November list.
 
 ### 3.2 Phone layout
 
-- No persistent Threads bottom tab. Use a four-item bottom bar: Chat, Needs you, Devices, More. “More” contains Models, Usage & limits, Memory, Skills and Settings.
-- Chat tab opens the pinned/recent chat. The top navigation menu opens searchable chat history and New project / New standard actions. Switching chat closes the history drawer.
-- Needs you is a global attention inbox of approval and waiting items. Every row displays the owning chat title; selecting it navigates to that chat and opens the thread inspector or approval sheet.
+- Phone tabs stay Chat / Devices / More. Chat opens the pinned/recent chat; Devices opens the device list; More opens a plain list of destinations, including Needs you, Models, Usage & limits, Memory, Skills and Settings.
+- Chat history opens from the chat header/menu and offers New project / New standard actions. Switching chat closes the history drawer.
+- Needs you is an inbox list reachable from More, not a tab or dashboard. Approval rows open the owning chat and its approval dock; waiting-device rows open the owning thread.
 - A thread opened from a chat is a full-height sheet/navigation destination on phone with a clear Back to chat action. The parent chat route remains in navigation state.
 - Management lists are one-column, content-first rows. Settings forms stack; wide tables become summary cards plus an optional detail sheet.
 - The bottom bar does not cover the composer or action buttons. Respect safe areas and software keyboard; composer remains above the keyboard.
@@ -144,7 +144,7 @@ These override anything below that disagrees, including the 25 November list.
 ### 3.3 Inside a chat
 
 - Chat header: title, mode, current/default model, chat menu, and thread-panel button for project chats.
-- Transcript: owner messages, orchestrator messages, inline thread cards, approval notice, budget warning and errors, in event order.
+- Transcript: owner messages, orchestrator messages, inline thread cards, budget notices and errors. A pending approval is shown only in the composer-replacing dock, not as a second approval notice.
 - Thread cards summarize title, status, device, model, latest useful line and any pending approval. No raw tool arguments in the card.
 - Thread panel: list scoped to this chat; groups Needs you / Running / Finished; opening an item selects it in the inspector.
 - Thread inspector: task brief/provenance, current state, checkpoint/hand-off, streamed activity, tool calls/results, files, final summary/rating, step-in composer, Stop.
@@ -161,7 +161,7 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 | Conversation | `#/chat/{conversationId}` | Chat | One project or standard transcript |
 | Thread inspector | `#/chat/{conversationId}/thread/{threadId}` | Thread sheet/child | Must verify thread belongs to conversation |
 | Thread panel | `#/chat/{conversationId}/threads` | Chat header panel or Needs you filter | Scoped to parent chat; not a global thread route |
-| Needs you inbox | `#/inbox` (proposed) | Needs you tab | Approvals and waiting-device items across chats |
+| Needs you inbox | `#/inbox` | More > Needs you | Approval and waiting-device list; approval rows open originating chat/thread with approval dock |
 | Devices | `#/devices`, `#/devices/{deviceId}` | Devices tab/detail | Presence, folders, tool permissions |
 | Models | `#/models` | More > Models | Provider/key-grouped registry, stats, proposals, rules, import |
 | Usage and limits | `#/usage`, optional `#/usage?conversation={id}` | More > Usage & limits | Account or chat-specific metering |
@@ -172,7 +172,7 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 
 - Existing `#/threads` links/deep links should redirect to `#/inbox` or resolve a thread to its owning chat. They must not reintroduce a permanent Threads tab.
 - Existing `#/chat/{id}/threads` remains valid as a panel/full-screen list under that chat.
-- Opening a thread from a push/notification resolves its conversation first, then opens the inspector. If lookup fails, show “Thread not found on this hub” plus a safe route back.
+- Opening a thread from a push/notification resolves its conversation first, then opens the inspector and selects the approval dock when `approval_id` is present. If lookup fails, show “Thread not found on this hub” plus a safe route back.
 - Usage links from a chat preserve conversation scope; navigating back returns to that chat.
 
 ### 3.5 Where capabilities live
@@ -180,7 +180,7 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 | Capability | Primary home | Secondary entry |
 |---|---|---|
 | Threads | Current project chat panel and inspector | Needs you inbox; chat cards; notifications |
-| Approvals | Needs you inbox; explicit approval sheet | Chat banner; thread inspector; notifications |
+| Approvals | Needs you inbox; approval dock in originating chat/thread | System notifications; inbox Review deep link |
 | Files | Thread inspector > Files | Final thread result; chat card link when outputs exist |
 | Models | Models destination, grouped by provider/key | Role-filtered model picker in composer |
 | Devices | Devices destination and per-device detail | Thread header/provenance; device picker when starting work |
@@ -214,11 +214,14 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 
 ### 4.3 Approval safety contract
 
-- Approval sheet order: “Run this tool?”; tool and device; owning thread/chat; human-readable reason (most prominent); exact input/command in selectable monospace block; waiting/timeout consequence; actions.
-- Actions: Approve, Deny, “Change it” (deny then open step-in with a draft), “Stop thread”. Do not rewrite arguments when the owner chooses Change.
-- On Manual, Approve may be the primary action. When a risk rule triggers, Approve and Deny have equal visual weight. Never use a bright primary style to nudge approval of a risky call.
-- A request answered on another client becomes a settled message; do not leave active buttons. A thread ending invalidates its pending approval.
-- Tool input can contain sensitive content. Do not put it in the global inbox preview, notifications, telemetry, or screen-lock display by default.
+- The approval dock replaces the composer while a request for this chat is pending; in a thread view it replaces that thread's step-in composer. It remains until answered, invalidated, or the owner navigates away. There is no collapse or “Reply instead” path while an action is pending: keep the owner focused on resolving or explicitly denying/stopping it. Other chats remain navigable.
+- Dock order: “Run this tool?”; tool and device; thread title with model-family colour mark and visible model name; owning chat when useful; human-readable reason (most prominent); exact input/command in selectable monospace disclosure, collapsed by default but explicitly labeled “Review exact input before approving”; timeout and precise consequence; actions.
+- The owner must expand and inspect the exact input before Approve is enabled. Never treat opening/reading the request as approval. Timeout copy reflects actual configured duration and action; if unavailable, say only “Waiting for an answer.”
+- Actions: Approve, Deny, “Change it” (deny then open step-in with a draft), “Stop thread”. Change never edits the pending arguments. Stop ends the thread and invalidates its request.
+- On Manual, Approve may be primary. On a risk-rule request, Approve and Deny have equal visual weight. No keyboard shortcut may approve; Enter does not activate the default action. Escape only leaves the dock/view and never answers or hides an unresolved request in the current view.
+- Several approvals: show one dock at a time with “1 of N”, Previous/Next controls, ordered oldest request first (same order on inbox and all clients); new requests append. Answering advances to the next pending request without a focus jump outside the dock.
+- Answered here shows a brief confirmation then advances/removes; resolved elsewhere shows “Answered on another device” with no live actions; ended thread says “Thread ended; this request can’t run”; offline retains details but disables all writes and says to reconnect. A lost response is reconciled against hub state before re-enabling actions.
+- Tool input is sensitive: never place it in notification payloads, inbox rows, analytics or lock-screen content. A collapsed disclosure still counts as shown only after the owner expands it; approving is impossible until then.
 
 ### 4.4 Permissions contract
 
@@ -241,8 +244,8 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 **Content hierarchy**
 
 1. Header: chat title; “Project” mode marker; model label (pinned model or role default); chat actions; “Threads” panel toggle with active/needs-you count.
-2. Attention strips: global/unread approval for this chat, then thread aggregate state (e.g. “2 running · MacBook waiting”). Keep banners compact and non-blocking.
-3. Transcript, chronological: user and orchestrator messages; grouped thread cards at the event point; approval and budget notices; errors.
+2. Attention: approval dock replaces composer for a pending request in this chat; otherwise thread aggregate state (e.g. “2 running · MacBook waiting”). Keep non-approval status compact and non-blocking.
+3. Transcript, chronological: user and orchestrator messages; grouped thread cards at the event point; budget notices and errors. Pending approvals appear only in the dock.
 4. Composer, anchored at bottom: multiline prompt, role-appropriate model picker, send action. Project mode is fixed after first message.
 5. Optional thread panel and inspector share the remaining width; do not make the transcript unusably narrow.
 
@@ -255,7 +258,7 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 **Phone layout**
 
 - Single-column transcript. Thread cards use full-width rows with title, status, device and one preview line; tap opens thread sheet.
-- Header “Threads” button opens a chat-scoped bottom/side sheet with counts and rows. The main bottom bar remains Chat / Needs you / Devices / More.
+- Header “Threads” button opens a chat-scoped bottom/side sheet with counts and rows. The main bottom bar remains Chat / Devices / More; Needs you is in More.
 - The composer stays visible above the keyboard. It grows to four lines then scrolls internally. Do not autoselect/focus it on chat navigation.
 - Opening a thread pushes a full-height screen; Back returns to the same chat and scroll position.
 
@@ -266,7 +269,7 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 - Streaming: assistant draft updates smoothly; caret is decorative; “Replying” announced sparingly to assistive tech. Send remains available if hub semantics permit a new wake-up; don't invent a cancel control.
 - Offline: transcript readable from cache; composer and model mutation disabled; typed draft preserved.
 - New message while scrolled up: floating “New messages/activity” action jumps to latest on request.
-- Approval: compact banner says what tool/device needs review and opens the exact approval sheet.
+- Approval: the dock replaces the composer as specified in 4.3/5.13; do not render a separate approval banner or modal. It stays fixed to the transcript column and does not steal focus on live arrival.
 - Thread card opens inspector; card menus may expose rating only after completion. No shell input/output in the card.
 - Chat menu provides chat usage, thread panel, and new chat. It is not the only route to threads.
 
@@ -329,7 +332,7 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 **Content hierarchy**
 
 1. Header: title, status word/icon, device, model, started time, routing reason (e.g. selected device/model rationale) if supplied.
-2. Attention context: approval card or waiting-device/checkpoint card. Device `last_seen`; explain hub checkpoint and file handoff state.
+2. Attention context: approval dock replaces composer when this thread has a pending request; otherwise waiting-device/checkpoint card. Device `last_seen`; explain hub checkpoint and file handoff state.
 3. Activity timeline: thread text; collapsible tool call rows with name/state; expandable exact input/output in monospace; approval resolution and owner messages; usage token summary.
 4. Result: final summary and status; thumbs-up/down rating if admin; no summary placeholder for empty output.
 5. Files: lazy-loaded list, path, size, source device, download action; empty/error/truncated states.
@@ -358,32 +361,28 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 
 **Purpose**
 
-- One reliable place to find work that requires owner action across every conversation, without detaching a thread from its parent.
+- A durable, cross-chat list for approvals and threads waiting for a device. It is reached from desktop sidebar and phone More > Needs you; it is not a tab or a place the owner must poll for new approvals.
+- New approvals also raise system notifications when opted in. Tapping a notification opens the originating chat/thread with its approval dock active.
 
 **Inbox content hierarchy**
 
-1. Pending approvals, newest first, grouped by chat then thread; show tool, device, plain reason and age. Do not show payload/arguments in list.
+1. Pending approvals, oldest first, grouped by chat then thread; show tool, device, thread, plain reason and age. Never show input/arguments in a row.
 2. Waiting for device, grouped by parent chat; show device, last seen, checkpoint/no checkpoint and latest update.
 3. Optional active count summary; omit routine running threads unless owner switches to “All active”.
-4. Each row includes chat title and is a deep link to parent chat + thread inspector/approval.
-
-**Approval sheet content and actions**
-
-- “Run this tool?” title; tool/device/thread/chat; risk reason in full; formatted exact input; waiting/timeout explanation; Approve, Deny, Change, Stop.
-- Manual reason: Approve can be primary. Risk-rule reason: Approve and Deny equal weight.
-- Change denies the call and opens thread step-in with a clear prefixed draft. Stop uses thread-stop confirmation semantics.
+4. Every approval row's Review action navigates to the owning chat (and thread route when available) and focuses the dock; the row itself never approves or denies. Waiting rows open the thread.
 
 **Desktop and phone**
 
-- Desktop inbox is a main destination with a dense, keyboard-navigable list and inspector/sheet on selection. Approval details in modal dialog; focus is trapped and restored.
-- Phone inbox uses the Needs you tab; approval is a full-screen/bottom sheet with sticky actions and arguments in a scrollable opaque block.
+- Desktop inbox is a main destination with a dense, keyboard-navigable list. Selecting Review opens the dock in the chat, not a second modal; browser Back returns to inbox.
+- Phone inbox is a normal list under More. Selecting Review opens the originating chat/thread and the dock occupies the composer area above the keyboard/safe-area inset. No separate modal approval sheet.
+- Keep settled rows briefly without actions, then remove them. If owner returns to inbox after answering elsewhere, show a settled label.
 
 **States and interactions**
 
-- Empty inbox: “Nothing needs you right now”; link to current chat, not a blank dashboard.
+- Empty: “Nothing needs you right now”; link to recent chat, not a blank dashboard.
 - Loading/error/offline: cached rows with last sync; no answer actions offline.
-- On answer elsewhere or expiration/thread-end: replace controls with settled status (“Answered on another device” / “Request no longer waiting”).
-- Timeout copy reflects actual configured timeout/action. If API doesn't provide it and limit lookup fails, say “Waiting for an answer” rather than invent a deadline.
+- On answer elsewhere or expiration/thread-end: show “Answered on another device” / “Request no longer waiting” with no actions; thread-end detail is explicit on the dock.
+- Timeout copy reflects actual configured timeout/action. If unavailable, say “Waiting for an answer” rather than invent a deadline.
 - Live additions update count and sort; do not steal keyboard focus. Use one announcement per new approval.
 
 ### 5.6 Model registry — grouped by provider/API key
@@ -567,8 +566,9 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 2. Hub: host, health, hub/protocol version, live-event connection.
 3. Provider connections/keys: add/edit, kind, endpoint, via-device, key state, write-only secret. Include clear note about encryption at rest and current sync-to-devices behavior.
 4. Appearance: System/Light/Dark; follow OS reduced motion/transparency/contrast.
-5. Sessions: active browser sessions and revoke action; session revocation separate from device token revocation.
-6. Advanced information: version, diagnostics without secrets; links to Devices, Models and Usage for related controls.
+5. Notifications: explicit per-client approval-notification opt-in, permission state, enable/disable/revoke controls, and platform-specific requirements. Never prompt on page/app launch; web copy and iPhone Home Screen requirement follow 5.14.
+6. Sessions: active browser sessions and revoke action; session revocation separate from device token revocation.
+7. Advanced information: version, diagnostics without secrets; links to Devices, Models and Usage for related controls.
 
 **Desktop and phone**
 
@@ -599,6 +599,117 @@ Routes below are canonical intent; web hash routes can retain their existing enc
 - Signing in disables duplicate submit and announces progress. Invalid token focuses/selects field and gives a generic, safe error. Network error offers retry without clearing token. Success clears the input and enters app.
 - Existing session detected silently enters app. Expired/revoked session clears app state and shows sign-in reason without exposing credential.
 - No token in URL/query parameters. Password manager may fill token field; Show/Hide updates accessible name.
+
+### 5.13 Approval dock
+
+**Purpose and trigger**
+
+- Replace the chat composer whenever that chat has one or more pending approvals. In a thread route, replace that thread's step-in composer when its approval is pending. The dock is inline at the bottom of the active conversation, not a modal.
+- The dock is not collapsible and has no “Reply instead” action. The owner must answer, navigate to another destination, or leave the view; no new message can be composed into the blocked chat/thread while its request is unresolved. Drafts already present are preserved and restored after resolution.
+- Chat view with several pending requests shows one approval at a time, “1 of N”, Previous/Next, oldest first; answering advances to the next. Thread view shows that thread's approval, with a control to return to the chat's full approval queue when others remain.
+
+**Dock content and actions**
+
+- Order: title “Run this tool?”; tool and device; thread title plus model-family colour mark and visible model name; chat title when the thread route lacks parent context; full safety reason as the most prominent content; “Review exact input” disclosure (collapsed by default, selectable monospace); timeout consequence; Approve / Deny; Change it / Stop thread.
+- Approve is disabled until exact input is expanded. This is an acknowledgement gate, not proof that the owner read every character; never imply otherwise. For risk-rule requests Approve and Deny have equal visual weight. Timeout text is factual and action-specific.
+- Change it denies then opens thread step-in with “Don’t run that. Instead: ” as a draft; it does not edit the request. Stop thread ends the thread with the existing stop confirmation semantics.
+- Desktop width: dock stays in the transcript column, at the bottom above the composer region; cap its body height and scroll content internally so reason and action controls remain available. Phone width: full-width opaque dock in the chat's bottom safe-area inset; keep actions visible above keyboard/home indicator, and scroll details independently. Do not open the keyboard automatically.
+- On Apple, use native safe-area inset and system controls. Liquid Glass may frame navigation/action chrome only; reason and input remain on opaque content surfaces.
+
+**Keyboard, focus and settled states**
+
+- Opening from a notification or inbox focuses the dock heading and announces tool/device/reason; focus does not land on Approve. When an approval arrives in the currently focused chat, announce once without moving focus or interrupting typing.
+- Tab follows reading order through input disclosure, Previous/Next and actions. Arrow keys navigate approval items only when focus is on the queue controls. Enter never approves; no approval shortcut. Escape leaves a disclosure or navigates/closes the panel only; it never answers, dismisses the pending state, or restores composer while still in that chat.
+- Use a polite live region for newly active request and queue position; announce answer outcome assertively once. Don't auto-read exact input. Respect VoiceOver, screen readers, keyboard-only use and Dynamic Type.
+- Answered here: confirm briefly then advance/remove. Answered elsewhere: “Answered on another device”; thread ended: “Thread ended; this request can’t run”. Remove active actions immediately. Offline or read-only session: retain details, disable all writes and state why; reconcile after reconnect before enabling.
+- Remove `renderApprovalBanner` as an answer entry point and remove the modal `openApproval` sheet. Keep the chat's non-blocking thread-state strip, but no duplicate approval banner. `ApprovalSheet.swift` becomes/feeds the shared native dock presentation; inbox `Review` navigates to the dock, never answers in place.
+
+- Render the selected approval from authoritative `store.approvals`; opening a stale deep link first refreshes approvals and never fabricates a request from notification text. A missing id routes to chat with a “This request is no longer waiting” status.
+- Use an explicit Close/Back-to-chat control only when the dock is shown as a full-height phone thread child; closing it returns to the parent chat, where the pending request remains docked. On desktop, navigating away and Back restores the originating chat/queue selection.
+- If the current chat has approvals while the owner is on its thread view, the thread composer is replaced only for its own pending request; an unrelated pending approval is represented by a queue count/control and does not block messaging to this thread.
+- Show the requested timestamp and remaining time only when the hub provides a timeout deadline/duration. Update countdown at a low frequency, and stop at zero while waiting for the authoritative timeout event; do not guess whether a call ran.
+- Deny/Approve disable immediately on first activation to prevent duplicate requests. Keep the request visible during the write; on network error refresh hub state before offering retry. Never retry an approval mutation automatically.
+- Risk classification comes from the hub reason/rule metadata, not client-side keyword matching. If reason metadata is absent, display the provided reason/fallback without claiming a safety rule triggered.
+- If multiple requests are equal-time, tie-break by approval id for stable ordering across clients. Previous/Next is disabled at list boundaries rather than wrapping silently.
+- On narrow viewports, keep both Approve and Deny reachable without horizontal scrolling; place Change it and Stop thread as clearly labeled secondary/destructive actions below them.
+- When the dock is active, hide/disable model picker, mode controls and Send; do not let keyboard submit bypass the dock. Restore the exact previous draft and composer selection after final resolution if the conversation remains open.
+- Do not visually dim the pending request after backgrounding. Returning to the chat reselects the oldest unresolved request unless a deep link identified a particular one.
+
+- Reference patterns: Claude Code Desktop's in-session app permission prompt and Cowork's approval modes, ChatGPT Desktop's permissions control beneath the composer, Cursor's MCP tool prompt with expandable arguments, and Antigravity's interactive permission card show that review belongs in the active task context. Claude's mobile behavior here follows the owner's observed reference, not a claim about a stable public spec. [Claude Code](https://docs.anthropic.com/en/docs/claude-code/desktop) · [Claude Cowork](https://support.anthropic.com/en/articles/13345190-getting-started-with-local-agent-mode) · [ChatGPT permissions](https://learn.chatgpt.com/docs/permissions) · [Cursor MCP](https://docs.cursor.com/advanced/model-context-protocol) · [Antigravity permissions](https://antigravity.google/docs/permissions/)
+
+### 5.14 Approval notifications
+
+**Web Push**
+
+- Serve via the hub's HTTPS origin. Register a service worker and Web Push/VAPID subscription per browser; bind and revoke subscriptions with the signed-in browser session. Push payload is allowlisted to exactly: `approval_id`, `conversation_id`, `thread_id`, tool name, device name, thread title and chat title. Never include input, reason, auth material or other transcript text.
+- Never request notification permission on page load or sign-in. Settings > Notifications contains an explicit “Enable approval notifications” button and plain copy: “Grouper can notify this browser when a tool needs your review. Notifications show tool/device/chat names, never the command or its contents. You must open Grouper to inspect and approve.” Only call the browser permission API after that gesture; show browser permission state and a disable/revoke control.
+- On iPhone Safari, the Settings row says “Add Grouper to your Home Screen to enable web notifications”; until installed as a Home Screen web app, do not show a dead enable switch. Feature-detect support and explain unsupported browsers.
+- Notification title: “Grouper needs your review”. Body: “{tool} on {device} · {thread title} · {chat title}”. Use a stable per-approval tag (`grouper-approval-{approval_id}`) so updates replace, not multiply, notifications. No Approve/Deny actions: notification omits exact input and reason, so approving there would violate the no-blind-approval contract.
+- Tap opens/focuses the hub app at the originating chat/thread with that approval selected and dock visible (deep link carries the approval id; validate it against loaded hub state). If closed, load app then resolve route. If request is already cleared, show settled status, not stale actions.
+- If the app is focused on the originating chat, suppress OS notification and show/announce the dock. If app is open but on another chat or not focused, show OS notification; tapping switches to the origin. A follow-up “cleared” push keyed by approval id removes the tagged notification when answered elsewhere or thread ends. If pushes arrive out of order, ignore stale request notifications after a clear.
+
+- Subscribe only while the signed-in session is valid; sign-out/revocation unsubscribes best-effort and deletes the server-side browser subscription. Permission denied by the browser is not re-prompted; Settings links to browser site settings.
+- Each enabled browser/device has its own subscription and opt-in. Do not silently enable another browser because the owner enabled one elsewhere. Re-enabling after permission is granted refreshes/re-registers the subscription without another permission prompt.
+- A clear push contains only the approval id and a cleared marker, is idempotent, and is processed by the service worker to close the matching notification. Clear events may arrive before create events; retain a bounded local tombstone so stale create events cannot resurrect a cleared notification.
+- Do not request notification permission merely because an approval arrives. If permission is default, show a non-modal in-app Settings hint; if denied, explain how to change browser settings without repeated prompts.
+- Push delivery is best effort, not the source of truth. On notification tap, the app fetches current approvals and threads, validates ownership/session, and renders pending or settled state. If offline, show cached details read-only with a reconnect status.
+- When app visibility/focus changes while a push is in flight, suppress only if the same chat is visible and foregrounded; another chat, a background tab or a minimized window still gets a notification. Avoid leaking a request on lock screen beyond the allowlisted names.
+- On Mac, use the native app's system notification authorization and app notification settings. Web notifications are separately permissioned per browser; neither client should infer the other's opt-in.
+- Notify on every distinct new approval, but deduplicate by approval id. A repeated push refreshes the same notification tag and never restarts a sound/vibration loop.
+- Notification failure must not change approval state or timeouts. The owner can always find current requests through the inbox and chat dock.
+
+**Apple apps and optional events**
+
+- iPhone app posts local approval notifications while running today; Mac uses the same policy. Remove Approve/Deny/Edit notification actions because the notification cannot show exact input. Tap opens the originating chat/thread with dock selected. Local notification content is minimal and matches web title/body; remove on cleared event.
+- Background APNs delivery for iPhone/Mac is future work requiring APNs provisioning and an Apple Developer account; do not imply current background delivery. Request system notification permission only from an explicit Settings opt-in, not at launch. App notification taps follow the same dock route.
+- Thread waiting for a device and thread completion notifications are optional later event types, off by default. Keep them out of the first approval push contract; never include thread text or files.
+- Reference: [Apple Web Push for web apps](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers), [WebKit Web Push on iOS](https://webkit.org/blog/13878/web-push-for-web-apps-on-ios-and-ipados/), [Claude Code desktop permissions](https://docs.anthropic.com/en/docs/claude-code/desktop), [Claude Cowork permissions](https://support.anthropic.com/en/articles/13345190-getting-started-with-local-agent-mode), [OpenAI permissions](https://learn.chatgpt.com/docs/permissions), [Antigravity permissions](https://antigravity.google/docs/permissions/), [Cursor MCP tool approval](https://docs.cursor.com/advanced/model-context-protocol). These document session/context prompts and argument review; Grouper's no-notification-actions rule is its stricter safety choice.
+
+### 5.15 Desktop command palette (Ctrl/Cmd+K)
+
+- Owner explanation: “The command palette is a quick search-and-actions box you can open from anywhere with Ctrl+K (Windows/Linux) or Cmd+K (Mac). Type a chat or thread name to jump straight there, find a model/device/page, or type an action such as New chat—without hunting through the sidebar. It does not send messages or approve tool calls.”
+- Desktop web and Mac app only. One centered, keyboard-first overlay on desktop; phone has no palette or shortcut, but exposes a labeled Search button in the chat/history header that opens searchable chat history (not the global command palette).
+- Search local client data only: conversation titles; thread titles across chats; loaded model names/IDs; loaded device names; destinations Needs you, Devices, Models, Usage & limits, Memory, Skills, Settings; actions New chat, New project chat, New standard chat, Switch theme (System/Light/Dark). Do not search transcript contents, tool input, secrets, or unloaded server-side history. No new hub endpoint.
+- Empty query shows recent destinations/chats and common actions, ordered by last-used local history; query results group as Actions, Chats, Threads, Models, Devices, Pages. Rank exact prefix/title match, then token/title match, then recency; stable tie-break by display title. Highlight matched text without changing labels. Cap initial list to a manageable 8 per group with “Show all” only if needed.
+- Row content: icon/type label, primary title, and useful disambiguator. Chat row shows Project/Standard; thread shows parent chat + device + model; model shows provider; device shows platform/presence; page/action shows a plain verb phrase. No tool arguments or private message preview.
+- Typing filters immediately from `store.conversations`, `store.threads`, `store.models`, and `store.devices`; derive page/action rows statically. If a data set is still loading, label it and update results when store events arrive. No server search or dependency beyond existing ES modules/store.
+- Up/Down moves selection; Home/End jumps; Enter activates selected row; Escape closes and restores opener focus; Tab moves between query, result list and close control (does not silently execute). No default action on empty query. Screen reader announces result count and selected row; preserve native text-editing shortcuts in query.
+- Chat opens `#/chat/{id}`; thread opens its owning `#/chat/{conversationId}/thread/{threadId}`; model/device/page opens its existing route; New actions open `#/chat/new` with the chosen mode; Switch theme applies the selection through existing appearance setting. Palette closes after navigation/action and restores sensible focus in destination.
+- Surface uses an opaque, high-contrast result body with regular Liquid Glass only on Apple navigation chrome; no new brand or color decisions. Add Cmd+K to the Mac menu bar's Search command and retain standard macOS text-editing/menu shortcuts.
+- References: [Raycast quicklinks](https://manual.raycast.com/), [Linear navigation](https://linear.app/enablement/guide/navigating-linear), [VS Code Command Palette](https://code.visualstudio.com/docs/getstarted/userinterface), [GitHub Command Palette](https://docs.github.com/en/get-started/accessibility/github-command-palette), [Slack keyboard navigation](https://slack.com/help/articles/115003340723-Navigate-Slack-with-your-keyboard-Navigate-Slack-with-your-keyboard), [ChatGPT chat search and Ctrl/Cmd+K](https://help.openai.com/en/articles/10056348-finding-your-chats-projects-and-files-in-chatgpt), [Claude chat search](https://support.claude.com/en/articles/11817273-use-claude-s-chat-search-and-memory-to-build-on-previous-context), [Apple HIG: Searching](https://developer.apple.com/design/human-interface-guidelines/searching), [Apple HIG: Keyboards](https://developer.apple.com/design/human-interface-guidelines/keyboards). GitHub combines navigation/search/commands; Slack's quick switcher jumps to conversations/pages; ChatGPT's shortcut opens content search, while Claude's reviewed search retrieves past chat context conversationally. Grouper's palette combines local navigation and safe actions without replacing chat history search.
+
+- Close on outside click only when no modal child is open; preserve typed query if owner closes and reopens within the same page session. Clear query only after a result is activated or the page is left.
+- `Ctrl/Cmd+K` is ignored while a native/browser modal dialog is active, while composing an IME sequence, or when focus is in a content-editable field that uses the same shortcut. It may open from ordinary text inputs only if the keystroke is not being consumed by editing.
+- The palette result list is virtualized only if needed; for the expected local data size, render a bounded list and preserve selection by stable type/id key as store updates arrive.
+- While loading initial stores, show known local results immediately and a small “Loading more results” status. Do not block the palette on network or issue a search request per keystroke.
+- For duplicate titles, disambiguate with project/standard, parent chat or provider; never merge results with different ids. Hide disabled/unavailable models only if the current model-registry UI does; otherwise show status in the row.
+- New project / New standard actions route to new chat with mode selected before first send; they do not create a conversation or send content until the owner types and submits.
+- Switch theme opens a short nested choice with System, Light and Dark, marks the current value, and returns focus to the palette query after selection. Do not add unsupported actions such as changing permissions or stopping a thread in v1.
+- If activation fails because a target disappeared, keep palette open, refresh local state, and announce “That item is no longer available”; don't navigate to an unrelated fallback.
+- Search normalization is case-insensitive and accent-insensitive; match title and explicitly listed metadata, not hidden identifiers or transcript bodies. Ignore punctuation-only queries and show the empty-query state.
+- Avoid ranking by whether an item is pending approval; the palette is navigation, not an attention inbox. Needs you result may show a count, but never preview arguments or provide Approve/Deny commands.
+- On macOS, Cmd+K is a standard app search command exposed in the menu bar and the same palette content is used as desktop web. Preserve system conventions for menu focus, VoiceOver and Full Keyboard Access.
+- Palette analytics, if added later, record only event type and result category; do not record raw query text, which may contain chat titles or private terms.
+- The palette does not replace sidebar chat history or dedicated Models/Devices/Needs you pages; it is a shortcut layer over their existing destinations.
+- Add a visible search icon/label to desktop shell as a discoverability fallback, with the `Ctrl K` / `⌘K` hint; shortcut is never required to find or use pages.
+- Phone's Search button searches chat titles only for v1 and uses the existing chat-history search behavior; model/device/page/action discovery remains in More or their own screens.
+- Keep palette empty state useful after a first-time session: show New chat, New project chat, New standard chat, and core pages even when there are no chats, threads or devices.
+
+- Opening behavior: keyboard shortcut toggles palette closed only when the palette already owns focus; otherwise it opens. Clicking the visible search control always opens it. The overlay is one instance per window and cannot stack.
+- Show a compact shortcut hint in the search field and a clear “Search chats, threads, models, devices, pages, actions” placeholder; don't call it only “Search” without scope.
+- Empty-query recents are local, bounded to five, and omit anything the owner has not opened; when history is unavailable, show common safe actions and pages instead.
+- For search, tokens may match in any order. Rank title exact/prefix above metadata matches; don't let a popular/recent weak match outrank a strong title match.
+- Keep action labels imperative (“New project chat”, “Switch theme”) and result labels noun-like (“Devices”, “Usage & limits”) so type and effect are clear before activation.
+- Include whether a thread is running, waiting, done or failed in its row, but don't expose live response text. The parent chat and device are the disambiguators.
+- Model results show provider identity and availability; selecting one opens Models detail, not a model switch in the current chat. Model changes remain in the role-aware composer picker.
+- Device results show Online/Offline text and selecting one opens its existing detail route; the palette does not grant access or change permissions.
+- Needs you result opens the inbox list rather than auto-opening the first request. Opening the page must not count as an answer or change queue ordering.
+- Chat history selection preserves the remembered scroll position when returning from a thread; palette result activation does not force the chat composer to focus.
+- If palette opens while a chat is loading, keep query interaction responsive and add results as store topics update; preserve the selected stable id if it remains in the filtered set.
+- Do not intercept ordinary `Cmd+F`/`Ctrl+F` browser Find or standard copy/paste/select-all shortcuts. The palette is for navigation/actions, not replacing text search in a document.
+- When the result list is empty, say “No matches” and offer a one-key clear query action; do not silently broaden to transcript search or server search.
+- `Switch theme` is an action with an explicit nested choice, not a direct cycle that changes theme every time the row is selected.
+- A selected action executes only on Enter/click. Arrow movement, preview, focus, or opening the palette never runs it.
 
 ## 6. Visual system (provisional until concept art)
 
@@ -663,11 +774,12 @@ Use semantic tokens and verify WCAG 2.2 AA contrast: body text at least 4.5:1; l
 
 ### Keyboard
 
-- Global web shortcuts: `Ctrl/Cmd+K` opens chat search/command palette; `Esc` closes topmost popover, then inspector, then panel/sheet; `Ctrl/Cmd+Enter` sends only if explicitly documented and does not conflict with IME. Shortcuts are discoverable and never the only way to act.
+- Global web shortcuts: `Ctrl/Cmd+K` opens the command palette; `Esc` closes its topmost transient layer, then inspector, then panel. The approval dock never binds Enter or any shortcut to Approve; Escape cannot answer or hide a pending request. `Ctrl/Cmd+Enter` sends only if explicitly documented and does not conflict with IME. Shortcuts are discoverable and never the only way to act.
 - Tab order follows visual order: sidebar, main header, transcript controls, composer, panel, inspector in a predictable roving/focus sequence. Provide Skip to main content.
 - Chat model picker supports type-to-filter, arrow navigation, Enter selection and Escape return to trigger. Provider group headings are not selectable model rows.
 - Thread panel supports arrow navigation between rows and Home/End; inspector retains its own normal tab order.
-- Approval modal traps focus, starts at title or safe first action (not Approve for risky prompt), and returns focus to the opener when closed. Escape dismisses only if unanswered; it never approves/denies.
+- Approval dock is inline, not a modal. Focus enters its heading only on explicit navigation; live arrivals announce without moving focus. For risk prompts, initial focus is never Approve; Enter/Escape cannot resolve or hide the request. Exact input is not auto-announced; approval stays disabled until its disclosure is expanded.
+- Palette uses dialog semantics, a labeled query field and a selectable result list; opening focuses query, Escape restores the invoker, and result activation moves focus to the destination heading/control. Announce result count and selected item, not every keystroke.
 - Destructive actions require confirmation and place initial focus on cancel/safe choice, except typed-confirm dialog where text input receives focus.
 
 ### Screen readers and live regions
@@ -705,11 +817,11 @@ Use semantic tokens and verify WCAG 2.2 AA contrast: body text at least 4.5:1; l
 
 ### iPhone
 
-- Use a native `TabView` with Chat, Needs you, Devices, More; no Threads tab. System tab bar can adopt platform material. More routes to Models, Usage & limits, Memory, Skills, Settings.
-- Chat uses native navigation stack; chat-scoped thread panel as sheet; thread inspector as full-height pushed/sheet screen with parent title and Back. Approval actions stay visible while arguments scroll.
+- Use a native `TabView` with Chat, Devices, More; no Threads or Needs you tab. More is a plain list including Needs you, Models, Usage & limits, Memory, Skills and Settings.
+- Chat uses native navigation stack; chat-scoped thread panel as sheet; thread inspector as full-height pushed/sheet screen with parent title and Back. Approval dock replaces composer and keeps its actions available while its details scroll.
 - Use native safe-area inset for composer; adjust for keyboard and dictation. Never place send/approval action under keyboard or home indicator.
 - Dynamic Type: allow chat bubbles, thread rows and approval reasons to expand vertically. No fixed-height status cards. Use SF Symbols or system-equivalent iconography with text labels.
-- Notifications/Live Activities, if implemented, show minimal title/status/device and never tool arguments or sensitive thread text unless the owner explicitly opts in. Approval notification deep link opens the parent chat/thread approval; background action must obey current auth and server result.
+- Approval notifications follow 5.14: explicit opt-in, minimal content, tap opens the originating chat/thread dock, and no notification-level Approve/Deny/Edit actions. Background APNs delivery is future work pending owner provisioning decision; do not imply it is active.
 
 ### Material and accessibility fallback
 
@@ -721,12 +833,12 @@ Use semantic tokens and verify WCAG 2.2 AA contrast: body text at least 4.5:1; l
 ## 9. Open questions for the owner
 
 1. What concept art/brand direction should replace the provisional warm-neutral/teal visual tokens, and should Grouper use a mascot/illustration at all?
-2. Should the phone primary tabs be Chat / Needs you / Devices / More as specified, or should Devices move under More to give Chat more prominence? *(Being brainstormed: `docs/gui-nav-ideas.md`.)*
+2. ~~Phone primary tabs~~ *Answered 26 November 2026: Chat / Devices / More; More is a plain list.*
 3. ~~Labels for multiple keys per provider~~ *Answered: one key per provider; a provider is a connection.*
 4. Should a user be able to create multiple project chats and standard chats freely, and should chats be renameable/archivable/searchable beyond current behavior?
 5. *Partly answered: two tracks, API costs per key and subscription usage/quota.* Which usage sources should be enabled in the first UI release: Grouper metering only, official provider billing/balance APIs, and/or device-local subscription snapshots? Which unofficial probes are acceptable to display?
 6. What budget values and warning threshold should be the initial suggested setup? All current hub limits are off by default; UI must not imply a cap is active.
 7. Should offline chat sends remain disabled, queue for later, or be answered locally and reconciled? Until chosen, preserve a draft and never pretend it was sent.
 8. Should usage dashboard show UTC day only or offer local-day as an alternate view? Backend limit semantics are UTC; display must avoid a mismatch.
-9. Should owner be able to customize notification content/privacy for thread completion and approvals on each Apple device?
+9. ~~Approval notification content/actions~~ *Answered 26 November 2026: minimal identifying text only; tapping opens the originating chat/thread; no Approve/Deny/Edit action without showing the exact input. Background APNs delivery remains future work.*
 10. Should provider API credentials continue syncing to all connected devices, or should future UI support per-device credential scopes? Current docs describe account keys syncing to devices.

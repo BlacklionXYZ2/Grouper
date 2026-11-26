@@ -34,7 +34,7 @@ time, `ProviderInfo.viaDevice`) are built and tested, on the Windows toolchain.
 
 ## Build on a Mac
 
-Requirements: macOS 26, Xcode 26, Swift 6, and XcodeGen.
+Requirements: macOS 26 or later, Xcode 26 or later (Xcode 27 for the iOS 27 and macOS 27 SDKs), Swift 6, and XcodeGen.
 
 ```sh
 brew install xcodegen
@@ -60,13 +60,38 @@ swift build --target GrouperAPI
 swift test --filter GrouperAPITests
 ```
 
+## Install a current build
+
+The apps target macOS 27 and iOS 27 first; the deployment target stays 26.
+
+**Mac (Apple Silicon), no Xcode needed:** every CI run on `harness` uploads
+`Grouper-macOS-arm64` (kept 14 days). On the run's page in GitHub Actions, download it,
+unzip it, then either run `xattr -dr com.apple.quarantine Grouper.app` or open it once
+and allow it in System Settings > Privacy & Security > Open Anyway. It's ad-hoc signed
+and not notarized, because there's no Apple developer team yet. With `gh`:
+`gh run download --repo BlacklionXYZ2/Grouper --name Grouper-macOS-arm64`.
+
+**iPhone:** an iPhone only installs signed apps, so CI's unsigned simulator build can't
+go on a phone. From the Mac, with Xcode and a free Apple Account:
+
+1. Build as in "Build on a Mac" below and open `Grouper.xcodeproj`.
+2. Xcode > Settings > Accounts: add your Apple Account (a Personal Team appears).
+3. For the `Grouper-iOS` and `GrouperWidgets` targets, Signing & Capabilities: tick
+   "Automatically manage signing" and pick the Personal Team.
+4. Plug in the iPhone, turn on Settings > Privacy & Security > Developer Mode (it
+   restarts), select the phone as the run destination and press Run.
+5. On the phone, trust the developer in Settings > General > VPN & Device Management.
+
+Free-team installs stop opening after 7 days (press Run again to renew). TestFlight, no
+expiry and background push (APNs) need the paid Apple Developer Program.
+
 ## CI
 
-`.github/workflows/apple.yml` runs on a `macos-26` runner with Xcode 26. It
-builds the host Mac library with `scripts/build-apple.sh`, runs `swift build`
+`.github/workflows/apple.yml` runs on a `macos-26` runner with the newest stable Xcode
+there. It builds the host Mac library with `scripts/build-apple.sh`, runs `swift build`
 and `swift test` in `apple/GrouperKit` (live hub tests skip), then builds
-`Grouper-macOS` and the iOS Simulator `Grouper-iOS` without code signing.
-xcodebuild logs are kept when that build fails. CI does not build an iOS
+`Grouper-macOS` and the iOS Simulator `Grouper-iOS` without code signing, and uploads
+the ad-hoc signed Mac app. xcodebuild logs are kept when that build fails. CI does not build an iOS
 XCFramework: the script has no iOS slice, and the iPhone target links
 `GrouperAPI` only.
 
