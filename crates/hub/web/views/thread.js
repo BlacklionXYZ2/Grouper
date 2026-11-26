@@ -198,6 +198,9 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
           stepText.focus({ preventScroll: true });
           if (stepSel) stepText.setSelectionRange(...stepSel);
           else stepText.setSelectionRange(stepText.value.length, stepText.value.length);
+        } else if (hadFocus && !container.contains(document.activeElement)) {
+          // The thread ended meanwhile (no step-in field): keep focus in this view.
+          titleEl.focus({ preventScroll: true });
         }
         stepSel = null;
       }

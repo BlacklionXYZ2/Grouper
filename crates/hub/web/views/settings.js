@@ -329,7 +329,11 @@ export function renderSettings(container) {
       notifyListSlot.replaceChildren();
       return;
     }
-    const mine = storedSubscriptionId();
+    // This browser's row: matched by its push endpoint, else by the id the hub gave it.
+    const sub = await currentSubscription();
+    if (signal.aborted) return;
+    const storedId = storedSubscriptionId();
+    const isMine = (row) => (sub && row.endpoint ? row.endpoint === sub.endpoint : String(row.id) === storedId);
     setChildren(
       notifyListSlot,
       h('h3', { class: 'sub-title notify-list-title' }, 'Browsers with notifications on'),
@@ -343,8 +347,10 @@ export function renderSettings(container) {
             h(
               'div',
               { class: 'grow' },
-              h('div', { class: 'row-title row-badges' }, row.label || 'Browser', String(row.id) === mine ? h('span', { class: 'badge accent' }, 'This browser') : null),
-              h('div', { class: 'meta' }, row.created ? h('span', null, `Added ${dateTime(row.created)}`) : null, h('span', null, row.last_ok ? `Last delivered ${ago(row.last_ok)}` : 'Nothing delivered yet')),
+              h('div', { class: 'row-title row-badges' }, row.label || 'Browser', isMine(row) ? h('span', { class: 'badge accent' }, 'This browser') : null),
+              h('div', { class: 'meta' }, row.created ? h('span', null, `Added ${dateTime(row.created)}`) : null, h('span', null, row.last_ok ? `Last delivered ${ago(row.last_ok)}` : 'Nothing delivered yet'),
+                row.last_error ? h('span', null, `Last error: ${row.last_error}`) : null,
+              ),
             ),
             h(
               'button',
@@ -353,7 +359,7 @@ export function renderSettings(container) {
                 type: 'button',
                 'data-write': true,
                 'aria-label': `Remove notifications for ${row.label || 'this browser'}`,
-                onclick: () => removeRow(row, String(row.id) === mine),
+                onclick: () => removeRow(row, isMine(row)),
               },
               'Remove',
             ),
