@@ -1,168 +1,189 @@
 /* Grouper web client.
    Content (transcripts, cards, lists, the approval reason) sits on solid surfaces.
    Only the navigation layer is glass: the sidebar, bars, the composer, the tab bar
-   and the "New messages" control. Reduced transparency makes the glass solid. */
+   and the "New messages" control. Reduced transparency makes the glass solid.
+
+   Look: docs/gui-concept-plan.md (26 Nov 2026). Navy, not grey; teal is the one
+   action colour; depth by tone, not shadow (dark mode has no card shadows; only
+   things that float use --shadow-float / --shadow-lg). Area stylesheets in css/
+   (chat, thread, approval, models, brand) load after this file and use these tokens. */
 
 :root {
   color-scheme: light dark;
   --font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Code", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
 
-  --bg: #f5f5f2;
-  --bg-tint: #eef3f2;
+  /* Light: cool blue-grey neutrals. Canvas lighter than the sidebar, cards white. */
+  --bg: #f4f6f9;
+  --bg-tint: #eef2f6;
   --surface: #ffffff;
-  --surface-2: #efefeb;
-  --surface-3: #e6e6e1;
-  /* Every text token is at least 4.5:1 on bg, surface, surface-2, glass and its
-     own soft tint (checked with WCAG 2 luminance; see the changelog). */
-  --text: #1b1c1e;
-  --text-2: #4f535a;
-  --text-3: #5f636a;
-  --border: rgba(20, 22, 26, 0.09);
-  --border-strong: rgba(20, 22, 26, 0.16);
-  --accent: #0b7372;
-  --accent-hover: #095f5e;
-  --accent-soft: rgba(14, 124, 123, 0.1);
-  --accent-ink: #ffffff;
-  --warn: #9a4a06;
-  --warn-soft: rgba(217, 119, 6, 0.12);
+  --surface-2: #eef2f6;
+  --surface-3: #e3e8ef;
+  --surface-select: #e0e8f4;
+  /* Every text token is at least 4.5:1 on bg, bg-tint, glass-solid, surface,
+     surface-2, surface-3 and surface-select (WCAG 2; pairs in the changelog). */
+  --text: #0f1722;
+  --text-2: #46505e;
+  --text-3: #5a6471;
+  --border: #dde3ea;
+  --border-strong: #c3cbd6;
+  --border-control: #78828f; /* inputs: 3:1 against bg, surface and glass */
+  --backdrop: linear-gradient(160deg, #e8eef5 0%, #f4f6f9 100%);
+  --accent: #0b7372; /* text, icons, links */
+  --accent-hover: #10b3ae; /* hover on the fill */
+  --accent-soft: #ddf3f2;
+  --accent-fill: #12c4bf; /* Approve, send, primary buttons; same in both modes */
+  --accent-fill-edge: #0b8a86; /* 3:1 boundary of the fill on light surfaces */
+  --accent-ink: #06262a; /* text on the fill: 7.3:1. White on it is 2.2:1, never use */
+  --ok: #0b6b4f;
+  --ok-soft: #d9f3e8;
+  --warn: #8a5a00;
+  --warn-soft: #fbefd0;
   --warn-ink: #ffffff; /* text on a solid warn fill (.count) */
   --danger: #b42318;
-  --danger-soft: rgba(180, 35, 24, 0.09);
+  --danger-soft: #fbe4e1;
   --danger-fill: #b42318; /* solid danger buttons */
   --danger-fill-hover: #9c1d13;
   --danger-fill-ink: #ffffff;
-  --ok: #1f7a3d;
-  --focus: #1a73e8;
+  --focus: #1a73e8; /* blue, so it never reads as the accent */
+  --user-avatar: #3f6fe0;
 
-  --glass-bg: rgba(250, 250, 247, 0.7);
-  --glass-solid: #f2f2ee;
-  --glass-border: rgba(255, 255, 255, 0.7);
-  --glass-edge: rgba(20, 22, 26, 0.08);
-  --glass-highlight: rgba(255, 255, 255, 0.85);
-  --shadow-sm: 0 1px 2px rgba(16, 18, 22, 0.06);
-  --shadow: 0 6px 24px rgba(16, 18, 22, 0.08), 0 1px 3px rgba(16, 18, 22, 0.06);
-  --shadow-lg: 0 24px 64px rgba(16, 18, 22, 0.18), 0 2px 8px rgba(16, 18, 22, 0.08);
-  --scrim: rgba(18, 20, 24, 0.32);
+  --glass-bg: rgba(233, 238, 244, 0.8);
+  --glass-solid: #e9eef4;
+  --glass-border: #dde3ea;
+  --glass-edge: rgba(15, 23, 34, 0.06);
+  --glass-highlight: rgba(255, 255, 255, 0.7);
+  --shadow-sm: 0 1px 2px rgba(15, 23, 34, 0.05);
+  --shadow: 0 4px 16px rgba(15, 23, 34, 0.06), 0 1px 3px rgba(15, 23, 34, 0.05);
+  --shadow-float: 0 8px 28px rgba(15, 23, 34, 0.12), 0 2px 6px rgba(15, 23, 34, 0.06);
+  --shadow-lg: 0 24px 64px rgba(15, 23, 34, 0.18), 0 2px 8px rgba(15, 23, 34, 0.08);
+  --scrim: rgba(15, 23, 34, 0.32);
 
-  --radius: 14px;
-  --radius-sm: 10px;
-  --radius-lg: 20px;
-  --sidebar-w: 284px;
-  /* Wider than the 420 px it was, so the thread's chat-style transcript reads
-     well; at 1280 px the chat column keeps about 540 px. */
-  --inspector-w: clamp(420px, 34vw, 500px);
+  --radius: 12px; /* cards, bubbles, composer, dock */
+  --radius-sm: 8px; /* buttons, rows, model chips, status pills */
+  --radius-xs: 6px; /* badges */
+  --radius-lg: 16px; /* window, sheets, dialogs */
+  --sidebar-w: 240px;
+  --inspector-w: clamp(384px, 30vw, 420px);
   --tabbar-h: 0px;
-  --bar-h: 60px;
+  --bar-h: 52px;
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
+/* Dark: navy from the concept art. Blue channel above red on every surface. */
 :root[data-theme="dark"] {
-  --bg: #141516;
-  --bg-tint: #131718;
-  --surface: #1c1d1f;
-  --surface-2: #26272a;
-  --surface-3: #2f3034;
-  --text: #ececec;
-  --text-2: #a8abb1;
-  --text-3: #9a9da3;
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --accent: #34b3ae;
-  --accent-hover: #4cc6c1;
-  --accent-soft: rgba(52, 179, 174, 0.14);
-  --accent-ink: #071a1a;
-  --warn: #f0a23b;
-  --warn-soft: rgba(240, 162, 59, 0.14);
-  --warn-ink: #1f1300; /* dark ink on the amber fill: 8.6:1 (#fff was 2.1:1) */
-  --danger: #ff7a6e;
-  --danger-soft: rgba(255, 122, 110, 0.12);
-  --danger-fill: #c9362b; /* #fff on it is 5.2:1 (the old #ff7a6e fill was 2.5:1) */
+  --bg: #10141d;
+  --bg-tint: #13171f;
+  --surface: #171c25;
+  --surface-2: #1d222c;
+  --surface-3: #20242d;
+  --surface-select: #1f2d41;
+  --text: #f3f6f9;
+  --text-2: #c5cfdc;
+  --text-3: #a4adbb;
+  --border: #272d36;
+  --border-strong: #3d434d;
+  --border-control: #656f7e;
+  --backdrop: linear-gradient(160deg, #071323 0%, #0a111c 100%);
+  --accent: #22d3ce;
+  --accent-hover: #3bd4cf;
+  --accent-soft: #152a38;
+  --accent-fill: #12c4bf;
+  --accent-fill-edge: #12c4bf;
+  --accent-ink: #06262a;
+  --ok: #2ee6b0;
+  --ok-soft: #102e27;
+  --warn: #fbbf24;
+  --warn-soft: #3d3016;
+  --warn-ink: #1f1300;
+  --danger: #f87171;
+  --danger-soft: #3f1d22;
+  --danger-fill: #c9362b; /* #fff on it is 5.2:1 */
   --danger-fill-hover: #b02c22;
   --danger-fill-ink: #ffffff;
-  --ok: #5ccf86;
   --focus: #7cb4ff;
-  --glass-bg: rgba(34, 35, 38, 0.62);
-  --glass-solid: #222326;
-  --glass-border: rgba(255, 255, 255, 0.09);
-  --glass-edge: rgba(0, 0, 0, 0.4);
-  --glass-highlight: rgba(255, 255, 255, 0.08);
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow: 0 6px 24px rgba(0, 0, 0, 0.35), 0 1px 3px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.4);
-  --scrim: rgba(0, 0, 0, 0.5);
+  --user-avatar: #5986f4;
+  --glass-bg: rgba(20, 24, 33, 0.82);
+  --glass-solid: #141821;
+  --glass-border: #272d36;
+  --glass-edge: transparent;
+  --glass-highlight: transparent;
+  --shadow-sm: none;
+  --shadow: none;
+  --shadow-float: 0 10px 32px rgba(2, 6, 14, 0.55), 0 2px 8px rgba(2, 6, 14, 0.4);
+  --shadow-lg: 0 24px 64px rgba(2, 6, 14, 0.6), 0 2px 8px rgba(2, 6, 14, 0.45);
+  --scrim: rgba(3, 6, 12, 0.6);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #141516;
-    --bg-tint: #131718;
-    --surface: #1c1d1f;
-    --surface-2: #26272a;
-    --surface-3: #2f3034;
-    --text: #ececec;
-    --text-2: #a8abb1;
-    --text-3: #9a9da3;
-    --border: rgba(255, 255, 255, 0.08);
-    --border-strong: rgba(255, 255, 255, 0.16);
-    --accent: #34b3ae;
-    --accent-hover: #4cc6c1;
-    --accent-soft: rgba(52, 179, 174, 0.14);
-    --accent-ink: #071a1a;
-    --warn: #f0a23b;
-    --warn-soft: rgba(240, 162, 59, 0.14);
-    --warn-ink: #1f1300; /* dark ink on the amber fill: 8.6:1 (#fff was 2.1:1) */
-    --danger: #ff7a6e;
-    --danger-soft: rgba(255, 122, 110, 0.12);
-    --danger-fill: #c9362b; /* #fff on it is 5.2:1 (the old #ff7a6e fill was 2.5:1) */
+    --bg: #10141d;
+    --bg-tint: #13171f;
+    --surface: #171c25;
+    --surface-2: #1d222c;
+    --surface-3: #20242d;
+    --surface-select: #1f2d41;
+    --text: #f3f6f9;
+    --text-2: #c5cfdc;
+    --text-3: #a4adbb;
+    --border: #272d36;
+    --border-strong: #3d434d;
+    --border-control: #656f7e;
+    --backdrop: linear-gradient(160deg, #071323 0%, #0a111c 100%);
+    --accent: #22d3ce;
+    --accent-hover: #3bd4cf;
+    --accent-soft: #152a38;
+    --accent-fill: #12c4bf;
+    --accent-fill-edge: #12c4bf;
+    --accent-ink: #06262a;
+    --ok: #2ee6b0;
+    --ok-soft: #102e27;
+    --warn: #fbbf24;
+    --warn-soft: #3d3016;
+    --warn-ink: #1f1300;
+    --danger: #f87171;
+    --danger-soft: #3f1d22;
+    --danger-fill: #c9362b;
     --danger-fill-hover: #b02c22;
     --danger-fill-ink: #ffffff;
-    --ok: #5ccf86;
     --focus: #7cb4ff;
-    --glass-bg: rgba(34, 35, 38, 0.62);
-    --glass-solid: #222326;
-    --glass-border: rgba(255, 255, 255, 0.09);
-    --glass-edge: rgba(0, 0, 0, 0.4);
-    --glass-highlight: rgba(255, 255, 255, 0.08);
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-    --shadow: 0 6px 24px rgba(0, 0, 0, 0.35), 0 1px 3px rgba(0, 0, 0, 0.3);
-    --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.4);
-    --scrim: rgba(0, 0, 0, 0.5);
+    --user-avatar: #5986f4;
+    --glass-bg: rgba(20, 24, 33, 0.82);
+    --glass-solid: #141821;
+    --glass-border: #272d36;
+    --glass-edge: transparent;
+    --glass-highlight: transparent;
+    --shadow-sm: none;
+    --shadow: none;
+    --shadow-float: 0 10px 32px rgba(2, 6, 14, 0.55), 0 2px 8px rgba(2, 6, 14, 0.4);
+    --shadow-lg: 0 24px 64px rgba(2, 6, 14, 0.6), 0 2px 8px rgba(2, 6, 14, 0.45);
+    --scrim: rgba(3, 6, 12, 0.6);
   }
 }
 
-/* Reduced transparency: solid surfaces on glass and soft tints, per scheme. */
+/* Reduced transparency: solid glass, per scheme (the soft tints are solid already). */
 @media (prefers-reduced-transparency: reduce) {
   :root:not([data-theme="dark"]) {
     --glass-bg: var(--glass-solid);
-    --glass-border: #c5c7cc;
-    --glass-edge: #b4b6bc;
+    --glass-border: #c3cbd6;
+    --glass-edge: transparent;
     --glass-highlight: transparent;
-    --accent-soft: #e3f0ef;
-    --warn-soft: #faeedc;
-    --danger-soft: #f9e9e7;
   }
 
   :root[data-theme="dark"] {
     --glass-bg: var(--glass-solid);
-    --glass-border: #3a3c42;
-    --glass-edge: #0c0d0e;
+    --glass-border: #3d434d;
+    --glass-edge: transparent;
     --glass-highlight: transparent;
-    --accent-soft: #182f2f;
-    --warn-soft: #312516;
-    --danger-soft: #331e1d;
   }
 }
 
 @media (prefers-reduced-transparency: reduce) and (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --glass-bg: var(--glass-solid);
-    --glass-border: #3a3c42;
-    --glass-edge: #0c0d0e;
+    --glass-border: #3d434d;
+    --glass-edge: transparent;
     --glass-highlight: transparent;
-    --accent-soft: #182f2f;
-    --warn-soft: #312516;
-    --danger-soft: #331e1d;
   }
 }
 
@@ -172,189 +193,209 @@
    and borders meet WCAG 1.4.11 (>= 3:1). */
 @media (prefers-contrast: more) {
   :root:not([data-theme="dark"]) {
-    --bg: #f3f3ef;
+    --bg: #f2f4f7;
+    --bg-tint: #ebeff4;
     --surface: #ffffff;
-    --surface-2: #e9e9e4;
-    --surface-3: #dadad3;
-    --text: #0c0d0e;
-    --text-2: #2b2e33;
-    --text-3: #363a40;
-    --border: rgba(20, 22, 26, 0.46);
-    --border-strong: rgba(20, 22, 26, 0.72);
-    --accent: #065857;
-    --accent-hover: #044342;
-    --accent-soft: #dff0ef;
-    --accent-ink: #ffffff;
-    --warn: #7c3800;
-    --warn-soft: #fae9d2;
+    --surface-2: #e8ecf1;
+    --surface-3: #d9dfe7;
+    --surface-select: #d4e0ef;
+    --text: #05090f;
+    --text-2: #222b38;
+    --text-3: #2e3846;
+    --border: #778190;
+    --border-strong: #4f5967;
+    --border-control: #4f5967;
+    --accent: #044e4d;
+    --accent-hover: #10b3ae;
+    --accent-soft: #d3eeed;
+    --accent-fill: #12c4bf;
+    --accent-fill-edge: #044e4d;
+    --accent-ink: #031a1c;
+    --ok: #08503b;
+    --ok-soft: #d3f0e3;
+    --warn: #6b4500;
+    --warn-soft: #faebc6;
     --warn-ink: #ffffff;
     --danger: #8f170e;
     --danger-soft: #fae2df;
     --danger-fill: #8f170e;
     --danger-fill-hover: #70110a;
     --danger-fill-ink: #ffffff;
-    --ok: #125c2b;
     --focus: #0b57d0;
     --glass-bg: var(--glass-solid);
-    --glass-solid: #efefe9;
-    --glass-border: rgba(20, 22, 26, 0.6);
-    --glass-edge: rgba(20, 22, 26, 0.72);
+    --glass-solid: #e6ebf1;
+    --glass-border: #4f5967;
+    --glass-edge: transparent;
     --glass-highlight: transparent;
   }
 
   :root[data-theme="dark"] {
-    --bg: #0c0d0e;
-    --bg-tint: #0d1213;
-    --surface: #141517;
-    --surface-2: #1f2124;
-    --surface-3: #2c2e33;
+    --bg: #0a0d14;
+    --bg-tint: #0c1018;
+    --surface: #121722;
+    --surface-2: #1a202c;
+    --surface-3: #232a37;
+    --surface-select: #1c2c44;
     --text: #ffffff;
-    --text-2: #d8dbe0;
-    --text-3: #c4c8cf;
-    --border: rgba(255, 255, 255, 0.4);
-    --border-strong: rgba(255, 255, 255, 0.68);
-    --accent: #5cdbd5;
-    --accent-hover: #80e7e2;
-    --accent-soft: #132e2e;
-    --accent-ink: #041313;
-    --warn: #ffbe63;
-    --warn-soft: #332410;
+    --text-2: #e1e7ef;
+    --text-3: #cdd5e0;
+    --border: #6b7584;
+    --border-strong: #a3adbb;
+    --border-control: #a3adbb;
+    --accent: #5ce6e1;
+    --accent-hover: #5ce6e1;
+    --accent-soft: #10303a;
+    --accent-fill: #2ad4cf;
+    --accent-fill-edge: #5ce6e1;
+    --accent-ink: #031a1c;
+    --ok: #6ef0c8;
+    --ok-soft: #0c2e25;
+    --warn: #ffd060;
+    --warn-soft: #3a2c0c;
     --warn-ink: #1a0f00;
     --danger: #ff9c92;
-    --danger-soft: #381816;
+    --danger-soft: #3e1a1e;
     --danger-fill: #a8241a;
     --danger-fill-hover: #8f1c13;
     --danger-fill-ink: #ffffff;
-    --ok: #7be8a3;
     --focus: #9ac7ff;
     --glass-bg: var(--glass-solid);
-    --glass-solid: #181a1d;
-    --glass-border: rgba(255, 255, 255, 0.55);
-    --glass-edge: rgba(255, 255, 255, 0.68);
+    --glass-solid: #0e121a;
+    --glass-border: #a3adbb;
+    --glass-edge: transparent;
     --glass-highlight: transparent;
   }
 }
 
 @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #0c0d0e;
-    --bg-tint: #0d1213;
-    --surface: #141517;
-    --surface-2: #1f2124;
-    --surface-3: #2c2e33;
+    --bg: #0a0d14;
+    --bg-tint: #0c1018;
+    --surface: #121722;
+    --surface-2: #1a202c;
+    --surface-3: #232a37;
+    --surface-select: #1c2c44;
     --text: #ffffff;
-    --text-2: #d8dbe0;
-    --text-3: #c4c8cf;
-    --border: rgba(255, 255, 255, 0.4);
-    --border-strong: rgba(255, 255, 255, 0.68);
-    --accent: #5cdbd5;
-    --accent-hover: #80e7e2;
-    --accent-soft: #132e2e;
-    --accent-ink: #041313;
-    --warn: #ffbe63;
-    --warn-soft: #332410;
+    --text-2: #e1e7ef;
+    --text-3: #cdd5e0;
+    --border: #6b7584;
+    --border-strong: #a3adbb;
+    --border-control: #a3adbb;
+    --accent: #5ce6e1;
+    --accent-hover: #5ce6e1;
+    --accent-soft: #10303a;
+    --accent-fill: #2ad4cf;
+    --accent-fill-edge: #5ce6e1;
+    --accent-ink: #031a1c;
+    --ok: #6ef0c8;
+    --ok-soft: #0c2e25;
+    --warn: #ffd060;
+    --warn-soft: #3a2c0c;
     --warn-ink: #1a0f00;
     --danger: #ff9c92;
-    --danger-soft: #381816;
+    --danger-soft: #3e1a1e;
     --danger-fill: #a8241a;
     --danger-fill-hover: #8f1c13;
     --danger-fill-ink: #ffffff;
-    --ok: #7be8a3;
     --focus: #9ac7ff;
     --glass-bg: var(--glass-solid);
-    --glass-solid: #181a1d;
-    --glass-border: rgba(255, 255, 255, 0.55);
-    --glass-edge: rgba(255, 255, 255, 0.68);
+    --glass-solid: #0e121a;
+    --glass-border: #a3adbb;
+    --glass-edge: transparent;
     --glass-highlight: transparent;
   }
 }
 
-/* Model-family accents (thread rows, the thread view's model chip, the model
-   picker). Suggestions, not brand colours. Each one is text-safe: at least
-   4.5:1 against surface, surface-2 and the page in its scheme (light worst
-   4.84:1, dark 6.57:1, Increase Contrast light 6.37:1, dark 9.49:1; WCAG 2
-   luminance). Hues step around the wheel; Grok is the neutral ink, Unknown a
-   quieter slate. Colour is never the only cue: every mark carries a glyph and
-   the model's name is always shown as text. Same block order as above. */
+/* Model-family colours (thread dots and pills, the family mark, the model chip,
+   the picker). Colour stays by family (owner question Q4); the common families
+   land on the concept art's set: Gemini/Gemma teal, Qwen purple, Llama orange,
+   Radium indigo. Each one is text-safe: at least 4.5:1 against bg, glass,
+   surface, surface-2, surface-select and its own tinted pill (.status.fam-tint)
+   in its scheme (WCAG 2; pairs in the changelog). Colour is never the only cue:
+   every mark carries a glyph and the model's name is always shown as text.
+   Same block order as above. */
 :root {
-  --fam-claude: #6a42c2;
-  --fam-gpt: #0a7058;
-  --fam-gemini: #1f5fcc;
-  --fam-llama: #a8430a;
-  --fam-qwen: #805b00;
+  --fam-gemini: #0b6b73;
+  --fam-qwen: #5b3fc4;
+  --fam-llama: #9a4a06;
+  --fam-radium: #4d4fc9;
+  --fam-claude: #a12d86;
+  --fam-gpt: #1f5fcc;
   --fam-deepseek: #0a6f8c;
   --fam-mistral: #bd2f4a;
   --fam-nemotron: #436e00;
-  --fam-ernie: #a12d86;
+  --fam-ernie: #805b00;
   --fam-grok: #2b2f36;
-  --fam-radium: #4d4fc9;
-  --fam-scripted: #6b6b2a;
+  --fam-scripted: #636327;
   --fam-unknown: #5b6573;
+  --fam-pill: 12%; /* how much family colour tints a pill's surface */
 }
 
 :root[data-theme="dark"] {
-  --fam-claude: #b9a2ff;
-  --fam-gpt: #4fd1a8;
-  --fam-gemini: #7fb0ff;
-  --fam-llama: #ff9d5c;
-  --fam-qwen: #e8c04a;
+  --fam-gemini: #4fe3e6;
+  --fam-qwen: #a78bfa;
+  --fam-llama: #f9a85a;
+  --fam-radium: #8891f0;
+  --fam-claude: #f28ad8;
+  --fam-gpt: #7fb0ff;
   --fam-deepseek: #5cc8e8;
   --fam-mistral: #ff8fa0;
   --fam-nemotron: #9fd24a;
-  --fam-ernie: #f28ad8;
+  --fam-ernie: #e8c04a;
   --fam-grok: #e6e8ec;
-  --fam-radium: #a7a9ff;
   --fam-scripted: #c9c97a;
   --fam-unknown: #a3adba;
+  --fam-pill: 16%;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --fam-claude: #b9a2ff;
-    --fam-gpt: #4fd1a8;
-    --fam-gemini: #7fb0ff;
-    --fam-llama: #ff9d5c;
-    --fam-qwen: #e8c04a;
+    --fam-gemini: #4fe3e6;
+    --fam-qwen: #a78bfa;
+    --fam-llama: #f9a85a;
+    --fam-radium: #8891f0;
+    --fam-claude: #f28ad8;
+    --fam-gpt: #7fb0ff;
     --fam-deepseek: #5cc8e8;
     --fam-mistral: #ff8fa0;
     --fam-nemotron: #9fd24a;
-    --fam-ernie: #f28ad8;
+    --fam-ernie: #e8c04a;
     --fam-grok: #e6e8ec;
-    --fam-radium: #a7a9ff;
     --fam-scripted: #c9c97a;
     --fam-unknown: #a3adba;
+    --fam-pill: 16%;
   }
 }
 
 @media (prefers-contrast: more) {
   :root:not([data-theme="dark"]) {
-    --fam-claude: #55309f;
-    --fam-gpt: #065c46;
-    --fam-gemini: #164aa3;
-    --fam-llama: #8a3606;
-    --fam-qwen: #6a4b00;
+    --fam-gemini: #06525a;
+    --fam-qwen: #47309f;
+    --fam-llama: #7a3a04;
+    --fam-radium: #3a3ca8;
+    --fam-claude: #82216b;
+    --fam-gpt: #164aa3;
     --fam-deepseek: #06566d;
     --fam-mistral: #981f38;
     --fam-nemotron: #395c00;
-    --fam-ernie: #82216b;
+    --fam-ernie: #6a4b00;
     --fam-grok: #16181c;
-    --fam-radium: #3a3ca8;
     --fam-scripted: #525220;
     --fam-unknown: #434b57;
   }
 
   :root[data-theme="dark"] {
-    --fam-claude: #d2c2ff;
-    --fam-gpt: #7fe6c4;
-    --fam-gemini: #a9c9ff;
-    --fam-llama: #ffbb8a;
-    --fam-qwen: #f5d77a;
+    --fam-gemini: #7ff0f2;
+    --fam-qwen: #c4b0ff;
+    --fam-llama: #ffc48a;
+    --fam-radium: #b0b6ff;
+    --fam-claude: #f8b0e6;
+    --fam-gpt: #a9c9ff;
     --fam-deepseek: #8adcf2;
     --fam-mistral: #ffb3bf;
     --fam-nemotron: #bfe57a;
-    --fam-ernie: #f8b0e6;
+    --fam-ernie: #f5d77a;
     --fam-grok: #ffffff;
-    --fam-radium: #c4c6ff;
     --fam-scripted: #dede9c;
     --fam-unknown: #c2cad4;
   }
@@ -362,17 +403,17 @@
 
 @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --fam-claude: #d2c2ff;
-    --fam-gpt: #7fe6c4;
-    --fam-gemini: #a9c9ff;
-    --fam-llama: #ffbb8a;
-    --fam-qwen: #f5d77a;
+    --fam-gemini: #7ff0f2;
+    --fam-qwen: #c4b0ff;
+    --fam-llama: #ffc48a;
+    --fam-radium: #b0b6ff;
+    --fam-claude: #f8b0e6;
+    --fam-gpt: #a9c9ff;
     --fam-deepseek: #8adcf2;
     --fam-mistral: #ffb3bf;
     --fam-nemotron: #bfe57a;
-    --fam-ernie: #f8b0e6;
+    --fam-ernie: #f5d77a;
     --fam-grok: #ffffff;
-    --fam-radium: #c4c6ff;
     --fam-scripted: #dede9c;
     --fam-unknown: #c2cad4;
   }
@@ -393,9 +434,9 @@ body {
 }
 
 body {
-  font: 15px/1.55 var(--font);
+  font: 15px/1.5 var(--font);
   color: var(--text);
-  background: radial-gradient(1200px 600px at 0% 0%, var(--bg-tint), transparent 70%), var(--bg);
+  background: var(--bg);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   overflow: hidden;
@@ -456,6 +497,12 @@ a {
   stroke-linejoin: round;
 }
 
+/* Filled icons (names ending in "-fill" in lib/dom.js): the sidebar and tab bar nav set. */
+.icon.icon-fill {
+  fill: currentColor;
+  stroke: none;
+}
+
 .noscript {
   padding: 24px;
 }
@@ -507,7 +554,9 @@ a {
   }
 }
 
-/* ---- shell */
+/* ---- shell
+   Desktop: sidebar (one step up from the canvas), main canvas, inspector, each
+   meeting the next at a 1px hairline. No floating panels, no gaps. */
 
 .shell {
   display: grid;
@@ -516,68 +565,107 @@ a {
 }
 
 .sidebar {
-  margin: 10px 0 10px 10px;
-  border-radius: var(--radius-lg);
   display: flex;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
   z-index: 30;
+  background: var(--glass-solid);
+  border-right: 1px solid var(--border);
+}
+
+/* The sidebar is chrome: it may be glass (V11), but on desktop it sits on the
+   flat canvas, so the solid tone reads the same and costs nothing. */
+.sidebar.glass {
+  background: var(--glass-solid);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border: none;
+  border-right: 1px solid var(--border);
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .sidebar-head {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 14px 12px 8px 16px;
+  min-height: var(--bar-h);
+  padding: 8px 12px 4px 16px;
 }
 
 .brand {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-weight: 650;
-  font-size: 16px;
+  font-weight: 600;
+  font-size: 18px;
   letter-spacing: -0.01em;
   color: var(--text);
   text-decoration: none;
   margin-right: auto;
+  border-radius: var(--radius-sm);
 }
 
+/* The mark: logo.svg (W6 replaces the placeholder; no code change needed). */
 .brand-mark {
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
+  flex: none;
   border-radius: 8px;
-  background: url("/app/icon.svg") center / cover;
+  background: url("/app/logo.svg") center / contain no-repeat;
+}
+
+.side-new {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 10px 4px;
+  min-height: 38px;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+/* Hover and current change the edge, not the fill, so the label keeps its contrast. */
+.side-new:hover {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.side-new[aria-current="page"] {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
 }
 
 .sidebar-scroll {
   flex: 1;
+  overflow-x: hidden;
   overflow-y: auto;
-  padding: 4px 8px 8px;
+  padding: 4px 10px 8px;
   scrollbar-width: thin;
 }
 
 .side-section {
-  margin-top: 14px;
+  margin-top: 10px;
 }
 
+/* Section labels ("Chats", "Needs you"): 12.5/600 in the main text colour. */
 .side-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 12px;
+  gap: 8px;
+  font-size: 12.5px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-3);
-  padding: 0 10px 6px;
+  color: var(--text);
+  padding: 0 8px 4px;
   margin: 0;
 }
 
 .side-title a {
-  text-transform: none;
-  letter-spacing: 0;
   font-weight: 500;
   text-decoration: none;
 }
@@ -593,6 +681,10 @@ a {
 
 .side-list:empty {
   display: none;
+}
+
+.side-list > li {
+  min-width: 0;
 }
 
 .side-icon {
@@ -616,25 +708,38 @@ a {
   color: var(--text-3);
 }
 
+/* One-line rows: icon, label, and a state dot or count at the end (V4). */
 .side-item {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 40px;
-  padding: 7px 10px;
-  border-radius: 10px;
-  color: var(--text);
+  min-height: 32px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
   text-decoration: none;
-  font-size: 14px;
+  font-size: 13.5px;
+  font-weight: 500;
+}
+
+.side-item > .icon {
+  width: 17px;
+  height: 17px;
+  color: var(--text-3);
 }
 
 .side-item:hover {
-  background: var(--accent-soft);
+  background: var(--surface-3);
+  color: var(--text);
 }
 
 .side-item[aria-current="page"] {
-  background: var(--surface);
-  box-shadow: var(--shadow-sm);
+  background: var(--surface-select);
+  color: var(--text);
+}
+
+.side-item[aria-current="page"] > .icon {
+  color: var(--accent);
 }
 
 .side-item .label {
@@ -645,46 +750,121 @@ a {
   white-space: nowrap;
 }
 
-.side-item .sub {
-  display: block;
-  font-size: 12px;
-  color: var(--text-3);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+/* A chat's live state at the row's end: a filled mint dot while threads run, a
+   hollow amber ring while one waits for a device, the approvals count otherwise.
+   Shape differs as well as colour; the words are in the row's accessible name. */
+.side-state {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+
+.side-state.running {
+  background: var(--ok);
+}
+
+.side-state.waiting {
+  border: 2px solid var(--warn);
+}
+
+.side-more {
+  width: 100%;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  font-size: 13.5px;
 }
 
 .side-empty {
-  padding: 6px 10px;
+  padding: 4px 8px;
+  margin: 0;
   color: var(--text-3);
   font-size: 13px;
 }
 
-.side-foot {
+/* "Needs you": a section header with the newest item's age and the count. */
+.side-needs {
+  margin-top: 12px;
+  padding-top: 10px;
   border-top: 1px solid var(--border);
-  padding: 8px;
-  display: grid;
-  gap: 1px;
 }
 
-.conn {
-  display: flex;
+.side-needs .side-item {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.side-needs-age {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12px;
+  gap: 5px;
   color: var(--text-3);
-  padding: 6px 10px 2px;
+  font-size: 12px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.side-needs-age::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+
+.side-needs-age:empty {
+  display: none;
+}
+
+.side-nav {
+  display: grid;
+  gap: 1px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+/* Footer: real connection state (Q8). Opens Devices. */
+.side-foot {
+  border-top: 1px solid var(--border);
+  padding: 6px 10px;
+}
+
+.side-status {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.side-status .conn-dot {
+  flex: none;
+}
+
+.side-status > .icon:last-child {
+  width: 15px;
+  height: 15px;
 }
 
 .conn-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--text-3);
+  box-sizing: border-box;
+  border: 2px solid var(--text-3);
 }
 
-.conn.online .conn-dot {
+.side-status.online .conn-dot {
   background: var(--ok);
+  border-color: var(--ok);
+}
+
+.side-status.partial .conn-dot {
+  border-color: var(--warn);
+  background: linear-gradient(90deg, var(--warn) 50%, transparent 50%);
 }
 
 .main {
@@ -705,20 +885,9 @@ a {
   scroll-padding-top: calc(var(--bar-h) + 16px);
 }
 
-/* A cap of page background behind the floating bar: content scrolling up fades
-   out in the gap above the bar and doesn't peek round its rounded corners. It
-   takes no space (negative margin) and sits under the bar (z-index 19 < 20). */
+/* The bar is flush with the top now, so nothing peeks round it: no fade cap. */
 .view::before {
-  content: "";
-  position: sticky;
-  top: 0;
-  z-index: 19;
-  flex: none;
-  display: block;
-  height: calc(10px + var(--bar-h) * 0.6);
-  margin-bottom: calc(-10px - var(--bar-h) * 0.6);
-  background: linear-gradient(to bottom, var(--bg) 0, var(--bg) 40%, transparent);
-  pointer-events: none;
+  content: none;
 }
 
 .main:focus,
@@ -734,11 +903,11 @@ a {
   left: 12px;
   z-index: 200;
   padding: 10px 16px;
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
   font-weight: 600;
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-float);
   transform: translateY(-200%);
 }
 
@@ -746,18 +915,25 @@ a {
   transform: none;
 }
 
+/* The view's bar: flush, 52px, a hairline below. Glass over the scrolling view. */
 .bar {
   position: sticky;
-  top: 10px;
+  top: 0;
   z-index: 20;
-  margin: 10px 12px 0;
+  margin: 0;
   min-height: var(--bar-h);
-  border-radius: var(--radius-lg);
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px 8px 16px;
+  gap: 8px;
+  padding: 6px 12px 6px 20px;
   flex: none;
+}
+
+.bar.glass {
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .bar-titles {
@@ -767,17 +943,18 @@ a {
 
 .bar h1 {
   margin: 0;
-  font-size: 16px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  line-height: 1.35;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .bar .caption {
-  font-size: 12.5px;
-  color: var(--text-2);
+  font-size: 12px;
+  color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -788,7 +965,7 @@ a {
   align-items: center;
   justify-content: flex-end;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 4px;
 }
 
 .view-body {
@@ -812,11 +989,9 @@ a {
 .inspector {
   width: var(--inspector-w);
   min-height: 0;
-  margin: 10px 10px 10px 0;
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-sm);
+  margin: 0;
+  background: var(--bg-tint);
+  border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -832,6 +1007,16 @@ a {
   display: none;
 }
 
+/* Each tab carries an outline and a filled icon; the selected tab shows the filled one. */
+.tab > .icon-fill,
+.tab[aria-current="page"] > .icon:not(.icon-fill) {
+  display: none;
+}
+
+.tab[aria-current="page"] > .icon-fill {
+  display: block;
+}
+
 /* ---- controls */
 
 .btn {
@@ -841,11 +1026,11 @@ a {
   gap: 6px;
   min-height: 36px;
   padding: 7px 14px;
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border-strong);
   background: var(--surface);
   color: var(--text);
-  font-weight: 550;
+  font-weight: 600;
   font-size: 14px;
   cursor: pointer;
   text-decoration: none;
@@ -868,9 +1053,10 @@ a {
   transform: none;
 }
 
+/* The one filled teal control per screen (V2). Dark ink on the fill: 7.3:1. */
 .btn-primary {
-  background: var(--accent);
-  border-color: transparent;
+  background: var(--accent-fill);
+  border-color: var(--accent-fill-edge);
   color: var(--accent-ink);
 }
 
@@ -894,7 +1080,17 @@ a {
 }
 
 .btn-ghost:hover {
-  background: var(--accent-soft);
+  background: var(--surface-3);
+}
+
+/* Outline: the art's Deny. Same size as the filled button beside it. */
+.btn-outline {
+  background: transparent;
+  border-color: var(--border-strong);
+}
+
+.btn-outline:hover {
+  background: var(--surface-3);
 }
 
 .btn-sm {
@@ -912,9 +1108,9 @@ a {
 .icon-btn {
   display: inline-grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
-  border-radius: 50%;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
   border: none;
   background: transparent;
   color: var(--text-2);
@@ -924,7 +1120,7 @@ a {
 }
 
 .icon-btn:hover {
-  background: var(--accent-soft);
+  background: var(--surface-3);
   color: var(--text);
 }
 
@@ -964,7 +1160,7 @@ a {
   min-height: 40px;
   padding: 8px 12px;
   border-radius: var(--radius-sm);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border-control); /* 3:1 boundary (the card hairline is 1.8:1) */
   background: var(--surface);
   color: var(--text);
 }
@@ -1019,7 +1215,7 @@ a {
   display: inline-flex;
   padding: 3px;
   gap: 2px;
-  border-radius: 999px;
+  border-radius: 10px;
   background: var(--surface-2);
   border: 1px solid var(--border);
 }
@@ -1031,7 +1227,7 @@ a {
   gap: 6px;
   min-height: 32px;
   padding: 4px 14px;
-  border-radius: 999px;
+  border-radius: 7px;
   font-size: 13.5px;
   font-weight: 550;
   color: var(--text-2);
@@ -1083,7 +1279,7 @@ a {
   height: 24px;
   border-radius: 999px;
   background: var(--surface-3);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border-control);
   position: relative;
   cursor: pointer;
   margin: 0;
@@ -1104,8 +1300,8 @@ a {
 }
 
 .switch input:checked {
-  background: var(--accent);
-  border-color: transparent;
+  background: var(--accent-fill);
+  border-color: var(--accent-fill-edge);
 }
 
 .switch input:checked::after {
@@ -1328,9 +1524,9 @@ button.list-row:hover {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 1px 8px;
+  padding: 1px 7px;
   min-height: 20px;
-  border-radius: 999px;
+  border-radius: var(--radius-xs);
   font-size: 11.5px;
   font-weight: 600;
   background: var(--surface-2);
@@ -1364,13 +1560,25 @@ button.list-row:hover {
   color: var(--text-2);
 }
 
+/* Good state only (Free, Local, On device, online): mint on dark mint (V2). */
+.badge.ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+/* Outline badge (the art's "Ra"): border and text in the colour, no fill. */
+.badge.outline {
+  background: transparent;
+  border: 1px solid currentColor;
+}
+
 .count {
   display: inline-grid;
   place-items: center;
   min-width: 18px;
   height: 18px;
   padding: 0 5px;
-  border-radius: 999px;
+  border-radius: var(--radius-xs);
   background: var(--warn);
   color: var(--warn-ink);
   font-size: 11px;
@@ -1665,17 +1873,9 @@ code,
   scrollbar-width: thin;
 }
 
+/* The bar is flush with the top (W1), so the old fade cap above it is gone. */
 .chat-column::before {
-  content: "";
-  position: sticky;
-  top: 0;
-  z-index: 19;
-  flex: none;
-  display: block;
-  height: calc(10px + var(--bar-h) * 0.6);
-  margin-bottom: calc(-10px - var(--bar-h) * 0.6);
-  background: linear-gradient(to bottom, var(--bg) 0, var(--bg) 40%, transparent);
-  pointer-events: none;
+  content: none;
 }
 
 .threads-btn {
@@ -1945,16 +2145,26 @@ button.strip:hover {
   color: var(--accent);
 }
 
+/* Status pill: a rounded rectangle, word plus icon (never colour alone).
+   statusPill(status, {family}) tints a Running pill with the family colour
+   (.fam-tint + .fam-<key>); waiting, failed and stopped keep fixed status
+   colours, so an orange family never reads as a warning (Q4). */
 .status {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  font-size: 11.5px;
-  font-weight: 650;
+  gap: 5px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.3;
   white-space: nowrap;
-  padding: 1px 8px 1px 6px;
-  border-radius: 999px;
-  min-height: 20px;
+  padding: 2px 8px 2px 7px;
+  border-radius: var(--radius-sm);
+  min-height: 22px;
+}
+
+.status.fam-tint {
+  color: var(--fam);
+  background: color-mix(in srgb, var(--fam) var(--fam-pill), var(--surface));
 }
 
 .status .icon {
@@ -1988,6 +2198,7 @@ button.strip:hover {
 }
 
 .status .live-dot {
+  flex: none;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -2108,7 +2319,7 @@ button.strip:hover {
   border: none;
   display: grid;
   place-items: center;
-  background: var(--accent);
+  background: var(--accent-fill);
   color: var(--accent-ink);
   cursor: pointer;
   flex: none;
@@ -2497,12 +2708,19 @@ dialog.sheet-dialog::backdrop {
 .toast {
   pointer-events: auto;
   padding: 10px 16px;
-  border-radius: 14px;
+  border-radius: var(--radius);
   font-size: 14px;
   display: flex;
   gap: 10px;
   align-items: center;
   animation: rise 0.2s var(--ease);
+}
+
+/* Toasts float, so they keep a shadow in dark mode too (V3). */
+.toast.glass {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-float);
 }
 
 .toast.error .icon {
@@ -2695,6 +2913,8 @@ dialog.sheet-dialog::backdrop {
     width: min(var(--inspector-w), calc(100vw - 20px));
     margin: 0;
     z-index: 60;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
     animation: slide-in 0.22s var(--ease);
   }
@@ -2719,12 +2939,13 @@ dialog.sheet-dialog::backdrop {
 
 @media (max-width: 760px) {
   :root {
-    --tabbar-h: calc(64px + env(safe-area-inset-bottom));
-    --bar-h: 54px;
+    --tabbar-h: calc(72px + env(safe-area-inset-bottom));
+    --bar-h: 52px;
   }
 
+  /* 16px body so iOS doesn't zoom into inputs. */
   body {
-    font-size: 15px;
+    font-size: 16px;
   }
 
   .shell {
@@ -2739,7 +2960,8 @@ dialog.sheet-dialog::backdrop {
     display: none !important;
   }
 
-  .sidebar {
+  .sidebar,
+  .sidebar.glass {
     position: fixed;
     top: 0;
     left: 0;
@@ -2747,6 +2969,7 @@ dialog.sheet-dialog::backdrop {
     width: min(320px, 86vw);
     margin: 0;
     border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
+    border-right: 1px solid var(--border-strong);
     transform: translateX(-105%);
     transition: transform 0.24s var(--ease);
     z-index: 70;
@@ -2755,6 +2978,7 @@ dialog.sheet-dialog::backdrop {
 
   .shell.drawer-open .sidebar {
     transform: none;
+    box-shadow: var(--shadow-lg);
   }
 
   .drawer-scrim {
@@ -2765,10 +2989,7 @@ dialog.sheet-dialog::backdrop {
   }
 
   .bar {
-    margin: 8px 8px 0;
-    top: 8px;
-    padding: 6px 6px 6px 8px;
-    border-radius: 18px;
+    padding: max(4px, env(safe-area-inset-top)) 6px 4px 6px;
   }
 
   .view-body {
@@ -2796,29 +3017,35 @@ dialog.sheet-dialog::backdrop {
     display: none;
   }
 
+  /* Floating rounded tab bar (V10): container 18, selected tile 12 on accent-soft. */
   .tabbar {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
     position: fixed;
-    left: 8px;
-    right: 8px;
-    bottom: calc(8px + env(safe-area-inset-bottom));
-    height: 58px;
-    border-radius: 22px;
+    left: 12px;
+    right: 12px;
+    bottom: calc(10px + env(safe-area-inset-bottom));
+    height: 60px;
+    border-radius: 18px;
     z-index: 50;
-    padding: 4px;
+    padding: 5px;
+  }
+
+  .tabbar.glass {
+    border: 1px solid var(--border-strong);
   }
 
   .tab {
     display: grid;
     justify-items: center;
     align-content: center;
-    gap: 2px;
-    border-radius: 18px;
+    gap: 3px;
+    border-radius: 12px;
     color: var(--text-2);
     text-decoration: none;
-    font-size: 11px;
-    font-weight: 600;
+    font-size: 11.5px;
+    font-weight: 500;
     position: relative;
   }
 
@@ -2830,6 +3057,7 @@ dialog.sheet-dialog::backdrop {
   .tab[aria-current="page"] {
     color: var(--accent);
     background: var(--accent-soft);
+    font-weight: 600;
   }
 
   .tab .count {
@@ -2971,14 +3199,6 @@ details > summary.list-row:hover {
   background: var(--surface-2);
 }
 
-.sidebar-scroll > .banner {
-  width: 100%;
-  margin: 4px 0 0;
-  cursor: pointer;
-  text-align: left;
-  font-weight: 600;
-}
-
 .composer-wrap {
   bottom: 10px;
 }
@@ -2995,24 +3215,9 @@ details > summary.list-row:hover {
   }
 }
 
-.sidebar-scroll {
-  overflow-x: hidden;
-}
-
 .chip-item {
   display: grid;
   min-width: 0;
-}
-
-.side-item .label {
-  white-space: normal;
-}
-
-.side-item .label .title {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .view,
@@ -3031,10 +3236,6 @@ details > summary.list-row:hover {
 
 code.nowrap {
   white-space: nowrap;
-}
-
-.side-list > li {
-  min-width: 0;
 }
 
 .row-sub.md p {
@@ -3559,8 +3760,8 @@ code.nowrap {
   align-content: start;
   background: var(--surface);
   color: var(--text);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-float); /* menus float: a shadow in both modes */
 }
 
 .menu-list {
@@ -4014,7 +4215,7 @@ code.nowrap {
   }
 
   .dot.on,
-  .conn.online .conn-dot {
+  .side-status.online .conn-dot {
     background: var(--ok);
     border-color: var(--ok);
   }
@@ -4549,7 +4750,7 @@ code.nowrap {
   }
 
   .dot.on,
-  .conn.online .conn-dot {
+  .side-status.online .conn-dot {
     background: Highlight;
     border: 4px solid Highlight;
   }
@@ -5986,48 +6187,7 @@ dialog.sheet-dialog.model-picker {
 
 /* ---- command palette (desktop). Opaque result body; tokens only, no new colours. */
 
-.sidebar-head {
-  flex-wrap: wrap;
-}
-
-.palette-launch {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1 0 100%;
-  min-height: 40px;
-  margin: 4px 0 2px;
-  padding: 6px 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--text-2);
-  font-size: 14px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.palette-launch:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-  background: var(--surface-2);
-}
-
-.palette-launch-label {
-  flex: 1;
-  min-width: 0;
-}
-
-.palette-kbd {
-  font-family: var(--font);
-  font-size: 12px;
-  line-height: 1.4;
-  color: var(--text-2);
-  background: var(--surface-2);
-  border: 1px solid var(--border-strong);
-  border-radius: 6px;
-  padding: 1px 6px;
-}
+/* The launcher is the search icon button in every view's bar (lib/ui.js bar()). */
 
 dialog.command-palette {
   border: 1px solid var(--border-strong);
@@ -6204,7 +6364,6 @@ dialog.command-palette::backdrop {
 }
 
 @media (prefers-contrast: more) {
-  .palette-launch,
   dialog.command-palette,
   .palette-option[aria-selected='true'] {
     border-color: var(--text-2);
@@ -6212,9 +6371,7 @@ dialog.command-palette::backdrop {
 }
 
 @media (forced-colors: active) {
-  .palette-launch,
-  dialog.command-palette,
-  .palette-kbd {
+  dialog.command-palette {
     background: Canvas;
     color: CanvasText;
     border: 1px solid CanvasText;
@@ -6245,5 +6402,263 @@ dialog.command-palette::backdrop {
   .palette-mark {
     background: transparent;
     text-decoration: underline;
+  }
+}
+
+/* ---- shared pieces for the area stylesheets (W1, 26 Nov 2026)
+   Base classes the chat, thread and model packages build on. Area files add
+   their own rules in css/*.css; they don't restyle these here. */
+
+/* A family's colour dot (thread rows, the threads card). Set .fam-<key>. */
+.fam-dot {
+  display: inline-block;
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--fam, var(--fam-unknown));
+}
+
+/* A model's name as a chip: "Gemma 4 E2B". Text is the fact; the colour is the
+   dot or mark beside it (V6). Optional .fam-mark inside. */
+.model-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 24px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-select);
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The threads card (V5): one card per delegation burst.
+   <div class="thread-group">
+     <div class="thread-group-head">[icon thread-tree] 3 threads running</div>
+     <ul class="thread-group-list"><li><a class="thread-line fam-<key>">
+       <span class="fam-dot"></span><span class="thread-line-title">…</span>
+       <span class="model-tag">…</span>[statusPill(status, {family})][icon chevron]
+     </a></li></ul>
+     <div class="thread-group-foot">…View details…</div>
+   </div> */
+.thread-group {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 6px;
+}
+
+.thread-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 4px;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.thread-group-head > .icon {
+  color: var(--accent);
+}
+
+.thread-group-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.thread-line {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) minmax(0, max-content) max-content 16px;
+  align-items: center;
+  column-gap: 12px;
+  width: 100%;
+  min-height: 38px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: 13.5px;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.thread-line:hover {
+  background: var(--surface-3);
+}
+
+.thread-line-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-line > .icon:last-child {
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+}
+
+.thread-group-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  padding: 6px 8px 4px;
+  border-top: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+@media (pointer: coarse), (max-width: 760px) {
+  .thread-line,
+  .side-new {
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 560px) {
+  /* Phones: dot, title, pill, chevron; the model chip moves under the title. */
+  .thread-line {
+    grid-template-columns: 10px minmax(0, 1fr) max-content 16px;
+    row-gap: 2px;
+  }
+
+  .thread-line > .model-tag {
+    grid-column: 2;
+    grid-row: 2;
+    justify-self: start;
+  }
+}
+
+/* ---- shell additions under Increase Contrast and forced colours */
+
+@media (prefers-contrast: more) {
+  .side-new {
+    border: 1.5px solid var(--accent);
+  }
+
+  .side-item[aria-current="page"] > .icon {
+    color: var(--text);
+  }
+
+  .bar.glass,
+  .sidebar.glass {
+    border-color: var(--border-strong);
+  }
+
+  .side-state.running {
+    border: 1.5px solid var(--text);
+  }
+
+  .model-tag,
+  .thread-group {
+    border: 1px solid var(--border-strong);
+  }
+
+  .status.fam-tint {
+    border: 1px solid currentColor;
+  }
+
+  .input,
+  .select,
+  .textarea {
+    border-width: 1.5px;
+  }
+}
+
+@media (forced-colors: active) {
+  .icon.icon-fill {
+    fill: currentColor;
+    stroke: none;
+  }
+
+  .sidebar.glass,
+  .bar.glass {
+    background: Canvas;
+    color: CanvasText;
+    border-color: CanvasText;
+  }
+
+  .side-new {
+    forced-color-adjust: none;
+    background: ButtonFace;
+    color: ButtonText;
+    border: 2px solid ButtonText;
+  }
+
+  .side-new:hover {
+    background: Highlight;
+    color: HighlightText;
+    border-color: Highlight;
+  }
+
+  .side-more {
+    color: CanvasText;
+  }
+
+  .side-state.running,
+  .side-needs-age::before {
+    forced-color-adjust: none;
+    background: CanvasText;
+  }
+
+  .side-state.waiting {
+    forced-color-adjust: none;
+    border-color: CanvasText;
+    background: Canvas;
+  }
+
+  .side-status.partial .conn-dot {
+    forced-color-adjust: none;
+    background: linear-gradient(90deg, CanvasText 50%, Canvas 50%);
+    border-color: CanvasText;
+  }
+
+  .fam-dot {
+    forced-color-adjust: none;
+    background: CanvasText;
+  }
+
+  .status.fam-tint {
+    background: Canvas;
+    color: CanvasText;
+    border: 2px solid Highlight;
+  }
+
+  .model-tag,
+  .thread-group {
+    background: Canvas;
+    color: CanvasText;
+    border: 1px solid CanvasText;
+  }
+
+  .thread-line {
+    color: LinkText;
+  }
+
+  .thread-line:hover {
+    outline: 1px solid Highlight;
+    outline-offset: -1px;
+  }
+
+  .btn-outline {
+    background: ButtonFace;
+    color: ButtonText;
+    border: 1px solid ButtonText;
   }
 }

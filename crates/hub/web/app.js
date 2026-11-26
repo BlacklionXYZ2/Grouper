@@ -24,11 +24,11 @@
 // focus and scroll survive the live updates. Everything it subscribes to is torn
 // down on sign-out.
 
-import { h, icon, setChildren, syncList, setText, setAttr } from './lib/dom.js';
+import { h, icon, setChildren, syncList, setText, setAttr, srOnly } from './lib/dom.js';
 import { get, enc, isAbort, onApiError } from './lib/api.js';
 import { store, on, emit, threadsIn, approvalsIn, needsYouCount, waitingThreads, resetStore } from './lib/store.js';
 import { startLive, stopLive, loadConversations, loadThreads, loadDevices, loadModels, loadApprovals } from './lib/live.js';
-import { closeDrawer, navigate, syncInert, bar, skeletonBlocks, errorBanner, toast } from './lib/ui.js';
+import { closeDrawer, navigate, syncInert, bar, skeletonBlocks, errorBanner, toast, isNarrow } from './lib/ui.js';
 import { ago } from './lib/format.js';
 import { renderLogin } from './views/login.js';
 import { renderChat } from './views/chat.js';
@@ -42,7 +42,7 @@ import { renderSettings } from './views/settings.js';
 import { renderMore } from './views/more.js';
 import { renderInbox } from './views/inbox.js';
 import { startNotifications, stopNotifications, forgetNotifications } from './lib/push.js';
-import { mountPalette, openPalette, paletteShortcut } from './views/palette.js';
+import { mountPalette, openPalette } from './views/palette.js';
 
 const root = document.getElementById('app');
 const LAST_CONV = 'grouper.lastConversation';
@@ -202,14 +202,19 @@ function buildShell() {
   els = { shell, sidebar, main, inspector, inspectorScrim, tabbar, offline };
   buildNav();
 
-  const subs = ['conversations', 'threads', 'approvals', 'online'].map((topic) => on(topic, scheduleNav));
+  const subs = ['conversations', 'threads', 'approvals', 'online', 'devices'].map((topic) => on(topic, scheduleNav));
   subs.push(
     on('online', (online) => {
       if (els) els.offline.hidden = online || !store.everOnline;
     }),
   );
+  // Keep the Needs you age ("3m ago") current while something waits.
+  const ageTimer = setInterval(() => {
+    if (needsYouCount()) scheduleNav();
+  }, 30000);
   signal.addEventListener('abort', () => {
     subs.forEach((off) => off());
+    clearInterval(ageTimer);
     cancelAnimationFrame(navFrame);
     navFrame = 0;
   });
@@ -267,68 +272,79 @@ function setBadge(badge, n) {
   setAttr(badge, 'aria-label', n ? `${n} ${badge.dataset.label}` : null);
 }
 
+// Chats shown in the sidebar before "More chats…" (V4: one-line rows, about eight).
+const SIDE_CHATS = 8;
+// On phones the palette isn't offered, so "More chats…" lists the rest in the drawer.
+let showAllChats = false;
+
+function moreChats() {
+  if (isNarrow()) {
+    showAllChats = true;
+    renderNav();
+    nav?.chatList.querySelector(`li:nth-child(${SIDE_CHATS + 1}) a`)?.focus();
+  } else {
+    // The palette has no "chats only" entry point yet; it opens on everything,
+    // with recent chats first.
+    openPalette();
+  }
+}
+
 function buildNav() {
-  const footLink = (href, label, iconName, view, badgeLabel) => {
+  showAllChats = false;
+  const navLink =(href, label, iconName, view, badgeLabel) => {
     const badge = badgeLabel ? countBadge(badgeLabel) : null;
     const a = h('a', { class: 'side-item', href }, icon(iconName), h('span', { class: 'label' }, label), badge);
     return { a, view, badge };
   };
-  // Needs you: everything waiting on the owner across all chats (#/inbox).
-  const needsBadge = countBadge('need you');
-  const needsItem = h(
-    'a',
-    { class: 'side-item side-needs', href: '#/inbox' },
-    icon('inbox'),
-    h('span', { class: 'label' }, h('span', { class: 'title' }, 'Needs you'), h('span', { class: 'sub' })),
-    needsBadge,
-  );
+  const newChat = h('a', { class: 'side-new', href: '#/chat/new' }, icon('new-chat'), h('span', null, 'New chat'));
   const chatList = h('ul', { class: 'side-list' });
   const chatEmpty = h('p', { class: 'side-empty' }, 'No conversations yet.');
-  const foot = [
-    footLink('#/devices', 'Devices', 'devices', ['devices']),
-    footLink('#/models', 'Models', 'models', ['models'], 'waiting'),
-    footLink('#/usage', 'Usage & limits', 'usage', ['usage']),
-    footLink('#/memory', 'Memory', 'memory', ['memory']),
-    footLink('#/skills', 'Skills', 'skills', ['skills']),
-    footLink('#/settings', 'Settings', 'settings', ['settings']),
+  const more = h(
+    'button',
+    { type: 'button', class: 'side-item side-more', hidden: true, onclick: moreChats },
+    icon('more'),
+    h('span', { class: 'label' }, 'More chats…'),
+  );
+  // Needs you: everything waiting on the owner across all chats (#/inbox). A section
+  // header with the newest item's age and the count; its name says it in words.
+  const needsBadge = countBadge('need you');
+  needsBadge.setAttribute('aria-hidden', 'true');
+  const needsAge = h('span', { class: 'side-needs-age', 'aria-hidden': 'true' });
+  const needsItem = h('a', { class: 'side-item', href: '#/inbox' }, h('span', { class: 'label' }, 'Needs you'), needsAge, needsBadge);
+  const sections = [
+    navLink('#/devices', 'Devices', 'devices-fill', ['devices']),
+    navLink('#/models', 'Models', 'models-fill', ['models'], 'waiting'),
+    navLink('#/usage', 'Usage & limits', 'usage-fill', ['usage']),
+    navLink('#/memory', 'Memory', 'memory-fill', ['memory']),
+    navLink('#/skills', 'Skills', 'skills-fill', ['skills']),
+    navLink('#/settings', 'Settings', 'settings-fill', ['settings']),
   ];
-  const conn = h('div', { class: 'conn', role: 'status' }, h('span', { class: 'conn-dot', 'aria-hidden': 'true' }), h('span', { class: 'conn-text' }));
+  // Real state, not a slogan (Q8): opens Devices.
+  const status = h(
+    'a',
+    { class: 'side-item side-status', href: '#/devices' },
+    h('span', { class: 'conn-dot', 'aria-hidden': 'true' }),
+    h('span', { class: 'label' }),
+    icon('chevron'),
+  );
   setChildren(
     els.sidebar,
-    h(
-      'div',
-      { class: 'sidebar-head' },
-      h('a', { class: 'brand', href: '#/chat' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), 'Grouper'),
-      h('a', { class: 'icon-btn', href: '#/chat/new', 'aria-label': 'New chat', title: 'New chat' }, icon('plus')),
-      h(
-        'button',
-        {
-          type: 'button',
-          class: 'palette-launch only-desktop',
-          'aria-label': 'Search chats, threads, models, devices, pages, actions',
-          'aria-haspopup': 'dialog',
-          'aria-controls': 'command-palette',
-          'aria-expanded': 'false',
-          'aria-keyshortcuts': paletteShortcut().keys,
-          onclick: () => openPalette(),
-        },
-        icon('search'),
-        h('span', { class: 'palette-launch-label' }, 'Search'),
-        h('kbd', { class: 'palette-kbd', 'aria-hidden': 'true' }, paletteShortcut().label),
-      ),
-    ),
+    h('div', { class: 'sidebar-head' }, h('a', { class: 'brand', href: '#/chat' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), 'Grouper')),
+    newChat,
     h(
       'div',
       { class: 'sidebar-scroll' },
-      needsItem,
-      h('section', { class: 'side-section', 'aria-labelledby': 'side-chats' }, h('h2', { class: 'side-title', id: 'side-chats' }, 'Chats'), chatList, chatEmpty),
+      h('section', { class: 'side-section', 'aria-labelledby': 'side-chats' }, h('h2', { class: 'side-title', id: 'side-chats' }, 'Chats'), chatList, more, chatEmpty),
+      h('div', { class: 'side-needs' }, needsItem),
+      h('nav', { class: 'side-nav', 'aria-label': 'Sections' }, sections.map((f) => f.a)),
     ),
-    h('nav', { class: 'side-foot', 'aria-label': 'Sections' }, foot.map((f) => f.a), conn),
+    h('div', { class: 'side-foot' }, status),
   );
 
+  // Phone tabs: outline icons, filled when selected (CSS shows one of the two).
   const tab = (href, label, iconName, views, badgeLabel) => {
     const badge = badgeLabel ? countBadge(badgeLabel) : null;
-    const a = h('a', { class: 'tab', href }, icon(iconName), h('span', null, label), badge);
+    const a = h('a', { class: 'tab', href }, icon(iconName), icon(`${iconName}-fill`), h('span', null, label), badge);
     return { a, view: views, badge };
   };
   const tabs = [
@@ -338,66 +354,112 @@ function buildNav() {
     tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings', 'inbox'], 'pending'),
   ];
   setChildren(els.tabbar, tabs.map((t) => t.a));
-  nav = { needsItem, needsBadge, chatList, chatEmpty, foot, conn, tabs };
-}
-
-function sideItem() {
-  const title = h('span', { class: 'title' });
-  const sub = h('span', { class: 'sub' });
-  const a = h('a', { class: 'side-item' }, h('span', { class: 'label' }, title, sub));
-  return h('li', null, a);
+  nav = { newChat, needsItem, needsBadge, needsAge, chatList, chatEmpty, more, sections, status, tabs };
 }
 
 function chatSideItem() {
-  const li = sideItem();
-  li.firstChild.append(countBadge('approvals waiting'));
-  return li;
+  const a = h(
+    'a',
+    { class: 'side-item' },
+    icon('chat'),
+    h('span', { class: 'label' }),
+    srOnly(''),
+    h('span', { class: 'side-state', hidden: true, 'aria-hidden': 'true' }),
+    countBadge('approvals waiting'),
+  );
+  a.querySelector('.count').setAttribute('aria-hidden', 'true');
+  return h('li', null, a);
+}
+
+/** The sidebar's chats: the newest few, plus the open one if it's older. */
+function sidebarChats(r) {
+  const limit = showAllChats ? 50 : SIDE_CHATS;
+  const list = store.conversations.slice(0, limit);
+  const open = r.view === 'chat' && r.conversation;
+  if (open && !list.some((c) => c.id === open)) {
+    const c = store.conversations.find((x) => x.id === open);
+    if (c) list.splice(limit - 1, 1, c);
+  }
+  return list;
+}
+
+/** Newest thing in Needs you (an approval request or a thread that began waiting). */
+function newestNeed() {
+  let newest = 0;
+  for (const a of store.approvals.values()) newest = Math.max(newest, a.ts || 0);
+  for (const t of waitingThreads()) newest = Math.max(newest, t.created || 0);
+  return newest;
+}
+
+/** The footer's words: "All systems online" only when it's true (Q8). */
+function systemStatus() {
+  if (!store.online) return { text: store.everOnline ? 'Offline · reconnecting' : 'Connecting…', state: 'offline' };
+  const devices = store.devices || [];
+  const up = devices.filter((d) => d.online).length;
+  if (!devices.length) return { text: 'Hub online', state: 'online' };
+  if (up === devices.length) return { text: 'All systems online', state: 'online' };
+  return { text: `${up} of ${devices.length} devices online`, state: 'partial' };
 }
 
 function renderNav() {
   if (!els || !nav) return;
   const r = parseRoute();
 
-  // Chats, newest first, with per-chat running/waiting lines and approval badges.
+  // Chats, newest first: one line each, the live state as a dot or count at the end
+  // and in words for screen readers (status is never colour alone).
+  const chats = sidebarChats(r);
   syncList(
     nav.chatList,
-    store.conversations.slice(0, 50),
+    chats,
     (c) => c.id,
     chatSideItem,
     (li, c) => {
       const a = li.firstChild;
       setAttr(a, 'href', `#/chat/${enc(c.id)}`);
       setAttr(a, 'aria-current', r.view === 'chat' && r.conversation === c.id ? 'page' : null);
-      setText(a.querySelector('.title'), c.title || 'Untitled');
+      setText(a.querySelector('.label'), c.title || 'Untitled');
       const chatThreads = threadsIn(c.id);
       const running = chatThreads.filter((t) => t.status === 'running').length;
       const waiting = chatThreads.filter((t) => t.status === 'waiting_device').length;
-      const subParts = [c.mode === 'standard' ? 'Standard' : 'Project'];
-      if (running) subParts.push(`${running} running`);
-      if (waiting) subParts.push(`${waiting} waiting`);
-      if (!running && !waiting) subParts.push(ago(c.created));
-      setText(a.querySelector('.sub'), subParts.join(' · '));
-      setBadge(a.querySelector('.count'), approvalsIn(c.id).length);
+      const approvals = approvalsIn(c.id).length;
+      const parts = [];
+      if (approvals) parts.push(approvals === 1 ? '1 approval waiting' : `${approvals} approvals waiting`);
+      if (waiting) parts.push(`${waiting} waiting for a device`);
+      if (running) parts.push(`${running} running`);
+      setText(a.querySelector('.visually-hidden'), parts.length ? `, ${parts.join(', ')}` : '');
+      setAttr(a, 'title', [c.mode === 'standard' ? 'Standard' : 'Project', ...(parts.length ? parts : [ago(c.created)])].join(' · '));
+      setBadge(a.querySelector('.count'), approvals);
+      const dot = a.querySelector('.side-state');
+      const state = approvals ? null : waiting ? 'waiting' : running ? 'running' : null;
+      dot.hidden = !state;
+      dot.classList.toggle('waiting', state === 'waiting');
+      dot.classList.toggle('running', state === 'running');
     },
   );
   nav.chatEmpty.hidden = store.conversations.length > 0;
+  nav.more.hidden = store.conversations.length <= chats.length;
 
-  // Needs you: the count badge, and the same in words (status is never colour alone).
+  // Needs you: the count and the newest item's age, and the same in words.
   const approvalCount = store.approvals.size;
   const waitingCount = waitingThreads().length;
+  const newest = approvalCount + waitingCount ? newestNeed() : 0;
   setAttr(nav.needsItem, 'aria-current', r.view === 'inbox' ? 'page' : null);
   setBadge(nav.needsBadge, approvalCount + waitingCount);
+  setText(nav.needsAge, newest ? ago(newest) : '');
   const needsParts = [];
   if (approvalCount) needsParts.push(approvalCount === 1 ? '1 approval' : `${approvalCount} approvals`);
-  if (waitingCount) needsParts.push(`${waitingCount} waiting`);
-  setText(nav.needsItem.querySelector('.sub'), needsParts.length ? needsParts.join(' · ') : 'Nothing right now');
+  if (waitingCount) needsParts.push(`${waitingCount} waiting for a device`);
+  setAttr(nav.needsItem, 'aria-label', `Needs you: ${needsParts.length ? `${needsParts.join(', ')}, newest ${ago(newest)}` : 'nothing right now'}`);
 
-  for (const f of nav.foot) {
+  setAttr(nav.newChat, 'aria-current', r.view === 'chat' && r.conversation === null ? 'page' : null);
+  for (const f of nav.sections) {
     setAttr(f.a, 'aria-current', f.view.includes(r.view) ? 'page' : null);
     if (f.badge) setBadge(f.badge, store.pendingProposals);
   }
-  nav.conn.classList.toggle('online', store.online);
-  setText(nav.conn.querySelector('.conn-text'), store.online ? `Connected · ${store.me?.name || 'signed in'}` : 'Offline · reconnecting');
+  const sys = systemStatus();
+  nav.status.classList.toggle('online', sys.state === 'online');
+  nav.status.classList.toggle('partial', sys.state === 'partial');
+  setText(nav.status.querySelector('.label'), sys.text);
 
   const needs = needsYouCount();
   for (const t of nav.tabs) {
