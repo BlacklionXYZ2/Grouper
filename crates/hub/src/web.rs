@@ -34,7 +34,14 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "index.html",
     "app.css",
     "app.js",
+    // Per-area stylesheets, linked after app.css (one owner each; see docs/gui-concept-plan.md).
+    "css/chat.css",
+    "css/thread.css",
+    "css/approval.css",
+    "css/models.css",
+    "css/brand.css",
     "icon.svg",
+    "logo.svg",
     "manifest.webmanifest",
     "privacy.css",
     "privacy.html",
@@ -188,6 +195,25 @@ mod tests {
         let manifest: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
         assert_eq!(manifest["scope"], "/");
         assert_eq!(manifest["display"], "standalone");
+    }
+
+    /// Every app stylesheet is linked from the page, app.css first (the area files
+    /// build on its tokens), and every linked file is one the hub serves.
+    #[test]
+    fn index_links_every_stylesheet_after_app_css() {
+        let index = std::str::from_utf8(ASSETS.iter().find(|(p, _)| *p == "index.html").unwrap().1).unwrap();
+        let links: Vec<&str> = index
+            .split("<link rel=\"stylesheet\" href=\"/app/")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap())
+            .collect();
+        assert_eq!(links.first(), Some(&"app.css"));
+        for (path, _) in ASSETS.iter().filter(|(p, _)| p.ends_with(".css") && *p != "privacy.css") {
+            assert!(links.contains(path), "{path} is served but not linked from index.html");
+        }
+        for link in &links {
+            assert!(ASSETS.iter().any(|(p, _)| p == link), "index.html links {link}, which isn't served");
+        }
     }
 
     /// The CSP forbids inline script and style, so the sources must not rely on them.

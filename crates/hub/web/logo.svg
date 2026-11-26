@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Grouper">
+  <!-- Placeholder mark (W1). W6 replaces this file with the fish-school mark; no code change needed. -->
+  <rect width="32" height="32" rx="8" fill="#12C4BF"/>
+  <path d="M5.5 16C8.5 10.5 15.5 9.5 20.5 13.5L26 10v12l-5.5-3.5C15.5 22.5 8.5 21.5 5.5 16z" fill="#06262A"/>
+  <circle cx="10.5" cy="15" r="1.4" fill="#12C4BF"/>
+</svg>

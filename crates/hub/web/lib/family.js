@@ -5,6 +5,8 @@
 // The family comes from the registry entry's provider model string (then its id),
 // matched on clear name prefixes only. Anything else is Unknown: never a guess.
 // The colour is a supplement. The model's name is always shown as text beside it.
+// Colours live in app.css (--fam-<key>); the common families sit on the concept
+// art's set: Gemini/Gemma teal, Qwen purple, Llama orange, Radium indigo.
 
 import { h, icon } from './dom.js';
 import { store } from './store.js';
@@ -89,6 +91,16 @@ export function familyMark(key) {
     { class: ['fam-mark', `fam-${f.key}`], 'aria-hidden': 'true', title: f.key === 'unknown' ? 'Family unknown' : `${f.label} family` },
     f.glyph || icon('models'),
   );
+}
+
+/**
+ * The family's colour dot (thread rows, the threads card). Decorative: the row
+ * names the model in text. Pair with `statusPill(status, { family: key })` so the
+ * dot and the Running pill share a hue.
+ */
+export function familyDot(key) {
+  const f = familyInfo(key);
+  return h('span', { class: ['fam-dot', `fam-${f.key in FAMILIES ? f.key : 'unknown'}`], 'aria-hidden': 'true' });
 }
 
 /** Words for screen readers, e.g. "Claude family" or "family unknown". */
