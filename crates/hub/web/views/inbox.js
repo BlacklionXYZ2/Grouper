@@ -184,10 +184,12 @@ export function renderInbox(container) {
     const cid = a.conversation_id || thread?.conversation_id;
     const row = li.firstChild;
     setText(row.querySelector('.inbox-tool'), a.tool);
-    setText(row.querySelector('.inbox-on'), ` on ${device}`);
+    setText(row.querySelector('.inbox-on'), ` · via ${device}`);
     setText(row.querySelector('.inbox-reason'), a.reason || 'This tool is set to Manual, so every call waits for you.');
-    setText(row.querySelector('.inbox-kind'), isManualReason(a.reason) ? 'Manual tool' : 'A safety rule asked');
-    row.querySelector('.inbox-kind').classList.toggle('inbox-risk', !isManualReason(a.reason));
+    const risk = !isManualReason(a.reason);
+    row.classList.toggle('is-risk', risk);
+    setText(row.querySelector('.inbox-kind'), risk ? 'A safety rule asked' : 'Manual tool');
+    row.querySelector('.inbox-kind').classList.toggle('inbox-risk', risk);
     const threadLink = row.querySelector('.inbox-thread-link');
     setText(threadLink, thread?.title || 'Open thread');
     setAttr(threadLink, 'href', cid ? `#/chat/${enc(cid)}/thread/${enc(a.thread_id)}` : `#/threads/${enc(a.thread_id)}`);
@@ -269,10 +271,10 @@ export function renderInbox(container) {
     setText(cp, waiting ? (t.checkpoint ? 'Checkpoint saved' : 'No checkpoint') : '');
     setText(a.querySelector('.inbox-age'), `Started ${ago(t.created)}`);
     const pill = a.querySelector('.tp-pill');
-    const key = `${t.status}|${t.checkpoint ? 1 : 0}`;
+    const key = `${t.status}|${t.checkpoint ? 1 : 0}|${fam}`;
     if (pill.dataset.key !== key) {
       pill.dataset.key = key;
-      setChildren(pill, statusPill(t.status, { checkpoint: t.checkpoint }));
+      setChildren(pill, statusPill(t.status, { checkpoint: t.checkpoint, family: fam }));
     }
   }
 
