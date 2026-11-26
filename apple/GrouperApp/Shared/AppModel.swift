@@ -75,6 +75,14 @@ final class AppModel: ObservableObject {
         didSet { if !online { approvalsReconciled = false } }
     }
     @Published var errorMessage: String?
+    /// `GET /v1/auth/status` for the hub: claimed, and whether Google sign-in is on. Nil while unknown.
+    @Published private(set) var authStatus: AuthStatus?
+    /// A Google sign-in or link is running (Google's page may be open).
+    @Published private(set) var googleBusy = false
+    /// Settings > Account: the Google account that owns the hub, once `googleLinkLoaded`.
+    @Published private(set) var linkedGoogle: LinkedGoogleAccount?
+    @Published private(set) var googleLinkLoaded = false
+    @Published private(set) var accountMessage: String?
 
     @Published private(set) var conversations: [ConversationInfo] = []
     @Published var selectedConversationId: String?
@@ -249,6 +257,101 @@ final class AppModel: ObservableObject {
             signedIn = false
             online = false
             errorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Sign in with Google (docs/accounts-design.md)
+
+    /// Whether this app has a Google client ID and the hub at `hubURL` allows Google sign-in.
+    var googleSignInAvailable: Bool { GoogleSignIn.oauth != nil && authStatus?.google == true }
+
+    /// Sign-in screen: `GET /v1/auth/status` for the address as typed. Unreachable hubs and hubs
+    /// without the route leave it nil, which hides Google sign-in.
+    func checkAuthStatus(for typed: String) async {
+        let hub = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        var status: AuthStatus?
+        if !hub.isEmpty, let api = try? HubClient(baseURL: hub) {
+            status = try? await api.authStatus()
+        }
+        // Typed on since: a newer check owns the result.
+        guard hub == hubURL.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+        authStatus = status
+    }
+
+    /// Signs in with Google: the hub's nonce, Google's page, then `POST /v1/auth/google` for an
+    /// admin token for this install. The token is saved like a pasted one and the app connects
+    /// exactly as a token sign-in does (on the Mac that also registers this Mac's node).
+    /// `setupCode` is sent only while the hub is unclaimed.
+    func signInWithGoogle(setupCode: String) async {
+        guard let oauth = GoogleSignIn.oauth, !googleBusy else { return }
+        googleBusy = true
+        defer { googleBusy = false }
+        errorMessage = nil
+        let trimmedHub = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let api = try HubClient(baseURL: trimmedHub)
+            let nonce = try await api.googleNonce()
+            let idToken = try await GoogleSignIn.idToken(oauth: oauth, nonce: nonce.nonce)
+            let code = authStatus?.claimed == false ? (SetupCode.normalized(setupCode) ?? setupCode) : nil
+            let result = try await api.signInWithGoogle(idToken: idToken, setupCode: code, client: .current,
+                                                        deviceName: GoogleSignIn.deviceName)
+            // Kept now, so a connection hiccup below doesn't lose the new token.
+            UserDefaults.standard.set(trimmedHub, forKey: "grouper.hubURL")
+            try KeychainStore.save(result.token, as: .admin)
+            hubURL = trimmedHub
+            adminToken = result.token
+        } catch {
+            errorMessage = GoogleSignIn.message(for: error)
+            if let hubError = error as? HubClientError, case .conflict = hubError {
+                await checkAuthStatus(for: trimmedHub) // claimed a moment ago
+            }
+            return
+        }
+        await connect()
+    }
+
+    /// Settings > Account: the Google account linked to this hub, and whether the hub allows Google.
+    func refreshGoogleLink() async {
+        guard let client else { return }
+        authStatus = try? await client.authStatus()
+        do {
+            linkedGoogle = try await client.linkedGoogleAccount()
+            accountMessage = nil
+        } catch HubClientError.notFound(_) {
+            linkedGoogle = nil // a hub from before Google sign-in
+        } catch {
+            accountMessage = "Couldn't check the linked Google account: \(error.localizedDescription)"
+        }
+        googleLinkLoaded = true
+    }
+
+    /// Settings > Account > Link your Google account: the same Google flow, then `POST /v1/auth/google/link`.
+    func linkGoogle() async {
+        guard let client, let oauth = GoogleSignIn.oauth, !googleBusy else { return }
+        googleBusy = true
+        defer { googleBusy = false }
+        accountMessage = nil
+        do {
+            let nonce = try await client.googleNonce()
+            let idToken = try await GoogleSignIn.idToken(oauth: oauth, nonce: nonce.nonce)
+            linkedGoogle = try await client.linkGoogle(idToken: idToken)
+            googleLinkLoaded = true
+        } catch {
+            accountMessage = GoogleSignIn.message(for: error)
+        }
+    }
+
+    /// Settings > Account > Unlink. Tokens and devices keep working.
+    func unlinkGoogle() async {
+        guard let client, !googleBusy else { return }
+        googleBusy = true
+        defer { googleBusy = false }
+        accountMessage = nil
+        do {
+            try await client.unlinkGoogle()
+            linkedGoogle = nil
+        } catch {
+            accountMessage = "Couldn't unlink the Google account: \(error.localizedDescription)"
         }
     }
 
@@ -457,6 +560,9 @@ final class AppModel: ObservableObject {
         online = false
         adminToken = ""
         errorMessage = nil
+        linkedGoogle = nil
+        googleLinkLoaded = false
+        accountMessage = nil
         conversations.removeAll()
         threads.removeAll()
         folders.removeAll()
