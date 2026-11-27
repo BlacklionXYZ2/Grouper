@@ -11,6 +11,8 @@
 //! Admin & move endpoints:
 //! - `GET /v1/hub/move` (authed) — current [`MoveStatus`].
 //! - `POST /v1/hub/move` (admin + fresh Google sign-in) — preflight and start a move.
+//!   Fresh sign-in is either an `id_token` or a cookie session from `POST /v1/auth/google/return`
+//!   created within the last 5 minutes for the owner's `sub`.
 //! - `DELETE /v1/hub/move` (admin) — cancel an active move before the Switch commit point.
 //! - `GET /v1/hub/move/{ticket}/snapshot` (target device token) — one-time backup archive download.
 //! - `POST /v1/hub/move/{ticket}/secrets` (target device token) — one-time X25519-encrypted secrets hand-over.
@@ -194,6 +196,8 @@ pub struct StartMoveRequest {
     /// Target device id, install id, or device name.
     pub target_device: String,
     /// Fresh Google ID token signed with a hub-issued nonce (<= 5 minutes old).
+    /// When omitted, a cookie session opened by `POST /v1/auth/google/return` within the
+    /// last 5 minutes for the owner's `sub` is accepted instead.
     #[serde(default)]
     pub id_token: Option<String>,
     /// What to do with running hub threads (`wait` or `stop`).
@@ -536,13 +540,45 @@ pub(crate) async fn pause_guard(State(hub): State<Arc<Hub>>, req: Request, next:
     err(StatusCode::SERVICE_UNAVAILABLE, "Your hub is moving")
 }
 
-/// Require a fresh Google sign-in per section 4a: one-time hub nonce consumed, `iat` within
-/// 5 minutes, and `sub` equal to the hub owner's.
-async fn verify_fresh_google_signin(hub: &Hub, id_token: Option<&str>) -> Result<(), (StatusCode, String)> {
-    let raw = id_token.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
-        (StatusCode::UNAUTHORIZED, "a fresh Google sign-in is required to move the hub".to_string())
-    })?;
-    crate::google_auth::verify_fresh(hub, raw, FRESH_SIGNIN_MAX_AGE).await
+/// Require a fresh Google sign-in per section 4a.
+///
+/// Either a one-time `id_token` (`iat` within 5 minutes, nonce consumed, `sub` equal to the
+/// hub owner's) or, when no token is sent, the caller's cookie session from
+/// `POST /v1/auth/google/return` created within that same window for the owner's `sub`.
+/// A plain token session, an older Google session, or another account's session does not qualify.
+/// Cookie CSRF rules are unchanged: they run in the session guard before this handler.
+async fn verify_fresh_google_signin(
+    hub: &Hub,
+    headers: &HeaderMap,
+    id_token: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(raw) = id_token.map(str::trim).filter(|s| !s.is_empty()) {
+        return crate::google_auth::verify_fresh(hub, raw, FRESH_SIGNIN_MAX_AGE).await;
+    }
+    verify_fresh_google_session(hub, headers)
+}
+
+fn verify_fresh_google_session(hub: &Hub, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    let Some(session) = crate::session::first_live_cookie_session(hub, headers) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "a fresh Google sign-in is required to move the hub".into(),
+        ));
+    };
+    let Some(sub) = session.google_sub else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "a fresh Google sign-in is required to move the hub".into(),
+        ));
+    };
+    if session.created.saturating_add(FRESH_SIGNIN_MAX_AGE.as_secs()) <= now() {
+        return Err((StatusCode::UNAUTHORIZED, "this Google sign-in is too old; sign in again".into()));
+    }
+    match hub.db.owner() {
+        Some(owner) if owner.provider == "google" && owner.sub == sub => Ok(()),
+        Some(_) => Err((StatusCode::FORBIDDEN, "this hub belongs to a different Google account".into())),
+        None => Err((StatusCode::FORBIDDEN, "this hub has no owner yet".into())),
+    }
 }
 
 // ------------------------------------------------------------------ old hub move driver
@@ -578,9 +614,10 @@ impl Hub {
     /// Run preflight checks and start moving the hub to `req.target_device`.
     pub async fn start_move(
         self: &Arc<Self>,
+        headers: &HeaderMap,
         req: StartMoveRequest,
     ) -> Result<MoveStatus, (StatusCode, String)> {
-        verify_fresh_google_signin(self, req.id_token.as_deref()).await?;
+        verify_fresh_google_signin(self, headers, req.id_token.as_deref()).await?;
 
         if self.is_stepped_down() {
             return Err((
@@ -1286,7 +1323,7 @@ async fn post_start_move(
     if let Some(r) = deny_unless_admin(&hub, &headers) {
         return r;
     }
-    match hub.start_move(req).await {
+    match hub.start_move(&headers, req).await {
         Ok(status) => (StatusCode::ACCEPTED, Json(status)).into_response(),
         Err((code, msg)) => err(code, msg),
     }
@@ -2711,6 +2748,143 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay_move.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // A cookie session qualifies only when POST /v1/auth/google/return just created it
+        // for this owner. Token sessions, sessions older than 5 minutes, and other accounts do not.
+        // The id_token cases above already accepted a fresh token.
+        let quiet = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        let login = quiet
+            .post(format!("{base}/v1/session"))
+            .header("x-grouper", "1")
+            .header("origin", &base)
+            .json(&json!({"token": &admin_token}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), reqwest::StatusCode::OK);
+        let token_cookie = login.headers().get(reqwest::header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+        let token_session = quiet
+            .post(format!("{base}/v1/hub/move"))
+            .header("cookie", &token_cookie)
+            .header("x-grouper", "1")
+            .header("origin", &base)
+            .json(&json!({"target_device": target_dev.id, "threads": "stop"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(token_session.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(!hub.migrate().status().state.is_active());
+
+        let start = quiet
+            .post(format!("{base}/v1/auth/google/start"))
+            .header("origin", &base)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start.status(), reqwest::StatusCode::OK);
+        let start_body: serde_json::Value = start.json().await.unwrap();
+        let nonce = start_body["nonce"].as_str().unwrap();
+        let state = start_body["state"].as_str().unwrap();
+        let web_token = crate::google_auth::tests::mint_for_test(nonce, "sub-oscar");
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("id_token", &web_token)
+            .append_pair("state", state)
+            .finish();
+        let returned = quiet
+            .post(format!("{base}/v1/auth/google/return"))
+            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(returned.status(), reqwest::StatusCode::SEE_OTHER);
+        let google_cookie = returned
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let (recorded_sub, recorded_at): (String, i64) = hub
+            .db
+            .c()
+            .query_row(
+                "SELECT google_sub, created FROM sessions WHERE google_sub IS NOT NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recorded_sub, "sub-oscar");
+        assert!(now().saturating_sub(recorded_at as u64) < 30);
+
+        let post_cookie = |cookie: &str, csrf: bool| {
+            let mut req = quiet
+                .post(format!("{base}/v1/hub/move"))
+                .header("cookie", cookie)
+                .header("origin", &base)
+                .json(&json!({"target_device": target_dev.id, "threads": "stop"}));
+            if csrf {
+                req = req.header("x-grouper", "1");
+            }
+            req.send()
+        };
+
+        let no_csrf = post_cookie(&google_cookie, false).await.unwrap();
+        assert_eq!(no_csrf.status(), reqwest::StatusCode::FORBIDDEN, "cookie moves still need the CSRF header");
+        assert!(!hub.is_move_paused());
+        assert!(!hub.migrate().status().state.is_active());
+
+        hub.db
+            .c()
+            .execute("UPDATE sessions SET created = ?1 WHERE google_sub = 'sub-oscar'", [now() as i64 - 360])
+            .unwrap();
+        let stale = post_cookie(&google_cookie, true).await.unwrap();
+        assert_eq!(stale.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let stale_body: serde_json::Value = stale.json().await.unwrap();
+        assert!(stale_body["error"].as_str().unwrap().contains("too old"), "{stale_body}");
+        assert!(!hub.migrate().status().state.is_active());
+
+        hub.db
+            .c()
+            .execute(
+                "UPDATE sessions SET created = ?1, google_sub = ?2 WHERE google_sub = 'sub-oscar'",
+                params![now() as i64, "sub-other"],
+            )
+            .unwrap();
+        let other = post_cookie(&google_cookie, true).await.unwrap();
+        assert_eq!(other.status(), reqwest::StatusCode::FORBIDDEN);
+        let other_body: serde_json::Value = other.json().await.unwrap();
+        assert!(other_body["error"].as_str().unwrap().contains("different Google account"), "{other_body}");
+        assert!(!hub.migrate().status().state.is_active());
+
+        hub.db
+            .c()
+            .execute("UPDATE sessions SET google_sub = 'sub-oscar' WHERE google_sub = 'sub-other'", [])
+            .unwrap();
+        let mut status_rx = hub.migrate().subscribe();
+        let accepted = post_cookie(&google_cookie, true).await.unwrap();
+        assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_secs(5), status_rx.wait_for(|s| s.state == MovePhase::Copying))
+            .await
+            .expect("google session move entered copying")
+            .unwrap();
+        let cancel = quiet
+            .delete(format!("{base}/v1/hub/move"))
+            .header("cookie", &google_cookie)
+            .header("x-grouper", "1")
+            .header("origin", &base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), reqwest::StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(5), status_rx.wait_for(|s| s.state == MovePhase::RolledBack))
+            .await
+            .expect("google session move cancelled")
+            .unwrap();
 
         let _ = node_stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), node_task).await;

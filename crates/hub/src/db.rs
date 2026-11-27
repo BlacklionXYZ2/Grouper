@@ -247,6 +247,8 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     conn.execute_batch(crate::offline::SCHEMA)?;
     conn.execute_batch(crate::limits::SCHEMA)?;
     conn.execute_batch(crate::session::SCHEMA)?;
+    // Sessions opened by POST /v1/auth/google/return record the Google `sub`. Older rows stay NULL.
+    ensure_column(&conn, "sessions", "google_sub", "ALTER TABLE sessions ADD COLUMN google_sub TEXT")?;
     conn.execute_batch(crate::push::SCHEMA)?;
     conn.execute_batch(crate::google_auth::SCHEMA)?;
     // Databases made before admin tokens: every existing token becomes a plain

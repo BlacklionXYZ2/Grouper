@@ -851,7 +851,7 @@ function renderList(container) {
           pendingMove = null;
           close({ started: status });
         } catch (err) {
-          showErr(describe(err));
+          showErr(err?.status === 401 ? 'Sign in with Google again.' : describe(err));
           busy = false;
           moveBtn.disabled = false;
           googleReauthBtn.disabled = false;

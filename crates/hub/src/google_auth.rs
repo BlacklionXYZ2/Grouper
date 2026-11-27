@@ -1174,7 +1174,7 @@ async fn finish(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) ->
         Ok(a) => a,
         Err(r) => return return_failed(&r.message),
     };
-    match crate::session::start_session(&hub, &headers, &auth) {
+    match crate::session::start_google_session(&hub, &headers, &auth, &id.sub) {
         Ok((cookies, _)) => {
             let mut response = see_other("/#/");
             for cookie in cookies {
@@ -1626,6 +1626,8 @@ pub(crate) mod tests {
         let cookie = cookie_pair(&headers);
         let r = f.http.get(f.url("/v1/limits")).header("cookie", &cookie).send().await.unwrap();
         assert_eq!(r.status(), S::OK);
+        let google_sub: Option<String> = f.hub.db.c().query_row("SELECT google_sub FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(google_sub, None, "POST /v1/auth/google does not record a return-page Google session");
         let r = f
             .http
             .put(f.url("/v1/limits"))
@@ -1865,6 +1867,14 @@ pub(crate) mod tests {
         let r = f.http.get(f.url("/v1/limits")).header("cookie", &cookie).send().await.unwrap();
         assert_eq!(r.status(), S::OK, "an admin session");
         assert_eq!(f.hub.db.owner().unwrap().sub, OWNER, "the setup code given to /start claimed the hub");
+        let (google_sub, created): (String, i64) = f
+            .hub
+            .db
+            .c()
+            .query_row("SELECT google_sub, created FROM sessions", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(google_sub, OWNER);
+        assert!(now().saturating_sub(created as u64) < 30, "return-page session records the sign-in time");
 
         // The state is one-time.
         let (status, headers) = f.finish(&[("id_token", &token), ("state", state)]).await;
