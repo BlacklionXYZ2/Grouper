@@ -297,7 +297,7 @@ fn parse_codex_credentials_json(text: &str, now: u64) -> CredLoad<CodexCredentia
 
 /// Extract only the numeric `exp` claim from a JWT access token, if present.
 /// Never reads or returns any other claim.
-fn jwt_exp_secs(token: &str) -> Option<u64> {
+pub(crate) fn jwt_exp_secs(token: &str) -> Option<u64> {
     let mut parts = token.split('.');
     let _header = parts.next()?;
     let payload = parts.next()?;
@@ -311,6 +311,24 @@ fn jwt_exp_secs(token: &str) -> Option<u64> {
         .ok()?;
     let v: Value = serde_json::from_slice(&bytes).ok()?;
     v.get("exp").and_then(parse_unix_secs)
+}
+
+/// Check Claude Code credential presence and expiry without returning any token or secret.
+pub(crate) fn claude_sign_in_state(home: Option<&Path>, now: u64) -> core_protocol::HarnessSignIn {
+    match load_claude_credentials(home, now) {
+        CredLoad::Ready(_) => core_protocol::HarnessSignIn::SignedIn,
+        CredLoad::Expired => core_protocol::HarnessSignIn::Expired,
+        CredLoad::NotSignedIn | CredLoad::Unavailable(_) => core_protocol::HarnessSignIn::NotSignedIn,
+    }
+}
+
+/// Check Codex credential presence and expiry without returning any token or secret.
+pub(crate) fn codex_sign_in_state(home: Option<&Path>, now: u64) -> core_protocol::HarnessSignIn {
+    match load_codex_credentials(home, now) {
+        CredLoad::Ready(_) => core_protocol::HarnessSignIn::SignedIn,
+        CredLoad::Expired => core_protocol::HarnessSignIn::Expired,
+        CredLoad::NotSignedIn | CredLoad::Unavailable(_) => core_protocol::HarnessSignIn::NotSignedIn,
+    }
 }
 
 /// Sanitize a short non-secret label (e.g. plan tier like `max`, `pro`, `plus`).

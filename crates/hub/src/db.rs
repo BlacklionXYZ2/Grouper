@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS models (
   context_window INTEGER NOT NULL DEFAULT 0,
   use_cases TEXT NOT NULL DEFAULT '', free INTEGER NOT NULL DEFAULT 0, roles TEXT NOT NULL DEFAULT '',
   modalities TEXT NOT NULL DEFAULT '',
-  kind TEXT NOT NULL DEFAULT 'api', device_id TEXT,
+  kind TEXT NOT NULL DEFAULT 'api', device_id TEXT, can_orchestrate INTEGER NOT NULL DEFAULT 0,
   source TEXT NOT NULL DEFAULT 'manual', hidden INTEGER NOT NULL DEFAULT 0, hidden_reason TEXT,
   missed_syncs INTEGER NOT NULL DEFAULT 0, last_seen INTEGER, display_name TEXT,
   price_source TEXT NOT NULL DEFAULT 'manual', tools TEXT NOT NULL DEFAULT 'unknown');
@@ -238,6 +238,7 @@ fn model_row(r: &rusqlite::Row, device_map: &HashMap<String, String>) -> rusqlit
     let tools: String = r.get(21)?;
     let provider_kind: Option<String> = r.get(22)?;
     let provider_options: Option<String> = r.get(23)?;
+    let can_orchestrate: bool = r.get::<_, i64>(24)? != 0;
     let is_harness_provider = provider_kind.as_deref() == Some("harness");
     let kind = if is_harness_provider {
         "harness".to_string()
@@ -270,6 +271,7 @@ fn model_row(r: &rusqlite::Row, device_map: &HashMap<String, String>) -> rusqlit
         modalities: csv_list(modalities),
         kind,
         device_id,
+        can_orchestrate,
         source: if source.is_empty() { "manual".into() } else { source },
         hidden,
         hidden_reason,
@@ -282,7 +284,7 @@ fn model_row(r: &rusqlite::Row, device_map: &HashMap<String, String>) -> rusqlit
 const MODEL_SELECT: &str = "SELECT m.id, m.provider_id, m.model, m.input_price, m.output_price, m.cache_read_price, \
                             m.cache_write_price, m.context_window, m.use_cases, m.free, m.roles, m.local, m.modalities, \
                             m.kind, m.device_id, m.source, m.hidden, m.hidden_reason, m.last_seen, m.display_name, \
-                            m.price_source, m.tools, p.kind, p.options \
+                            m.price_source, m.tools, p.kind, p.options, m.can_orchestrate \
                             FROM models m LEFT JOIN providers p ON p.id = m.provider_id";
 
 fn conversation_row(r: &rusqlite::Row) -> rusqlite::Result<ConversationInfo> {
@@ -368,6 +370,7 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "models", "display_name", "ALTER TABLE models ADD COLUMN display_name TEXT")?;
     ensure_column(&conn, "models", "price_source", "ALTER TABLE models ADD COLUMN price_source TEXT NOT NULL DEFAULT 'manual'")?;
     ensure_column(&conn, "models", "tools", "ALTER TABLE models ADD COLUMN tools TEXT NOT NULL DEFAULT 'unknown'")?;
+    ensure_column(&conn, "models", "can_orchestrate", "ALTER TABLE models ADD COLUMN can_orchestrate INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "conversations", "model", "ALTER TABLE conversations ADD COLUMN model TEXT")?;
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
@@ -1202,8 +1205,8 @@ impl Db {
         c.execute(
             "INSERT INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
                cache_write_price, context_window, use_cases, free, roles, local, modalities,
-               kind, device_id, source, hidden, hidden_reason, last_seen, display_name, price_source, tools)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+               kind, device_id, source, hidden, hidden_reason, last_seen, display_name, price_source, tools, can_orchestrate)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT (id) DO UPDATE SET
                provider_id = excluded.provider_id,
                model = excluded.model,
@@ -1226,7 +1229,8 @@ impl Db {
                last_seen = excluded.last_seen,
                display_name = excluded.display_name,
                price_source = excluded.price_source,
-               tools = excluded.tools",
+               tools = excluded.tools,
+               can_orchestrate = excluded.can_orchestrate",
             params![
                 m.id,
                 m.provider_id,
@@ -1250,6 +1254,7 @@ impl Db {
                 display_name,
                 price_source,
                 tools,
+                m.can_orchestrate,
             ],
         )?;
         Ok(())
@@ -2328,6 +2333,7 @@ mod tests {
             "display_name",
             "price_source",
             "tools",
+            "can_orchestrate",
         ] {
             assert!(
                 db.c()

@@ -1423,6 +1423,13 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                     hub.handle_move_status(&device_id, &move_id, &stage, progress_pct, error, target_url).await;
                 }
             }
+            Ok(NodeMessage::HarnessReport { harnesses }) => {
+                if hub.is_live_conn(&device_id, conn_id).await
+                    && let Err(e) = crate::harness::apply_report(&hub.db, &device_id, &harnesses)
+                {
+                    tracing::warn!(device = %device_id, "applying harness report failed: {e:#}");
+                }
+            }
             Ok(NodeMessage::Hello { .. }) => {
                 if let Err(mpsc::error::TrySendError::Full(_)) =
                     tx.try_send(HubMessage::Error { message: "already said hello".into() })
