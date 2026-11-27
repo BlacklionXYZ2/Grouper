@@ -418,15 +418,13 @@ fn check_sign_in(def: &HarnessDef, opts: &ScanOptions, bin_path: &Path) -> Harne
 
     match def.slug {
         "claude-code" => {
-            let probe_home = (!opts.include_system_dirs).then_some(home).or(Some(home));
             // When scanning the real host (`include_system_dirs`), pass `None` so `CLAUDE_CONFIG_DIR`
             // and macOS Keychain are respected just like `usage_probes.rs`.
-            let state = if opts.include_system_dirs {
+            if opts.include_system_dirs {
                 usage_probes::claude_sign_in_state(None, opts.now)
             } else {
-                usage_probes::claude_sign_in_state(probe_home, opts.now)
-            };
-            state
+                usage_probes::claude_sign_in_state(Some(home), opts.now)
+            }
         }
         "codex" => {
             let state = if opts.include_system_dirs {
@@ -1105,13 +1103,13 @@ mod tests {
         fn install_fake_cli(&self, dir_rel: &str, binary: &str) -> PathBuf {
             let name = if cfg!(windows) { format!("{binary}.cmd") } else { binary.to_string() };
             let rel = format!("{dir_rel}/{name}");
-            let full = self.write(&rel, if cfg!(windows) { "@echo off\r\necho 1.0.0\r\n" } else { "#!/bin/sh\necho 1.0.0\n" });
+            let _full = self.write(&rel, if cfg!(windows) { "@echo off\r\necho 1.0.0\r\n" } else { "#!/bin/sh\necho 1.0.0\n" });
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&full).unwrap().permissions();
+                let mut perms = std::fs::metadata(&_full).unwrap().permissions();
                 perms.set_mode(0o755);
-                std::fs::set_permissions(&full, perms).unwrap();
+                std::fs::set_permissions(&_full, perms).unwrap();
             }
             self.path.join(dir_rel)
         }

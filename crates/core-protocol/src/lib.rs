@@ -1416,6 +1416,26 @@ mod tests {
         let s = serde_json::to_string(&ack).unwrap();
         assert!(s.contains(r#""type":"workspace_file_result""#), "{s}");
         assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), ack);
+
+        let hr = NodeMessage::HarnessReport {
+            harnesses: vec![DetectedHarness {
+                harness: "claude-code".into(),
+                display_name: "Claude Code".into(),
+                version: Some("1.0.0".into()),
+                sign_in: HarnessSignIn::SignedIn,
+                login_command: None,
+                capabilities: HarnessCapabilities {
+                    can_orchestrate: true,
+                    supports_resume: true,
+                    supports_mcp: true,
+                },
+                models: vec![HarnessModel { id: "opus".into(), display_name: Some("Claude Opus".into()) }],
+            }],
+        };
+        let s = serde_json::to_string(&hr).unwrap();
+        assert!(s.contains(r#""type":"harness_report""#), "{s}");
+        assert!(s.contains(r#""sign_in":"signed_in""#), "{s}");
+        assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), hr);
     }
 
     #[test]
