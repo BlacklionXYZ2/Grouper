@@ -10,8 +10,12 @@
 // defaults), "Local" (models marked local, via_device, or using a local provider
 // URL) — then "Harnesses (subscriptions)" grouped by device, then "More models…"
 // which expands all API models grouped under their provider headers (id, kind,
-// key status, via_device). Typing to filter automatically reveals matching
-// provider groups. A model reached through two providers appears under each
+// key status, via_device). Each provider header is a disclosure button with a
+// model count; groups above 12 models start collapsed (the chosen model's group
+// never does), the choice is remembered per provider, and groups above 50 show
+// the first 50 plus "Show all N". Headers take part in arrow-key navigation;
+// Enter on one toggles it. Typing to filter ignores collapse state and shows
+// every matching row. A model reached through two providers appears under each
 // provider. API models and harnesses stay clearly separate.
 
 import { h, icon, setChildren, setText, setAttr } from '../lib/dom.js';
@@ -20,6 +24,32 @@ import { store, on, isAdmin, deviceName } from '../lib/store.js';
 import { familyKey, familyMark, familyInfo } from '../lib/family.js';
 
 let providersCache = null; // the last GET /v1/providers, shared between openings
+
+// Provider groups under "More models" collapse, because a catalogue such as
+// OpenRouter's has hundreds of models. A group is collapsed by default above
+// COLLAPSE_ABOVE models; the owner's choice per provider is remembered.
+const COLLAPSE_ABOVE = 12;
+const SHOW_FIRST = 50;
+const GROUPS_KEY = 'grouper.mp.groups';
+
+function loadGroupPrefs() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GROUPS_KEY) || '{}');
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveGroupPref(pid, expanded) {
+  try {
+    const prefs = loadGroupPrefs();
+    prefs[pid] = Boolean(expanded);
+    localStorage.setItem(GROUPS_KEY, JSON.stringify(prefs));
+  } catch {
+    // storage unavailable: the choice lasts for this opening only
+  }
+}
 
 export function price(n) {
   return n < 0.1 && n > 0 ? n.toFixed(3) : n.toFixed(2);
@@ -117,7 +147,11 @@ export function openModelPicker({ role, current = '', opener = null }) {
     let done = false;
     let activeKey = null; // unique option key (since a model can appear in Suggested/Local and More models)
     let moreOpen = false;
-    let options = []; // visible option elements, in order
+    let options = []; // visible navigation items (options, group headers, "Show all" rows), in order
+    const groupPrefs = loadGroupPrefs();
+    const touched = new Set(); // providers toggled during this opening (their choice beats the defaults)
+    const showAll = new Set(); // providers whose "Show all N" row was used
+    const withCurrent = new Set(store.models.filter((m) => current && m.id === current).map((m) => m.provider_id));
 
     const titleEl = h('h2', { id: 'mp-title' }, roleTitle(role));
     const currentEl = h('p', { class: 'caption', id: 'mp-current' });
@@ -209,7 +243,8 @@ export function openModelPicker({ role, current = '', opener = null }) {
       if (e.key === 'Enter') {
         e.preventDefault();
         const el = options.find((o) => o.dataset.key === activeKey);
-        if (el && el.getAttribute('aria-disabled') !== 'true') close(el.dataset.value);
+        if (el?.dataset.action) activateNav(el);
+        else if (el && el.getAttribute('aria-disabled') !== 'true') close(el.dataset.value);
         return;
       }
       const moves = { ArrowDown: 1, ArrowUp: -1, PageDown: 8, PageUp: -8 };
@@ -231,6 +266,29 @@ export function openModelPicker({ role, current = '', opener = null }) {
       }
       setAttr(search, 'aria-activedescendant', activeEl ? activeEl.id : null);
       if (activeEl && scroll) activeEl.scrollIntoView({ block: 'nearest' });
+    }
+
+    function isExpanded(pid, count) {
+      if (touched.has(pid)) return Boolean(groupPrefs[pid]);
+      if (withCurrent.has(pid)) return true; // the chosen model's provider opens expanded
+      if (typeof groupPrefs[pid] === 'boolean') return groupPrefs[pid];
+      return count <= COLLAPSE_ABOVE;
+    }
+
+    function activateNav(el) {
+      const pid = el.dataset.pid;
+      if (el.dataset.action === 'toggle') {
+        const count = Number(el.dataset.count) || 0;
+        const next = !isExpanded(pid, count);
+        groupPrefs[pid] = next;
+        touched.add(pid);
+        saveGroupPref(pid, next);
+      } else if (el.dataset.action === 'showall') {
+        showAll.add(pid);
+      }
+      activeKey = el.dataset.key;
+      render();
+      search.focus({ preventScroll: true });
     }
 
     function providerList() {
@@ -497,33 +555,63 @@ export function openModelPicker({ role, current = '', opener = null }) {
           const p = providers.get(pid);
           const models = byProvider.get(pid).sort((a, b) => a.id.localeCompare(b.id));
           const labelId = `mp-g-${g}`;
-          const rows = models.map((m) => {
-            const opt = modelOption(m, idx++, `more:${pid}`, p);
-            if (!firstMoreKey) firstMoreKey = opt.dataset.key;
-            return opt;
-          });
+          const rowsId = `mp-rows-${g}`;
+          const total = models.length;
+          const expanded = filtering || isExpanded(pid, total);
+          const capped = expanded && !filtering && total > SHOW_FIRST && !showAll.has(pid);
+          const header = h(
+            'button',
+            {
+              type: 'button',
+              id: `mp-opt-${idx++}`,
+              class: ['mp-provider', 'mp-nav', expanded && 'is-open'],
+              'aria-expanded': expanded ? 'true' : 'false',
+              'aria-controls': rowsId,
+              tabindex: '-1',
+              dataset: { key: `more:hdr:${pid}`, action: 'toggle', pid, count: String(total) },
+              onclick: (e) => activateNav(e.currentTarget),
+            },
+            icon(expanded ? 'down' : 'chevron'),
+            h('span', { class: 'mp-provider-id', id: labelId }, `${pid || 'Unknown provider'} · ${total}`),
+            p?.kind ? h('span', { class: 'badge' }, p.kind) : null,
+            p ? h('span', { class: ['badge', p.has_key ? 'ok' : 'muted'] }, p.has_key ? 'Key set' : 'No key') : null,
+            p?.via_device ? h('span', { class: 'badge muted' }, `via ${deviceName(p.via_device)}`) : null,
+            providersKnown && !p ? h('span', { class: 'badge warn' }, 'Unknown provider') : null,
+          );
+          if (!firstMoreKey) firstMoreKey = header.dataset.key;
+          const rows = [];
+          if (expanded) {
+            for (const m of capped ? models.slice(0, SHOW_FIRST) : models) rows.push(modelOption(m, idx++, `more:${pid}`, p));
+            if (capped) {
+              rows.push(
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    id: `mp-opt-${idx++}`,
+                    class: 'mp-showall mp-nav',
+                    tabindex: '-1',
+                    dataset: { key: `more:all:${pid}`, action: 'showall', pid },
+                    onclick: (e) => activateNav(e.currentTarget),
+                  },
+                  `Show all ${total}`,
+                ),
+              );
+            }
+          }
           parts.push(
             h(
               'div',
               { class: 'mp-group', role: 'group', 'aria-labelledby': labelId },
-              h(
-                'div',
-                { class: 'mp-provider', id: labelId },
-                h('span', { class: 'visually-hidden' }, 'More models, provider '),
-                h('span', { class: 'mp-provider-id' }, pid || 'Unknown provider'),
-                p?.kind ? h('span', { class: 'badge' }, p.kind) : null,
-                p ? h('span', { class: ['badge', p.has_key ? 'ok' : 'muted'] }, p.has_key ? 'Key set' : 'No key') : null,
-                p?.via_device ? h('span', { class: 'badge muted' }, `via ${deviceName(p.via_device)}`) : null,
-                providersKnown && !p ? h('span', { class: 'badge warn' }, 'Unknown provider') : null,
-              ),
-              rows,
+              header,
+              h('div', { class: 'mp-rows', id: rowsId, role: 'none' }, rows),
             ),
           );
         });
       }
 
       setChildren(list, parts);
-      options = [...list.querySelectorAll('[role="option"]')];
+      options = [...list.querySelectorAll('[role="option"], .mp-nav')];
 
       if (!filtering && apiShown.length) {
         const providerCount = providerIds.length;
@@ -567,10 +655,10 @@ export function openModelPicker({ role, current = '', opener = null }) {
       if (!nextKey) {
         if (filtering && options.length > 1) {
           // Typing puts the first enabled match under the cursor.
-          const firstEnabled = options.find((o, i) => i > 0 && o.getAttribute('aria-disabled') !== 'true');
+          const firstEnabled = options.find((o, i) => i > 0 && !o.dataset.action && o.getAttribute('aria-disabled') !== 'true');
           nextKey = firstEnabled ? firstEnabled.dataset.key : options[0].dataset.key;
         } else {
-          const match = options.find((o) => o.dataset.value === current);
+          const match = options.find((o) => !o.dataset.action && o.dataset.value === current);
           nextKey = match ? match.dataset.key : options[0]?.dataset.key || 'default';
         }
       }
