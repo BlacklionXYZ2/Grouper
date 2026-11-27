@@ -331,6 +331,94 @@
   border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 }
 
+/* ---- activity lines (design system 3.2): one line per outcome, in the assistant's column */
+
+.chat-transcript .activity-run {
+  margin-left: 44px;
+}
+
+.activity-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.activity-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-lh);
+  color: var(--text-3);
+}
+
+.activity-line > .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.activity-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-link {
+  color: var(--text-2);
+  text-decoration: underline;
+  text-decoration-color: var(--line-3);
+  text-underline-offset: 2px;
+}
+
+.activity-link:hover {
+  color: var(--text);
+}
+
+.activity-time {
+  margin-left: auto;
+  flex: none;
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
+}
+
+.activity-fold {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-lh);
+  color: var(--text-3);
+}
+
+.activity-fold::-webkit-details-marker {
+  display: none;
+}
+
+.activity-fold > .icon {
+  width: 14px;
+  height: 14px;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.activity-details[open] > .activity-fold > .icon {
+  transform: rotate(90deg);
+}
+
+.activity-details[open] > .activity-list {
+  margin-top: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-fold > .icon {
+    transition: none;
+  }
+}
+
 /* ---- grouped threads card (V5, V6; extends W1's .thread-group in app.css) */
 
 .chat-transcript .thread-group {

@@ -18,7 +18,7 @@ import { renderMarkdown } from '../lib/md.js';
 import { store, on, conv, deviceName, deviceOnline, threadsIn, approvalsFor, approvalsIn, isAdmin } from '../lib/store.js';
 import { loadConversation, loadConversations } from '../lib/live.js';
 import { bar, navigate, statusPill, skeleton, toast, announce, sentenceSpeaker, autoGrow, toastError } from '../lib/ui.js';
-import { isActive, num, plural, usd, time } from '../lib/format.js';
+import { isActive, num, plural, usd, time, elapsed } from '../lib/format.js';
 import { familyOfId, familyMark, familyDot, familyLabel, setFamilyClass } from '../lib/family.js';
 import { mountApprovalDock } from './approvals.js';
 import { mountThreadsPanel } from './threads-panel.js';
@@ -55,6 +55,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
   const threadPlans = new Map(); // thread_id -> { done, total } from latest update_plan tool_call
   const threadGroups = new Set(); // { el, headText, list, ids }
   let activeGroup = null;
+  let activeRun = null; // the run of consecutive activity lines (design system 3.2)
   let lastSpeaker = null; // 'user' | 'assistant' | null
   let rendered = false;
   let sending = false;
@@ -522,6 +523,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
     threadPlans.clear();
     threadGroups.clear();
     activeGroup = null;
+    activeRun = null;
     lastSpeaker = null;
     const c = conv(cid);
     if (!c.events.length && !sending) {
@@ -555,6 +557,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         transcript.querySelector('.empty')?.remove();
         add(renderUserMessage(e.text, { seq: e.seq, ts: e.ts }));
         activeGroup = null;
+        activeRun = null;
         lastSpeaker = 'user';
         break;
       }
@@ -562,11 +565,13 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         transcript.querySelector('.empty')?.remove();
         add(renderAssistantMessage(e.text, { seq: e.seq, ts: e.ts, continuation: lastSpeaker === 'assistant' }));
         activeGroup = null;
+        activeRun = null;
         lastSpeaker = 'assistant';
         break;
       case 'error':
         add(h('div', { class: 'msg msg-error', role: live ? 'alert' : null }, icon('warning'), h('div', null, e.message)));
         activeGroup = null;
+        activeRun = null;
         lastSpeaker = null;
         break;
       case 'budget_warning':
@@ -574,6 +579,7 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         break;
       case 'thread_started': {
         transcript.querySelector('.empty')?.remove();
+        activeRun = null;
         if (!activeGroup) {
           activeGroup = createThreadGroup();
           threadGroups.add(activeGroup);
@@ -583,8 +589,79 @@ export function renderChat(container, { conversation: cid, thread: openThreadId,
         lastSpeaker = 'assistant';
         break;
       }
+      case 'thread_finished':
+      case 'approval_resolved':
+        addActivity(e);
+        break;
       default:
         break;
+    }
+  }
+
+  // ---- activity lines (3.2): outcomes that need no decision, one line each
+
+  function threadLink(tid, title) {
+    return h(
+      'a',
+      {
+        class: 'activity-link',
+        href: `#/chat/${enc(store.threads.get(tid)?.conversation_id || cid)}/thread/${enc(tid)}`,
+        onclick: (ev) => {
+          if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+          ev.preventDefault();
+          openThreadSheet(tid);
+        },
+      },
+      title,
+    );
+  }
+
+  /** The line for one stored event, or null when it isn't worth one. */
+  function activityLine(e) {
+    const t = e.thread_id ? store.threads.get(e.thread_id) : null;
+    const title = t?.title || 'Thread';
+    let iconName;
+    let parts;
+    if (e.kind === 'thread_finished') {
+      const tid = e.thread_id;
+      const secs = t?.created && e.ts ? Math.max(0, e.ts - t.created) : null;
+      const how = e.status === 'done' ? 'finished' : e.status === 'failed' ? 'failed' : 'stopped';
+      iconName = e.status === 'done' ? 'check' : e.status === 'failed' ? 'warning' : 'stop';
+      parts = [threadLink(tid, title), ` ${how}${secs !== null && e.status === 'done' ? ` in ${elapsed(secs)}` : ''}`];
+    } else {
+      if (e.reason === 'dropped') return null;
+      const asked = conv(cid).events.find((x) => x.kind === 'approval_requested' && x.approval_id === e.approval_id);
+      const tool = asked?.tool || 'a tool call';
+      iconName = e.approved ? 'check' : 'x';
+      parts = [`${e.approved ? 'Approved' : 'Denied'} ${tool}`];
+      if (e.thread_id && t?.title) parts.push(' in ', threadLink(e.thread_id, title));
+    }
+    const stamp = typeof e.ts === 'number' && e.ts > 0 ? h('time', { class: 'activity-time', datetime: new Date(e.ts * 1000).toISOString() }, time(e.ts)) : null;
+    return h('li', { class: 'activity-line' }, icon(iconName), h('span', { class: 'activity-text' }, ...parts), stamp);
+  }
+
+  function addActivity(e) {
+    const line = activityLine(e);
+    if (!line) return;
+    transcript.querySelector('.empty')?.remove();
+    activeGroup = null;
+    if (!activeRun) {
+      const list = h('ul', { class: 'activity-list', 'aria-label': 'Activity' });
+      const el = h('div', { class: 'activity-run' }, list);
+      activeRun = { el, list, count: 0, summary: null, details: null };
+      add(el);
+    }
+    const run = activeRun;
+    run.list.append(line);
+    run.count += 1;
+    if (run.count > 4) {
+      if (!run.details) {
+        run.summary = h('summary', { class: 'activity-fold' }, icon('chevron'), h('span', null));
+        run.details = h('details', { class: 'activity-details' }, run.summary);
+        run.el.replaceChildren(run.details);
+        run.details.append(run.list);
+      }
+      setText(run.summary.querySelector('span'), `${run.count} events`);
     }
   }
 
