@@ -158,13 +158,31 @@ pub struct WorkspaceListing {
     pub truncated: bool,
 }
 
+/// Host capability metadata reported by a node in [`NodeMessage::Hello`].
+/// Tells the hub whether this install can become the hub, its version, disk headroom,
+/// and whether `cloudflared` is installed.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct NodeHostInfo {
+    pub can_host: bool,
+    pub app_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    #[serde(default)]
+    pub cloudflared: bool,
+}
+
 /// Device → hub.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeMessage {
     /// Must be the first frame on a new connection. The device's tools are listed
     /// over MCP (`tools/list`) once the hub has welcomed it.
-    Hello { protocol_version: u32, client_version: String },
+    Hello {
+        protocol_version: u32,
+        client_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<NodeHostInfo>,
+    },
     /// One MCP JSON-RPC message from the device's MCP server to the hub's client.
     Mcp { message: Value },
     /// Ask the hub to relay a model call to the device named by the provider's
@@ -197,6 +215,19 @@ pub enum NodeMessage {
         ok: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    /// Hub move: progress or acknowledgement from the target node.
+    HubMoveStatus {
+        move_id: String,
+        /// `copying`, `ready`, `switched`, or `failed`.
+        stage: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress_pct: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// Optional direct URL where the new hub is reachable (for LAN/local confirmation).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_url: Option<String>,
     },
 }
 
@@ -252,6 +283,29 @@ pub enum HubMessage {
     /// away. Write it into that thread's workspace (`path` is workspace-relative, with
     /// `/`) before the thread's `StartThread`, which follows on the same connection.
     WorkspaceFile { thread_id: String, path: String, content_base64: String },
+    /// Hub move: offer a one-time ticket to the target node so it can download the
+    /// snapshot (`GET /v1/hub/move/{ticket}/snapshot`) and fetch encrypted secrets.
+    HubMoveOffer {
+        move_id: String,
+        ticket: String,
+        target_device_id: String,
+        current_epoch: u64,
+        snapshot_bytes: u64,
+        snapshot_sha256: String,
+    },
+    /// Hub move: tell the target node to commit the switch (`hub_device_id` -> target,
+    /// `epoch` -> `new_epoch`) while the old hub stops serving.
+    HubMoveCommit {
+        move_id: String,
+        ticket: String,
+        target_device_id: String,
+        new_epoch: u64,
+    },
+    /// Hub move: cancel an in-progress move so the target discards its staging folder.
+    HubMoveAbort {
+        move_id: String,
+        reason: String,
+    },
 }
 
 /// A tool definition as models see it.
@@ -479,6 +533,22 @@ pub enum EventBody {
         online: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device: Option<DeviceInfo>,
+    },
+    /// Hub move progress (live only, seq 0, never stored).
+    HubMoveProgress {
+        move_id: String,
+        /// `idle`, `preparing`, `copying`, `switching`, `done`, or `rolled_back`.
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_device_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress_pct: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 
@@ -1149,10 +1219,29 @@ mod tests {
 
     #[test]
     fn frames_round_trip() {
-        let m = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "0.1.0".into() };
+        let m = NodeMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "0.1.0".into(),
+            host: Some(NodeHostInfo {
+                can_host: true,
+                app_version: "0.1.0".into(),
+                free_bytes: Some(1_000_000),
+                cloudflared: true,
+            }),
+        };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""type":"hello""#));
+        assert!(s.contains(r#""can_host":true"#));
         assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), m);
+        // Legacy hello without host field still deserializes cleanly.
+        let legacy: NodeMessage = serde_json::from_str(
+            r#"{"type":"hello","protocol_version":6,"client_version":"0.1.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy,
+            NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "0.1.0".into(), host: None }
+        );
 
         let rpc = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let h = HubMessage::Mcp { message: rpc.clone() };

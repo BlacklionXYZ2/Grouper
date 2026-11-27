@@ -19,8 +19,8 @@ use core_agent::thread::{ApprovalDecision, ThreadControl, ThreadHost, spawn_thre
 use core_agent::tools::{Workspace, file_tools, shell_tool};
 use core_agent::{Tool, ToolOutput};
 use core_protocol::{
-    AgentEvent, Capability, DeviceInfo, HubMessage, MAX_WS_MESSAGE_BYTES, NodeMessage, PING_INTERVAL_SECS,
-    PROTOCOL_VERSION, ProviderConfig, ThreadSpec, ToolDef,
+    AgentEvent, Capability, DeviceInfo, HubMessage, MAX_WS_MESSAGE_BYTES, NodeHostInfo, NodeMessage,
+    PING_INTERVAL_SECS, PROTOCOL_VERSION, ProviderConfig, ThreadSpec, ToolDef,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -62,11 +62,97 @@ pub enum Status {
     Unauthorized,
 }
 
+/// Hub move offer delivered to a target node over its WebSocket connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubMoveOfferInfo {
+    pub move_id: String,
+    pub ticket: String,
+    pub target_device_id: String,
+    pub current_epoch: u64,
+    pub snapshot_bytes: u64,
+    pub snapshot_sha256: String,
+}
+
+/// Hub move commit signal delivered to a target node when the old hub is ready to switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubMoveCommitInfo {
+    pub move_id: String,
+    pub ticket: String,
+    pub target_device_id: String,
+    pub new_epoch: u64,
+}
+
 pub trait Events: Send + Sync + 'static {
     fn status(&self, status: Status);
     fn presence(&self, devices: Vec<DeviceInfo>);
     /// A thread started (`running`) or ended (`done`/`failed`/`stopped`) on this device.
     fn thread(&self, _thread_id: &str, _title: &str, _state: &str) {}
+    /// The current hub offered this node a move ticket (`HubMessage::HubMoveOffer`).
+    fn hub_move_offer(&self, _offer: HubMoveOfferInfo) {}
+    /// The current hub told this node to commit a staged hub move (`HubMessage::HubMoveCommit`).
+    fn hub_move_commit(&self, _commit: HubMoveCommitInfo) {}
+    /// The current hub aborted an in-progress move (`HubMessage::HubMoveAbort`).
+    fn hub_move_abort(&self, _move_id: &str, _reason: &str) {}
+}
+
+/// Detect whether this device can host Grouper, its client version, and whether `cloudflared` is installed.
+pub fn detect_host_info() -> NodeHostInfo {
+    NodeHostInfo {
+        can_host: cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+        app_version: CLIENT_VERSION.to_string(),
+        free_bytes: None,
+        cloudflared: has_cloudflared(),
+    }
+}
+
+fn has_cloudflared() -> bool {
+    let names: &[&str] = if cfg!(windows) { &["cloudflared.exe", "cloudflared"] } else { &["cloudflared"] };
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            for name in names {
+                if is_executable_file(&dir.join(name)) {
+                    return true;
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    let extra = {
+        let mut paths = vec![
+            PathBuf::from(r"C:\Program Files (x86)\cloudflared\cloudflared.exe"),
+            PathBuf::from(r"C:\Program Files\cloudflared\cloudflared.exe"),
+        ];
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            paths.push(PathBuf::from(local).join("cloudflared").join("cloudflared.exe"));
+        }
+        paths
+    };
+    #[cfg(not(windows))]
+    let extra = vec![
+        PathBuf::from("/opt/homebrew/bin/cloudflared"),
+        PathBuf::from("/usr/local/bin/cloudflared"),
+        PathBuf::from("/usr/bin/cloudflared"),
+        PathBuf::from("/snap/bin/cloudflared"),
+    ];
+    extra.iter().any(|p| is_executable_file(p))
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,7 +183,18 @@ enum Outcome {
 }
 
 /// Run until `shutdown` becomes true or the hub rejects the token.
-pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn Events>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn Events>, shutdown: watch::Receiver<bool>) {
+    run_with_host(config, Some(detect_host_info()), handler, events, shutdown).await;
+}
+
+/// Like [`run`], but reports an explicit [`NodeHostInfo`] in the `Hello` frame (or `None` to omit it).
+pub async fn run_with_host(
+    config: Config,
+    host_info: Option<NodeHostInfo>,
+    handler: Arc<dyn ToolHandler>,
+    events: Arc<dyn Events>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let url = match core_protocol::connect_url(&config.hub_url) {
         Ok(u) => u,
         Err(e) => {
@@ -123,7 +220,7 @@ pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn 
         events.status(Status::Connecting);
         let started = tokio::time::Instant::now();
         let outcome = tokio::select! {
-            o = connect_once(&url, &config, &handler, &events, &host, &folders) => o,
+            o = connect_once(&url, &config, host_info.as_ref(), &handler, &events, &host, &folders) => o,
             _ = shutdown.changed() => Outcome::Stop,
         };
         match outcome {
@@ -351,6 +448,7 @@ fn start_thread(
 async fn connect_once(
     url: &str,
     config: &Config,
+    host_info: Option<&NodeHostInfo>,
     handler: &Arc<dyn ToolHandler>,
     events: &Arc<dyn Events>,
     host: &Arc<McpHost>,
@@ -383,7 +481,11 @@ async fn connect_once(
     };
     let (mut sink, mut stream) = ws.split();
 
-    let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: CLIENT_VERSION.into() };
+    let hello = NodeMessage::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_version: CLIENT_VERSION.into(),
+        host: host_info.cloned(),
+    };
     if let Err(e) = sink.send(Message::Text(serde_json::to_string(&hello).unwrap().into())).await {
         return Outcome::Retry(e.to_string());
     }
@@ -500,6 +602,34 @@ async fn connect_once(
                             return Outcome::Retry("outgoing queue full".into());
                         }
                     }
+                    Ok(HubMessage::HubMoveOffer {
+                        move_id,
+                        ticket,
+                        target_device_id,
+                        current_epoch,
+                        snapshot_bytes,
+                        snapshot_sha256,
+                    }) => {
+                        events.hub_move_offer(HubMoveOfferInfo {
+                            move_id,
+                            ticket,
+                            target_device_id,
+                            current_epoch,
+                            snapshot_bytes,
+                            snapshot_sha256,
+                        });
+                    }
+                    Ok(HubMessage::HubMoveCommit { move_id, ticket, target_device_id, new_epoch }) => {
+                        events.hub_move_commit(HubMoveCommitInfo {
+                            move_id,
+                            ticket,
+                            target_device_id,
+                            new_epoch,
+                        });
+                    }
+                    Ok(HubMessage::HubMoveAbort { move_id, reason }) => {
+                        events.hub_move_abort(&move_id, &reason);
+                    }
                     Ok(HubMessage::Pong) => {}
                     Ok(HubMessage::Error { message }) => {
                         tracing::warn!("hub error: {message}");
@@ -520,6 +650,23 @@ mod tests {
     use super::*;
     use core_protocol::Permission;
     use serde_json::json;
+
+    #[test]
+    fn detect_host_info_reports_desktop_capability_and_version() {
+        let info = detect_host_info();
+        assert_eq!(info.app_version, CLIENT_VERSION);
+        let expected_can_host = cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"));
+        assert_eq!(info.can_host, expected_can_host);
+        let hello = NodeMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_version: CLIENT_VERSION.into(),
+            host: Some(info.clone()),
+        };
+        let encoded = serde_json::to_value(&hello).unwrap();
+        assert_eq!(encoded["type"], "hello");
+        assert_eq!(encoded["host"]["can_host"], expected_can_host);
+        assert_eq!(encoded["host"]["app_version"], CLIENT_VERSION);
+    }
 
     #[test]
     fn approval_nonce_is_fresh_for_each_connection() {

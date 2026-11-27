@@ -590,6 +590,16 @@ fn print_event(e: &Event) {
         EventBody::DevicePresence { device_id, online, .. } => {
             println!("  · device {device_id} {}", if *online { "online" } else { "offline" });
         }
+        EventBody::HubMoveProgress { state, target_name, progress_pct, message, error, .. } => {
+            let who = target_name.as_deref().unwrap_or("target");
+            let pct = progress_pct.map(|p| format!(" ({p}%)")).unwrap_or_default();
+            let detail = error.as_deref().or(message.as_deref()).unwrap_or("");
+            if detail.is_empty() {
+                println!("  · hub move → {who}: {state}{pct}");
+            } else {
+                println!("  · hub move → {who}: {state}{pct} — {detail}");
+            }
+        }
     }
 }
 

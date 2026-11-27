@@ -10,6 +10,7 @@ pub mod limits;
 pub mod link;
 pub mod mcp;
 pub mod memory;
+pub mod migrate;
 pub mod offline;
 pub mod orchestrator;
 pub mod probes;
