@@ -9,6 +9,30 @@ Owner's request: "The costs and usage section should be a tab at the bottom whic
 sections." (1) API costs with a donut by API key, a Day / Week / Month meter, and token counts per key
 and per model. (2) Subscription usage meters per provider, showing whatever windows each plan has.
 
+## Owner decisions (27 November 2026)
+
+These override anything below that disagrees.
+
+1. **Periods:** rolling, in local time: today, last 7 days, last 30 days (section 4.1 as written).
+2. **iPhone tabs:** Chat · Usage · Devices · More (section 2 as written).
+3. **Grok:** build the probe, with its own off switch.
+4. **Subscription usage belongs to the whole account**, like the harnesses themselves: every device
+   sees every plan's meters. Consequences:
+   - **Reading is on by default** on any device where a harness is signed in. The device keeps a local
+     off switch (whole device, or per provider); there is no remote switch. Section 5.6's "turn it on"
+     flow becomes "turn it off", and the "Opt-in needed" state in 5.4 becomes "Reading is off on that
+     device".
+   - **Same account, proven, not guessed.** Each probe reports `account_key`, an opaque fingerprint of
+     the subscription account (hex of the first 16 bytes of SHA-256 of
+     `"grouper-sub-account:" + provider + ":" + the account's stable id`, computed on the device; the
+     raw id never leaves it). Cards merge by provider and `account_key`: one card naming every device
+     when the keys match, separate cards when they differ (Claude signed in to two different accounts),
+     and one card per device when a probe can't read an id. This replaces the "agree within 5 points"
+     rule in 5.1 and open question 7.
+5. Open questions 3, 6 and 8 follow the recommendations: colours are changeable, the donut falls back to
+   token share when nothing cost money, and native Breakdown and Limits show "Coming to this app" until
+   built.
+
 ## 1. What changes, in one page
 
 - **Usage becomes a top-level destination everywhere**, and a tab on the phone.
