@@ -1,5 +1,6 @@
 //! Encryption for secrets stored by the hub.
 
+use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,6 @@ use chacha20poly1305::{
 const ENV_KEY: &str = "GROUPER_MASTER_KEY";
 const ENV_KEY_FILE: &str = "GROUPER_MASTER_KEY_FILE";
 pub(crate) const PLAIN_KEY_FILE: &str = "master.key";
-#[cfg(any(windows, test))]
 pub(crate) const DPAPI_KEY_FILE: &str = "master.key.dpapi";
 #[cfg(windows)]
 const DPAPI_PREFIX: &str = "dpapi:";
@@ -23,6 +23,28 @@ const KEYCHAIN_SERVICE: &str = "uk.clockmillbarn.grouper.hub";
 const PREFIX: &str = "enc:v1:";
 const KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 24;
+
+thread_local! {
+    static SUPPRESS_MIGRATION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` without migrating/deleting a plain `master.key` file (used by `backup::restore`
+/// so a plain `master.key` placed before `restore` stays in place until the next hub start).
+pub(crate) fn without_migration<T>(f: impl FnOnce() -> T) -> T {
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SUPPRESS_MIGRATION.with(|flag| flag.set(self.0));
+        }
+    }
+    let prev = SUPPRESS_MIGRATION.with(|flag| {
+        let old = flag.get();
+        flag.set(true);
+        old
+    });
+    let _guard = Guard(prev);
+    f()
+}
 
 pub struct Secrets {
     cipher: XChaCha20Poly1305,
@@ -34,8 +56,51 @@ impl Secrets {
     }
 
     pub(crate) fn load_with_create(data_dir: &Path, allow_create: bool) -> Result<Self> {
-        let key = load_key_bytes(data_dir, allow_create, true)?;
+        let allow_migrate = !SUPPRESS_MIGRATION.with(Cell::get);
+        let key = load_key_bytes(data_dir, allow_create, allow_migrate)?;
         Ok(Self::from_key(key))
+    }
+
+    /// Load an existing master key for `backup::restore` verification without creating a new key
+    /// and without migrating/deleting a plain `master.key`. If a plain `master.key` was placed in
+    /// `data_dir` for `--force` restore, prefer it over a previous hub's protected key.
+    pub(crate) fn load_for_restore(data_dir: &Path) -> Result<Self> {
+        if std::env::var_os(ENV_KEY).is_some() {
+            let key = load_key_bytes(data_dir, false, false).context("reading GROUPER_MASTER_KEY")?;
+            return Ok(Self::from_key(key));
+        }
+        if let Some(explicit) = std::env::var_os(ENV_KEY_FILE) {
+            let path = PathBuf::from(explicit);
+            if !path.is_file() {
+                bail!(
+                    "master key missing ({}). This backup does not contain the master key. Restore the same \
+                     key with {ENV_KEY} or {ENV_KEY_FILE} (Docker: /secrets/master.key) \
+                     before restoring, or provider keys cannot be decrypted. Nothing was restored",
+                    path.display()
+                );
+            }
+            let key = load_or_create_plain_file(&path, data_dir, false)
+                .with_context(|| format!("reading master key {}", path.display()))?;
+            return Ok(Self::from_key(key));
+        }
+        let plain_path = data_dir.join(PLAIN_KEY_FILE);
+        if plain_path.is_file() {
+            let key = load_or_create_plain_file(&plain_path, data_dir, false)
+                .with_context(|| format!("reading master key {}", plain_path.display()))?;
+            return Ok(Self::from_key(key));
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Some(encoded) = read_protected_key(data_dir)? {
+            let key = decode_key(encoded.trim())
+                .with_context(|| format!("invalid protected master key for {}", data_dir.display()))?;
+            return Ok(Self::from_key(key));
+        }
+        bail!(
+            "master key missing ({}). This backup does not contain the master key. Restore the same \
+             key with {ENV_KEY} or {ENV_KEY_FILE} (Docker: /secrets/master.key) \
+             before restoring, or provider keys cannot be decrypted. Nothing was restored",
+            plain_path.display()
+        )
     }
 
     pub(crate) fn from_key(key: [u8; KEY_BYTES]) -> Self {
@@ -160,12 +225,19 @@ fn load_key_bytes(data_dir: &Path, allow_create: bool, allow_migrate: bool) -> R
 
     #[cfg(any(windows, target_os = "macos"))]
     {
+        let plain_path = data_dir.join(PLAIN_KEY_FILE);
+        if !allow_migrate && plain_path.is_file() {
+            let raw = fs::read_to_string(&plain_path)
+                .with_context(|| format!("reading master key file {}", plain_path.display()))?;
+            return decode_key(raw.trim())
+                .with_context(|| format!("invalid master key file {}", plain_path.display()));
+        }
+
         if let Some(encoded) = read_protected_key(data_dir)? {
             return decode_key(encoded.trim())
                 .with_context(|| format!("invalid protected master key for {}", data_dir.display()));
         }
 
-        let plain_path = data_dir.join(PLAIN_KEY_FILE);
         match fs::metadata(&plain_path) {
             Ok(_) => {
                 if allow_migrate {
