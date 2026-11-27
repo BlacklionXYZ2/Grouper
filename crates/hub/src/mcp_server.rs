@@ -304,6 +304,20 @@ mod tests {
         let remote = post(endpoint(&run.lan_base, &chat_a), Some(token_a.clone())).await;
         assert_eq!(remote.status(), reqwest::StatusCode::FORBIDDEN);
 
+        // A reverse proxy in front of loopback (Cloudflare adds cf-ray) is not loopback.
+        let tunneled = run
+            .http
+            .post(endpoint(&run.base, &chat_a))
+            .header("accept", ACCEPT)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token_a}"))
+            .header("cf-ray", "8a1b2c3d4e5f6a7b-LHR")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(tunneled.status(), reqwest::StatusCode::FORBIDDEN);
+
         let ok = post(endpoint(&run.base, &chat_a), Some(token_a.clone())).await;
         assert_eq!(ok.status(), reqwest::StatusCode::OK);
         assert!(ok.headers().get("mcp-session-id").is_some(), "initialize should open an MCP session");
