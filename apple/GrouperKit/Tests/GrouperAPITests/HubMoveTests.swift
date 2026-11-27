@@ -368,6 +368,23 @@ final class HubMoveTests: XCTestCase {
         XCTAssertTrue(HubMoveClient.hubLacksMoveAPI(HubClientError.notFound("not found")))
         XCTAssertTrue(HubMoveClient.hubLacksMoveAPI(HubClientError.server(status: 405, message: "")))
     }
+
+    func testStartMoveRefusesABlankGoogleIDTokenWithoutPosting() async throws {
+        let session = HubMoveStub.session { _ in
+            (500, #"{"error":"should not be called"}"#)
+        }
+        let client = try HubMoveClient(baseURL: "https://hub.test", token: "admin.secret", session: session)
+        do {
+            _ = try await client.startMove(targetDevice: "d_mac", idToken: "  ")
+            XCTFail("expected a blank id_token to be refused")
+        } catch {
+            XCTAssertEqual(
+                error as? HubClientError,
+                .badRequest("A fresh Google sign-in is required to move the hub.")
+            )
+        }
+        XCTAssertTrue(HubMoveStub.requests.isEmpty)
+    }
 }
 
 /// Answers requests from a closure and records them, matching the existing URLProtocol stubs.

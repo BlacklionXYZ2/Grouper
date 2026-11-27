@@ -359,12 +359,15 @@ public enum MoveThreadsMode: String, Codable, Equatable, Hashable, Sendable {
 }
 
 /// Request body for `POST /v1/hub/move` (admin + fresh Google ID token).
+/// `idToken` is the Google ID token from a sign-in that used a nonce just issued by
+/// `POST /v1/auth/google/nonce`: the hub requires it (issued within 5 minutes, bound to
+/// that one-time nonce, and from the hub owner's account). Wire name: `id_token`.
 public struct StartMoveRequest: Codable, Equatable, Sendable {
     public let targetDevice: String
-    public let idToken: String?
+    public let idToken: String
     public let threads: MoveThreadsMode
 
-    public init(targetDevice: String, idToken: String?, threads: MoveThreadsMode = .wait) {
+    public init(targetDevice: String, idToken: String, threads: MoveThreadsMode = .wait) {
         self.targetDevice = targetDevice
         self.idToken = idToken
         self.threads = threads
@@ -649,12 +652,17 @@ public actor HubMoveClient {
     }
 
     /// `POST /v1/hub/move` (admin + fresh Google ID token): preflight and start a hub move.
+    /// `idToken` must be the token from `GoogleSignIn.idToken` for a nonce from `POST /v1/auth/google/nonce`.
     public func startMove(
         targetDevice: String,
-        idToken: String?,
+        idToken: String,
         threads: MoveThreadsMode = .wait
     ) async throws -> MoveStatus {
-        let body = StartMoveRequest(targetDevice: targetDevice, idToken: idToken, threads: threads)
+        let token = idToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.isEmpty {
+            throw HubClientError.badRequest("A fresh Google sign-in is required to move the hub.")
+        }
+        let body = StartMoveRequest(targetDevice: targetDevice, idToken: token, threads: threads)
         return try await send(["v1", "hub", "move"], method: "POST", body: body)
     }
 
