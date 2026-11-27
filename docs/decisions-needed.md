@@ -105,6 +105,21 @@ Open design points (no action yet):
   else gets the app.
 - **Mac as hub** (design package 11) waits until a real PC → other-machine move has worked.
 
+## Models and harnesses (27 November 2026)
+
+Built as `docs/models-and-harnesses-design.md` describes. Open points, each with the recommendation the build follows:
+
+- **May the orchestrator give threads to a harness on its own?** Today it only does when asked by
+  name. Recommendation: keep it off by default; add a per-harness switch "use for threads
+  automatically", skipped when that subscription's plan window is above 90 %.
+- **Harness detection reads whether Claude/Codex credential files exist and are unexpired** on every
+  device, without the usage-probe opt-in (only "signed in / expired / not signed in" leaves the
+  device). Recommendation: keep.
+- **Try it on your PC:** with Claude Code signed in on the hub's computer, pick "Claude Code" as a
+  project chat's orchestrator. Check that it only uses Grouper's tools, that a second message
+  continues the same session, and that threads start. Many CLI flags are marked "VERIFY" in
+  `crates/core-client/src/harness.rs`.
+
 ## Housekeeping (no decision needed, just actions)
 
 - **Hub model:** the online hub now uses free OpenRouter models, swapping to another free
