@@ -598,4 +598,176 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap().trim(), first.trim());
         fs::remove_dir_all(dir).ok();
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dpapi_protected_round_trip() {
+        let dir = std::env::temp_dir().join(format!("grouper-secrets-dpapi-{}", crate::db::random_hex(6)));
+        let first = Secrets::load(&dir).unwrap();
+        let dpapi_path = dir.join(DPAPI_KEY_FILE);
+        let plain_path = dir.join(PLAIN_KEY_FILE);
+        assert!(dpapi_path.is_file(), "expected {}", dpapi_path.display());
+        assert!(!plain_path.exists(), "plain master.key must not be created on Windows");
+
+        let on_disk = fs::read_to_string(&dpapi_path).unwrap();
+        assert!(on_disk.starts_with(DPAPI_PREFIX));
+        let key_b64 = read_master_key_b64(&dir).unwrap();
+        assert!(!on_disk.contains(&key_b64), "raw key must not appear in master.key.dpapi");
+
+        let sealed = first.seal("provider-key-win").unwrap();
+        let second = Secrets::load(&dir).unwrap();
+        assert_eq!(second.open(&sealed).unwrap(), "provider-key-win");
+
+        // write_master_key_b64 lands DPAPI-protected in a target directory without plain master.key.
+        let target_dir = dir.join("moved-target");
+        write_master_key_b64(&target_dir, &key_b64).unwrap();
+        assert!(target_dir.join(DPAPI_KEY_FILE).is_file());
+        assert!(!target_dir.join(PLAIN_KEY_FILE).exists());
+        assert_eq!(Secrets::load(&target_dir).unwrap().open(&sealed).unwrap(), "provider-key-win");
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn migration_deletes_plain_file_only_after_verified_read_back() {
+        let dir = std::env::temp_dir().join(format!("grouper-secrets-migrate-{}", crate::db::random_hex(6)));
+        fs::create_dir_all(&dir).unwrap();
+        let plain_path = dir.join(PLAIN_KEY_FILE);
+        let raw_key = [0x5Au8; KEY_BYTES];
+        let encoded = STANDARD.encode(raw_key);
+        fs::write(&plain_path, format!("{encoded}\n")).unwrap();
+
+        // Write failure -> plain file stays intact.
+        assert!(
+            migrate_plain_file_with(&plain_path, |_| bail!("simulated write failure"), || unreachable!())
+                .is_err()
+        );
+        assert!(plain_path.is_file());
+
+        // Missing read-back -> plain file stays intact.
+        assert!(migrate_plain_file_with(&plain_path, |_| Ok(()), || Ok(None)).is_err());
+        assert!(plain_path.is_file());
+
+        // Mismatched read-back -> plain file stays intact.
+        let wrong_b64 = STANDARD.encode([0x11u8; KEY_BYTES]);
+        assert!(migrate_plain_file_with(&plain_path, |_| Ok(()), || Ok(Some(wrong_b64.clone()))).is_err());
+        assert!(plain_path.is_file());
+        assert_eq!(fs::read_to_string(&plain_path).unwrap().trim(), encoded);
+
+        // Identical verified read-back -> deletes plain file and returns the exact key.
+        let stored = std::cell::RefCell::new(None);
+        let migrated = migrate_plain_file_with(
+            &plain_path,
+            |v| {
+                *stored.borrow_mut() = Some(v.to_string());
+                Ok(())
+            },
+            || Ok(stored.borrow().clone()),
+        )
+        .unwrap();
+        assert_eq!(migrated, raw_key);
+        assert!(!plain_path.exists(), "plain master.key must be deleted after verified read-back");
+
+        #[cfg(windows)]
+        {
+            // Real DPAPI migration on Windows: plain master.key -> master.key.dpapi, plain deleted.
+            let win_dir = dir.join("real-win-migrate");
+            fs::create_dir_all(&win_dir).unwrap();
+            let win_plain = win_dir.join(PLAIN_KEY_FILE);
+            fs::write(&win_plain, format!("{encoded}\n")).unwrap();
+            let pre_sealed = Secrets::from_key(raw_key).seal("migrated-secret").unwrap();
+
+            let loaded = Secrets::load(&win_dir).unwrap();
+            assert_eq!(loaded.open(&pre_sealed).unwrap(), "migrated-secret");
+            assert!(win_dir.join(DPAPI_KEY_FILE).is_file());
+            assert!(!win_plain.exists());
+
+            // Subsequent load reads from DPAPI and still decrypts.
+            let loaded_again = Secrets::load(&win_dir).unwrap();
+            assert_eq!(loaded_again.open(&pre_sealed).unwrap(), "migrated-secret");
+        }
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    const CHILD_MODE_ENV: &str = "GROUPER_SECRETS_TEST_CHILD";
+
+    #[test]
+    fn env_var_wins_and_server_mode_key_file_is_unchanged() {
+        if let Ok(mode) = std::env::var(CHILD_MODE_ENV) {
+            let root = PathBuf::from(std::env::var("GROUPER_SECRETS_TEST_DIR").unwrap());
+            match mode.as_str() {
+                "env_wins" => {
+                    let data_dir = root.join("data");
+                    let env_expected = [0x33u8; KEY_BYTES];
+                    let sealed_by_env = Secrets::from_key(env_expected).seal("from-env").unwrap();
+                    let loaded = Secrets::load(&data_dir).unwrap();
+                    assert_eq!(loaded.open(&sealed_by_env).unwrap(), "from-env");
+                    assert_eq!(read_master_key_b64(&data_dir).unwrap(), STANDARD.encode(env_expected));
+                    // Plain master.key in data_dir must remain untouched when GROUPER_MASTER_KEY is set.
+                    assert!(data_dir.join(PLAIN_KEY_FILE).is_file());
+                }
+                "server_file" => {
+                    let data_dir = root.join("server-data");
+                    fs::create_dir_all(&data_dir).unwrap();
+                    let key_file = PathBuf::from(std::env::var(ENV_KEY_FILE).unwrap());
+                    assert!(!key_file.exists());
+
+                    let first = Secrets::load(&data_dir).unwrap();
+                    assert!(key_file.is_file(), "server mode must create GROUPER_MASTER_KEY_FILE");
+                    let raw = fs::read_to_string(&key_file).unwrap();
+                    let decoded = decode_key(raw.trim()).unwrap();
+                    assert_eq!(STANDARD.encode(decoded), raw.trim());
+                    assert!(!data_dir.join(PLAIN_KEY_FILE).exists());
+                    assert!(!data_dir.join(DPAPI_KEY_FILE).exists());
+
+                    let sealed = first.seal("docker-secret").unwrap();
+                    let second = Secrets::load(&data_dir).unwrap();
+                    assert_eq!(second.open(&sealed).unwrap(), "docker-secret");
+                    assert!(key_file.is_file(), "server mode must never migrate/delete GROUPER_MASTER_KEY_FILE");
+                    assert_eq!(read_master_key_b64(&data_dir).unwrap(), raw.trim());
+                }
+                other => panic!("unknown child mode {other}"),
+            }
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("grouper-secrets-env-{}", crate::db::random_hex(6)));
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        // Populate both protected store (on desktop) and a plain master.key, plus a key file, all with different keys.
+        write_master_key_b64(&data_dir, &STANDARD.encode([0x11u8; KEY_BYTES])).unwrap();
+        fs::write(data_dir.join(PLAIN_KEY_FILE), format!("{}\n", STANDARD.encode([0x22u8; KEY_BYTES]))).unwrap();
+        let other_file = root.join("other-master.key");
+        fs::write(&other_file, format!("{}\n", STANDARD.encode([0x44u8; KEY_BYTES]))).unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+
+        // 1. GROUPER_MASTER_KEY wins over GROUPER_MASTER_KEY_FILE, protected store, and plain master.key.
+        let status = std::process::Command::new(&exe)
+            .args(["--exact", "secrets::tests::env_var_wins_and_server_mode_key_file_is_unchanged", "--nocapture"])
+            .env(CHILD_MODE_ENV, "env_wins")
+            .env("GROUPER_SECRETS_TEST_DIR", &root)
+            .env(ENV_KEY, STANDARD.encode([0x33u8; KEY_BYTES]))
+            .env(ENV_KEY_FILE, &other_file)
+            .status()
+            .unwrap();
+        assert!(status.success(), "env_wins child failed");
+
+        // 2. Server mode with GROUPER_MASTER_KEY_FILE creates/reads plain file and never uses DPAPI/Keychain.
+        let server_key_file = root.join("secrets-vol").join("master.key");
+        let status = std::process::Command::new(&exe)
+            .args(["--exact", "secrets::tests::env_var_wins_and_server_mode_key_file_is_unchanged", "--nocapture"])
+            .env(CHILD_MODE_ENV, "server_file")
+            .env("GROUPER_SECRETS_TEST_DIR", &root)
+            .env_remove(ENV_KEY)
+            .env(ENV_KEY_FILE, &server_key_file)
+            .status()
+            .unwrap();
+        assert!(status.success(), "server_file child failed");
+
+        let _ = remove_master_key(&data_dir);
+        fs::remove_dir_all(root).ok();
+    }
 }
