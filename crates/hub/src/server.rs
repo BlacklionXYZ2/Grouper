@@ -159,6 +159,8 @@ pub struct Hub {
     pub(crate) tunnel: crate::tunnel::TunnelState,
     /// Step-down detection state ([`crate::stepdown`]).
     pub(crate) stepdown: crate::stepdown::StepDownState,
+    /// Hub move state machine ([`crate::migrate`]).
+    pub(crate) migrate: crate::migrate::MigrateState,
     /// Last-seen host capability metadata per device id ([`crate::devices`]).
     pub(crate) host_info: std::sync::Mutex<HashMap<String, core_protocol::NodeHostInfo>>,
 }
@@ -191,6 +193,7 @@ impl Hub {
             link: Default::default(),
             tunnel: crate::tunnel::TunnelState::new(),
             stepdown: crate::stepdown::StepDownState::new(),
+            migrate: crate::migrate::MigrateState::new(),
             host_info: std::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -208,6 +211,16 @@ impl Hub {
     /// Whether this hub has stepped down after detecting a higher-epoch peer hub.
     pub fn is_stepped_down(&self) -> bool {
         self.stepdown.is_stepped_down()
+    }
+
+    /// Hub move state machine and progress.
+    pub fn migrate(&self) -> &crate::migrate::MigrateState {
+        &self.migrate
+    }
+
+    /// Whether writes are currently paused for an active hub move.
+    pub fn is_move_paused(&self) -> bool {
+        self.migrate.is_paused()
     }
 
     /// [`Db::issue_device`], then the live side of a reused device: its old token's browser sessions
@@ -443,6 +456,7 @@ impl Hub {
 
     /// A user's message: create the conversation if needed and wake its agent.
     pub async fn chat(self: &Arc<Self>, req: ChatRequest) -> anyhow::Result<String> {
+        anyhow::ensure!(!self.is_move_paused(), "Your hub is moving");
         let text = req.text.trim().to_string();
         anyhow::ensure!(!text.is_empty(), "message is empty");
         let requested = req.model.as_deref().map(str::trim).filter(|model| !model.is_empty()).map(str::to_string);
@@ -611,8 +625,10 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::push::routes())
         .merge(crate::tunnel::routes())
         .merge(crate::devices::routes())
+        .merge(crate::migrate::routes())
         .merge(crate::web::routes())
-        .with_state(hub)
+        .with_state(hub.clone())
+        .layer(axum::middleware::from_fn_with_state(hub, crate::migrate::pause_guard))
         .layer(axum::middleware::from_fn(crate::session::guard))
         .layer(axum::middleware::from_fn(crate::session::response_security))
 }
@@ -1373,7 +1389,11 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                     hub.workspace_file_result(&device_id, conn_id, &thread_id, path, ok, error).await;
                 }
             }
-            Ok(NodeMessage::HubMoveStatus { .. }) => {}
+            Ok(NodeMessage::HubMoveStatus { move_id, stage, progress_pct, error, target_url }) => {
+                if hub.is_live_conn(&device_id, conn_id).await {
+                    hub.handle_move_status(&device_id, &move_id, &stage, progress_pct, error, target_url).await;
+                }
+            }
             Ok(NodeMessage::Hello { .. }) => {
                 if let Err(mpsc::error::TrySendError::Full(_)) =
                     tx.try_send(HubMessage::Error { message: "already said hello".into() })

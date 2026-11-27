@@ -56,7 +56,13 @@ pub struct HubHandle {
 
 /// Start the hub in local mode on `binds` (`127.0.0.1:47600`, `127.0.0.1:0` in tests, etc.).
 pub async fn start(data_dir: impl AsRef<Path>, binds: &[SocketAddr]) -> Result<HubHandle> {
-    start_with_options(data_dir, binds, Options::default()).await
+    start_inner(data_dir, binds, Options::default(), false).await
+}
+
+/// Start the hub in local mode initially paused for a hub-move switch (refuses writes with 503
+/// until [`crate::migrate::MigrateState::set_paused`] is cleared).
+pub async fn start_paused(data_dir: impl AsRef<Path>, binds: &[SocketAddr]) -> Result<HubHandle> {
+    start_inner(data_dir, binds, Options::default(), true).await
 }
 
 /// Start the hub with explicit [`Options`] (used by `grouper-hub serve` for server mode).
@@ -64,6 +70,15 @@ pub async fn start_with_options(
     data_dir: impl AsRef<Path>,
     binds: &[SocketAddr],
     options: Options,
+) -> Result<HubHandle> {
+    start_inner(data_dir, binds, options, false).await
+}
+
+async fn start_inner(
+    data_dir: impl AsRef<Path>,
+    binds: &[SocketAddr],
+    options: Options,
+    start_paused: bool,
 ) -> Result<HubHandle> {
     ensure!(!binds.is_empty(), "at least one bind address is required");
     let data_dir = data_dir.as_ref().to_path_buf();
@@ -82,6 +97,9 @@ pub async fn start_with_options(
 
     let hub = Hub::new(db, data_dir.clone());
     hub.set_local_mode(options.local);
+    if start_paused {
+        hub.migrate().set_paused(true);
+    }
     // Threads waiting for a device keep waiting; a hub part that was running stops at once.
     hub.recover_waiting_threads();
     // Threads that were running when the hub stopped can't be resumed.
