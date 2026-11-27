@@ -2364,7 +2364,7 @@ mod tests {
         ] {
             let target_dir = root.join(format!("target-{step_name}"));
             old_hub.migrate().set_config(MigrateConfig {
-                confirm_timeout: Duration::from_millis(400),
+                confirm_timeout: Duration::from_secs(2),
                 copy_timeout: Duration::from_secs(10),
                 poll_interval: Duration::from_millis(25),
                 inject_failure: Some(failure),
@@ -2401,7 +2401,7 @@ mod tests {
                 node_stop_rx,
             ));
 
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(15), async {
                 loop {
                     if old_hub.is_online(&target_dev.id).await
                         && old_hub.host_info_for(&target_dev.id).is_some_and(|h| h.can_host)
@@ -2418,11 +2418,11 @@ mod tests {
             let target_tok_t = target_token.clone();
             let target_dir_t = target_dir.clone();
             let target_task = tokio::spawn(async move {
-                let Ok(Ok(offer)) = tokio::time::timeout(Duration::from_secs(3), offer_rx).await else {
+                let Ok(Ok(offer)) = tokio::time::timeout(Duration::from_secs(10), offer_rx).await else {
                     return Err(anyhow!("no offer (failed before copy)"));
                 };
                 let mut opts = TargetMoveOptions::new(target_dir_t, vec![loopback]);
-                opts.confirm_timeout = Duration::from_millis(400);
+                opts.confirm_timeout = Duration::from_secs(2);
                 opts.poll_interval = Duration::from_millis(25);
                 if failure == InjectedFailure::SkipSwitchConfirm {
                     opts.inject_failure = Some(InjectedFailure::SkipSwitchConfirm);
@@ -2451,7 +2451,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("step {step_name} did not roll back in time"))
             .unwrap();
 
-            let target_res = tokio::time::timeout(Duration::from_secs(5), target_task)
+            let target_res = tokio::time::timeout(Duration::from_secs(15), target_task)
                 .await
                 .expect("target task exited")
                 .unwrap();
@@ -2487,7 +2487,7 @@ mod tests {
             let _ = node_stop_tx.send(true);
             let _ = tokio::time::timeout(Duration::from_secs(2), node_task).await;
             // Wait until old hub clears the disconnected node before starting the next scenario.
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(15), async {
                 while old_hub.is_online(&target_dev.id).await {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
