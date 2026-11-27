@@ -16,7 +16,8 @@ core-memory.workspace = true
 core-agent.workspace = true
 providers.workspace = true
 async-trait.workspace = true
-rmcp = { workspace = true, features = ["client"] }
+rmcp = { workspace = true, features = ["client", "server", "transport-streamable-http-server"] }
+tower-service = "0.3"
 rusqlite = { workspace = true, features = ["backup"] }
 reqwest.workspace = true
 anyhow.workspace = true

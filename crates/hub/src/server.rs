@@ -644,6 +644,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::limits::routes())
         .merge(crate::files::routes())
         .merge(crate::session::routes())
+        .merge(crate::mcp_server::routes())
         .merge(crate::google_auth::routes())
         .merge(crate::link::routes())
         .merge(crate::push::routes())
