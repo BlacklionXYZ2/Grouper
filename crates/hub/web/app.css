@@ -744,7 +744,7 @@ body {
 }
 
 body {
-  font: 15px/1.5 var(--font);
+  font: var(--type-body-size)/1.5 var(--font); /* unitless line-height so smaller text inherits a ratio */
   color: var(--text);
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
@@ -768,7 +768,7 @@ a {
 :focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
-  border-radius: 6px;
+  border-radius: var(--r-chip);
 }
 
 ::selection {
@@ -776,7 +776,7 @@ a {
 }
 
 ::placeholder {
-  color: var(--text-3);
+  color: var(--text-4);
   opacity: 1;
 }
 
@@ -831,7 +831,7 @@ a {
 .boot-mark {
   width: 44px;
   height: 44px;
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: url("/app/icon.svg") center / cover;
   box-shadow: var(--shadow);
 }
@@ -881,7 +881,7 @@ a {
   overflow: hidden;
   z-index: 30;
   background: var(--glass-solid);
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--line-2);
 }
 
 /* The sidebar is chrome: it may be glass (V11), but on desktop it sits on the
@@ -891,7 +891,7 @@ a {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   border: none;
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--line-2);
   border-radius: 0;
   box-shadow: none;
 }
@@ -908,13 +908,13 @@ a {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-weight: 600;
-  font-size: 18px;
-  letter-spacing: -0.01em;
+  font-weight: var(--type-heading-weight);
+  font-size: var(--type-heading-size);
+  letter-spacing: var(--type-heading-track);
   color: var(--text);
   text-decoration: none;
   margin-right: auto;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
 }
 
 /* Small mark: the 7-fish glyph. Sign-in, welcome and boot keep logo.svg / icon.svg. */
@@ -922,7 +922,7 @@ a {
   width: 28px;
   height: 28px;
   flex: none;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   background: url("/app/logo-glyph.svg") center / contain no-repeat;
 }
 
@@ -933,10 +933,10 @@ a {
   margin: 6px 10px 4px;
   min-height: 38px;
   padding: 7px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--accent-soft);
   color: var(--accent);
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   text-decoration: none;
 }
@@ -968,7 +968,7 @@ a {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 600;
   color: var(--text);
   padding: 0 8px 4px;
@@ -1025,11 +1025,11 @@ a {
   gap: 10px;
   min-height: 32px;
   padding: 5px 8px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   color: var(--text-2);
   text-decoration: none;
-  font-size: 13.5px;
-  font-weight: 500;
+  font-size: var(--type-ui-size);
+  font-weight: var(--type-ui-weight);
 }
 
 .side-item > .icon {
@@ -1068,7 +1068,7 @@ a {
   flex: none;
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   box-sizing: border-box;
 }
 
@@ -1087,26 +1087,26 @@ a {
   cursor: pointer;
   text-align: left;
   font: inherit;
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
 }
 
 .side-empty {
   padding: 4px 8px;
   margin: 0;
   color: var(--text-3);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 /* "Needs you": a section header with the newest item's age and the count. */
 .side-needs {
   margin-top: 12px;
   padding-top: 10px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
 }
 
 .side-needs .side-item {
   color: var(--text);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 600;
 }
 
@@ -1114,9 +1114,9 @@ a {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  color: var(--text-3);
-  font-size: 12px;
-  font-weight: 400;
+  color: var(--text-4);
+  font-size: var(--type-caption-size);
+  font-weight: var(--type-caption-weight);
   white-space: nowrap;
 }
 
@@ -1124,7 +1124,7 @@ a {
   content: "";
   width: 6px;
   height: 6px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: var(--warn);
 }
 
@@ -1137,17 +1137,17 @@ a {
   gap: 1px;
   margin-top: 6px;
   padding-top: 6px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
 }
 
 /* Footer: real connection state (Q8). Opens Devices. */
 .side-foot {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding: 6px 10px;
 }
 
 .side-status {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
 }
 
@@ -1163,7 +1163,7 @@ a {
 .conn-dot {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   box-sizing: border-box;
   border: 2px solid var(--text-3);
 }
@@ -1214,7 +1214,7 @@ a {
   left: 12px;
   z-index: 200;
   padding: 10px 16px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface);
   color: var(--text);
   font-weight: 600;
@@ -1242,7 +1242,7 @@ a {
 
 .bar.glass {
   border: none;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-2);
   border-radius: 0;
   box-shadow: none;
 }
@@ -1254,17 +1254,17 @@ a {
 
 .bar h1 {
   margin: 0;
-  font-size: 15px;
+  font-size: var(--type-body-size);
   font-weight: 600;
-  letter-spacing: -0.005em;
-  line-height: 1.35;
+  letter-spacing: var(--type-body-track);
+  line-height: var(--type-body-lh);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .bar .caption {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1302,7 +1302,7 @@ a {
   min-height: 0;
   margin: 0;
   background: var(--bg-tint);
-  border-left: 1px solid var(--border);
+  border-left: 1px solid var(--line-2);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1337,16 +1337,16 @@ a {
   gap: 6px;
   min-height: 36px;
   padding: 7px 14px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   border: 1px solid var(--border-strong);
   background: var(--surface);
   color: var(--text);
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   cursor: pointer;
   text-decoration: none;
   white-space: nowrap;
-  transition: background 0.15s var(--ease), border-color 0.15s var(--ease), transform 0.1s var(--ease);
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
 }
 
 .btn:hover {
@@ -1407,13 +1407,13 @@ a {
 .btn-sm {
   min-height: 30px;
   padding: 4px 11px;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 .btn-lg {
   min-height: 44px;
   padding: 10px 20px;
-  font-size: 15px;
+  font-size: var(--type-body-size);
 }
 
 .icon-btn {
@@ -1421,7 +1421,7 @@ a {
   place-items: center;
   width: 36px;
   height: 36px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   border: none;
   background: transparent;
   color: var(--text-2);
@@ -1453,13 +1453,13 @@ a {
 
 .field > span,
 .field-label {
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   color: var(--text-2);
 }
 
 .hint {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
   margin: 0;
 }
@@ -1470,7 +1470,7 @@ a {
   width: 100%;
   min-height: 40px;
   padding: 8px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   border: 1px solid var(--border-control); /* 3:1 boundary (the card hairline is 1.8:1) */
   background: var(--surface);
   color: var(--text);
@@ -1493,7 +1493,7 @@ a {
 .input.mono,
 .textarea.mono {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 .row-form {
@@ -1511,7 +1511,7 @@ a {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   cursor: pointer;
 }
 
@@ -1526,9 +1526,9 @@ a {
   display: inline-flex;
   padding: 3px;
   gap: 2px;
-  border-radius: 10px;
+  border-radius: 10px; /* concentric: 10 around the 7 thumb (design-system.md 2.9) */
   background: var(--surface-2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
 }
 
 .seg label {
@@ -1538,13 +1538,13 @@ a {
   gap: 6px;
   min-height: 32px;
   padding: 4px 14px;
-  border-radius: 7px;
-  font-size: 13.5px;
-  font-weight: 550;
+  border-radius: 7px; /* concentric: thumb inside the 10px pill */
+  font-size: var(--type-ui-size);
+  font-weight: var(--type-ui-weight);
   color: var(--text-2);
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 }
 
 .seg input {
@@ -1581,20 +1581,20 @@ a {
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
 }
 
 .switch input {
   appearance: none;
   width: 40px;
   height: 24px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface-3);
   border: 1px solid var(--border-control);
   position: relative;
   cursor: pointer;
   margin: 0;
-  transition: background 0.15s var(--ease);
+  transition: background var(--dur-fast) var(--ease-out);
 }
 
 .switch input::after {
@@ -1604,10 +1604,10 @@ a {
   left: 2px;
   width: 18px;
   height: 18px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: #fff;
   box-shadow: var(--shadow-sm);
-  transition: transform 0.15s var(--ease);
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 
 .switch input:checked {
@@ -1623,8 +1623,8 @@ a {
 
 .card {
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
   box-shadow: var(--shadow-sm);
 }
 
@@ -1647,14 +1647,14 @@ a {
 
 .section-head h2 {
   margin: 0;
-  font-size: 17px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
+  font-size: var(--type-heading-size);
+  font-weight: var(--type-heading-weight);
+  letter-spacing: var(--type-heading-track);
 }
 
 .section-note {
   color: var(--text-2);
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   margin: -4px 0 12px;
 }
 
@@ -1664,8 +1664,8 @@ a {
 }
 
 .provider-group {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: var(--shadow-sm);
   overflow: hidden;
@@ -1690,7 +1690,7 @@ a {
   margin-top: 2px;
   color: var(--text-3);
   flex: none;
-  transition: transform 0.15s var(--ease);
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 
 .provider-group[open] > summary > .icon {
@@ -1698,7 +1698,7 @@ a {
 }
 
 .provider-group[open] > summary {
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
 }
 
 .provider-shell.has-add > .provider-group > summary {
@@ -1710,7 +1710,7 @@ a {
    colour transition, which the reduced-motion rule above cuts to nothing. */
 .model-row,
 .model-row > td {
-  transition: background-color 0.6s var(--ease), box-shadow 0.6s var(--ease);
+  transition: background-color 0.6s var(--ease-out), box-shadow 0.6s var(--ease-out); /* 0.6s target flash: a highlight fade, outside the duration scale */
 }
 
 li.model-row.is-target,
@@ -1743,7 +1743,7 @@ tr.model-row.is-target > td:first-child {
 
 .provider-id {
   display: block;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .provider-meta {
@@ -1775,7 +1775,7 @@ tr.model-row.is-target > td:first-child {
 }
 
 .list > li {
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
 }
 
 .list > li:last-child {
@@ -1818,7 +1818,7 @@ button.list-row:hover {
 
 .row-sub {
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   overflow-wrap: anywhere;
 }
 
@@ -1827,7 +1827,7 @@ button.list-row:hover {
   flex-wrap: wrap;
   gap: 4px 12px;
   color: var(--text-3);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   margin-top: 4px;
 }
 
@@ -1837,8 +1837,8 @@ button.list-row:hover {
   gap: 4px;
   padding: 1px 7px;
   min-height: 20px;
-  border-radius: var(--radius-xs);
-  font-size: 11.5px;
+  border-radius: var(--r-chip);
+  font-size: var(--type-micro-size);
   font-weight: 600;
   background: var(--surface-2);
   color: var(--text-2);
@@ -1889,11 +1889,11 @@ button.list-row:hover {
   min-width: 18px;
   height: 18px;
   padding: 0 5px;
-  border-radius: var(--radius-xs);
+  border-radius: var(--r-chip);
   background: var(--warn);
   color: var(--warn-ink);
-  font-size: 11px;
-  font-weight: 700;
+  font-size: var(--type-micro-size);
+  font-weight: 600;
 }
 
 /* Needs you (sidebar and the phone Chat tab). Other counts stay amber.
@@ -1909,7 +1909,7 @@ button.list-row:hover {
   width: 8px;
   height: 8px;
   box-sizing: border-box;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   display: inline-block;
   flex: none;
   background: transparent;
@@ -1926,11 +1926,11 @@ button.list-row:hover {
   gap: 10px;
   align-items: center;
   padding: 10px 14px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   background: var(--surface-2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   color: var(--text);
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   margin: 0 0 14px;
 }
 
@@ -1970,7 +1970,7 @@ button.list-row:hover {
 .empty h2 {
   color: var(--text);
   margin: 0 0 6px;
-  font-size: 18px;
+  font-size: var(--type-heading-size);
 }
 
 .empty p {
@@ -1979,7 +1979,7 @@ button.list-row:hover {
 }
 
 .skeleton {
-  border-radius: 8px;
+  border-radius: var(--r-control);
   background: linear-gradient(90deg, var(--surface-2) 0%, var(--surface-3) 50%, var(--surface-2) 100%);
   background-size: 200% 100%;
   animation: shimmer 1.4s linear infinite;
@@ -2001,7 +2001,7 @@ button.list-row:hover {
 
 .skeleton.block {
   height: 64px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
 }
 
 @keyframes shimmer {
@@ -2012,27 +2012,27 @@ button.list-row:hover {
 
 .table-wrap {
   overflow-x: auto;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  border: 1px solid var(--line-2);
   background: var(--surface);
 }
 
 .table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
 }
 
 .table th,
 .table td {
   padding: 9px 12px;
   text-align: left;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
   white-space: nowrap;
 }
 
 .table th {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   font-weight: 600;
   color: var(--text-2);
   background: var(--surface-2);
@@ -2043,7 +2043,7 @@ button.list-row:hover {
   text-align: right;
   font-variant-numeric: tabular-nums;
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
 }
 
 .table tbody tr:last-child td {
@@ -2051,7 +2051,7 @@ button.list-row:hover {
 }
 
 .table tfoot td {
-  font-weight: 650;
+  font-weight: 600;
   border-top: 1px solid var(--border-strong);
   border-bottom: none;
 }
@@ -2070,10 +2070,10 @@ code,
 .code {
   margin: 0;
   padding: 10px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-2);
-  font-size: 12.5px;
-  line-height: 1.5;
+  font-size: var(--type-caption-size);
+  line-height: 18px; /* mono role: 12.5 / 18 (design-system.md 2.7) */
   overflow: auto;
   max-height: 360px;
   white-space: pre-wrap;
@@ -2129,13 +2129,13 @@ code,
 .md code {
   font-size: 0.88em;
   padding: 0.1em 0.35em;
-  border-radius: 5px;
+  border-radius: var(--r-chip);
   background: var(--surface-2);
 }
 
 .md pre.md-code {
   padding: 12px 14px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-2);
   overflow-x: auto;
   line-height: 1.45;
@@ -2144,7 +2144,7 @@ code,
 .md pre.md-code code {
   padding: 0;
   background: none;
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
 }
 
 .md blockquote {
@@ -2155,7 +2155,7 @@ code,
 
 .md hr {
   border: none;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   margin: 1em 0;
 }
 
@@ -2218,7 +2218,7 @@ code,
 .threads-dot {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: var(--warn);
   flex: none;
 }
@@ -2228,9 +2228,9 @@ code,
   flex: none;
   align-self: stretch;
   margin: 10px 10px 10px 0;
-  border-radius: var(--radius-lg);
+  border-radius: var(--r-sheet);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
@@ -2273,10 +2273,10 @@ dialog.threads-sheet[open] .threads-panel {
   align-items: center;
   gap: 8px;
   padding: 8px 14px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface-2);
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 button.strip {
@@ -2316,7 +2316,7 @@ button.strip:hover {
   max-width: min(82%, 620px);
   background: var(--surface-2);
   padding: 10px 15px;
-  border-radius: 20px 20px 6px 20px;
+  border-radius: 20px 20px 6px 20px; /* bubble with a 6px tail corner */
   white-space: pre-wrap;
 }
 
@@ -2325,8 +2325,8 @@ button.strip:hover {
 }
 
 .msg-assistant {
-  line-height: 1.65;
-  font-size: 15.5px;
+  line-height: var(--type-body-lh);
+  font-size: var(--type-body-size);
 }
 
 .msg-error {
@@ -2336,8 +2336,8 @@ button.strip:hover {
   color: var(--danger);
   background: var(--danger-soft);
   padding: 10px 14px;
-  border-radius: var(--radius);
-  font-size: 14px;
+  border-radius: var(--r-card);
+  font-size: var(--type-ui-size);
 }
 
 .msg-note {
@@ -2345,7 +2345,7 @@ button.strip:hover {
   gap: 8px;
   align-items: center;
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   align-self: center;
   text-align: center;
 }
@@ -2376,13 +2376,13 @@ button.strip:hover {
   align-items: center;
   gap: 8px;
   color: var(--text-3);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 .replying .pulse {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: var(--accent);
   animation: pulse 1.2s ease-in-out infinite;
 }
@@ -2405,14 +2405,14 @@ button.strip:hover {
   gap: 4px;
   text-align: left;
   padding: 12px 14px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   box-shadow: var(--shadow-sm);
   cursor: pointer;
   color: inherit;
   min-width: 0;
-  transition: border-color 0.15s var(--ease), box-shadow 0.15s var(--ease), transform 0.1s var(--ease);
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
 }
 
 .chip:hover {
@@ -2434,7 +2434,7 @@ button.strip:hover {
 
 .chip-title {
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   display: -webkit-box;
   -webkit-line-clamp: 2;
   line-clamp: 2;
@@ -2443,7 +2443,7 @@ button.strip:hover {
 }
 
 .chip-meta {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2451,7 +2451,7 @@ button.strip:hover {
 }
 
 .chip-line {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2461,7 +2461,7 @@ button.strip:hover {
 
 .chip-line .tool {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--type-micro-size);
   color: var(--accent);
 }
 
@@ -2473,13 +2473,13 @@ button.strip:hover {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 500;
-  line-height: 1.3;
+  line-height: var(--type-caption-lh);
   white-space: nowrap;
   padding: 2px 8px 2px 7px;
   border: none;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   min-height: 22px;
 }
 
@@ -2528,7 +2528,7 @@ button.strip:hover {
   flex: none;
   width: 7px;
   height: 7px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: currentColor;
   animation: pulse 1.4s ease-in-out infinite;
 }
@@ -2546,7 +2546,8 @@ button.strip:hover {
 }
 
 .composer {
-  border-radius: 24px;
+  border-radius: var(--r-composer);
+  border-color: var(--line-3); /* composer edge: the floating hairline */
   padding: 8px 8px 8px 16px;
   display: grid;
   gap: 6px;
@@ -2561,8 +2562,8 @@ button.strip:hover {
   min-height: 26px;
   max-height: 168px;
   padding: 6px 0 2px;
-  line-height: 1.5;
-  font-size: 15.5px;
+  line-height: var(--type-body-lh);
+  font-size: var(--type-body-size);
   field-sizing: content;
 }
 
@@ -2588,7 +2589,7 @@ button.strip:hover {
 .composer .seg label {
   min-height: 28px;
   padding: 2px 12px;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 /* The model button: opens the covering model picker. */
@@ -2601,10 +2602,10 @@ button.strip:hover {
   min-height: 30px;
   padding: 3px 10px 3px 6px;
   border: 1px solid var(--border-strong);
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface);
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   cursor: pointer;
 }
 
@@ -2642,7 +2643,7 @@ button.strip:hover {
 .send-btn {
   width: 38px;
   height: 38px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   border: none;
   display: grid;
   place-items: center;
@@ -2666,13 +2667,13 @@ button.strip:hover {
 
 .composer-note {
   text-align: center;
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
   margin: 6px 0 0;
 }
 
 .composer-error {
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   color: var(--danger);
   padding: 0 4px;
 }
@@ -2686,16 +2687,16 @@ button.strip:hover {
   translate: -50% 0;
   z-index: 16;
   white-space: nowrap;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   padding: 7px 14px;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   cursor: pointer;
   color: var(--text);
   display: inline-flex;
   gap: 6px;
   align-items: center;
-  animation: fade-in 0.2s var(--ease);
+  animation: fade-in var(--dur-base) var(--ease-out);
 }
 
 @keyframes fade-in {
@@ -2717,8 +2718,8 @@ button.strip:hover {
 
 .welcome h2 {
   margin: 0 0 8px;
-  font-size: 26px;
-  letter-spacing: -0.02em;
+  font-size: var(--type-display-size);
+  letter-spacing: var(--type-display-track);
 }
 
 .welcome p {
@@ -2731,7 +2732,7 @@ button.strip:hover {
 
 .sheet-head {
   padding: 16px 16px 12px 18px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
   display: grid;
   gap: 6px;
 }
@@ -2744,8 +2745,8 @@ button.strip:hover {
 
 .sheet-head h2 {
   margin: 0;
-  font-size: 17px;
-  line-height: 1.3;
+  font-size: var(--type-heading-size);
+  line-height: var(--type-heading-lh);
   flex: 1;
   min-width: 0;
   overflow-wrap: anywhere;
@@ -2761,7 +2762,7 @@ button.strip:hover {
 }
 
 .sheet-foot {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding: 12px 14px;
   display: grid;
   gap: 10px;
@@ -2769,11 +2770,11 @@ button.strip:hover {
 }
 
 .sub-title {
-  font-size: 12px;
-  font-weight: 650;
-  color: var(--text-3);
+  font-size: var(--type-micro-size);
+  font-weight: 600;
+  color: var(--text-4);
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.7px;
   margin: 0 0 8px;
   display: flex;
   justify-content: space-between;
@@ -2781,8 +2782,8 @@ button.strip:hover {
 }
 
 .tool-row {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-control);
   background: var(--surface);
 }
 
@@ -2793,7 +2794,7 @@ button.strip:hover {
   padding: 7px 10px;
   cursor: pointer;
   list-style: none;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   min-height: 36px;
 }
 
@@ -2802,7 +2803,7 @@ button.strip:hover {
 }
 
 .tool-row > summary .chev {
-  transition: transform 0.15s var(--ease);
+  transition: transform var(--dur-fast) var(--ease-out);
   color: var(--text-3);
   width: 14px;
   height: 14px;
@@ -2814,7 +2815,7 @@ button.strip:hover {
 
 .tool-row .tool-name {
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -2829,34 +2830,34 @@ button.strip:hover {
 }
 
 .tool-row .tool-body .label {
-  font-size: 11.5px;
+  font-size: var(--type-micro-size);
   font-weight: 600;
-  color: var(--text-3);
+  color: var(--text-4);
 }
 
 .ok-word {
   color: var(--ok);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
 }
 
 .fail-word {
   color: var(--danger);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
 }
 
 .run-word {
   color: var(--accent);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
 }
 
 .callout {
   padding: 12px 14px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   background: var(--surface-2);
-  font-size: 14px;
+  font-size: var(--type-ui-size);
 }
 
 .callout.warn {
@@ -2865,7 +2866,7 @@ button.strip:hover {
 
 .callout h3 {
   margin: 0 0 4px;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2887,8 +2888,8 @@ button.strip:hover {
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
-  border-radius: 8px;
-  font-size: 13px;
+  border-radius: var(--r-control);
+  font-size: var(--type-ui-size);
   text-decoration: none;
   color: var(--text);
 }
@@ -2901,20 +2902,20 @@ button.strip:hover {
   flex: 1;
   min-width: 0;
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   overflow-wrap: anywhere;
 }
 
 .file-row .size {
-  color: var(--text-3);
-  font-size: 12px;
+  color: var(--text-4);
+  font-size: var(--type-caption-size);
 }
 
 /* ---- dialogs */
 
 dialog.sheet-dialog {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-sheet);
   padding: 0;
   background: var(--surface);
   color: var(--text);
@@ -2927,7 +2928,7 @@ dialog.sheet-dialog {
 dialog.sheet-dialog[open] {
   display: flex;
   flex-direction: column;
-  animation: rise 0.22s var(--ease);
+  animation: rise var(--dur-slow) var(--ease-snap);
 }
 
 dialog.sheet-dialog::backdrop {
@@ -2947,13 +2948,13 @@ dialog.sheet-dialog::backdrop {
 
 .dialog-head h2 {
   margin: 0;
-  font-size: 19px;
-  letter-spacing: -0.01em;
+  font-size: var(--type-title-size);
+  letter-spacing: var(--type-title-track);
 }
 
 .dialog-head .caption {
   color: var(--text-2);
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   margin-top: 2px;
 }
 
@@ -2976,10 +2977,10 @@ dialog.sheet-dialog::backdrop {
 }
 
 .reason {
-  font-size: 16px;
-  line-height: 1.5;
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-lh);
   padding: 14px 16px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   background: var(--warn-soft);
   display: flex;
   gap: 10px;
@@ -3009,7 +3010,7 @@ dialog.sheet-dialog::backdrop {
   padding: 4px 0;
   color: var(--accent);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   text-align: left;
 }
 
@@ -3034,18 +3035,18 @@ dialog.sheet-dialog::backdrop {
 .toast {
   pointer-events: auto;
   padding: 10px 16px;
-  border-radius: var(--radius);
-  font-size: 14px;
+  border-radius: var(--r-card);
+  font-size: var(--type-ui-size);
   display: flex;
   gap: 10px;
   align-items: center;
-  animation: rise 0.2s var(--ease);
+  animation: rise var(--dur-base) var(--ease-out);
 }
 
 /* Toasts float, so they keep a shadow in dark mode too (V3). */
 .toast.glass {
   background: var(--surface);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--line-3);
   box-shadow: var(--shadow-float);
 }
 
@@ -3078,7 +3079,7 @@ dialog.sheet-dialog::backdrop {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .folders {
@@ -3103,13 +3104,13 @@ dialog.sheet-dialog::backdrop {
 
 .tool-item .tool-title {
   font-family: var(--mono);
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   overflow-wrap: anywhere;
 }
 
 .policy {
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   color: var(--text-2);
   margin: 0;
 }
@@ -3136,19 +3137,19 @@ dialog.sheet-dialog::backdrop {
 }
 
 .stat .k {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
 }
 
 .stat .v {
-  font-size: 22px;
-  font-weight: 650;
+  font-size: var(--type-title-size);
+  font-weight: var(--type-title-weight);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em;
+  letter-spacing: var(--type-title-track);
 }
 
 .stat .s {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
 }
 
@@ -3173,11 +3174,11 @@ dialog.sheet-dialog::backdrop {
 
 .limit-name {
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
 }
 
 .limit-help {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
 }
 
@@ -3201,21 +3202,21 @@ dialog.sheet-dialog::backdrop {
 .login-card {
   width: min(420px, 100%);
   padding: 28px 26px 24px;
-  border-radius: 24px;
+  border-radius: var(--r-sheet);
   display: grid;
   gap: 16px;
 }
 
 .login-card h1 {
   margin: 0;
-  font-size: 24px;
-  letter-spacing: -0.02em;
+  font-size: var(--type-display-size);
+  letter-spacing: var(--type-display-track);
 }
 
 .login-card p {
   margin: 0;
   color: var(--text-2);
-  font-size: 14px;
+  font-size: var(--type-ui-size);
 }
 
 .login-card .brand-mark,
@@ -3226,7 +3227,7 @@ dialog.sheet-dialog::backdrop {
 .login-card .brand-mark {
   width: 40px;
   height: 40px;
-  border-radius: 12px;
+  border-radius: var(--r-card);
 }
 
 /* ---- narrow desktop: inspector floats over the content */
@@ -3244,10 +3245,10 @@ dialog.sheet-dialog::backdrop {
     width: min(var(--inspector-w), calc(100vw - 20px));
     margin: 0;
     z-index: 60;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-lg);
+    border: 1px solid var(--line-3);
+    border-radius: var(--r-sheet);
     box-shadow: var(--shadow-lg);
-    animation: slide-in 0.22s var(--ease);
+    animation: slide-in var(--dur-slow) var(--ease-snap);
   }
 
   .inspector-scrim:not([hidden]) {
@@ -3278,7 +3279,7 @@ dialog.sheet-dialog::backdrop {
 
   /* 16px body so iOS doesn't zoom into inputs. */
   body {
-    font-size: 16px;
+    font-size: var(--type-body-size);
   }
 
   .shell {
@@ -3301,10 +3302,10 @@ dialog.sheet-dialog::backdrop {
     bottom: 0;
     width: min(320px, 86vw);
     margin: 0;
-    border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
-    border-right: 1px solid var(--border-strong);
+    border-radius: 0 var(--r-sheet) var(--r-sheet) 0;
+    border-right: 1px solid var(--line-3);
     transform: translateX(-105%);
-    transition: transform 0.24s var(--ease);
+    transition: transform var(--dur-slow) var(--ease-snap);
     z-index: 70;
     padding-top: env(safe-area-inset-top);
   }
@@ -3360,13 +3361,13 @@ dialog.sheet-dialog::backdrop {
     right: 12px;
     bottom: calc(10px + env(safe-area-inset-bottom));
     height: 60px;
-    border-radius: 18px;
+    border-radius: 18px; /* concentric: 12 tile plus 6 padding */
     z-index: 50;
     padding: 5px;
   }
 
   .tabbar.glass {
-    border: 1px solid var(--border-strong);
+    border: 1px solid var(--line-3);
   }
 
   .tab {
@@ -3374,11 +3375,11 @@ dialog.sheet-dialog::backdrop {
     justify-items: center;
     align-content: center;
     gap: 3px;
-    border-radius: 12px;
+    border-radius: var(--r-card);
     color: var(--text-2);
     text-decoration: none;
-    font-size: 11.5px;
-    font-weight: 500;
+    font-size: var(--type-micro-size);
+    font-weight: var(--type-micro-weight);
     position: relative;
   }
 
@@ -3406,8 +3407,8 @@ dialog.sheet-dialog::backdrop {
     bottom: 0;
     width: 100%;
     height: calc(100dvh - 40px - env(safe-area-inset-top));
-    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
-    animation: sheet-up 0.26s var(--ease);
+    border-radius: var(--r-sheet) var(--r-sheet) 0 0;
+    animation: sheet-up var(--dur-slow) var(--ease-snap);
     padding-bottom: env(safe-area-inset-bottom);
   }
 
@@ -3415,7 +3416,7 @@ dialog.sheet-dialog::backdrop {
     width: 100vw;
     max-width: 100vw;
     margin: auto 0 0;
-    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    border-radius: var(--r-sheet) var(--r-sheet) 0 0;
     max-height: 92dvh;
     padding-bottom: env(safe-area-inset-bottom);
   }
@@ -3423,7 +3424,7 @@ dialog.sheet-dialog::backdrop {
   dialog.threads-sheet[open] {
     height: min(92dvh, 100%);
     /* Own slide. `rise` is transform-only too; this sheet travels farther. */
-    animation: threads-sheet-in 0.22s var(--ease);
+    animation: threads-sheet-in var(--dur-slow) var(--ease-snap);
   }
 
   .limit-row {
@@ -3496,8 +3497,8 @@ dialog.sheet-dialog::backdrop {
   gap: 8px;
   align-items: center;
   padding: 8px 16px;
-  border-radius: 999px;
-  font-size: 13px;
+  border-radius: var(--r-full);
+  font-size: var(--type-ui-size);
   font-weight: 600;
   color: var(--warn);
 }
@@ -3560,9 +3561,9 @@ details > summary.list-row:hover {
 }
 
 .hint code {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   padding: 1px 5px;
-  border-radius: 5px;
+  border-radius: var(--r-chip);
   background: var(--surface-2);
 }
 
@@ -3679,7 +3680,7 @@ code.nowrap {
   display: flex;
   align-items: center;
   border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface);
   min-height: 40px;
   padding: 0 10px;
@@ -3715,7 +3716,7 @@ code.nowrap {
 
 .unit-field .unit {
   color: var(--text-2);
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   white-space: nowrap;
 }
@@ -3742,8 +3743,8 @@ code.nowrap {
 
 .reason-kind {
   display: block;
-  font-size: 13px;
-  letter-spacing: 0.02em;
+  font-size: var(--type-micro-size);
+  letter-spacing: 0.7px;
   text-transform: uppercase;
   color: var(--text-2);
   margin-bottom: 2px;
@@ -3792,8 +3793,8 @@ code.nowrap {
   flex-direction: column;
   max-height: min(70vh, 640px);
   background: var(--surface);
-  border: 1.5px solid color-mix(in srgb, var(--warn) 45%, var(--border-strong));
-  border-radius: var(--radius-lg);
+  border: 1.5px solid color-mix(in srgb, var(--warn) 45%, var(--line-3));
+  border-radius: var(--r-sheet);
   box-shadow: var(--shadow);
   overflow: hidden;
 }
@@ -3804,8 +3805,8 @@ code.nowrap {
 
 .dock-title {
   margin: 0;
-  font-size: 17px;
-  line-height: 1.3;
+  font-size: var(--type-heading-size);
+  line-height: var(--type-heading-lh);
 }
 
 .dock-body {
@@ -3825,13 +3826,13 @@ code.nowrap {
 }
 
 .dock-tool {
-  font-size: 14.5px;
+  font-size: var(--type-body-size);
   color: var(--text-2);
 }
 
 .dock-tool-name {
   color: var(--text);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .dock-thread {
@@ -3839,7 +3840,7 @@ code.nowrap {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   color: var(--text-2);
 }
 
@@ -3850,7 +3851,7 @@ code.nowrap {
 }
 
 .dock-model .mono {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
 }
 
 .dock-input > summary {
@@ -3858,7 +3859,7 @@ code.nowrap {
   align-items: center;
   gap: 6px;
   min-height: 36px;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   color: var(--accent);
   cursor: pointer;
@@ -3872,7 +3873,7 @@ code.nowrap {
 .dock-input > summary .chev {
   width: 16px;
   height: 16px;
-  transition: rotate 0.15s var(--ease);
+  transition: rotate var(--dur-fast) var(--ease-out);
 }
 
 .dock-input[open] > summary .chev {
@@ -3885,7 +3886,7 @@ code.nowrap {
 }
 
 .dock-foot {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding: 10px 16px 12px;
   display: grid;
   gap: 8px;
@@ -3899,8 +3900,8 @@ code.nowrap {
 }
 
 .dock-pos {
-  font-size: 13px;
-  font-weight: 650;
+  font-size: var(--type-ui-size);
+  font-weight: 600;
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
 }
@@ -3912,7 +3913,7 @@ code.nowrap {
 }
 
 .dock-status {
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   color: var(--text-2);
 }
 
@@ -3933,7 +3934,7 @@ code.nowrap {
 @media (max-width: 760px) {
   .approval-dock {
     max-height: min(62vh, 560px);
-    border-radius: var(--radius);
+    border-radius: var(--r-card);
   }
 
   /* The arrows and "1 of N" say enough; the buttons keep their full names. */
@@ -3957,7 +3958,7 @@ code.nowrap {
 
 .login-card {
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   box-shadow: var(--shadow);
 }
 
@@ -3997,8 +3998,8 @@ code.nowrap {
   background: #ffffff;
   color: #1f1f1f;
   border: 1px solid #747775;
-  font-weight: 550;
-  font-size: 15px;
+  font-weight: 500;
+  font-size: var(--type-body-size);
 }
 
 .google-btn:hover:not(:disabled) {
@@ -4017,7 +4018,7 @@ code.nowrap {
 }
 
 .login-disclosure {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding-top: 10px;
 }
 
@@ -4026,7 +4027,7 @@ code.nowrap {
   align-items: center;
   gap: 6px;
   min-height: 36px;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   color: var(--accent);
   cursor: pointer;
@@ -4042,7 +4043,7 @@ code.nowrap {
 .login-disclosure > summary > .icon {
   width: 16px;
   height: 16px;
-  transition: transform 0.15s var(--ease);
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 
 .login-disclosure[open] > summary > .icon {
@@ -4066,7 +4067,7 @@ code.nowrap {
 }
 
 .foot-note {
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 /* ---- chat header menu, modal grids, row badges, probe summary */
@@ -4085,14 +4086,14 @@ code.nowrap {
   min-width: 230px;
   max-width: min(320px, calc(100vw - 24px));
   padding: 6px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   z-index: 45;
   display: grid;
   gap: 2px;
   align-content: start;
   background: var(--surface);
   color: var(--text);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--line-3);
   box-shadow: var(--shadow-float); /* menus float: a shadow in both modes */
 }
 
@@ -4108,15 +4109,15 @@ code.nowrap {
 }
 
 .menu-usage-val {
-  font-size: 16px;
-  font-weight: 650;
+  font-size: var(--type-body-size);
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
   font-family: var(--mono);
 }
 
 .menu-sep {
   height: 1px;
-  background: var(--border);
+  background: var(--line-1);
   margin: 4px 6px;
 }
 
@@ -4127,13 +4128,13 @@ code.nowrap {
   width: 100%;
   min-height: 38px;
   padding: 7px 10px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   border: none;
   background: transparent;
   color: var(--text);
   text-decoration: none;
-  font-size: 14px;
-  font-weight: 500;
+  font-size: var(--type-ui-size);
+  font-weight: var(--type-ui-weight);
   cursor: pointer;
   text-align: left;
 }
@@ -4263,7 +4264,7 @@ code.nowrap {
   .seg {
     flex-wrap: wrap;
     max-width: 100%;
-    border-radius: 16px;
+    border-radius: var(--r-sheet);
   }
 
   .limit-row {
@@ -4341,7 +4342,7 @@ code.nowrap {
   }
 
   ::placeholder {
-    color: var(--text-3);
+    color: var(--text-4);
     opacity: 1;
   }
 
@@ -4381,12 +4382,12 @@ code.nowrap {
 
   .side-item[aria-current="page"] {
     border: 1.5px solid var(--border-strong);
-    font-weight: 650;
+    font-weight: 600;
   }
 
   .tab[aria-current="page"] {
     border: 1.5px solid var(--accent);
-    font-weight: 700;
+    font-weight: 600;
   }
 
   .status,
@@ -4443,7 +4444,7 @@ code.nowrap {
   .md pre.md-code,
   .md code,
   .hint code {
-    border: 1px solid var(--border);
+    border: 1px solid var(--line-2);
   }
 
   .msg-inbound.from-orchestrator {
@@ -4456,7 +4457,7 @@ code.nowrap {
 
   .seg label:has(input:checked) {
     box-shadow: inset 0 0 0 1.5px var(--border-strong);
-    font-weight: 700;
+    font-weight: 600;
   }
 
   .seg label.bypass:has(input:checked) {
@@ -4487,7 +4488,7 @@ code.nowrap {
   }
 
   .btn-ghost {
-    border-color: var(--border);
+    border-color: var(--line-2);
   }
 
   .btn-ghost:hover,
@@ -4536,7 +4537,7 @@ code.nowrap {
   .meter {
     height: 10px;
     border: 1px solid var(--border-strong);
-    border-radius: 999px;
+    border-radius: var(--r-full);
   }
 
   /* Non-color shape cue on presence dots: hollow when offline, filled when online. */
@@ -4754,7 +4755,7 @@ code.nowrap {
     background: Highlight;
     color: HighlightText;
     border: 1px solid Highlight;
-    font-weight: 700;
+    font-weight: 600;
   }
 
   .side-item[aria-current="page"] {
@@ -4817,7 +4818,7 @@ code.nowrap {
   .status.danger,
   .badge.danger {
     border: 3px double CanvasText;
-    font-weight: 700;
+    font-weight: 600;
   }
 
   .count,
@@ -4924,7 +4925,7 @@ code.nowrap {
     background: Highlight;
     color: HighlightText;
     border: 3px double CanvasText;
-    font-weight: 700;
+    font-weight: 600;
   }
 
   .btn-danger:hover:not(:disabled) {
@@ -4979,7 +4980,7 @@ code.nowrap {
     color: HighlightText;
     border: 1px solid Highlight;
     box-shadow: none;
-    font-weight: 700;
+    font-weight: 600;
   }
 
   .seg label.bypass:has(input:checked) {
@@ -5065,7 +5066,7 @@ code.nowrap {
     forced-color-adjust: none;
     height: 10px;
     border: 1px solid CanvasText;
-    border-radius: 999px;
+    border-radius: var(--r-full);
     background: Canvas;
     overflow: hidden;
   }
@@ -5192,11 +5193,10 @@ code.nowrap {
   height: 18px;
   padding: 0 3px;
   border: 1.5px solid var(--fam, var(--text-3));
-  border-radius: 5px;
+  border-radius: var(--r-chip);
   background: var(--surface);
   color: var(--fam, var(--text-3));
-  font: 700 10px/1 var(--mono);
-  letter-spacing: -0.02em;
+  font: 600 var(--type-micro-size)/1 var(--mono); /* was 10px; nothing under 11.5px */
   vertical-align: -4px;
 }
 
@@ -5235,7 +5235,7 @@ code.nowrap {
 }
 
 .tp-model-name {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
   overflow-wrap: anywhere;
 }
@@ -5259,8 +5259,8 @@ code.nowrap {
 }
 
 .inbox-h2 {
-  font-size: 15px;
-  font-weight: 650;
+  font-size: var(--type-body-size);
+  font-weight: 600;
   margin: 0 0 10px;
   color: var(--text);
 }
@@ -5275,7 +5275,7 @@ code.nowrap {
 }
 
 .inbox-chat {
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   margin: 0 0 4px;
   padding: 0 2px;
@@ -5288,14 +5288,14 @@ code.nowrap {
 }
 
 .inbox-list {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
   overflow: hidden;
 }
 
 .list.card.inbox-list {
   background: var(--surface);
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
 }
 
 .inbox-row {
@@ -5315,7 +5315,7 @@ code.nowrap {
 }
 
 .inbox-tool {
-  font-size: 14px;
+  font-size: var(--type-ui-size);
 }
 
 .inbox-reason {
@@ -5362,7 +5362,7 @@ code.nowrap {
 }
 
 .inbox-toggle {
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   white-space: nowrap;
 }
 
@@ -5426,9 +5426,9 @@ code.nowrap {
   padding: 4px 12px 4px 6px;
   border: 1px solid var(--border-strong);
   border-left: 4px solid var(--fam, var(--fam-unknown));
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-2);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 .model-chip[hidden] {
@@ -5440,14 +5440,14 @@ code.nowrap {
 }
 
 .model-chip-name {
-  font-weight: 650;
-  font-size: 13px;
+  font-weight: 600;
+  font-size: var(--type-ui-size);
   overflow-wrap: anywhere;
 }
 
 .model-chip-note {
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--type-caption-size);
 }
 
 /* One column that never grows past the inspector: a long line in a brief or a
@@ -5494,7 +5494,7 @@ code.nowrap {
 }
 
 .thread-transcript .msg-assistant {
-  font-size: 15px;
+  font-size: var(--type-body-size);
 }
 
 /* Messages into the thread (the brief, the owner's and the orchestrator's). */
@@ -5505,7 +5505,7 @@ code.nowrap {
 }
 
 .msg-inbound .md :is(h1, h2, h3, h4) {
-  font-size: 14.5px;
+  font-size: var(--type-body-size);
   margin: 8px 0 2px;
 }
 
@@ -5535,8 +5535,8 @@ code.nowrap {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
-  font-weight: 650;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
   color: var(--text-2);
 }
 
@@ -5554,7 +5554,7 @@ code.nowrap {
 }
 
 .thread-who .mono {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   overflow-wrap: anywhere;
 }
 
@@ -5568,8 +5568,8 @@ code.nowrap {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
-  font-weight: 650;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
   color: var(--text-2);
 }
 
@@ -5601,7 +5601,7 @@ code.nowrap {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
 }
 
@@ -5621,8 +5621,8 @@ code.nowrap {
 
 .composer.thread-composer {
   background: var(--surface);
-  border: 1px solid var(--border-strong);
-  border-radius: 20px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-composer);
   padding: 6px 6px 6px 14px;
 }
 
@@ -5656,21 +5656,21 @@ dialog.sheet-dialog.model-picker {
   display: grid;
   gap: 8px;
   padding: 16px 16px 12px 20px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
 }
 
 .mp-head h2 {
   flex: 1;
   margin: 0;
-  font-size: 15px;
+  font-size: var(--type-body-size);
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: var(--type-body-track);
 }
 
 .mp-head .caption {
   margin: 0;
   color: var(--text-2);
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
 }
 
 .mp-search {
@@ -5710,11 +5710,11 @@ dialog.sheet-dialog.model-picker {
 
 .mp-section {
   margin: 14px 10px 2px;
-  font-size: 12px;
-  font-weight: 650;
-  color: var(--text-3);
+  font-size: var(--type-micro-size);
+  font-weight: 600;
+  color: var(--text-4);
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.7px;
 }
 
 .mp-group {
@@ -5729,13 +5729,13 @@ dialog.sheet-dialog.model-picker {
   gap: 6px;
   padding: 8px 10px 2px;
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 .mp-provider-id {
   font-family: var(--mono);
-  font-size: 12.5px;
-  font-weight: 650;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
   color: var(--text);
 }
 
@@ -5745,7 +5745,7 @@ dialog.sheet-dialog.model-picker {
   gap: 10px;
   padding: 9px 10px;
   border: 2px solid transparent;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   cursor: pointer;
 }
 
@@ -5791,11 +5791,11 @@ dialog.sheet-dialog.model-picker {
 }
 
 .mp-option.selected .mp-opt-id {
-  font-weight: 750;
+  font-weight: 600;
 }
 
 .mp-opt-model {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
   overflow-wrap: anywhere;
 }
@@ -5842,7 +5842,7 @@ dialog.sheet-dialog.model-picker {
     border: none;
     border-radius: 0;
     padding-top: env(safe-area-inset-top);
-    animation: threads-sheet-in 0.22s var(--ease);
+    animation: threads-sheet-in var(--dur-slow) var(--ease-snap);
   }
 
   .mp-option {
@@ -5865,8 +5865,8 @@ dialog.sheet-dialog.model-picker {
 
   .model-chip,
   .composer.thread-composer {
-    border: 1.5px solid var(--border-strong);
-    border-left: 5px solid var(--fam, var(--border-strong));
+    border: 1.5px solid var(--line-3);
+    border-left: 5px solid var(--fam, var(--line-3));
   }
 
   .composer.thread-composer {
@@ -5990,9 +5990,9 @@ dialog.sheet-dialog.model-picker {
   align-items: center;
   gap: 8px;
   margin: 0;
-  font-size: 18px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
+  font-size: var(--type-heading-size);
+  font-weight: var(--type-heading-weight);
+  letter-spacing: var(--type-heading-track);
 }
 
 .u-track-head h2 .icon {
@@ -6008,7 +6008,7 @@ dialog.sheet-dialog.model-picker {
 .u-track-body[aria-busy="true"] > .u-subgrid,
 .u-breakdown [aria-busy="true"] > .u-table {
   opacity: 0.7;
-  transition: opacity 0.15s var(--ease);
+  transition: opacity var(--dur-fast) var(--ease-out);
 }
 
 .u-banner {
@@ -6025,9 +6025,9 @@ dialog.sheet-dialog.model-picker {
 }
 
 .u-big {
-  font-size: 22px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
+  font-size: var(--type-title-size);
+  font-weight: var(--type-title-weight);
+  letter-spacing: var(--type-title-track);
 }
 
 .badge.u-est {
@@ -6042,7 +6042,7 @@ dialog.sheet-dialog.model-picker {
 }
 
 .u-summary-k {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
 }
 
@@ -6054,7 +6054,7 @@ dialog.sheet-dialog.model-picker {
 }
 
 .u-summary-s {
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   color: var(--text-2);
 }
 
@@ -6082,13 +6082,13 @@ dialog.sheet-dialog.model-picker {
 
 .u-card h3 {
   margin: 0;
-  font-size: 15px;
-  font-weight: 650;
+  font-size: var(--type-body-size);
+  font-weight: 600;
   overflow-wrap: anywhere;
 }
 
 .u-card-sub {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
   overflow-wrap: anywhere;
 }
@@ -6132,12 +6132,12 @@ dialog.sheet-dialog.model-picker {
   min-height: 32px;
   max-width: 100%;
   padding: 4px 10px 4px 12px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   border: 1px solid var(--accent);
   background: var(--accent-soft);
   color: var(--text);
   font: inherit;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   cursor: pointer;
   overflow-wrap: anywhere;
   text-align: left;
@@ -6158,20 +6158,20 @@ dialog.sheet-dialog.model-picker {
 }
 
 .u-block {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   margin-top: 10px;
   padding-top: 10px;
 }
 
 .u-block h4 {
   margin: 0 0 6px;
-  font-size: 12.5px;
-  font-weight: 650;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
   color: var(--text-2);
 }
 
 .u-block .hint {
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   color: var(--text-2);
 }
 
@@ -6190,14 +6190,14 @@ dialog.sheet-dialog.model-picker {
 }
 
 .u-facts dt {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
 }
 
 .u-facts dd {
   margin: 0;
-  font-size: 14px;
-  font-weight: 550;
+  font-size: var(--type-ui-size);
+  font-weight: var(--type-ui-weight);
 }
 
 .u-rep + .u-rep {
@@ -6209,7 +6209,7 @@ dialog.sheet-dialog.model-picker {
   flex-wrap: wrap;
   justify-content: space-between;
   gap: 2px 12px;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
 }
 
 .u-rep-k {
@@ -6226,7 +6226,7 @@ dialog.sheet-dialog.model-picker {
   align-items: center;
   gap: 4px 6px;
   margin-top: 6px;
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
 }
 
@@ -6255,7 +6255,7 @@ dialog.sheet-dialog.model-picker {
 
 .u-meter {
   height: 8px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface-3);
   overflow: hidden;
 }
@@ -6281,7 +6281,7 @@ dialog.sheet-dialog.model-picker {
   align-items: center;
   gap: 4px 8px;
   margin-top: 4px;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
 }
@@ -6310,7 +6310,7 @@ dialog.sheet-dialog.model-picker {
 
 .u-statuses .banner {
   margin: 0;
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
 }
 
 .u-empty {
@@ -6331,11 +6331,11 @@ dialog.sheet-dialog.model-picker {
 .u-cmd {
   margin: 0 0 8px;
   padding: 8px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   overflow-x: auto;
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
 }
 
 .u-caption {
@@ -6345,8 +6345,8 @@ dialog.sheet-dialog.model-picker {
 .u-breakdown .table .u-rowhead {
   background: transparent;
   color: var(--text);
-  font-size: 13.5px;
-  font-weight: 500;
+  font-size: var(--type-ui-size);
+  font-weight: var(--type-ui-weight);
   white-space: normal;
   min-width: 180px;
 }
@@ -6354,7 +6354,7 @@ dialog.sheet-dialog.model-picker {
 .u-breakdown .table tfoot th {
   background: transparent;
   color: var(--text);
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   border-top: 1px solid var(--border-strong);
   border-bottom: none;
 }
@@ -6391,7 +6391,7 @@ dialog.sheet-dialog.model-picker {
   display: inline-block;
   width: 48px;
   height: 6px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface-3);
   overflow: hidden;
 }
@@ -6429,8 +6429,8 @@ dialog.sheet-dialog.model-picker {
 }
 
 .u-rowcard-cost {
-  font-weight: 650;
-  font-size: 15px;
+  font-weight: 600;
+  font-size: var(--type-body-size);
   white-space: nowrap;
 }
 
@@ -6451,7 +6451,7 @@ dialog.sheet-dialog.model-picker {
 
 .limit-now {
   margin-top: 4px;
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
 }
@@ -6462,8 +6462,8 @@ dialog.sheet-dialog.model-picker {
 
 .u-legend h2 {
   margin: 0 0 10px;
-  font-size: 17px;
-  font-weight: 650;
+  font-size: var(--type-heading-size);
+  font-weight: var(--type-heading-weight);
 }
 
 .u-legend dl {
@@ -6471,7 +6471,7 @@ dialog.sheet-dialog.model-picker {
   grid-template-columns: max-content minmax(0, 1fr);
   gap: 8px 14px;
   margin: 0;
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   color: var(--text-2);
 }
 
@@ -6536,8 +6536,8 @@ dialog.sheet-dialog.model-picker {
 /* The launcher is the search icon button in every view's bar (lib/ui.js bar()). */
 
 dialog.command-palette {
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-lg);
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-sheet);
   padding: 0;
   background: var(--surface);
   color: var(--text);
@@ -6550,7 +6550,7 @@ dialog.command-palette {
 dialog.command-palette[open] {
   display: flex;
   flex-direction: column;
-  animation: rise 0.18s var(--ease);
+  animation: rise var(--dur-base) var(--ease-out);
 }
 
 dialog.command-palette::backdrop {
@@ -6573,7 +6573,7 @@ dialog.command-palette::backdrop {
   gap: 8px;
   min-width: 0;
   padding: 10px 8px 10px 14px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
 }
 
 .palette-close {
@@ -6584,7 +6584,7 @@ dialog.command-palette::backdrop {
   width: 46px;
   margin-right: 4px;
   border-radius: 0;
-  box-shadow: inset 0 -1px 0 var(--border);
+  box-shadow: inset 0 -1px 0 var(--line-1);
 }
 
 .palette-query {
@@ -6592,8 +6592,8 @@ dialog.command-palette::backdrop {
   min-width: 0;
   border: none;
   background: transparent;
-  font-size: 16px;
-  line-height: 1.4;
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-lh);
   padding: 8px 2px;
   color: var(--text);
 }
@@ -6618,11 +6618,11 @@ dialog.command-palette::backdrop {
 .palette-loading {
   margin: 8px 10px 4px;
   color: var(--text-2);
-  font-size: 14px;
+  font-size: var(--type-ui-size);
 }
 
 .palette-loading {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
 }
 
 .palette-list {
@@ -6633,11 +6633,11 @@ dialog.command-palette::backdrop {
 
 .palette-group {
   margin: 10px 10px 4px;
-  font-size: 12px;
+  font-size: var(--type-micro-size);
   font-weight: 600;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.7px;
   text-transform: uppercase;
-  color: var(--text-3);
+  color: var(--text-4);
 }
 
 .palette-group-items {
@@ -6654,7 +6654,7 @@ dialog.command-palette::backdrop {
   min-height: 40px;
   padding: 7px 10px;
   border: 1px solid transparent;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: transparent;
   color: var(--text);
   text-align: left;
@@ -6680,7 +6680,7 @@ dialog.command-palette::backdrop {
 
 .palette-title {
   grid-column: 2;
-  font-size: 14.5px;
+  font-size: var(--type-body-size);
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -6689,7 +6689,7 @@ dialog.command-palette::backdrop {
 
 .palette-meta {
   grid-column: 2;
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--text-2);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -6700,7 +6700,7 @@ dialog.command-palette::backdrop {
   background: var(--surface-3);
   color: inherit;
   font: inherit;
-  font-weight: 650;
+  font-weight: 600;
   border-radius: 2px;
   padding: 0 1px;
 }
@@ -6761,7 +6761,7 @@ dialog.command-palette::backdrop {
   flex: none;
   width: 10px;
   height: 10px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: var(--fam, var(--fam-unknown));
 }
 
@@ -6774,7 +6774,7 @@ dialog.command-palette::backdrop {
   gap: 3px;
   padding: 0 6px;
   border: none;
-  border-radius: var(--radius-xs);
+  border-radius: var(--r-chip);
   background: var(--purple-soft);
   color: var(--purple);
   font-weight: 600;
@@ -6798,10 +6798,10 @@ dialog.command-palette::backdrop {
   max-width: 100%;
   min-height: 24px;
   padding: 2px 8px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-select);
   color: var(--text-2);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
@@ -6819,8 +6819,8 @@ dialog.command-palette::backdrop {
    </div> */
 .thread-group {
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
   box-shadow: var(--shadow-sm);
   padding: 6px;
 }
@@ -6830,8 +6830,8 @@ dialog.command-palette::backdrop {
   align-items: center;
   gap: 8px;
   padding: 6px 8px 4px;
-  font-size: 13.5px;
-  font-weight: 500;
+  font-size: var(--type-ui-size);
+  font-weight: var(--type-ui-weight);
   color: var(--text);
 }
 
@@ -6856,10 +6856,10 @@ dialog.command-palette::backdrop {
   min-height: 38px;
   padding: 5px 8px;
   border: none;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: transparent;
   color: var(--text);
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   text-align: left;
   text-decoration: none;
   cursor: pointer;
@@ -6888,9 +6888,9 @@ dialog.command-palette::backdrop {
   gap: 6px;
   margin-top: 2px;
   padding: 6px 8px 4px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   color: var(--text-3);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
 }
 
 @media (pointer: coarse), (max-width: 760px) {
