@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use core_protocol::{
-    DetectedHarness, EventBody, HarnessSignIn, HarnessUsage, HubMessage, ModelEntry, ProviderConfig,
+    DetectedHarness, EventBody, HarnessSignIn, HarnessUsage, HubMessage, ModelEntry, Permission, ProviderConfig,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
@@ -26,7 +26,7 @@ use crate::catalog::derive_registry_id;
 use crate::db::{Db, now};
 use crate::discover::lookup_price;
 use crate::orchestrator::Wake;
-use crate::server::{Hub, QueueResult};
+use crate::server::{ApprovalAnswer, Hub, QueueResult};
 
 const HARNESS_META_PREFIX: &str = "device_harnesses:";
 
@@ -39,8 +39,8 @@ pub struct HarnessReportOutcome {
 }
 
 /// Canonical provider id for a harness CLI on a specific device (`claude-code@<device_id>`).
-/// Harness CLIs whose headless mode can't be confined (no read-only or plan mode that Grouper can
-/// rely on). Standard-chat turns are refused for these until per-turn approval exists.
+/// Harness CLIs whose headless mode can't be confined (Hermes runs every tool; OpenCode always
+/// passes `--auto`). Each turn asks the owner unless that device's chat tool for the agent is Bypass.
 pub(crate) const UNCONFINABLE_HARNESSES: &[&str] = &["hermes", "opencode"];
 
 pub fn provider_id(harness: &str, device_id: &str) -> String {
@@ -484,6 +484,18 @@ pub fn format_switched_message(prior_turns: &[(&str, String)], message: &str) ->
     out
 }
 
+/// MCP chat tool for a harness agent (`hermes` → `hermes__hermes_chat`). That row in
+/// `tools` is the device's permission for the agent (`permission.rs` / `tool_permissions`).
+fn agent_chat_tool(agent: &str) -> String {
+    let own = agent.replace('-', "_");
+    format!("{agent}__{own}_chat")
+}
+
+/// Bypass on the agent's chat tool (kept even if the tool is currently unavailable).
+fn device_tool_is_bypass(db: &Db, device_id: &str, tool: &str) -> bool {
+    db.all_tools(Some(device_id)).into_iter().any(|t| t.name == tool && t.permission == Permission::Bypass)
+}
+
 fn probe_provider_for_agent(agent: &str) -> Option<&'static str> {
     match agent {
         "claude-code" => Some("claude"),
@@ -493,6 +505,59 @@ fn probe_provider_for_agent(agent: &str) -> Option<&'static str> {
 }
 
 impl Hub {
+    /// Unconfinable harnesses (Hermes, OpenCode) can run any tool on the device during the
+    /// turn. Ask first, unless the owner set that agent's chat tool to Bypass. Deny and
+    /// timeout skip the turn; the caller surfaces the error in the chat.
+    async fn approve_unconfined_turn(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        device_id: &str,
+        device_name: &str,
+        agent: &str,
+        label: &str,
+        message: &str,
+    ) -> Result<(), String> {
+        if !UNCONFINABLE_HARNESSES.contains(&agent) {
+            return Ok(());
+        }
+        let tool = agent_chat_tool(agent);
+        if device_tool_is_bypass(&self.db, device_id, &tool) {
+            return Ok(());
+        }
+        let approval_id = Hub::new_approval_id();
+        let (tx, rx) = oneshot::channel();
+        let preview = truncate_chars(message, 400);
+        let reason = format!(
+            "{label} on {device_name} can run any tool on that device during this turn. It has no safe mode, so this turn waits for you. Message: {preview}"
+        );
+        let input = json!({
+            "harness": label,
+            "agent": agent,
+            "device": device_name,
+            "message": message,
+        });
+        let asked = self
+            .request_conversation_approval(device_id, conversation_id, &approval_id, &tool, input, &reason, tx)
+            .await;
+        if !asked {
+            return Err(format!(
+                "Couldn't ask for approval to run {label} on {device_name}, so this turn did not run."
+            ));
+        }
+        match rx.await {
+            Ok(ApprovalAnswer::Allow) => Ok(()),
+            Ok(ApprovalAnswer::TimedOut { secs }) => {
+                let phrase = core_agent::thread::approval_timeout_phrase(secs);
+                Err(format!(
+                    "{label} on {device_name} was not approved within {phrase}, so this turn did not run. It can run any tool on that device."
+                ))
+            }
+            _ => Err(format!(
+                "{label} on {device_name} was denied, so this turn did not run. It can run any tool on that device."
+            )),
+        }
+    }
+
     /// Execute one harness turn on the device hosting `model`, resuming the
     /// conversation's stored `harness_session` (or seeding a new session with a compact
     /// copy of earlier visible turns when switching into a harness mid-chat).
@@ -515,14 +580,6 @@ impl Hub {
             return Err(format!("harness model {} has no CLI agent configured", model.id));
         };
         let label = harness_label(model, provider.as_ref());
-        // Hermes ignores the confinement level (its one-shot mode runs every tool without asking)
-        // and OpenCode always auto-approves. The design asks for an approval per turn for these;
-        // until that exists they are refused rather than run unconfined on the owner's device.
-        if UNCONFINABLE_HARNESSES.contains(&agent.as_str()) {
-            return Err(format!(
-                "{label} can't be confined to a safe mode yet, so Grouper won't run it in a chat. Pick Claude Code, Codex, Antigravity, Grok or pi, or an API model."
-            ));
-        }
         let host_ref = model
             .device_id
             .as_deref()
@@ -566,6 +623,10 @@ impl Hub {
         } else {
             message.to_string()
         };
+
+        // Ask before minting an orchestrator token, so a denial leaves the previous token in place.
+        self.approve_unconfined_turn(conversation_id, &device_id, &device_name, &agent, &label, &wire_message)
+            .await?;
 
         let (mcp, allowed_tools, system_prompt) = if let Some(prompt) = orchestrator_prompt {
             let port = self.loopback_port();
@@ -1625,6 +1686,234 @@ fn main() {
         assert_eq!(hub.db.conversation_harness_session(&conv), None);
         assert_eq!(live_orchestrator_tokens(&hub.db, &conv), 0);
 
+        drop(hub);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn signed_in_entry(harness: &str, display: &str, model: &str) -> DetectedHarness {
+        DetectedHarness {
+            harness: harness.into(),
+            display_name: display.into(),
+            version: Some("1.0.0".into()),
+            sign_in: HarnessSignIn::SignedIn,
+            login_command: None,
+            capabilities: HarnessCapabilities {
+                can_orchestrate: false,
+                supports_resume: true,
+                supports_mcp: true,
+            },
+            models: vec![HarnessModel { id: model.into(), display_name: Some(display.into()) }],
+        }
+    }
+
+    fn chat_error(hub: &Hub, conv: &str) -> String {
+        hub.db
+            .events(conv, 0, None)
+            .iter()
+            .find_map(|e| match &e.body {
+                EventBody::Error { message } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn asked_approval(hub: &Hub, conv: &str) -> bool {
+        hub.db.events(conv, 0, None).iter().any(|e| matches!(e.body, EventBody::ApprovalRequested { .. }))
+    }
+
+    async fn wait_for_approval(hub: &Arc<Hub>, conv: &str) -> core_protocol::PendingApproval {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(approval) = hub.pending_approvals(Some(conv)).await.into_iter().next() {
+                return approval;
+            }
+            if start.elapsed() > Duration::from_secs(8) {
+                panic!("no approval for {conv}: {:?}", hub.db.events(conv, 0, None));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Hermes asks before the turn; approve runs it, deny and timeout do not.
+    /// Bypass skips the ask. Claude Code, which can be confined, never asks.
+    #[tokio::test]
+    async fn unconfinable_harness_asks_unless_bypass_and_confinable_does_not() {
+        use core_protocol::{ChatRequest, PROTOCOL_VERSION, ToolDef};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        assert_eq!(agent_chat_tool("hermes"), "hermes__hermes_chat");
+        assert_eq!(agent_chat_tool("opencode"), "opencode__opencode_chat");
+        assert!(UNCONFINABLE_HARNESSES.contains(&"hermes"));
+        assert!(UNCONFINABLE_HARNESSES.contains(&"opencode"));
+        assert!(!UNCONFINABLE_HARNESSES.contains(&"claude-code"));
+
+        let dir = tmp_dir();
+        let db = Db::open(&dir).unwrap();
+        let (pc, pc_token) = db.add_device("Gaming PC", "windows", false).unwrap();
+        apply_report(
+            &db,
+            &pc.id,
+            &[
+                signed_in_entry("hermes", "Hermes", "nous"),
+                signed_in_entry("claude-code", "Claude Code", "sonnet"),
+            ],
+        )
+        .unwrap();
+        let hermes_id = model_registry_id("hermes", &pc.id, "nous");
+        let claude_id = model_registry_id("claude-code", &pc.id, "sonnet");
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_hub = hub.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, crate::server::router(server_hub)).await;
+        });
+
+        let ws_url = format!("ws://{addr}{}", core_protocol::CONNECT_PATH);
+        let mut req = ws_url.into_client_request().unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {pc_token}").parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let (mut sink, mut stream) = ws.split();
+        sink.send(WsMsg::Text(
+            serde_json::to_string(&core_protocol::NodeMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_version: "0.1.0".into(),
+                host: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let Some(Ok(WsMsg::Text(t))) = stream.next().await else { panic!("ws closed before welcome") };
+            if matches!(serde_json::from_str::<HubMessage>(&t), Ok(HubMessage::Welcome { .. })) {
+                break;
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen_for_dev = seen.clone();
+        let dev_task = tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                let WsMsg::Text(t) = msg else { continue };
+                let Ok(HubMessage::HarnessTurn { conversation_id, agent, message, .. }) =
+                    serde_json::from_str::<HubMessage>(&t)
+                else {
+                    continue;
+                };
+                seen_for_dev.lock().unwrap().push((agent.clone(), message));
+                let reply = core_protocol::NodeMessage::HarnessFinished {
+                    conversation_id,
+                    text: format!("ran:{agent}"),
+                    session_id: "sess-1".into(),
+                    usage: core_protocol::HarnessUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                };
+                if sink.send(WsMsg::Text(serde_json::to_string(&reply).unwrap().into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut events_rx = hub.subscribe_events_for_test();
+        let say = |text: &'static str, model: String| {
+            let hub = hub.clone();
+            async move {
+                hub.chat(ChatRequest {
+                    conversation_id: None,
+                    mode: Some("standard".into()),
+                    text: text.into(),
+                    model: Some(model),
+                })
+                .await
+                .unwrap()
+            }
+        };
+
+        // Approve: the turn is held until the owner allows it, then the device runs it.
+        let approved = say("please run hermes", hermes_id.clone()).await;
+        let approval = wait_for_approval(&hub, &approved).await;
+        assert_eq!(seen.lock().unwrap().len(), 0, "the device must not run before approval");
+        assert_eq!(approval.tool, "hermes__hermes_chat");
+        assert_eq!(approval.device_id, pc.id);
+        assert!(approval.thread_id.is_empty(), "a standard chat has no thread");
+        assert_eq!(approval.input["message"], "please run hermes");
+        assert_eq!(approval.input["device"], "Gaming PC");
+        assert!(approval.reason.contains("Hermes"), "{}", approval.reason);
+        assert!(approval.reason.contains("Gaming PC"), "{}", approval.reason);
+        assert!(approval.reason.contains("any tool"), "{}", approval.reason);
+        assert!(approval.reason.contains("please run hermes"), "{}", approval.reason);
+        assert!(hub.resolve_approval(&approval.approval_id, true).await);
+        wait_for_turn_finished(&mut events_rx, &approved).await;
+        assert_eq!(seen.lock().unwrap().as_slice(), [("hermes".into(), "please run hermes".into())]);
+        let assistant = hub.db.events(&approved, 0, None).iter().any(|e| {
+            matches!(&e.body, EventBody::AssistantMessage { text } if text.contains("ran:hermes"))
+        });
+        assert!(assistant, "approving runs the turn");
+        assert!(hub.pending_approvals(Some(&approved)).await.is_empty());
+
+        // Deny: the chat records why, and the device never sees the turn.
+        let denied = say("do not run this", hermes_id.clone()).await;
+        let approval = wait_for_approval(&hub, &denied).await;
+        assert!(hub.resolve_approval(&approval.approval_id, false).await);
+        wait_for_turn_finished(&mut events_rx, &denied).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "a denial must not run the harness");
+        let denied_err = chat_error(&hub, &denied);
+        assert!(denied_err.contains("was denied"), "{denied_err}");
+        assert!(denied_err.contains("Gaming PC"), "{denied_err}");
+        assert!(denied_err.contains("any tool"), "{denied_err}");
+        assert!(hub.db.events(&denied, 0, None).iter().all(|e| !matches!(e.body, EventBody::AssistantMessage { .. })));
+
+        // Timeout: nobody answers, so the turn does not run.
+        let mut limits = hub.db.limits();
+        limits.approval_timeout_secs = Some(1);
+        hub.db.set_limits(&limits).unwrap();
+        let timed = say("this one times out", hermes_id.clone()).await;
+        let _ = wait_for_approval(&hub, &timed).await;
+        wait_for_turn_finished(&mut events_rx, &timed).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "a timeout must not run the harness");
+        let timed_err = chat_error(&hub, &timed);
+        assert!(timed_err.contains("not approved within"), "{timed_err}");
+        assert!(timed_err.contains("Gaming PC"), "{timed_err}");
+        assert!(hub.pending_approvals(Some(&timed)).await.is_empty());
+        limits.approval_timeout_secs = None;
+        hub.db.set_limits(&limits).unwrap();
+
+        // Bypass on the agent's chat tool skips the approval and runs the turn.
+        hub.db.upsert_tools(
+            &pc.id,
+            &[ToolDef {
+                name: "hermes__hermes_chat".into(),
+                description: "Hermes chat".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        );
+        hub.db.set_permission(&pc.id, "hermes__hermes_chat", Permission::Bypass).unwrap();
+        let bypassed = say("run without asking", hermes_id.clone()).await;
+        wait_for_turn_finished(&mut events_rx, &bypassed).await;
+        assert!(!asked_approval(&hub, &bypassed), "Bypass must not ask");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(seen.lock().unwrap()[1].0, "hermes");
+
+        // A confinable harness never asks, even with no Bypass row.
+        let confined = say("hello claude", claude_id).await;
+        wait_for_turn_finished(&mut events_rx, &confined).await;
+        assert!(!asked_approval(&hub, &confined), "Claude Code can be confined, so it does not ask");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(seen.lock().unwrap()[2].0, "claude-code");
+        assert!(chat_error(&hub, &confined).is_empty(), "{}", chat_error(&hub, &confined));
+
+        dev_task.abort();
+        server_task.abort();
         drop(hub);
         let _ = std::fs::remove_dir_all(dir);
     }
