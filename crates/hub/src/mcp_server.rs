@@ -75,7 +75,7 @@ impl ServerHandler for OrchestratorServer {
             rmcp::model::NumberOrString::Number(n) => n.to_string(),
             rmcp::model::NumberOrString::String(s) => s.to_string(),
         };
-        let name = request.name.clone();
+        let name = request.name.into_owned();
         // The harness keeps its own session. Grouper's transcript is these events.
         self.hub.emit(
             &conversation_id,
