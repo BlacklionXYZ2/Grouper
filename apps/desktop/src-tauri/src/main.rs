@@ -4,6 +4,7 @@ mod autostart;
 mod node;
 mod oauth;
 mod settings;
+mod toasts;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -63,6 +64,10 @@ impl DesktopState {
 
     pub(crate) fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub(crate) fn hub_handle(&self) -> Option<Arc<HubHandle>> {
+        self.hub.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn set_hub(&self, next: Option<Arc<HubHandle>>) -> Option<Arc<HubHandle>> {
@@ -436,6 +441,7 @@ fn main() {
             let _ = show_main_window(app);
         }))
         .plugin(autostart::plugin())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![setup, choose])
         .setup(|app| {
             let data_dir = app_data_dir()?;
@@ -491,6 +497,7 @@ fn main() {
 
             autostart::apply_default(app.handle());
             install_tray(app.handle())?;
+            toasts::start(app.handle());
             build_main_window(app.handle(), target)?;
             Ok(())
         })
