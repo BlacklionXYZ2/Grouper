@@ -718,9 +718,11 @@ mod harness_rule_tests {
             base_url: None,
             api_key: None,
             options: json!({
-                "steps": [
-                    {"last": "hello project", "reply": [{"type": "text", "text": "Handled by API fallback."}]}
-                ]
+                "inline": {
+                    "rules": [
+                        {"last": "hello project", "reply": [{"type": "text", "text": "Handled by API fallback."}]}
+                    ]
+                }
             }),
         })
         .unwrap();
