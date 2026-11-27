@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use core_client::usage_probes::{SUPPORTED_PROVIDERS, UsageProbeSetting};
 use serde::{Deserialize, Serialize};
 
 pub const SETTINGS_FILE: &str = "desktop.json";
@@ -26,7 +27,7 @@ pub enum HostMode {
     AnotherComputer,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DesktopSettings {
     /// `None` before the user completes the first-run screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,9 +57,72 @@ pub struct DesktopSettings {
     /// DPAPI-protected non-admin node token (Windows) for in-process `core-client`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     node_token: Option<String>,
+    /// "Read subscription usage on this device". On by default; there is no remote switch.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub usage_probes: bool,
+    /// Providers (claude, codex, grok, antigravity) the user switched off individually.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_probes_off: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+impl Default for DesktopSettings {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            remote_hub_url: None,
+            install_id: String::new(),
+            google_desktop_client_id: None,
+            google_desktop_client_secret: None,
+            admin_hub_url: None,
+            admin_token: None,
+            node_hub_url: None,
+            node_token: None,
+            usage_probes: true,
+            usage_probes_off: Vec::new(),
+        }
+    }
 }
 
 impl DesktopSettings {
+    /// What the node should advertise: the whole-device switch plus per-provider switches.
+    pub fn usage_probe_setting(&self) -> UsageProbeSetting {
+        if !self.usage_probes {
+            return UsageProbeSetting::off();
+        }
+        if self.usage_probes_off.is_empty() {
+            return UsageProbeSetting::default();
+        }
+        let on: Vec<String> = SUPPORTED_PROVIDERS
+            .iter()
+            .filter(|p| !self.usage_probes_off.iter().any(|o| o == *p))
+            .map(|p| p.to_string())
+            .collect();
+        if on.is_empty() {
+            UsageProbeSetting::off()
+        } else {
+            UsageProbeSetting { enabled: true, providers: Some(on) }
+        }
+    }
+
+    pub fn usage_provider_on(&self, provider: &str) -> bool {
+        !self.usage_probes_off.iter().any(|o| o == provider)
+    }
+
+    pub fn set_usage_provider(&mut self, provider: &str, on: bool) {
+        self.usage_probes_off.retain(|o| o != provider);
+        if !on && SUPPORTED_PROVIDERS.contains(&provider) {
+            self.usage_probes_off.push(provider.to_string());
+        }
+    }
+
     pub fn settings_path(data_dir: &Path) -> PathBuf {
         data_dir.join(SETTINGS_FILE)
     }
@@ -508,6 +572,41 @@ mod tests {
 
         assert!(validate_hub_url("http://remote.example.com").is_err());
         assert_eq!(validate_hub_url("http://localhost:47600/").unwrap(), "http://localhost:47600");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_reading_defaults_on_and_persists_switches() {
+        let dir = temp_dir("usage");
+        let mut s = DesktopSettings::load(&dir).unwrap();
+        assert!(s.usage_probes);
+        assert_eq!(s.usage_probe_setting(), UsageProbeSetting::default());
+
+        s.set_usage_provider("grok", false);
+        s.set_usage_provider("grok", false);
+        s.save(&dir).unwrap();
+        let loaded = DesktopSettings::load(&dir).unwrap();
+        assert!(!loaded.usage_provider_on("grok") && loaded.usage_provider_on("claude"));
+        assert_eq!(
+            loaded.usage_probe_setting().providers.as_deref(),
+            Some(&["claude".to_string(), "codex".to_string(), "antigravity".to_string()][..])
+        );
+
+        let mut off = loaded;
+        off.usage_probes = false;
+        off.save(&dir).unwrap();
+        let reloaded = DesktopSettings::load(&dir).unwrap();
+        assert!(!reloaded.usage_probes);
+        assert_eq!(reloaded.usage_probe_setting(), UsageProbeSetting::off());
+
+        let mut none = reloaded;
+        none.usage_probes = true;
+        for p in SUPPORTED_PROVIDERS {
+            none.set_usage_provider(p, false);
+        }
+        assert_eq!(none.usage_probe_setting(), UsageProbeSetting::off());
+        none.set_usage_provider("grok", true);
+        assert_eq!(none.usage_probe_setting().providers.as_deref(), Some(&["grok".to_string()][..]));
         let _ = fs::remove_dir_all(&dir);
     }
 

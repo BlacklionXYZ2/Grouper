@@ -53,6 +53,21 @@ struct SettingsView: View {
                     Text("This Mac is registered with the hub.")
                 }
                 LabeledContent("Node", value: node.statusText)
+                Toggle("Read subscription usage on this device", isOn: Binding(
+                    get: { node.readUsage },
+                    set: { node.setReadUsage($0) }
+                ))
+                Text("Lets this Mac read how much of your Claude, ChatGPT, Grok and Antigravity plans is used, from the sign-ins those apps keep here. Only percentages and reset times go to your hub.")
+                    .font(.caption).foregroundStyle(Theme.text2)
+                if node.readUsage {
+                    ForEach(MacNodeController.usageProviders) { provider in
+                        Toggle(provider.name, isOn: Binding(
+                            get: { !node.usageProvidersOff.contains(provider.id) },
+                            set: { node.setReadUsage(provider: provider.id, $0) }
+                        ))
+                        .padding(.leading, 16)
+                    }
+                }
                 Button(model.registeringDevice ? "Registering…" : "Register again") {
                     Task { await model.registerThisMacAgain() }
                 }

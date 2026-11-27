@@ -140,6 +140,30 @@ impl core_client::Events for EventBridge {
     }
 }
 
+/// The device owner's usage-reading choice, as the node wants it. Unknown provider names are
+/// ignored; an explicit list with none left means nothing is read.
+fn usage_probe_setting(enabled: bool, providers: Option<Vec<String>>) -> core_client::usage_probes::UsageProbeSetting {
+    use core_client::usage_probes::{SUPPORTED_PROVIDERS, UsageProbeSetting};
+    if !enabled {
+        return UsageProbeSetting::off();
+    }
+    let Some(list) = providers else {
+        return UsageProbeSetting::default();
+    };
+    let mut kept: Vec<String> = Vec::new();
+    for name in list {
+        let name = name.trim().to_ascii_lowercase();
+        if SUPPORTED_PROVIDERS.contains(&name.as_str()) && !kept.contains(&name) {
+            kept.push(name);
+        }
+    }
+    if kept.is_empty() {
+        UsageProbeSetting::off()
+    } else {
+        UsageProbeSetting { enabled: true, providers: Some(kept) }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct GrouperClient {
     runtime: tokio::runtime::Runtime,
@@ -153,6 +177,10 @@ pub struct GrouperClient {
 impl GrouperClient {
     /// `workspace_root`: folder for thread workspaces, or `None` to run no threads here.
     /// `allow_shell`: offer `run_shell` to threads (still gated by permissions).
+    /// `usage_probes`: read this device's subscription usage (percentages and reset times only).
+    /// On by default in the apps; this is the device owner's local off switch.
+    /// `usage_probe_providers` narrows it to some of claude, codex, grok and antigravity
+    /// (`None`: all of them).
     #[uniffi::constructor]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -161,6 +189,8 @@ impl GrouperClient {
         capabilities: Vec<Capability>,
         workspace_root: Option<String>,
         allow_shell: bool,
+        usage_probes: bool,
+        usage_probe_providers: Option<Vec<String>>,
         handler: Arc<dyn ToolHandler>,
         listener: Arc<dyn ClientListener>,
     ) -> Result<Arc<Self>, ClientError> {
@@ -168,6 +198,7 @@ impl GrouperClient {
         if core_protocol::split_token(&token).is_none() {
             return Err(ClientError::Invalid { message: "token should look like <device-id>.<secret>".into() });
         }
+        let usage = usage_probe_setting(usage_probes, usage_probe_providers);
         let capabilities = capabilities.iter().map(Capability::to_core).collect::<Result<Vec<_>, _>>()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -190,8 +221,8 @@ impl GrouperClient {
                     eprintln!("grouper: scoped folders: {e}");
                     Vec::new()
                 }),
-                usage_probes: false,
-                usage_probe_providers: None,
+                usage_probes: usage.enabled,
+                usage_probe_providers: usage.providers,
             },
             handler,
             listener,
@@ -483,6 +514,17 @@ mod tests {
         assert!(matches!(store.sync_once(), Err(SyncStoreError::Unreachable { .. })));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_reading_follows_the_device_setting() {
+        use core_client::usage_probes::UsageProbeSetting;
+        assert_eq!(usage_probe_setting(true, None), UsageProbeSetting::default());
+        assert_eq!(usage_probe_setting(false, Some(vec!["claude".into()])), UsageProbeSetting::off());
+        let some = usage_probe_setting(true, Some(vec![" Grok ".into(), "bogus".into(), "grok".into(), "claude".into()]));
+        assert_eq!(some.providers, Some(vec!["grok".to_string(), "claude".to_string()]));
+        assert_eq!(usage_probe_setting(true, Some(vec![])), UsageProbeSetting::off());
+        assert_eq!(usage_probe_setting(true, Some(vec!["bogus".into()])), UsageProbeSetting::off());
     }
 
     #[test]
