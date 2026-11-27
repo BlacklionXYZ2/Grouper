@@ -100,6 +100,8 @@ struct SetupStateView {
     default_remote_hub_url: &'static str,
     local_hub_url: &'static str,
     google_desktop_configured: bool,
+    /// False until this PC's hub has an owner. "Continue" on This computer stays hidden until then.
+    local_hub_claimed: bool,
 }
 
 #[tauri::command]
@@ -111,6 +113,7 @@ fn setup(state: State<'_, DesktopState>) -> SetupStateView {
         default_remote_hub_url: DEFAULT_REMOTE_HUB_URL,
         local_hub_url: LOCAL_HUB_URL,
         google_desktop_configured: oauth::resolve_oauth_config(&s).is_some(),
+        local_hub_claimed: local_hub_claimed(state.inner()),
     }
 }
 
@@ -134,6 +137,12 @@ async fn apply_choice(
     remote_hub_url: Option<&str>,
     sign_in_with_google: bool,
 ) -> Result<()> {
+    if mode == HostMode::ThisComputer && !sign_in_with_google && !local_hub_claimed(state) {
+        anyhow::bail!(
+            "This computer has no owner yet. Sign in with Google to claim it before continuing."
+        );
+    }
+
     let mut updated = state.settings_snapshot();
     updated.set_choice(mode, remote_hub_url)?;
     let target_url = updated.active_hub_url().expect("mode was just set");
@@ -142,9 +151,9 @@ async fn apply_choice(
         prev_node.stop().await;
     }
 
-    // Stop any running local hub if switching to another computer OR if we need port 47600
-    // temporarily for the Desktop OAuth loopback redirect (`http://localhost:47600/oauth/google/return`).
-    if (mode == HostMode::AnotherComputer || sign_in_with_google)
+    // Google's return listens on its own loopback port, so sign-in leaves the hub running.
+    // Stop the embedded hub only when this PC is no longer the one hosting it.
+    if mode == HostMode::AnotherComputer
         && let Some(prev) = state.take_hub()
     {
         prev.stop().await;
@@ -210,6 +219,27 @@ async fn apply_choice(
 
     open_target_in_main_window(app, WebviewUrl::External(target_url.parse()?))?;
     Ok(())
+}
+
+/// Whether the local hub database already has an owner. A missing database is unclaimed.
+/// Uses the running hub when this process holds it, so a second open does not run migrations.
+fn local_hub_claimed(state: &DesktopState) -> bool {
+    if let Some(handle) = state.hub.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        && let Some(hub) = handle.hub()
+    {
+        return hub.db.owner().is_some();
+    }
+    let dir = hub_data_dir(&state.data_dir);
+    if !dir.join("grouper.db").is_file() {
+        return false;
+    }
+    match hub::db::Db::open(&dir) {
+        Ok(db) => db.owner().is_some(),
+        Err(err) => {
+            tracing::warn!("could not read local hub owner: {err:#}");
+            false
+        }
+    }
 }
 
 async fn ensure_embedded_hub(state: &DesktopState) -> Result<Arc<HubHandle>> {

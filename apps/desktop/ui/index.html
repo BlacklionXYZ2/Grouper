@@ -182,7 +182,7 @@
       </div>
 
       <div class="actions">
-        <button id="continue-btn" class="primary" type="submit">Continue</button>
+        <button id="continue-btn" class="primary" type="submit" hidden>Continue</button>
         <button id="google-btn" class="secondary" type="button" hidden>Sign in with Google</button>
       </div>
       <div id="error" role="alert" hidden></div>
@@ -199,6 +199,8 @@
     const googleBtn = document.getElementById("google-btn");
     const errorEl = document.getElementById("error");
     const oauthNoteEl = document.getElementById("oauth-note");
+    let localHubClaimed = false;
+    let googleConfigured = false;
 
     function selectedMode() {
       const checked = form.querySelector('input[name="mode"]:checked');
@@ -206,7 +208,16 @@
     }
 
     function syncVisibility() {
-      remoteBox.hidden = selectedMode() !== "another_computer";
+      const thisComputer = selectedMode() === "this_computer";
+      remoteBox.hidden = thisComputer;
+      // Continue on an unclaimed hub opens a window that cannot be claimed over HTTP.
+      const hideContinue = thisComputer && !localHubClaimed;
+      continueBtn.hidden = hideContinue;
+      googleBtn.classList.toggle("primary", hideContinue);
+      googleBtn.classList.toggle("secondary", !hideContinue);
+      if (!googleConfigured) {
+        oauthNoteEl.hidden = !thisComputer;
+      }
     }
 
     form.addEventListener("change", syncVisibility);
@@ -231,6 +242,7 @@
 
     form.addEventListener("submit", (e) => {
       e.preventDefault();
+      if (continueBtn.hidden) return;
       submitChoice(false);
     });
 
@@ -247,11 +259,12 @@
         if (state.remote_hub_url) {
           remoteInput.value = state.remote_hub_url;
         }
-        if (state.google_desktop_configured) {
+        localHubClaimed = Boolean(state.local_hub_claimed);
+        googleConfigured = Boolean(state.google_desktop_configured);
+        if (googleConfigured) {
           googleBtn.hidden = false;
         } else {
-          oauthNoteEl.textContent = "Desktop Google OAuth (GROUPER_GOOGLE_DESKTOP_CLIENT_ID) is not configured yet; on a local hub, #/token-signin works on loopback.";
-          oauthNoteEl.hidden = false;
+          oauthNoteEl.textContent = "Sign in with Google needs GROUPER_GOOGLE_DESKTOP_CLIENT_ID. This computer stays closed until that sign-in claims the hub. The client secret, when Google asks for one, comes from the saved DPAPI setting or GROUPER_GOOGLE_DESKTOP_CLIENT_SECRET.";
         }
         syncVisibility();
       } catch (err) {

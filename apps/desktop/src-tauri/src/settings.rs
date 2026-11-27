@@ -40,9 +40,10 @@ pub struct DesktopSettings {
     /// Optional Google Desktop OAuth client ID (overridden by `GROUPER_GOOGLE_DESKTOP_CLIENT_ID`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub google_desktop_client_id: Option<String>,
-    /// Optional Google Desktop OAuth client secret if Google requires it during code exchange.
+    /// DPAPI-protected Google Desktop OAuth client secret (`dpapi:<base64>`). Never plaintext.
+    /// Absent means the caller falls back to `GROUPER_GOOGLE_DESKTOP_CLIENT_SECRET`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub google_desktop_client_secret: Option<String>,
+    google_desktop_client_secret: Option<String>,
     /// Hub URL that `admin_token` belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_hub_url: Option<String>,
@@ -71,14 +72,26 @@ impl DesktopSettings {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
+        let mut changed = false;
         if !hub::db::valid_install_id(&settings.install_id) {
             settings.install_id = new_install_id();
+            changed = true;
+        }
+        if seal_legacy_client_secret(&mut settings)? {
+            changed = true;
+        }
+        if changed {
             settings.save(data_dir)?;
         }
         Ok(settings)
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<()> {
+        if let Some(secret) = &self.google_desktop_client_secret
+            && !secret.starts_with("dpapi:")
+        {
+            bail!("refusing to write a plaintext Google client secret to desktop.json");
+        }
         fs::create_dir_all(data_dir)
             .with_context(|| format!("creating {}", data_dir.display()))?;
         let path = Self::settings_path(data_dir);
@@ -136,6 +149,33 @@ impl DesktopSettings {
         }
         self.mode = Some(mode);
         Ok(())
+    }
+
+    /// Store the Desktop OAuth client secret sealed with DPAPI. An empty secret clears it.
+    pub fn set_google_desktop_client_secret(&mut self, secret: &str) -> Result<()> {
+        let trimmed = secret.trim();
+        if trimmed.is_empty() {
+            self.google_desktop_client_secret = None;
+            return Ok(());
+        }
+        let sealed = seal_token(trimmed)?;
+        if !sealed.starts_with("dpapi:") {
+            bail!("refusing to store the Google client secret without Windows DPAPI");
+        }
+        self.google_desktop_client_secret = Some(sealed);
+        Ok(())
+    }
+
+    /// The Desktop OAuth client secret, if one was stored with DPAPI.
+    pub fn google_desktop_client_secret(&self) -> Result<Option<String>> {
+        let Some(stored) = &self.google_desktop_client_secret else {
+            return Ok(None);
+        };
+        if !stored.starts_with("dpapi:") {
+            bail!("stored Google client secret is not DPAPI-protected");
+        }
+        let plain = open_token(stored)?;
+        Ok((!plain.is_empty()).then_some(plain))
     }
 
     pub fn set_admin_token(&mut self, hub_url: &str, token: &str) -> Result<()> {
@@ -252,6 +292,22 @@ pub fn machine_device_name() -> String {
     } else {
         cleaned.to_string()
     }
+}
+
+/// An older `desktop.json` may hold the secret in the clear. Seal it before the next save.
+fn seal_legacy_client_secret(settings: &mut DesktopSettings) -> Result<bool> {
+    let Some(stored) = settings.google_desktop_client_secret.clone() else {
+        return Ok(false);
+    };
+    if stored.is_empty() {
+        settings.google_desktop_client_secret = None;
+        return Ok(true);
+    }
+    if stored.starts_with("dpapi:") {
+        return Ok(false);
+    }
+    settings.set_google_desktop_client_secret(&stored)?;
+    Ok(true)
 }
 
 fn new_install_id() -> String {
@@ -415,6 +471,44 @@ mod tests {
 
         assert!(validate_hub_url("http://remote.example.com").is_err());
         assert_eq!(validate_hub_url("http://localhost:47600/").unwrap(), "http://localhost:47600");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn google_client_secret_never_lands_in_desktop_json() {
+        let dir = temp_dir("oauth-secret");
+        let secret = "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ut-of-json";
+        let mut s = DesktopSettings::load(&dir).unwrap();
+        let set = s.set_google_desktop_client_secret(secret);
+        #[cfg(windows)]
+        {
+            set.unwrap();
+            s.save(&dir).unwrap();
+            let raw = fs::read_to_string(DesktopSettings::settings_path(&dir)).unwrap();
+            assert!(!raw.contains(secret), "client secret must not appear in desktop.json");
+            assert!(raw.contains("dpapi:"), "secret should be stored as a DPAPI blob");
+            let loaded = DesktopSettings::load(&dir).unwrap();
+            assert_eq!(loaded.google_desktop_client_secret().unwrap().as_deref(), Some(secret));
+
+            let install_id = loaded.install_id.clone();
+            let forged = format!(
+                "{{\n  \"install_id\": \"{install_id}\",\n  \"google_desktop_client_secret\": \"{secret}\"\n}}\n"
+            );
+            fs::write(DesktopSettings::settings_path(&dir), &forged).unwrap();
+            let migrated = DesktopSettings::load(&dir).unwrap();
+            let raw_after = fs::read_to_string(DesktopSettings::settings_path(&dir)).unwrap();
+            assert!(!raw_after.contains(secret), "legacy plaintext secret must be resealed on load");
+            assert!(raw_after.contains("dpapi:"));
+            assert_eq!(migrated.google_desktop_client_secret().unwrap().as_deref(), Some(secret));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(set.is_err(), "without DPAPI the secret must not be stored");
+            s.save(&dir).unwrap();
+            let raw = fs::read_to_string(DesktopSettings::settings_path(&dir)).unwrap();
+            assert!(!raw.contains(secret));
+            assert!(!raw.contains("google_desktop_client_secret"));
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
