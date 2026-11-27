@@ -39,6 +39,10 @@ pub struct HarnessReportOutcome {
 }
 
 /// Canonical provider id for a harness CLI on a specific device (`claude-code@<device_id>`).
+/// Harness CLIs whose headless mode can't be confined (no read-only or plan mode that Grouper can
+/// rely on). Standard-chat turns are refused for these until per-turn approval exists.
+pub(crate) const UNCONFINABLE_HARNESSES: &[&str] = &["hermes", "opencode"];
+
 pub fn provider_id(harness: &str, device_id: &str) -> String {
     format!("{}@{}", harness.trim(), device_id.trim())
 }
@@ -507,6 +511,14 @@ impl Hub {
             return Err(format!("harness model {} has no CLI agent configured", model.id));
         };
         let label = harness_label(model, provider.as_ref());
+        // Hermes ignores the confinement level (its one-shot mode runs every tool without asking)
+        // and OpenCode always auto-approves. The design asks for an approval per turn for these;
+        // until that exists they are refused rather than run unconfined on the owner's device.
+        if UNCONFINABLE_HARNESSES.contains(&agent.as_str()) {
+            return Err(format!(
+                "{label} can't be confined to a safe mode yet, so Grouper won't run it in a chat. Pick Claude Code, Codex, Antigravity, Grok or pi, or an API model."
+            ));
+        }
         let host_ref = model
             .device_id
             .as_deref()
