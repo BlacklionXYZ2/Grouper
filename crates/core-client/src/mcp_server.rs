@@ -36,8 +36,10 @@ pub(crate) struct DeviceServer {
     folders: Arc<Folders>,
     /// Where thread workspaces live, for the hub's workspace tools.
     workspace_root: Option<PathBuf>,
-    /// Whether this device opted in to read-only subscription usage probes.
+    /// Whether this device allows read-only subscription usage probes.
     usage_probes: bool,
+    /// The providers switched on locally (`None`: all supported).
+    usage_probe_providers: Option<Vec<String>>,
 }
 
 impl DeviceServer {
@@ -56,6 +58,7 @@ impl DeviceServer {
             folders,
             workspace_root: config.workspace_root.clone(),
             usage_probes: config.usage_probes,
+            usage_probe_providers: config.usage_probe_providers.clone(),
         }
     }
 
@@ -78,7 +81,9 @@ impl DeviceServer {
             if !self.usage_probes {
                 return (false, serde_json::json!({"error": "usage probes are disabled on this device"}).to_string());
             }
-            return crate::usage_probes::call(&args).await;
+            // Only providers switched on locally run, whatever the hub asks for.
+            let enabled = crate::usage_probes::enabled_providers(self.usage_probe_providers.as_deref());
+            return crate::usage_probes::call(&args, &enabled).await;
         }
         if self.workspace.iter().any(|d| d.name == name) {
             return (false, format!("{name} only runs inside a thread on this device"));
@@ -107,7 +112,8 @@ impl ServerHandler for DeviceServer {
             meta.insert(FOLDERS_META_KEY.into(), serde_json::to_value(self.folders.infos()).unwrap_or_default());
         }
         if self.usage_probes {
-            meta.insert(USAGE_PROBES_META_KEY.into(), serde_json::json!(crate::usage_probes::SUPPORTED_PROVIDERS));
+            let enabled = crate::usage_probes::enabled_providers(self.usage_probe_providers.as_deref());
+            meta.insert(USAGE_PROBES_META_KEY.into(), serde_json::json!(enabled));
         }
         if !meta.is_empty() {
             info.meta = Some(MetaObject(meta));

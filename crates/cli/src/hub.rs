@@ -67,9 +67,24 @@ pub enum HubCmd {
         /// Scoped folders file. Default: <config dir>/grouper/folders.json.
         #[arg(long, env = "GROUPER_FOLDERS_CONFIG")]
         folders_config: Option<PathBuf>,
-        /// Enable read-only subscription usage probes (Claude Code, Codex).
-        #[arg(long, env = "GROUPER_USAGE_PROBES")]
-        usage_probes: bool,
+        /// Read-only subscription usage probes, ON by default for Claude Code, Codex, Grok and
+        /// Antigravity (usage belongs to the whole account). `--usage-probes=claude,grok` limits
+        /// them to those providers; a bare `--usage-probes` means all. They use the CLIs' local
+        /// sign-ins; tokens stay on this device and are never sent to the hub. Switch off with
+        /// `--no-usage-probes`. This can only be set here, never from another device.
+        #[arg(
+            long,
+            env = "GROUPER_USAGE_PROBES",
+            value_name = "PROVIDERS",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "all",
+            value_parser = core_client::usage_probes::UsageProbeSetting::from_flag
+        )]
+        usage_probes: Option<core_client::usage_probes::UsageProbeSetting>,
+        /// Don't read subscription usage on this device at all.
+        #[arg(long, conflicts_with = "usage_probes")]
+        no_usage_probes: bool,
     },
     /// Show whether this machine's hub is running, its identity (account, hub_device_id, epoch) and tunnel status.
     Status,
@@ -152,6 +167,8 @@ pub struct RunOptions {
     pub folders: Vec<String>,
     pub folders_config: Option<PathBuf>,
     pub usage_probes: bool,
+    /// `None`: every supported provider.
+    pub usage_probe_providers: Option<Vec<String>>,
 }
 
 /// Live handles for `grouper hub run` (embedded hub + in-process non-admin node).
@@ -219,6 +236,7 @@ impl RunningLocalHub {
             mcp_config: opts.mcp_config,
             folders,
             usage_probes: opts.usage_probes,
+            usage_probe_providers: opts.usage_probe_providers,
         };
 
         let (node_shutdown, node_rx) = watch::channel(false);
@@ -530,7 +548,13 @@ pub async fn run(cli_hub: Option<&str>, cli_token: Option<&str>, cmd: HubCmd) ->
             folders,
             folders_config,
             usage_probes,
+            no_usage_probes,
         } => {
+            let probe_setting = if no_usage_probes {
+                core_client::usage_probes::UsageProbeSetting::off()
+            } else {
+                usage_probes.unwrap_or_default()
+            };
             let data_dir = resolve_data_dir(data)?;
             let install_id = credentials::install_id()?;
             let running = RunningLocalHub::start(RunOptions {
@@ -542,7 +566,8 @@ pub async fn run(cli_hub: Option<&str>, cli_token: Option<&str>, cmd: HubCmd) ->
                 mcp_config,
                 folders,
                 folders_config,
-                usage_probes,
+                usage_probes: probe_setting.enabled,
+                usage_probe_providers: probe_setting.providers,
             })
             .await?;
 
@@ -717,6 +742,7 @@ mod tests {
             folders: vec![],
             folders_config: Some(folders_path),
             usage_probes: false,
+            usage_probe_providers: None,
         })
         .await
         .unwrap();

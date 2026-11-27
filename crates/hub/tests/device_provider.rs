@@ -167,6 +167,7 @@ async fn hosted_provider_serves_hub_calls_streams_cancels_and_reports_offline() 
         mcp_config: Some(mcp_config),
         folders: Vec::new(),
         usage_probes: false,
+        usage_probe_providers: None,
     };
     let (host_stop, host_stopped) = tokio::sync::watch::channel(false);
     let host_client = tokio::spawn(core_client::run(
@@ -184,6 +185,7 @@ async fn hosted_provider_serves_hub_calls_streams_cancels_and_reports_offline() 
         mcp_config: Some(dir.join("mcp.json")),
         folders: Vec::new(),
         usage_probes: false,
+        usage_probe_providers: None,
     };
     let (laptop_stop, laptop_stopped) = tokio::sync::watch::channel(false);
     let laptop_client = tokio::spawn(core_client::run(
