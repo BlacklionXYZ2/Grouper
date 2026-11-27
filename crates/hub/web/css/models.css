@@ -60,8 +60,8 @@
 /* Section labels: sentence case, no tracking. */
 .mp-section {
   text-transform: none;
-  letter-spacing: 0;
-  font-size: 12.5px;
+  letter-spacing: var(--type-caption-track);
+  font-size: var(--type-caption-size);
   font-weight: 600;
   color: var(--text-2);
 }
@@ -75,7 +75,7 @@
 
 @media (min-width: 761px) {
   dialog.sheet-dialog.model-picker[open] {
-    animation: mp-rise 0.22s var(--ease);
+    animation: mp-rise var(--dur-slow) var(--ease-snap);
   }
 }
 
@@ -99,7 +99,7 @@
 .mp-opt-id {
   flex: 1 1 auto;
   min-width: 0;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   color: var(--text);
 }
@@ -115,7 +115,7 @@
 .mp-opt-sub {
   margin-top: 2px;
   gap: 2px 10px;
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
 }
 
@@ -141,15 +141,15 @@
   gap: 8px;
   min-height: 40px;
   padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-control);
   background: var(--surface-2);
   color: var(--text);
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   cursor: pointer;
   text-align: left;
-  transition: background 0.15s var(--ease), border-color 0.15s var(--ease);
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
 }
 
 .mp-more-btn:hover {
@@ -163,7 +163,7 @@
 }
 
 .mp-more-meta {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   font-weight: 500;
   color: var(--text-3);
 }
@@ -217,13 +217,13 @@
   flex-wrap: wrap;
   gap: 2px 10px;
   margin-top: 2px;
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
 }
 
 .models-subsection {
   margin: 14px 0 8px;
-  font-size: 13px;
-  font-weight: 650;
+  font-size: var(--type-ui-size);
+  font-weight: 600;
   color: var(--text-2);
 }
 

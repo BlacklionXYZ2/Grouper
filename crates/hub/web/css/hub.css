@@ -9,8 +9,8 @@
   gap: 12px;
   padding: 16px 18px;
   margin: 0 0 18px;
-  border-radius: var(--radius);
-  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: var(--r-card);
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--line-2));
   border-left: 4px solid var(--accent);
   background:
     linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 55%, var(--surface)) 0%, color-mix(in srgb, var(--purple-soft) 45%, var(--surface)) 55%, var(--surface) 100%);
@@ -18,18 +18,18 @@
 }
 
 .hub-card.is-moving {
-  border-color: color-mix(in srgb, var(--purple) 45%, var(--border));
+  border-color: color-mix(in srgb, var(--purple) 45%, var(--line-2));
   border-left-color: var(--purple-fill);
 }
 
 .hub-card.is-replaced {
-  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--line-2));
   border-left-color: var(--warn);
   background: color-mix(in srgb, var(--warn-soft) 35%, var(--surface));
 }
 
 .hub-card.is-error {
-  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line-2));
   border-left-color: var(--danger);
 }
 
@@ -52,7 +52,7 @@
 .hub-card-ico {
   width: 38px;
   height: 38px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   display: grid;
   place-items: center;
   flex: none;
@@ -73,9 +73,9 @@
 
 .hub-card-title {
   margin: 0;
-  font-size: 16px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
+  font-size: var(--type-body-size);
+  font-weight: 600;
+  letter-spacing: var(--type-body-track);
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -112,12 +112,12 @@
   align-items: center;
   gap: 6px;
   padding: 3px 10px;
-  border-radius: 999px;
-  font-size: 12.5px;
-  font-weight: 550;
+  border-radius: var(--r-full);
+  font-size: var(--type-caption-size);
+  font-weight: 500;
   background: var(--surface-2);
   color: var(--text-2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
 }
 
 .hub-move-step .icon {
@@ -147,7 +147,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   color: var(--text-2);
 }
 
@@ -180,14 +180,14 @@ progress.hub-progress::-webkit-progress-bar {
 progress.hub-progress::-webkit-progress-value {
   background: var(--accent-fill);
   border-radius: var(--progress-bar-radius);
-  transition: inline-size 0.3s var(--ease);
+  transition: inline-size var(--dur-slow) var(--ease-in-out);
   animation: var(--progress-bar-animation, revert-rule);
 }
 
 progress.hub-progress::-moz-progress-bar {
   background: var(--accent-fill);
   border-radius: var(--progress-bar-radius);
-  transition: inline-size 0.3s var(--ease);
+  transition: inline-size var(--dur-slow) var(--ease-in-out);
   animation: var(--progress-bar-animation, revert-rule);
 }
 
@@ -257,7 +257,7 @@ progress.hub-progress:dir(rtl):indeterminate {
   align-items: center;
   gap: 6px;
   margin-top: 4px;
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   color: var(--warn);
 }
 
@@ -283,21 +283,21 @@ progress.hub-progress:dir(rtl):indeterminate {
 
 .hub-ineligible-row .row-title {
   color: var(--text-2);
-  font-weight: 550;
+  font-weight: 500;
 }
 
 .hub-threads-choice {
   margin: 0;
   padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
   display: grid;
   gap: 10px;
 }
 
 .hub-threads-choice legend {
   padding: 0 6px;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   color: var(--text-2);
 }
@@ -320,14 +320,14 @@ progress.hub-progress:dir(rtl):indeterminate {
 .hub-radio-title {
   display: block;
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
   color: var(--text);
 }
 
 .hub-reauth-box {
   padding: 12px 14px;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  border: 1px solid var(--line-2);
   background: var(--surface-2);
   display: grid;
   gap: 10px;
@@ -340,7 +340,7 @@ progress.hub-progress:dir(rtl):indeterminate {
   gap: 8px;
   flex-wrap: wrap;
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--type-ui-size);
 }
 
 /* ---- Remote access settings */
@@ -364,14 +364,14 @@ progress.hub-progress:dir(rtl):indeterminate {
 
 .remote-toggle-label {
   font-weight: 600;
-  font-size: 14.5px;
+  font-size: var(--type-body-size);
 }
 
 .remote-form {
   display: grid;
   gap: 8px;
   padding-top: 12px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
 }
 
 .remote-inline-actions {
@@ -385,11 +385,11 @@ progress.hub-progress:dir(rtl):indeterminate {
   display: block;
   margin-top: 6px;
   padding: 6px 10px;
-  border-radius: var(--radius-xs);
+  border-radius: var(--r-chip);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   user-select: all;
 }
 

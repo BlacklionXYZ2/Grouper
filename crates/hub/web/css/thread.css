@@ -22,7 +22,7 @@
   margin: 0;
   z-index: 60;
   border: none;
-  border-left: 1px solid var(--border);
+  border-left: 1px solid var(--line-2);
   border-radius: 0;
   box-shadow: none;
   animation: none;
@@ -36,8 +36,8 @@
     right: 10px;
     bottom: 10px;
     left: 10px;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-lg);
+    border: 1px solid var(--line-3);
+    border-radius: var(--r-sheet);
   }
 }
 
@@ -69,7 +69,7 @@
 }
 
 .thread-view .sheet-head h2 {
-  font-size: 16px;
+  font-size: var(--type-body-size);
   font-weight: 600;
   margin-right: 6px;
 }
@@ -91,7 +91,7 @@
   border: none;
   min-height: 28px;
   padding: 3px 10px 3px 9px;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 .tv-pill .thread-time {
@@ -110,10 +110,10 @@
   max-width: 100%;
   min-height: 28px;
   padding: 3px 10px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-2);
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   font-weight: 500;
 }
 
@@ -159,7 +159,7 @@
 }
 
 .tv-model .tv-chip-text {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
 }
 
 .tv-mark {
@@ -182,7 +182,7 @@
 
 .tv-reason {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--type-ui-size);
 }
 
 .tv-reason > summary {
@@ -192,7 +192,7 @@
   cursor: pointer;
   color: var(--text-2);
   font-weight: 500;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
 }
 
 .tv-reason > summary:hover {
@@ -215,11 +215,11 @@
 
 /* Section labels in the panel: sentence case, not the shell's upper-case caps. */
 .thread-view .tv-section-title {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 600;
   color: var(--text);
   text-transform: none;
-  letter-spacing: normal;
+  letter-spacing: var(--type-caption-track);
 }
 
 .tv-meta-sep[hidden] {
@@ -256,15 +256,15 @@
 
 .tv-plan {
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
 }
 
 .tv-plan > summary {
   display: grid;
   gap: 6px;
   padding: 10px 10px 10px 12px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   cursor: pointer;
   list-style: none;
 }
@@ -282,15 +282,15 @@
 
 .tv-plan-title {
   margin: 0;
-  font-size: 13.5px;
-  font-weight: 650;
+  font-size: var(--type-ui-size);
+  font-weight: 600;
   color: var(--text);
 }
 
 .tv-plan-count {
   flex: 1;
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   font-variant-numeric: tabular-nums;
 }
 
@@ -300,7 +300,7 @@
   height: 16px;
   color: var(--text-3);
   transform: rotate(90deg);
-  transition: transform 0.15s var(--ease);
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 
 details[open] > summary .tv-chev {
@@ -314,7 +314,7 @@ details[open] > summary .tv-chev {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--purple);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 600;
 }
 
@@ -337,7 +337,7 @@ details[open] > summary .tv-chev {
   width: 0;
   border-radius: 2px;
   background: linear-gradient(90deg, var(--accent-fill), var(--purple-fill));
-  transition: width 0.3s var(--ease);
+  transition: width var(--dur-slow) var(--ease-in-out);
 }
 
 .tv-plan.is-complete .tv-plan-fill {
@@ -362,9 +362,9 @@ details[open] > summary .tv-chev {
   gap: 10px;
   align-items: start;
   padding: 5px 8px;
-  border-radius: var(--radius-sm);
-  font-size: 13.5px;
-  line-height: 1.4;
+  border-radius: var(--r-control);
+  font-size: var(--type-ui-size);
+  line-height: var(--type-ui-lh);
   color: var(--text);
 }
 
@@ -380,7 +380,7 @@ details[open] > summary .tv-chev {
   width: 16px;
   height: 16px;
   margin-top: 1px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   border: 1.5px solid var(--text-3);
 }
 
@@ -454,7 +454,7 @@ details[open] > summary .tv-chev {
 }
 
 .thread-view .thread-who .mono {
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .thread-view .msg-ask {
@@ -481,7 +481,7 @@ details[open] > summary .tv-chev {
 .tv-tool-state .live-dot {
   width: 7px;
   height: 7px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: currentColor;
   animation: pulse 1.4s ease-in-out infinite;
 }
@@ -489,7 +489,7 @@ details[open] > summary .tv-chev {
 /* ---- state cards: waiting for a device, checkpoint, done, failed, stopped */
 
 .tv-state h3 {
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
 }
 
 .tv-state p {
@@ -540,7 +540,7 @@ details[open] > summary .tv-chev {
 
 .tv-state h3 .tv-when {
   margin-left: auto;
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   font-weight: 400;
   color: var(--text-2);
 }
@@ -608,7 +608,7 @@ details[open] > summary .tv-chev {
 .tp-count {
   margin-left: auto;
   color: var(--text-2);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
@@ -656,7 +656,7 @@ details[open] > summary .tv-chev {
   align-items: center;
   gap: 2px 10px;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--type-caption-size);
 }
 
 .tp-sub {
@@ -665,7 +665,7 @@ details[open] > summary .tv-chev {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-2);
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
 }
 
 .tp-sub[hidden],
@@ -685,7 +685,7 @@ details[open] > summary .tv-chev {
   align-items: center;
   gap: 3px;
   color: var(--purple);
-  font-weight: 650;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
 
@@ -702,7 +702,7 @@ details[open] > summary .tv-chev {
   padding-top: 8px;
   padding-bottom: 8px;
   font: inherit;
-  font-size: 13.5px;
+  font-size: var(--type-ui-size);
 }
 
 .tp-approval > .icon:first-child {
