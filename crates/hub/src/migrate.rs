@@ -3092,18 +3092,22 @@ mod tests {
             .unwrap()
             .expect("desktop target move succeeded");
 
-        let mut move_rx = old_hub.migrate().subscribe();
-        let waited = tokio::time::timeout(Duration::from_secs(30), move_rx.wait_for(|s| s.state == MovePhase::Done)).await;
+        // Wait for a state that stays true. On fast machines the old hub reaches Done, steps down
+        // and resets its move status to Idle before a watcher could see Done (seen on Linux CI).
+        let waited = tokio::time::timeout(Duration::from_secs(30), async {
+            while !old_handle.is_stepped_down() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
         if waited.is_err() {
-            // Diagnose CI-only failures: where did the old hub's move stop, and what does the
-            // public endpoint answer?
             let status = old_hub.migrate().subscribe().borrow().clone();
             let probe = reqwest::Client::new().get(format!("{pub_url}/v1/hub")).send().await;
             let probe = match probe {
                 Ok(r) => format!("{} {}", r.status(), r.text().await.unwrap_or_default()),
                 Err(e) => format!("error: {e}"),
             };
-            panic!("old hub did not finish the move within 30 s; status: {status:?}; public endpoint: {probe}");
+            panic!("old hub did not step down within 30 s; status: {status:?}; public endpoint: {probe}");
         }
 
         assert!(old_handle.is_stepped_down());
