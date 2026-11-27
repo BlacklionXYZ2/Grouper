@@ -71,6 +71,8 @@ $H device add "Mac CLI" --platform macos      # token for the device that runs t
 $H device add "Phone" --platform ios --admin  # admin token for you, the chat client
 $H provider scripted --kind scripted --options "{\"script\": \"$PWD/examples/scripted-demo.json\"}"
 $H model fake --provider scripted --model fake-1 --roles orchestrator,standard,thread
+$H model-price fake --input 1.5 --output 6   # later: set only the prices (USD per 1M tokens; also --cache-read, --cache-write)
+#   and re-price past calls that were recorded at $0. Unlike `model`, it keeps use cases, roles and name.
 $H serve
 ```
 

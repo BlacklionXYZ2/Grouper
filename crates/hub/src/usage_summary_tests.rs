@@ -233,7 +233,8 @@ struct Fixture {
     dir: std::path::PathBuf,
 }
 
-/// Providers: `p1` (priced model, an unpriced one, a display name), `p2` (local, free model),
+/// Providers: `p1` (priced model, an unpriced one, a display name), `p2` (local, free model: not a key),
+/// `ps` (the scripted test fake: not a key),
 /// `p3` (unused), the harness `claude-code@dev1`; usage rows at `since + n`, plus rows outside the
 /// range, a subscription row, and one for a provider that no longer exists.
 async fn fixture() -> Fixture {
@@ -245,6 +246,7 @@ async fn fixture() -> Fixture {
     db.upsert_provider(&provider("p1", "openai", Some("https://api.example.com/v1"))).unwrap();
     db.upsert_provider(&provider("p2", "openai", Some("http://127.0.0.1:11434/v1"))).unwrap();
     db.upsert_provider(&provider("p3", "anthropic", None)).unwrap();
+    db.upsert_provider(&provider("ps", "scripted", None)).unwrap();
     db.upsert_provider(&ProviderConfig {
         id: "claude-code@dev1".into(),
         kind: "harness".into(),
@@ -279,6 +281,7 @@ async fn fixture() -> Fixture {
     insert_usage(&db, Some("c2"), "p1", "mystery-model", "api", t(32), (400, 40), 0.0);
     insert_usage(&db, Some("c2"), "p2", "tiny", "api", t(40), (900, 90), 0.0);
     insert_usage(&db, Some("c2"), "p2", "unmarked", "api", t(41), (50, 5), 0.0);
+    insert_usage(&db, Some("c2"), "ps", "script", "api", t(42), (70, 7), 0.0);
     insert_usage(&db, Some("c2"), "gone", "old-model", "api", t(50), (10, 1), 0.5);
     // Subscription rows never feed the totals or the keys.
     insert_usage(&db, Some("c1"), "claude-code@dev1", "sonnet", "subscription", t(60), (300, 30), 0.0);
@@ -315,7 +318,8 @@ async fn summary_totals_match_the_provider_breakdown_without_subscription_rows()
         .unwrap();
     // `/v1/usage` also lists the subscription provider; the summary leaves it out.
     assert!(breakdown.iter().any(|row| row.key == "claude-code@dev1"));
-    let api_rows: Vec<_> = breakdown.iter().filter(|row| row.key != "claude-code@dev1").collect();
+    // Neither does it list the local `p2` or the scripted `ps`: they are not API keys.
+    let api_rows: Vec<_> = breakdown.iter().filter(|row| !["claude-code@dev1", "p2", "ps"].contains(&row.key.as_str())).collect();
     let mut calls = 0;
     let mut cost = 0.0;
     let mut tokens = 0;
@@ -343,8 +347,9 @@ async fn summary_totals_match_the_provider_breakdown_without_subscription_rows()
             + summary.total.cache_write_tokens,
         tokens
     );
-    // 2 + 3 + 1 + 1 + 1 (gone) + 1 (p3 at `since`); the boundary rows and subscription rows are out.
-    assert_eq!(summary.total.calls, 9);
+    // 2 + 3 + 1 (gone) + 1 (p3 at `since`); the boundary rows, subscription rows and the
+    // local and scripted providers' rows are out.
+    assert_eq!(summary.total.calls, 7);
     assert!((summary.total.cost - 0.80).abs() < 1e-9, "{}", summary.total.cost);
     std::fs::remove_dir_all(&f.dir).ok();
 }
@@ -355,9 +360,10 @@ async fn summary_lists_every_key_flags_removed_and_unpriced_and_groups_subscript
     let summary: UsageSummary =
         get_summary(&f, &format!("since={}&until={}", f.since, f.until)).await.json().await.unwrap();
 
-    // Sorted by cost, then tokens, then id: gone (0.5), p1 (0.05), p3 (0.25) -> gone, p3, p1, then p2 (tokens).
+    // Sorted by cost, then tokens, then id: gone (0.5), p1 (0.05), p3 (0.25) -> gone, p3, p1.
+    // The local `p2` and the scripted `ps` are not API keys, though they have rows.
     let order: Vec<&str> = summary.keys.iter().map(|k| k.provider.as_str()).collect();
-    assert_eq!(order, ["gone", "p3", "p1", "p2"]);
+    assert_eq!(order, ["gone", "p3", "p1"]);
     // Harness providers are not keys.
     assert!(summary.keys.iter().all(|k| k.provider != "claude-code@dev1"));
 
@@ -380,12 +386,7 @@ async fn summary_lists_every_key_flags_removed_and_unpriced_and_groups_subscript
     assert_eq!((mystery.model.as_str(), mystery.name.as_str(), mystery.priced), ("mystery-model", "mystery-model", false));
     assert_eq!(summary.unpriced_calls, 3);
 
-    // A key on a local address is local, and so are its models; free and local models count as priced.
-    let p2 = summary.keys.iter().find(|k| k.provider == "p2").unwrap();
-    assert!(p2.local);
-    let tiny = p2.models.iter().find(|m| m.model == "tiny").unwrap();
-    assert!(tiny.free && tiny.local && tiny.priced);
-    assert!(p2.models.iter().find(|m| m.model == "unmarked").unwrap().priced);
+    assert!(summary.keys.iter().all(|k| k.provider != "p2" && k.provider != "ps"));
 
     // p3's boundary row at `since` is included, and it is listed with a colour and no model entry.
     let p3 = summary.keys.iter().find(|k| k.provider == "p3").unwrap();
@@ -416,12 +417,12 @@ async fn summary_lists_every_key_flags_removed_and_unpriced_and_groups_subscript
 #[tokio::test]
 async fn summary_lists_unused_keys_and_accepts_exact_instants() {
     let f = fixture().await;
-    // A range with no usage at all still lists every non-harness key, with zero totals.
+    // A range with no usage at all still lists every billed key, with zero totals.
     let quiet = f.since + 3 * 86_400;
     let summary: UsageSummary = get_summary(&f, &format!("since={quiet}&until={}", quiet + 60)).await.json().await.unwrap();
     let mut ids: Vec<&str> = summary.keys.iter().map(|k| k.provider.as_str()).collect();
     ids.sort();
-    assert_eq!(ids, ["p1", "p2", "p3"]);
+    assert_eq!(ids, ["p1", "p3"]);
     assert!(summary.keys.iter().all(|k| k.totals.calls == 0 && k.models.is_empty() && !k.removed));
     assert_eq!((summary.total.calls, summary.unpriced_calls), (0, 0));
     assert!(summary.subscriptions.is_empty());
@@ -431,12 +432,12 @@ async fn summary_lists_unused_keys_and_accepts_exact_instants() {
     let summary: UsageSummary =
         get_summary(&f, "since=2026-11-25T01:00:00%2B01:00&until=2026-11-26T00:00:00Z").await.json().await.unwrap();
     assert_eq!((summary.since, summary.until), (f.since, f.until));
-    assert_eq!(summary.total.calls, 9);
+    assert_eq!(summary.total.calls, 7);
 
     // `until` defaults to now; the old date forms still parse.
     let summary: UsageSummary = get_summary(&f, "since=2026-11-25").await.json().await.unwrap();
     assert!(summary.until >= crate::db::now() - 5);
-    assert_eq!(summary.total.calls, 9 + 1); // the row at the old `until` counts now; only `since - 1` is out
+    assert_eq!(summary.total.calls, 7 + 1); // the row at the old `until` counts now; only `since - 1` is out
     let summary: UsageSummary = get_summary(&f, "since=2026-11-25&until=2026-11-25").await.json().await.unwrap();
     assert_eq!(summary.until, f.until);
 
@@ -672,4 +673,79 @@ fn harness_threads_for_grok_and_antigravity_map_to_their_probes() {
     assert_eq!(matching_probe_providers(&db, &api.id), vec!["grok", "antigravity"]);
     assert!(PROBE_PROVIDERS.contains(&"grok") && PROBE_PROVIDERS.contains(&"antigravity"));
     std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn local_scripted_and_device_providers_are_not_keys() {
+    let dir = temp_dir("notkeys");
+    let db = Db::open(&dir).unwrap();
+    db.add_device("dev1", "linux", false).unwrap();
+    db.upsert_provider(&provider("real", "openai", Some("https://api.example.com/v1"))).unwrap();
+    db.upsert_provider(&provider("lmstudio", "openai", Some("http://127.0.0.1:45123/v1"))).unwrap();
+    db.upsert_provider(&provider("scripted", "scripted", None)).unwrap();
+    let mut via = provider("remote-box", "openai", Some("https://box.example.com/v1"));
+    via.options = json!({"via_device": "dev1"});
+    db.upsert_provider(&via).unwrap();
+    for id in ["real", "lmstudio", "scripted", "remote-box"] {
+        insert_usage(&db, None, id, "m", "api", 100, (10, 1), if id == "real" { 1.0 } else { 0.0 });
+    }
+    let summary = db.usage_summary(0, 1000, None).unwrap();
+    let ids: Vec<&str> = summary.keys.iter().map(|k| k.provider.as_str()).collect();
+    assert_eq!(ids, ["real"]);
+    assert_eq!(summary.total.calls, 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn changing_a_models_price_reprices_only_its_unpriced_api_calls() {
+    let dir = temp_dir("reprice");
+    let db = Db::open(&dir).unwrap();
+    db.upsert_provider(&provider("radium", "openai", Some("https://api.example.com/v1"))).unwrap();
+    db.upsert_model(&model("radium-tycho", "radium", "tycho-1.0", 0.0, 0.0)).unwrap();
+    insert_usage(&db, None, "radium", "tycho-1.0", "api", 10, (1_000_000, 500_000), 0.0); // plus cache 7 and 3
+    insert_usage(&db, None, "radium", "tycho-1.0", "api", 11, (1_000_000, 0), 0.75); // already has a cost
+    insert_usage(&db, None, "radium", "tycho-1.0", "subscription", 12, (1_000_000, 0), 0.0);
+    insert_usage(&db, None, "radium", "other-model", "api", 13, (1_000_000, 0), 0.0);
+
+    let (hub, base) = serve(db, &dir).await;
+    let (_, admin) = hub.db.add_device("Admin", "ios", true).unwrap();
+    let mut entry = hub.db.find_model("radium-tycho").unwrap();
+    entry.input_price = 2.0;
+    entry.output_price = 4.0;
+    let response = reqwest::Client::new()
+        .put(format!("{base}/v1/models/radium-tycho"))
+        .bearer_auth(&admin)
+        .json(&entry)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let costs: Vec<f64> = {
+        let c = hub.db.c();
+        let mut st = c.prepare("SELECT cost FROM usage ORDER BY ts").unwrap();
+        st.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    // 1M input at 2 + 0.5M output at 4 + 7 cache-read at 1 (half of input) + 3 cache-write at 2.
+    let expected = 2.0 + 2.0 + 7.0 / 1e6 + 6.0 / 1e6;
+    assert!((costs[0] - expected).abs() < 1e-9, "{costs:?}");
+    assert_eq!(costs[1..], [0.75, 0.0, 0.0]);
+    // Again: nothing is left to re-price.
+    let again = hub.db.find_model("radium-tycho").unwrap();
+    assert_eq!(hub.db.reprice_unpriced_usage(&again).unwrap(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reprice_counts_rows_changed() {
+    let dir = temp_dir("reprice-count");
+    let db = Db::open(&dir).unwrap();
+    db.upsert_provider(&provider("p", "openai", Some("https://api.example.com/v1"))).unwrap();
+    db.upsert_model(&model("mm", "p", "up", 1.0, 1.0)).unwrap();
+    for ts in 1..=3 {
+        insert_usage(&db, None, "p", "up", "api", ts, (1000, 1000), 0.0);
+    }
+    let m = db.find_model("mm").unwrap();
+    assert_eq!(db.reprice_unpriced_usage(&m).unwrap(), 3);
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -1020,7 +1020,15 @@ async fn put_model(
     admin!(hub, headers);
     m.id = id;
     match hub.db.upsert_model(&m) {
-        Ok(()) => Json(hub.db.find_model(&m.id).unwrap_or(m)).into_response(),
+        Ok(()) => {
+            let saved = hub.db.find_model(&m.id).unwrap_or(m);
+            match hub.db.reprice_unpriced_usage(&saved) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("re-priced {n} past calls of model {}", saved.id),
+                Err(e) => tracing::warn!("re-pricing past calls of model {} failed: {e}", saved.id),
+            }
+            Json(saved).into_response()
+        }
         Err(e) => model_rule_err(StatusCode::BAD_REQUEST, e),
     }
 }
