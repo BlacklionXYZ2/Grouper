@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Where should Grouper run?</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f8f8f7;
+      --card: #ffffff;
+      --fg: #18181b;
+      --muted: #52525b;
+      --border: #d4d4d8;
+      --accent: #4f46e5;
+      --accent-fg: #ffffff;
+      --err: #b91c1c;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #121215;
+        --card: #1b1b20;
+        --fg: #f4f4f5;
+        --muted: #a1a1aa;
+        --border: #303038;
+        --accent: #6366f1;
+        --accent-fg: #ffffff;
+        --err: #f87171;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--fg);
+      font: 15px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    main {
+      width: 100%;
+      max-width: 460px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 28px;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 21px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    p.lead {
+      margin: 0 0 20px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .option {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 10px;
+      cursor: pointer;
+    }
+    .option:has(input:checked) {
+      border-color: var(--accent);
+      outline: 1px solid var(--accent);
+    }
+    .option input[type="radio"] {
+      margin-top: 3px;
+      accent-color: var(--accent);
+    }
+    .option-title {
+      font-weight: 600;
+      display: block;
+      margin-bottom: 2px;
+    }
+    .option-desc {
+      color: var(--muted);
+      font-size: 13px;
+      display: block;
+    }
+    .remote-box {
+      margin: 6px 0 14px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .remote-box[hidden] { display: none; }
+    .remote-box label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .remote-box input {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--fg);
+      font: inherit;
+      font-size: 14px;
+    }
+    .hint {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 18px;
+    }
+    button {
+      padding: 9px 16px;
+      border-radius: 8px;
+      border: 1px solid transparent;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.primary {
+      background: var(--accent);
+      color: var(--accent-fg);
+    }
+    button.secondary {
+      background: transparent;
+      color: var(--fg);
+      border-color: var(--border);
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    #error {
+      margin-top: 12px;
+      color: var(--err);
+      font-size: 13px;
+    }
+    #oauth-note {
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Where should Grouper run?</h1>
+    <p class="lead">You can change this later from the Grouper tray icon.</p>
+
+    <form id="setup-form">
+      <label class="option">
+        <input type="radio" name="mode" value="this_computer" checked>
+        <span>
+          <span class="option-title">This computer</span>
+          <span class="option-desc">Grouper runs here and your other devices connect to it. Pick a computer that stays on.</span>
+        </span>
+      </label>
+
+      <label class="option">
+        <input type="radio" name="mode" value="another_computer">
+        <span>
+          <span class="option-title">Another computer</span>
+          <span class="option-desc">Don't run a hub on this PC; open a hub that is already set up elsewhere.</span>
+        </span>
+      </label>
+
+      <div id="remote-box" class="remote-box" hidden>
+        <label for="remote-url">Hub address</label>
+        <input id="remote-url" type="url" autocomplete="off" spellcheck="false" value="https://grouper.clockmillbarn.uk">
+        <p class="hint">Defaults to https://grouper.clockmillbarn.uk; changeable later.</p>
+      </div>
+
+      <div class="actions">
+        <button id="continue-btn" class="primary" type="submit">Continue</button>
+        <button id="google-btn" class="secondary" type="button" hidden>Sign in with Google</button>
+      </div>
+      <div id="error" role="alert" hidden></div>
+      <p id="oauth-note" hidden></p>
+    </form>
+  </main>
+
+  <script>
+    const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+    const form = document.getElementById("setup-form");
+    const remoteBox = document.getElementById("remote-box");
+    const remoteInput = document.getElementById("remote-url");
+    const continueBtn = document.getElementById("continue-btn");
+    const googleBtn = document.getElementById("google-btn");
+    const errorEl = document.getElementById("error");
+    const oauthNoteEl = document.getElementById("oauth-note");
+
+    function selectedMode() {
+      const checked = form.querySelector('input[name="mode"]:checked');
+      return checked ? checked.value : "this_computer";
+    }
+
+    function syncVisibility() {
+      remoteBox.hidden = selectedMode() !== "another_computer";
+    }
+
+    form.addEventListener("change", syncVisibility);
+
+    async function submitChoice(signInWithGoogle) {
+      errorEl.hidden = true;
+      continueBtn.disabled = true;
+      googleBtn.disabled = true;
+      try {
+        await invoke("choose", {
+          mode: selectedMode(),
+          remoteHubUrl: remoteInput.value,
+          signInWithGoogle: Boolean(signInWithGoogle),
+        });
+      } catch (err) {
+        errorEl.textContent = String(err);
+        errorEl.hidden = false;
+        continueBtn.disabled = false;
+        googleBtn.disabled = false;
+      }
+    }
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      submitChoice(false);
+    });
+
+    googleBtn.addEventListener("click", () => submitChoice(true));
+
+    (async () => {
+      if (!invoke) return;
+      try {
+        const state = await invoke("setup");
+        if (state.mode) {
+          const radio = form.querySelector(`input[name="mode"][value="${state.mode}"]`);
+          if (radio) radio.checked = true;
+        }
+        if (state.remote_hub_url) {
+          remoteInput.value = state.remote_hub_url;
+        }
+        if (state.google_desktop_configured) {
+          googleBtn.hidden = false;
+        } else {
+          oauthNoteEl.textContent = "Desktop Google OAuth (GROUPER_GOOGLE_DESKTOP_CLIENT_ID) is not configured yet; on a local hub, #/token-signin works on loopback.";
+          oauthNoteEl.hidden = false;
+        }
+        syncVisibility();
+      } catch (err) {
+        errorEl.textContent = String(err);
+        errorEl.hidden = false;
+      }
+    })();
+  </script>
+</body>
+</html>
