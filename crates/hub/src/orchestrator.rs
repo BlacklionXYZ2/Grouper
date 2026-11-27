@@ -924,4 +924,66 @@ mod harness_rule_tests {
         drop(hub);
         std::fs::remove_dir_all(dir).ok();
     }
+
+    /// An API orchestrator still runs the in-hub tool loop. It does not open a harness session
+    /// or mint an orchestrator MCP token.
+    #[tokio::test]
+    async fn project_api_orchestrator_is_unchanged() {
+        let dir = tmp("api-unchanged");
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "scripted".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({
+                "inline": {
+                    "rules": [
+                        {"last": "hello api orchestrator", "reply": [{"type": "text", "text": "Handled by the API orchestrator."}]}
+                    ]
+                }
+            }),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "api-orch".into(),
+            provider_id: "scripted".into(),
+            model: "scripted-api".into(),
+            roles: vec!["orchestrator".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let project_conv = db.create_conversation("project", "API project").unwrap();
+        db.set_conversation_model(&project_conv, Some("api-orch")).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        run_turn(&hub, &project_conv, vec![Wake::User("hello api orchestrator".into())]).await;
+
+        let events = hub.db.events(&project_conv, 0, None);
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.body,
+                EventBody::AssistantMessage { text } if text.contains("Handled by the API orchestrator.")
+            )),
+            "API orchestrator should still answer through the model loop, got: {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| !matches!(&e.body, EventBody::Error { .. })),
+            "API orchestrator turn raised an error: {events:?}"
+        );
+        assert_eq!(hub.db.conversation_harness_session(&project_conv), None);
+        let live_tokens: i64 = hub
+            .db
+            .c()
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tokens WHERE conversation_id = ?1 AND revoked = 0",
+                [&project_conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_tokens, 0);
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

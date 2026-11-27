@@ -1355,4 +1355,277 @@ fn main() {
         drop(hub);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[derive(Clone, Debug)]
+    struct OrchestratorTurn {
+        session_id: Option<String>,
+        message: String,
+        mcp_url: Option<String>,
+        mcp_token: Option<String>,
+        allowed_tools: Vec<String>,
+        system_prompt: Option<String>,
+    }
+
+    fn live_orchestrator_tokens(db: &Db, conversation_id: &str) -> i64 {
+        db.c()
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tokens WHERE conversation_id = ?1 AND revoked = 0",
+                [conversation_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Project chat on the hub's own device: turn 2 and a thread wake-up resume one session,
+    /// each turn carries that chat's loopback MCP token, and deleting the chat revokes it.
+    #[tokio::test]
+    async fn project_harness_orchestrator_resumes_on_turn_two_and_on_wake() {
+        use core_protocol::{ChatRequest, PROTOCOL_VERSION};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let dir = tmp_dir();
+        let db = Db::open(&dir).unwrap();
+        let (pc, pc_token) = db.add_device("Gaming PC", "windows", false).unwrap();
+        db.set_hub_device_id(&pc.id).unwrap();
+        apply_report(
+            &db,
+            &pc.id,
+            &[claude_entry(HarnessSignIn::SignedIn, "1.0.0", &[("opus", "Claude Opus")])],
+        )
+        .unwrap();
+        let opus_id = model_registry_id("claude-code", &pc.id, "opus");
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        hub.set_loopback_port(port);
+        let server_hub = hub.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, crate::server::router(server_hub)).await;
+        });
+
+        let ws_url = format!("ws://{addr}{}", core_protocol::CONNECT_PATH);
+        let mut req = ws_url.into_client_request().unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {pc_token}").parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let (mut sink, mut stream) = ws.split();
+        sink.send(WsMsg::Text(
+            serde_json::to_string(&core_protocol::NodeMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_version: "0.1.0".into(),
+                host: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let Some(Ok(WsMsg::Text(t))) = stream.next().await else { panic!("ws closed before welcome") };
+            if matches!(serde_json::from_str::<HubMessage>(&t), Ok(HubMessage::Welcome { .. })) {
+                break;
+            }
+        }
+
+        let seen_turns = Arc::new(std::sync::Mutex::new(Vec::<OrchestratorTurn>::new()));
+        let seen_for_dev = seen_turns.clone();
+        let dev_task = tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                let WsMsg::Text(t) = msg else { continue };
+                let Ok(HubMessage::HarnessTurn {
+                    conversation_id,
+                    session_id,
+                    message,
+                    mcp,
+                    allowed_tools,
+                    system_prompt,
+                    ..
+                }) = serde_json::from_str::<HubMessage>(&t)
+                else {
+                    continue;
+                };
+                let (mcp_url, mcp_token) = match mcp {
+                    Some(mcp) => (Some(mcp.url), Some(mcp.bearer_token)),
+                    None => (None, None),
+                };
+                seen_for_dev.lock().unwrap().push(OrchestratorTurn {
+                    session_id: session_id.clone(),
+                    message,
+                    mcp_url,
+                    mcp_token,
+                    allowed_tools,
+                    system_prompt,
+                });
+                let reply = core_protocol::NodeMessage::HarnessFinished {
+                    conversation_id,
+                    text: "orchestrator reply".into(),
+                    session_id: session_id.unwrap_or_else(|| "orch-sess-1".into()),
+                    usage: core_protocol::HarnessUsage {
+                        input_tokens: 3,
+                        output_tokens: 4,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                };
+                if sink
+                    .send(WsMsg::Text(serde_json::to_string(&reply).unwrap().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let mut events_rx = hub.subscribe_events_for_test();
+        let mcp_url = format!("http://127.0.0.1:{port}/mcp/orchestrator");
+        let expect_mcp = |turn: &OrchestratorTurn, previous: Option<&str>| {
+            assert_eq!(turn.mcp_url.as_deref(), Some(mcp_url.as_str()));
+            let token = turn.mcp_token.as_deref().expect("orchestrator turn carries the chat token");
+            assert_ne!(Some(token), previous);
+            assert_eq!(turn.allowed_tools, vec!["mcp__grouper__*".to_string()]);
+            assert!(
+                turn.system_prompt.as_deref().is_some_and(|p| p.contains("You are the orchestrator")),
+                "project turn must send the orchestrator prompt"
+            );
+            token.to_string()
+        };
+
+        let conv = hub
+            .chat(ChatRequest {
+                conversation_id: None,
+                mode: Some("project".into()),
+                text: "Hello turn one".into(),
+                model: Some(opus_id),
+            })
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut events_rx, &conv).await;
+        assert_eq!(hub.db.conversation_harness_session(&conv).as_deref(), Some("orch-sess-1"));
+        let token_1 = {
+            let recorded = seen_turns.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].session_id, None, "turn 1 starts a session");
+            assert!(recorded[0].message.contains("Hello turn one"), "{}", recorded[0].message);
+            assert!(!recorded[0].message.contains("[Earlier in this conversation]"));
+            let token = expect_mcp(&recorded[0], None);
+            assert_eq!(hub.db.orchestrator_conversation(&token).as_deref(), Some(conv.as_str()));
+            token
+        };
+
+        hub.chat(ChatRequest {
+            conversation_id: Some(conv.clone()),
+            mode: None,
+            text: "Follow up turn two".into(),
+            model: None,
+        })
+        .await
+        .unwrap();
+        wait_for_turn_finished(&mut events_rx, &conv).await;
+        assert_eq!(hub.db.conversation_harness_session(&conv).as_deref(), Some("orch-sess-1"));
+        let token_2 = {
+            let recorded = seen_turns.lock().unwrap();
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(recorded[1].session_id.as_deref(), Some("orch-sess-1"), "turn 2 resumes");
+            assert!(recorded[1].message.contains("Follow up turn two"), "{}", recorded[1].message);
+            assert!(!recorded[1].message.contains("[Earlier in this conversation]"));
+            let token = expect_mcp(&recorded[1], Some(&token_1));
+            assert!(hub.db.orchestrator_conversation(&token_1).is_none(), "turn 2 replaces the previous token");
+            assert_eq!(hub.db.orchestrator_conversation(&token).as_deref(), Some(conv.as_str()));
+            token
+        };
+
+        hub.wake(
+            &conv,
+            Wake::ThreadDone {
+                thread_id: "t1".into(),
+                title: "notes".into(),
+                status: "finished".into(),
+                summary: "The notes are ready.".into(),
+            },
+        )
+        .await;
+        wait_for_turn_finished(&mut events_rx, &conv).await;
+        assert_eq!(hub.db.conversation_harness_session(&conv).as_deref(), Some("orch-sess-1"));
+        let token_3 = {
+            let recorded = seen_turns.lock().unwrap();
+            assert_eq!(recorded.len(), 3);
+            assert_eq!(recorded[2].session_id.as_deref(), Some("orch-sess-1"), "a wake-up resumes the same session");
+            assert!(recorded[2].message.contains("The notes are ready."), "{}", recorded[2].message);
+            assert!(recorded[2].message.contains("[Thread t1 \"notes\" finished]"), "{}", recorded[2].message);
+            assert!(!recorded[2].message.contains("[Earlier in this conversation]"));
+            let token = expect_mcp(&recorded[2], Some(&token_2));
+            assert!(hub.db.orchestrator_conversation(&token_2).is_none());
+            assert_eq!(hub.db.orchestrator_conversation(&token).as_deref(), Some(conv.as_str()));
+            token
+        };
+        assert_eq!(live_orchestrator_tokens(&hub.db, &conv), 1);
+
+        assert!(hub.delete_conversation(&conv).await.unwrap());
+        assert!(hub.db.conversation(&conv).is_none());
+        assert!(hub.db.orchestrator_conversation(&token_3).is_none(), "deleting the chat revokes its token");
+        assert_eq!(live_orchestrator_tokens(&hub.db, &conv), 0);
+
+        dev_task.abort();
+        server_task.abort();
+        drop(hub);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn project_harness_orchestrator_on_another_device_errors() {
+        use core_protocol::ChatRequest;
+
+        let dir = tmp_dir();
+        let db = Db::open(&dir).unwrap();
+        let (laptop, _) = db.add_device("Laptop", "windows", false).unwrap();
+        apply_report(
+            &db,
+            &laptop.id,
+            &[claude_entry(HarnessSignIn::SignedIn, "1.0.0", &[("opus", "Claude Opus")])],
+        )
+        .unwrap();
+        let opus_id = model_registry_id("claude-code", &laptop.id, "opus");
+        let hub = Hub::new(db, dir.clone());
+        let hub_id = hub.db.hub_device_id();
+        assert_ne!(hub_id, laptop.id, "the harness device must not be the hub device");
+        let hub_name = hub.resolve_device(&hub_id).map(|(_, name)| name).unwrap();
+        let mut events_rx = hub.subscribe_events_for_test();
+
+        let conv = hub
+            .chat(ChatRequest {
+                conversation_id: None,
+                mode: Some("project".into()),
+                text: "Orchestrate from the laptop".into(),
+                model: Some(opus_id),
+            })
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut events_rx, &conv).await;
+
+        let events = hub.db.events(&conv, 0, None);
+        let err_msg = events
+            .iter()
+            .find_map(|e| match &e.body {
+                EventBody::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .expect("expected an error event");
+        assert!(err_msg.contains("Laptop"), "{err_msg}");
+        assert!(err_msg.contains(&hub_name), "{err_msg}");
+        assert!(
+            err_msg.contains("only from the hub's own device"),
+            "{err_msg}"
+        );
+        assert!(events.iter().all(|e| !matches!(e.body, EventBody::AssistantMessage { .. })));
+        assert_eq!(hub.db.conversation_harness_session(&conv), None);
+        assert_eq!(live_orchestrator_tokens(&hub.db, &conv), 0);
+
+        drop(hub);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
