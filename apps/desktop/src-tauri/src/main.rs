@@ -264,7 +264,8 @@ async fn ensure_embedded_hub(state: &DesktopState) -> Result<Arc<HubHandle>> {
     }
     let hub_dir = hub_data_dir(&state.data_dir);
     let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_HUB_PORT));
-    let handle = hub::host::start(&hub_dir, &[bind])
+    let install_id = state.settings_snapshot().install_id;
+    let handle = hub::host::start_with_install(&hub_dir, &[bind], Some(&install_id))
         .await
         .with_context(|| format!("starting embedded hub on {bind}"))?;
     tracing::info!(
@@ -453,8 +454,12 @@ fn main() {
                 Some(HostMode::ThisComputer) => {
                     let hub_dir = hub_data_dir(&data_dir);
                     let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_HUB_PORT));
-                    let handle = tauri::async_runtime::block_on(hub::host::start(&hub_dir, &[bind]))
-                        .with_context(|| format!("starting embedded hub on {bind}"))?;
+                    let handle = tauri::async_runtime::block_on(hub::host::start_with_install(
+                        &hub_dir,
+                        &[bind],
+                        Some(&settings.install_id),
+                    ))
+                    .with_context(|| format!("starting embedded hub on {bind}"))?;
                     tracing::info!(
                         client_version = core_client::CLIENT_VERSION,
                         data_dir = %hub_dir.display(),
