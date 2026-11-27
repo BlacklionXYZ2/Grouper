@@ -92,6 +92,64 @@ pub(crate) fn canonical_install_id<'a>(install_id: &'a str, install_kind: Option
     install_id
 }
 
+/// What older apps put in front of the name of their sign-in device ("Grouper on Oscar's Mac").
+const APP_NAME_PREFIX: &str = "Grouper on ";
+
+/// A device name as people see it: the machine's own name, without the "Grouper on " that an
+/// app's sign-in device used to carry (the same machine's node never had it).
+pub(crate) fn machine_name(name: &str) -> &str {
+    match name.strip_prefix(APP_NAME_PREFIX).map(str::trim) {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => name,
+    }
+}
+
+/// The live device row an install's registration or sign-in should take over, if any.
+/// First by `install_id` (the `<id>-node` spelling older Apple builds used counts for a node);
+/// failing that, the one live row of the same role (admin or not), platform and machine name
+/// that predates install ids, so a machine's existing rows are attached to it, not duplicated.
+/// Two or more such rows are ambiguous and match nothing: `grouper-hub device merge` settles them.
+fn find_reusable_device(
+    tx: &rusqlite::Transaction<'_>,
+    install: &Install<'_>,
+    admin: bool,
+    name: &str,
+    platform: &str,
+) -> Result<Option<String>> {
+    let canonical = canonical_install_id(install.id, Some(install.kind), admin);
+    let legacy = legacy_node_install_id(canonical);
+    let node = !admin && install.kind == NODE_INSTALL;
+    let found: Option<String> = tx
+        .query_row(
+            "SELECT id FROM devices
+             WHERE install_kind = ?1 AND admin = ?2 AND revoked = 0
+               AND (install_id = ?3 OR (?5 AND (install_id = ?4 OR install_id = ?6)))
+             ORDER BY created DESC LIMIT 1",
+            params![install.kind, admin, install.id, canonical, node, legacy],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if found.is_some() {
+        return Ok(found);
+    }
+    let mut st = tx.prepare(
+        "SELECT id, name FROM devices
+         WHERE admin = ?1 AND revoked = 0 AND (install_id IS NULL OR install_id = '') AND lower(platform) = ?2",
+    )?;
+    let wanted = machine_name(name).to_lowercase();
+    let candidates: Vec<String> = st
+        .query_map(params![admin, platform], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, existing)| machine_name(existing).to_lowercase() == wanted)
+        .map(|(id, _)| id)
+        .collect();
+    Ok(match candidates.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    })
+}
+
 /// A new device would pass the hub's device limit.
 #[derive(Debug)]
 pub struct DeviceCapReached(pub usize);
@@ -440,6 +498,8 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "devices", "install_id", "ALTER TABLE devices ADD COLUMN install_id TEXT")?;
     ensure_column(&conn, "devices", "install_kind", "ALTER TABLE devices ADD COLUMN install_kind TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS devices_install ON devices (install_id);")?;
+    // `grouper-hub device merge`: this credential belongs to the same machine as that device row.
+    ensure_column(&conn, "devices", "merged_into", "ALTER TABLE devices ADD COLUMN merged_into TEXT")?;
     // Link devices to the owning Google account (`hub_owner.sub`), and track which device is the hub.
     ensure_column(&conn, "devices", "account_sub", "ALTER TABLE devices ADD COLUMN account_sub TEXT")?;
     conn.execute_batch(
@@ -990,22 +1050,27 @@ impl Db {
             .query_row("SELECT sub FROM hub_owner WHERE id = 1", [], |r| r.get(0))
             .optional()?;
         let existing: Option<String> = match &install {
-            Some(i) => tx
-                .query_row(
-                    "SELECT id FROM devices WHERE install_id = ?1 AND install_kind = ?2 AND admin = ?3 AND revoked = 0
-                     ORDER BY created DESC LIMIT 1",
-                    params![i.id, i.kind, admin],
-                    |r| r.get(0),
-                )
-                .optional()?,
+            Some(i) => find_reusable_device(&tx, i, admin, name, &platform)?,
             None => None,
         };
+        // Stored so every credential of one machine carries the machine's one install id.
+        let stored_install = install.map(|i| (canonical_install_id(i.id, Some(i.kind), admin), i.kind));
         let (id, account_sub, ended_sessions) = match existing {
             Some(id) => {
                 tx.execute(
                     "UPDATE devices SET secret_hash = ?1, name = ?2, platform = ?3,
-                       account_sub = COALESCE(?4, account_sub) WHERE id = ?5",
-                    params![hash(&secret), name, platform, owner_sub, id],
+                       account_sub = COALESCE(?4, account_sub),
+                       install_id = COALESCE(?6, install_id), install_kind = COALESCE(?7, install_kind)
+                     WHERE id = ?5",
+                    params![
+                        hash(&secret),
+                        name,
+                        platform,
+                        owner_sub,
+                        id,
+                        stored_install.map(|(i, _)| i),
+                        stored_install.map(|(_, k)| k)
+                    ],
                 )?;
                 let account_sub: Option<String> =
                     tx.query_row("SELECT account_sub FROM devices WHERE id = ?1", [&id], |r| r.get(0))?;
@@ -1035,8 +1100,8 @@ impl Db {
                         hash(&secret),
                         ts(),
                         admin,
-                        install.map(|i| i.id),
-                        install.map(|i| i.kind),
+                        stored_install.map(|(i, _)| i),
+                        stored_install.map(|(_, k)| k),
                         owner_sub,
                     ],
                 )?;
@@ -1102,6 +1167,44 @@ impl Db {
             bail!("no such device");
         }
         let _ = c.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [id]);
+        Ok(())
+    }
+
+    /// Make `other` another credential of the machine `keep` is on, so the Devices list shows
+    /// them once. Only the listing changes: neither token, permission, tool or thread placement
+    /// is touched, nothing is revoked and `other` keeps whatever rights it had (it does not gain
+    /// `keep`'s). Both must be live; a browser session's row is not a device and can't be merged.
+    pub fn merge_devices(&self, keep: &str, other: &str) -> Result<()> {
+        if keep == other {
+            bail!("pick two different devices");
+        }
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let platform_of = |id: &str| -> Result<String> {
+            tx.query_row("SELECT platform FROM devices WHERE id = ?1 AND revoked = 0", [id], |r| r.get::<_, String>(0))
+                .optional()?
+                .with_context(|| format!("no live device {id}"))
+        };
+        for id in [keep, other] {
+            if platform_of(id)? == "web" {
+                bail!("{id} is a browser session's credential, not a device; browser sessions are listed in Settings");
+            }
+        }
+        // Don't leave `keep` pointing back at `other`.
+        tx.execute("UPDATE devices SET merged_into = NULL WHERE id = ?1 AND merged_into = ?2", params![keep, other])?;
+        tx.execute("UPDATE devices SET merged_into = ?1 WHERE id = ?2", params![keep, other])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Undo [`Db::merge_devices`] for `id`: it and every device merged into it are no longer
+    /// joined by a merge (devices that share an `install_id` still list together).
+    pub fn unmerge_device(&self, id: &str) -> Result<()> {
+        let c = self.c();
+        if c.query_row("SELECT 1 FROM devices WHERE id = ?1", [id], |_| Ok(())).optional()?.is_none() {
+            bail!("no such device");
+        }
+        c.execute("UPDATE devices SET merged_into = NULL WHERE id = ?1 OR merged_into = ?1", [id])?;
         Ok(())
     }
 
@@ -3113,6 +3216,92 @@ mod tests {
         assert!(db.free_alternates("openrouter", "claude-free").is_empty());
 
         drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_first_install_id_attaches_to_the_one_matching_old_row() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        // Rows made before install ids existed, as on the live hub.
+        let (old_app, old_app_token) = db.add_device("Grouper on Oscar's Macbook Air", "macos", true).unwrap();
+        let (old_node, old_node_token) = db.add_device("Oscar's Macbook Air", "macos", false).unwrap();
+        let (old_phone, _) = db.add_device("Grouper on iPhone", "ios", true).unwrap();
+        let id = "mac_install_12345678";
+
+        // The app signs in under the machine's own name: it takes over its old admin row (new token).
+        let app = db.issue_device("Oscar's Macbook Air", "macos", true, Some(Install { id, kind: "macos" }), None).unwrap();
+        assert!(app.reused);
+        assert_eq!(app.device.id, old_app.id);
+        assert_eq!(app.device.name, "Oscar's Macbook Air");
+        assert!(db.authenticate(&old_app_token).is_none(), "the old token was replaced");
+        assert!(db.authenticate(&app.token).unwrap().admin);
+
+        // The node registers: it takes its old plain row, not the admin one, and stays plain.
+        let node = db.issue_device("Oscar's Macbook Air", "macos", false, Some(Install { id, kind: NODE_INSTALL }), None).unwrap();
+        assert!(node.reused);
+        assert_eq!(node.device.id, old_node.id);
+        assert!(db.authenticate(&old_node_token).is_none());
+        assert!(!db.authenticate(&node.token).unwrap().admin);
+        assert_eq!(db.device_install_id(&old_app.id).as_deref(), Some(id));
+        assert_eq!(db.device_install_id(&old_node.id).as_deref(), Some(id));
+
+        // Signing in again finds the row by its install id now, and the phone's new name still matches its old row.
+        let again = db.issue_device("Oscar's Macbook Air", "macos", true, Some(Install { id, kind: "macos" }), None).unwrap();
+        assert_eq!(again.device.id, old_app.id);
+        let phone = db.issue_device("iPhone", "ios", true, Some(Install { id: "ios_install_12345678", kind: "ios" }), None).unwrap();
+        assert_eq!(phone.device.id, old_phone.id);
+        assert_eq!(phone.device.name, "iPhone");
+        assert_eq!(db.devices().len(), 3, "no row was added");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_old_row_is_not_taken_when_it_is_ambiguous_or_has_other_rights() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let (admin_row, _) = db.add_device("Studio", "macos", true).unwrap();
+        // A plain registration never takes an admin row, even under the same name.
+        let plain = db
+            .issue_device("Studio", "macos", false, Some(Install { id: "studio_install_123456", kind: NODE_INSTALL }), None)
+            .unwrap();
+        assert!(!plain.reused);
+        assert_ne!(plain.device.id, admin_row.id);
+        assert!(!plain.device.admin);
+        assert!(db.authenticate(&plain.token).is_some_and(|a| !a.admin));
+
+        // Two old rows that both fit: nothing is guessed, a new row is made.
+        db.add_device("Grouper on Twin", "linux", false).unwrap();
+        db.add_device("Twin", "linux", false).unwrap();
+        let twin = db
+            .issue_device("Twin", "linux", false, Some(Install { id: "twin_install_1234567", kind: NODE_INSTALL }), None)
+            .unwrap();
+        assert!(!twin.reused);
+        // A different platform or name doesn't match either.
+        db.add_device("Laptop", "windows", false).unwrap();
+        let other = db
+            .issue_device("Laptop", "linux", false, Some(Install { id: "laptop_install_12345", kind: NODE_INSTALL }), None)
+            .unwrap();
+        assert!(!other.reused);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_node_registering_under_the_plain_install_id_takes_its_legacy_node_row() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let id = "mac_install_12345678";
+        // Older Apple builds registered the node as `<id>-node`.
+        let legacy_id = legacy_node_install_id(id);
+        let old = db.issue_device("Mac", "macos", false, Some(Install { id: &legacy_id, kind: NODE_INSTALL }), None).unwrap();
+        let now = db.issue_device("Mac", "macos", false, Some(Install { id, kind: NODE_INSTALL }), None).unwrap();
+        assert!(now.reused);
+        assert_eq!(now.device.id, old.device.id);
+        assert_eq!(db.device_install_id(&old.device.id).as_deref(), Some(id), "the row now carries the plain id");
+        // The old spelling still finds the same row (an older build that hasn't updated).
+        let again = db.issue_device("Mac", "macos", false, Some(Install { id: &legacy_id, kind: NODE_INSTALL }), None).unwrap();
+        assert_eq!(again.device.id, old.device.id);
+        assert_eq!(db.devices().len(), 1);
         std::fs::remove_dir_all(dir).ok();
     }
 }
