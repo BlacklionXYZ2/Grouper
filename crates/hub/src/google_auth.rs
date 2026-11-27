@@ -417,6 +417,7 @@ struct Identity {
     email: String,
     name: String,
     nonce: String,
+    iat: u64,
 }
 
 impl Identity {
@@ -691,7 +692,7 @@ fn check_claims(c: &Value, cfg: &Config, now: u64, require_nonce: bool) -> Resul
     } else {
         text("nonce").unwrap_or_default()
     };
-    Ok(Identity { sub, email, name: text("name").unwrap_or_default(), nonce })
+    Ok(Identity { sub, email, name: text("name").unwrap_or_default(), nonce, iat })
 }
 
 /// The origin and id in a `state`, if it is well formed and the origin is one sign-in may return to.
@@ -815,6 +816,33 @@ impl Hub {
         let install = install_id.map(|id| crate::db::Install { id, kind: platform });
         let issued = self.issue_device(&name, platform, true, install, None).await?;
         Ok((owner, issued))
+    }
+}
+
+/// Verify a fresh Google ID token for a sensitive owner action (such as moving the hub):
+/// checks signature, issuer, audience, expiry and `email_verified`, consumes a one-time hub
+/// nonce, requires `iat` within `max_age`, and requires `sub` to equal the hub owner's.
+pub(crate) async fn verify_fresh(hub: &Hub, id_token: &str, max_age: Duration) -> Result<(), (StatusCode, String)> {
+    verify_fresh_inner(hub, id_token, max_age).await.map_err(|r| (r.status, r.message))
+}
+
+async fn verify_fresh_inner(hub: &Hub, id_token: &str, max_age: Duration) -> Result<(), Refusal> {
+    let id = hub.google.verify(id_token).await?;
+    if !hub.google.consume_nonce(&id.nonce) {
+        return Err(Refusal::token(
+            "this sign-in wasn't started on this hub, was already used, or took too long; try again",
+        ));
+    }
+    if id.iat.saturating_add(max_age.as_secs()) <= now() {
+        return Err(Refusal::token("this Google sign-in is too old; sign in again"));
+    }
+    match hub.db.owner() {
+        Some(owner) if owner.provider == PROVIDER && owner.sub == id.sub => Ok(()),
+        Some(_) => {
+            tracing::info!(sub = %sub_tag(&id.sub), "fresh Google sign-in refused: not this hub's owner");
+            Err(Refusal::new(StatusCode::FORBIDDEN, "this hub belongs to a different Google account"))
+        }
+        None => Err(Refusal::new(StatusCode::FORBIDDEN, "this hub has no owner yet")),
     }
 }
 
@@ -1223,7 +1251,7 @@ pub(crate) fn routes() -> Router<Arc<Hub>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1293,6 +1321,32 @@ mod tests {
         c["aud"] = json!(WEB_CLIENT);
         c["azp"] = json!(WEB_CLIENT);
         c
+    }
+
+    /// Point `hub.google` at an in-process fake Google JWKS server for tests in sibling modules.
+    pub(crate) async fn configure_hub_for_test(hub: &Hub) {
+        let jwks = jwks_server(Arc::new(AtomicUsize::new(0))).await;
+        hub.google.configure(|c| {
+            c.client_ids = vec![CLIENT.into()];
+            c.web_client_id = WEB_CLIENT.into();
+            c.return_url = RETURN_URL.into();
+            c.public_url = None;
+            c.jwks_url = jwks;
+            c.issuers = vec![ISS.into()];
+        });
+    }
+
+    /// Mint a test RS256 Google ID token for `(nonce, sub)` issued right now.
+    pub(crate) fn mint_for_test(nonce: &str, sub: &str) -> String {
+        mint(&claims(nonce, sub))
+    }
+
+    /// Mint a test RS256 Google ID token for `(nonce, sub)` issued at `iat` (with 1-hour `exp`).
+    pub(crate) fn mint_for_test_at(nonce: &str, sub: &str, iat: u64) -> String {
+        let mut c = claims(nonce, sub);
+        c["iat"] = json!(iat);
+        c["exp"] = json!(iat + 3600);
+        mint(&c)
     }
 
     struct Fixture {
@@ -2008,5 +2062,34 @@ mod tests {
         assert_eq!(status, S::OK, "{body}");
         let (status, _, _) = f.sign_in(&mint(&claims(&f.nonce().await, STRANGER)), "ios", None).await;
         assert_eq!(status, S::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn verify_fresh_enforces_one_time_nonce_recent_iat_and_owner_sub() {
+        let f = fixture().await;
+        let max_age = Duration::from_secs(300);
+
+        // Unclaimed hub has no owner yet -> 403 Forbidden.
+        let unclaimed_tok = mint(&claims(&f.nonce().await, OWNER));
+        assert_eq!(verify_fresh(&f.hub, &unclaimed_tok, max_age).await.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        f.claim().await;
+
+        // Empty or malformed token -> 401 Unauthorized.
+        assert_eq!(verify_fresh(&f.hub, "", max_age).await.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        assert_eq!(verify_fresh(&f.hub, "not.a.jwt", max_age).await.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        // Stale `iat` (>= 5 minutes old, though `exp` is still valid) -> 401 Unauthorized.
+        let stale = mint_for_test_at(&f.nonce().await, OWNER, now() - 300);
+        assert_eq!(verify_fresh(&f.hub, &stale, max_age).await.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        // Wrong `sub` -> 403 Forbidden.
+        let wrong_sub = mint(&claims(&f.nonce().await, STRANGER));
+        assert_eq!(verify_fresh(&f.hub, &wrong_sub, max_age).await.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // Valid fresh owner token succeeds once, and replaying it (reused nonce) fails with 401.
+        let valid = mint(&claims(&f.nonce().await, OWNER));
+        verify_fresh(&f.hub, &valid, max_age).await.unwrap();
+        assert_eq!(verify_fresh(&f.hub, &valid, max_age).await.unwrap_err().0, StatusCode::UNAUTHORIZED);
     }
 }
