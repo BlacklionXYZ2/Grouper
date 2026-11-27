@@ -1,0 +1,19 @@
+{
+  "models": [
+    {
+      "id": "grok-4.7-0709",
+      "aliases": ["grok-4.7", "grok-latest"],
+      "input_modalities": ["text", "image"],
+      "output_modalities": ["text"],
+      "prompt_text_token_price": 20000,
+      "completion_text_token_price": 60000,
+      "cached_prompt_text_token_price": 5000
+    },
+    {
+      "id": "grok-3-mini",
+      "aliases": [],
+      "input_modalities": ["text"],
+      "output_modalities": ["text"]
+    }
+  ]
+}
