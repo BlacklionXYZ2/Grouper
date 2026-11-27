@@ -6,12 +6,13 @@
 // (aria-activedescendant), Enter picks it, Escape closes and focus returns to the
 // button that opened it.
 //
-// Sections: "Default model" at the top, then "Suggested" (role defaults — no
-// last-used model history is stored by the hub or client), then "Local" (models
-// marked local, via_device, or using a local provider URL), then "More models…"
-// which expands all models grouped under their provider headers (id, kind, key
-// status, via_device). Typing to filter automatically reveals matching provider
-// groups. A model reached through two providers appears under each provider.
+// Sections: "Default model" at the top, then API sections — "Suggested" (role
+// defaults), "Local" (models marked local, via_device, or using a local provider
+// URL) — then "Harnesses (subscriptions)" grouped by device, then "More models…"
+// which expands all API models grouped under their provider headers (id, kind,
+// key status, via_device). Typing to filter automatically reveals matching
+// provider groups. A model reached through two providers appears under each
+// provider. API models and harnesses stay clearly separate.
 
 import { h, icon, setChildren, setText, setAttr } from '../lib/dom.js';
 import { get, isAbort } from '../lib/api.js';
@@ -34,12 +35,59 @@ function isLocalUrl(url) {
   }
 }
 
+const HARNESS_NAMES = {
+  'claude-code': 'Claude Code',
+  codex: 'Codex',
+  antigravity: 'Antigravity',
+  grok: 'Grok',
+  hermes: 'Hermes',
+  pi: 'pi',
+  opencode: 'OpenCode',
+  cursor: 'Cursor',
+};
+
+export function isHarnessModel(m, provider) {
+  return Boolean(m?.kind === 'harness' || provider?.kind === 'harness');
+}
+
+export function harnessDeviceId(m, provider) {
+  if (m?.device_id) return m.device_id;
+  if (provider?.via_device) return provider.via_device;
+  const pid = String(m?.provider_id || provider?.id || '');
+  const at = pid.indexOf('@');
+  return at >= 0 ? pid.slice(at + 1) : '';
+}
+
+export function harnessCliName(m, provider) {
+  const optName = typeof provider?.options?.display_name === 'string' ? provider.options.display_name.trim() : '';
+  if (optName) return optName;
+  const optSlug = typeof provider?.options?.harness === 'string' ? provider.options.harness.trim() : '';
+  const pid = String(m?.provider_id || provider?.id || '');
+  const pidSlug = pid.includes('@') ? pid.slice(0, pid.indexOf('@')) : '';
+  const slug = optSlug || pidSlug;
+  return HARNESS_NAMES[slug] || slug || 'Harness';
+}
+
+export function harnessSignInInfo(provider) {
+  const opts = provider?.options;
+  if (!opts || typeof opts !== 'object') return null;
+  if (opts.installed === false) return { label: 'Not installed', tone: 'muted' };
+  if (opts.sign_in === 'expired') return { label: 'Expired', tone: 'warn' };
+  if (opts.sign_in === 'signed_in' || opts.signed_in === true) return { label: 'Signed in', tone: 'ok' };
+  if (opts.sign_in === 'not_signed_in' || opts.signed_in === false) return { label: 'Not signed in', tone: 'muted' };
+  return null;
+}
+
 export function isLocalModel(m, provider) {
+  if (isHarnessModel(m, provider)) return false;
   return Boolean(m.local || provider?.via_device || isLocalUrl(provider?.base_url));
 }
 
-/** At most one right-aligned badge: Local (with host device if remote-hosted) or Free. */
+/** At most one right-aligned badge: Harness, Local (with host device if remote-hosted) or Free. */
 export function modelBadge(m, provider, { right = false } = {}) {
+  if (isHarnessModel(m, provider)) {
+    return h('span', { class: ['badge', 'accent', right && 'mp-badge'] }, 'Harness');
+  }
   if (isLocalModel(m, provider)) {
     const host = provider?.via_device ? deviceName(provider.via_device) : '';
     return h('span', { class: ['badge', 'ok', right && 'mp-badge'] }, host ? `Local · ${host}` : 'Local');
@@ -161,7 +209,7 @@ export function openModelPicker({ role, current = '', opener = null }) {
       if (e.key === 'Enter') {
         e.preventDefault();
         const el = options.find((o) => o.dataset.key === activeKey);
-        if (el) close(el.dataset.value);
+        if (el && el.getAttribute('aria-disabled') !== 'true') close(el.dataset.value);
         return;
       }
       const moves = { ArrowDown: 1, ArrowUp: -1, PageDown: 8, PageUp: -8 };
@@ -204,17 +252,26 @@ export function openModelPicker({ role, current = '', opener = null }) {
     function matches(m, words, provider) {
       if (!words.length) return true;
       const fam = familyInfo(familyKey(m));
-      const host = provider?.via_device ? deviceName(provider.via_device) : '';
+      const harness = isHarnessModel(m, provider);
+      const devId = harness ? harnessDeviceId(m, provider) : '';
+      const dev = devId ? store.devices.find((d) => d.id === devId) : null;
+      const host = harness
+        ? (devId ? deviceName(devId) : '')
+        : (provider?.via_device ? deviceName(provider.via_device) : '');
       const local = isLocalModel(m, provider);
       const hay = [
         m.id,
         m.model,
+        m.display_name || '',
         m.provider_id,
         provider?.kind || '',
+        harness ? `${harnessCliName(m, provider)} harness subscription` : '',
+        harness && m.can_orchestrate ? 'orchestrates mcp' : '',
+        dev ? (dev.online ? 'online' : 'offline') : '',
         host,
         m.roles.join(' '),
         fam.key === 'unknown' ? '' : `${fam.label} ${fam.maker}`,
-        m.free ? 'free' : 'paid',
+        harness ? '' : (m.free ? 'free' : 'paid'),
         local ? 'local' : '',
       ]
         .join(' ')
@@ -222,19 +279,64 @@ export function openModelPicker({ role, current = '', opener = null }) {
       return words.every((w) => hay.includes(w));
     }
 
-    function optionEl(value, key, idx, content, selected) {
+    function optionEl(value, key, idx, content, selected, { disabled = false } = {}) {
       return h(
         'div',
         {
           id: `mp-opt-${idx}`,
-          class: ['mp-option', selected && 'selected'],
+          class: ['mp-option', selected && 'selected', disabled && 'is-disabled'],
           role: 'option',
           'aria-selected': selected ? 'true' : 'false',
+          'aria-disabled': disabled ? 'true' : null,
           dataset: { value, key },
-          onclick: () => close(value),
+          onclick: disabled ? undefined : () => close(value),
         },
         content,
         selected ? h('span', { class: 'mp-check', 'aria-hidden': 'true' }, icon('check')) : null,
+      );
+    }
+
+    function harnessOption(m, idx, keyPrefix, provider) {
+      const famKey = familyKey(m);
+      const cliName = harnessCliName(m, provider);
+      const devId = harnessDeviceId(m, provider);
+      const dev = devId ? store.devices.find((d) => d.id === devId) : null;
+      const devName = devId ? deviceName(devId) : 'unknown device';
+      const canOrch = Boolean(m.can_orchestrate);
+      const disabled = role === 'orchestrator' && !canOrch;
+      const badge = modelBadge(m, provider, { right: true });
+      const subItems = [
+        h('span', { class: 'mp-opt-provider' }, `${cliName} on ${devName}`),
+        dev ? h('span', null, dev.online ? 'online' : 'offline') : null,
+        h('span', { class: 'mp-price' }, 'Subscription'),
+        role === 'orchestrator'
+          ? h('span', { class: 'mp-opt-note' }, canOrch ? 'Orchestrates via MCP' : 'Standard chats and threads only')
+          : m.roles.includes(role)
+            ? h('span', null, `${role} default`)
+            : null,
+      ];
+      return optionEl(
+        m.id,
+        `${keyPrefix}:${m.id}`,
+        idx,
+        h(
+          'div',
+          { class: ['mp-opt-main', 'has-fam', `fam-${famKey}`] },
+          familyMark(famKey),
+          h(
+            'div',
+            { class: 'mp-opt-text' },
+            h(
+              'div',
+              { class: 'mp-opt-line' },
+              h('span', { class: 'mp-opt-id' }, `${cliName} · ${m.model}`),
+              badge,
+            ),
+            h('div', { class: 'meta mp-opt-meta mp-opt-sub' }, subItems),
+          ),
+        ),
+        current === m.id,
+        { disabled },
       );
     }
 
@@ -282,14 +384,16 @@ export function openModelPicker({ role, current = '', opener = null }) {
       const providers = new Map(providerList().map((p) => [p.id, p]));
       const providersKnown = Boolean(providersCache);
       const shown = store.models.filter((m) => matches(m, words, providers.get(m.provider_id)));
+      const apiShown = shown.filter((m) => !isHarnessModel(m, providers.get(m.provider_id)));
+      const harnessShown = shown.filter((m) => isHarnessModel(m, providers.get(m.provider_id)));
 
-      // Suggested: current role default(s) first, then any other role defaults.
+      // Suggested: API role default(s) first, then any other API role defaults.
       // ("Last used" model history isn't stored by the hub or client.)
       const byIdThenProvider = (a, b) => a.id.localeCompare(b.id) || a.provider_id.localeCompare(b.provider_id);
-      const primaryRole = shown.filter((m) => m.roles.includes(role)).sort(byIdThenProvider);
-      const otherRoles = shown.filter((m) => !m.roles.includes(role) && m.roles.length > 0).sort(byIdThenProvider);
+      const primaryRole = apiShown.filter((m) => m.roles.includes(role)).sort(byIdThenProvider);
+      const otherRoles = apiShown.filter((m) => !m.roles.includes(role) && m.roles.length > 0).sort(byIdThenProvider);
       const suggested = [...primaryRole, ...otherRoles];
-      const localModels = shown.filter((m) => isLocalModel(m, providers.get(m.provider_id))).sort(byIdThenProvider);
+      const localModels = apiShown.filter((m) => isLocalModel(m, providers.get(m.provider_id))).sort(byIdThenProvider);
 
       let idx = 0;
       const parts = [];
@@ -341,8 +445,46 @@ export function openModelPicker({ role, current = '', opener = null }) {
         );
       }
 
+      if (harnessShown.length) {
+        const byDevice = new Map();
+        for (const m of harnessShown) {
+          const devId = harnessDeviceId(m, providers.get(m.provider_id));
+          if (!byDevice.has(devId)) byDevice.set(devId, []);
+          byDevice.get(devId).push(m);
+        }
+        const deviceIds = [...byDevice.keys()].sort((a, b) => deviceName(a).localeCompare(deviceName(b)) || a.localeCompare(b));
+        parts.push(
+          h(
+            'div',
+            { class: 'mp-group', role: 'group', 'aria-label': 'Harnesses (subscriptions)' },
+            h('div', { class: 'mp-section', 'aria-hidden': 'true' }, 'Harnesses (subscriptions)'),
+            deviceIds.map((devId, g) => {
+              const dev = devId ? store.devices.find((x) => x.id === devId) : null;
+              const label = devId ? deviceName(devId) : 'Unknown device';
+              const models = byDevice.get(devId).sort((a, b) => {
+                const ca = harnessCliName(a, providers.get(a.provider_id));
+                const cb = harnessCliName(b, providers.get(b.provider_id));
+                return ca.localeCompare(cb) || a.model.localeCompare(b.model) || a.id.localeCompare(b.id);
+              });
+              const headerId = `mp-hd-${g}`;
+              return h(
+                'div',
+                { class: 'mp-group', role: 'group', 'aria-labelledby': headerId },
+                h(
+                  'div',
+                  { class: 'mp-provider', id: headerId },
+                  h('span', { class: 'mp-provider-id' }, label),
+                  dev ? h('span', { class: ['badge', dev.online ? 'ok' : 'muted'] }, dev.online ? 'Online' : 'Offline') : null,
+                ),
+                models.map((m) => harnessOption(m, idx++, `harness:${devId}`, providers.get(m.provider_id))),
+              );
+            }),
+          ),
+        );
+      }
+
       const byProvider = new Map();
-      for (const m of shown) {
+      for (const m of apiShown) {
         if (!byProvider.has(m.provider_id)) byProvider.set(m.provider_id, []);
         byProvider.get(m.provider_id).push(m);
       }
@@ -383,7 +525,7 @@ export function openModelPicker({ role, current = '', opener = null }) {
       setChildren(list, parts);
       options = [...list.querySelectorAll('[role="option"]')];
 
-      if (!filtering && shown.length) {
+      if (!filtering && apiShown.length) {
         const providerCount = providerIds.length;
         moreHost.hidden = false;
         setChildren(
@@ -424,8 +566,9 @@ export function openModelPicker({ role, current = '', opener = null }) {
       let nextKey = keep ? activeKey : null;
       if (!nextKey) {
         if (filtering && options.length > 1) {
-          // Typing puts the first match under the cursor.
-          nextKey = options[1].dataset.key;
+          // Typing puts the first enabled match under the cursor.
+          const firstEnabled = options.find((o, i) => i > 0 && o.getAttribute('aria-disabled') !== 'true');
+          nextKey = firstEnabled ? firstEnabled.dataset.key : options[0].dataset.key;
         } else {
           const match = options.find((o) => o.dataset.value === current);
           nextKey = match ? match.dataset.key : options[0]?.dataset.key || 'default';

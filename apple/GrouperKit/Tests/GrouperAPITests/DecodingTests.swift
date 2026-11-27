@@ -36,6 +36,18 @@ final class DecodingTests: XCTestCase {
         let model = try JSONDecoder.grouper.decode(ModelEntry.self, from: Data(modelRaw.utf8))
         XCTAssertEqual(model.inputPrice, 0)
         XCTAssertEqual(model.modalities, [])
+        XCTAssertEqual(model.kind, "api")
+        XCTAssertNil(model.deviceId)
+        XCTAssertFalse(model.canOrchestrate)
+        XCTAssertFalse(model.isHarness)
+
+        let harnessRaw = #"{"id":"claude-code-pc-opus","provider_id":"claude-code@pc","model":"opus","kind":"harness","device_id":"pc","can_orchestrate":true,"display_name":"Claude Opus"}"#
+        let harness = try JSONDecoder.grouper.decode(ModelEntry.self, from: Data(harnessRaw.utf8))
+        XCTAssertEqual(harness.kind, "harness")
+        XCTAssertEqual(harness.deviceId, "pc")
+        XCTAssertTrue(harness.canOrchestrate)
+        XCTAssertTrue(harness.isHarness)
+        XCTAssertEqual(harness.displayName, "Claude Opus")
     }
 
     func testEventRoundTripKeepsFlattenedShape() throws {

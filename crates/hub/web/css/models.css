@@ -25,6 +25,20 @@
   border-color: var(--border-strong);
 }
 
+.mp-option.is-disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
+.mp-option.is-disabled:hover {
+  background: transparent;
+  border-color: transparent;
+}
+
+.mp-opt-note {
+  color: var(--text-2);
+}
+
 /* Active row: tone plus a neutral strong edge, never the search box's blue ring.
    The inset accent bar keeps keyboard focus visible without blue. */
 .mp-option.active {
@@ -204,6 +218,17 @@
   gap: 2px 10px;
   margin-top: 2px;
   font-size: 12.5px;
+}
+
+.models-subsection {
+  margin: 14px 0 8px;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-2);
+}
+
+.models-subsection:first-of-type {
+  margin-top: 4px;
 }
 
 @media (max-width: 760px) {
