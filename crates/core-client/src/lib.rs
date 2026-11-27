@@ -259,6 +259,8 @@ struct Threads {
     identity: Mutex<Option<(String, String)>>,
     /// Calls this device is executing for the hub, keyed by hub call id.
     model_tasks: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Standard-chat harness turns executing on this device, keyed by conversation id.
+    harness_tasks: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     /// Calls a local thread asked the hub to relay, keyed by device call id.
     model_waiters: Mutex<HashMap<String, device_provider::ModelWaiter>>,
     /// Random for each connection, so a reconnect cannot reuse an old approval id.
@@ -280,6 +282,7 @@ impl Threads {
             providers: Mutex::new(Vec::new()),
             identity: Mutex::new(None),
             model_tasks: Mutex::new(HashMap::new()),
+            harness_tasks: Mutex::new(HashMap::new()),
             model_waiters: Mutex::new(HashMap::new()),
             approval_nonce: u64::from_le_bytes(nonce),
             next: AtomicU64::new(1),
@@ -305,6 +308,9 @@ impl Threads {
         self.approvals.lock().unwrap().clear();
         for (_, cancel) in self.model_tasks.lock().unwrap().drain() {
             let _ = cancel.send(true);
+        }
+        for (_, handle) in self.harness_tasks.lock().unwrap().drain() {
+            handle.abort();
         }
         self.model_waiters.lock().unwrap().clear();
     }
@@ -444,6 +450,69 @@ fn start_thread(
             t.send(NodeMessage::ThreadFinished { thread_id: id, ok: result.ok, summary: result.summary });
         }
     });
+}
+
+const MAX_HARNESS_TASKS: usize = 16;
+
+fn start_harness_turn(
+    conversation_id: String,
+    agent: String,
+    model: String,
+    session_id: Option<String>,
+    message: String,
+    config: &Config,
+    threads: &Arc<Threads>,
+) {
+    let workdir = match harness::chat_workdir(config.workspace_root.as_deref(), &conversation_id) {
+        Ok(dir) => dir,
+        Err(error) => {
+            threads.send(NodeMessage::HarnessFailed { conversation_id, error });
+            return;
+        }
+    };
+    {
+        let tasks = threads.harness_tasks.lock().unwrap();
+        if !tasks.contains_key(&conversation_id) && tasks.len() >= MAX_HARNESS_TASKS {
+            drop(tasks);
+            threads.send(NodeMessage::HarnessFailed {
+                conversation_id,
+                error: "this device is busy with other harness turns; try again shortly".into(),
+            });
+            return;
+        }
+    }
+    let weak = Arc::downgrade(threads);
+    let conv_key = conversation_id.clone();
+    let join = tokio::spawn(async move {
+        let result = harness::turn(
+            &agent,
+            &model,
+            session_id.as_deref(),
+            &message,
+            &workdir,
+            harness::HarnessLevel::Confined,
+        )
+        .await;
+        if let Some(t) = weak.upgrade() {
+            t.harness_tasks.lock().unwrap().remove(&conv_key);
+            match result {
+                Ok(out) => t.send(NodeMessage::HarnessFinished {
+                    conversation_id: conv_key,
+                    text: out.text,
+                    session_id: out.session_id,
+                    usage: out.usage,
+                }),
+                Err(error) => t.send(NodeMessage::HarnessFailed { conversation_id: conv_key, error }),
+            }
+        }
+    });
+    let abort = join.abort_handle();
+    let mut tasks = threads.harness_tasks.lock().unwrap();
+    if threads.closed.load(Ordering::SeqCst) {
+        abort.abort();
+    } else if let Some(prev) = tasks.insert(conversation_id, abort) {
+        prev.abort();
+    }
 }
 
 async fn connect_once(
@@ -631,6 +700,9 @@ async fn connect_once(
                     }
                     Ok(HubMessage::HubMoveAbort { move_id, reason }) => {
                         events.hub_move_abort(&move_id, &reason);
+                    }
+                    Ok(HubMessage::HarnessTurn { conversation_id, agent, model, session_id, message }) => {
+                        start_harness_turn(conversation_id, agent, model, session_id, message, config, &threads);
                     }
                     Ok(HubMessage::Pong) => {}
                     Ok(HubMessage::Error { message }) => {
