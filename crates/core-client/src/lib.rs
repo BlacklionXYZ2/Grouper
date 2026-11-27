@@ -7,7 +7,7 @@
 //! orchestrator starts here, reports presence and status through [`Events`], pings,
 //! and reconnects with backoff.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1036,5 +1036,257 @@ mod tests {
         // A late approval request is denied at once.
         assert_eq!(threads.approve("t1", "list_files", &json!({}), "late").await, ApprovalDecision::Denied);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Fake `claude` that records each turn under `$HOME` and, while `hold` exists, waits so a
+    /// test can queue another message or kill the process. Never a real CLI.
+    const FAKE_THREAD_CLAUDE: &str = r#"
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+fn after(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let home = env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+        .expect("home");
+    let pid = std::process::id();
+    fs::write(home.join("pid"), pid.to_string()).unwrap();
+    let mut waited = false;
+    while home.join("hold").exists() {
+        waited = true;
+        thread::sleep(Duration::from_millis(30));
+    }
+    let resume = after(&args, "--resume");
+    let msg = after(&args, "-p").unwrap_or_default();
+    let mode = after(&args, "--permission-mode").unwrap_or_default();
+    let model = after(&args, "--model").unwrap_or_default();
+    let cwd = env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let sid = resume.clone().unwrap_or_else(|| "thread-sess-1".into());
+    let line = format!(
+        "pid={pid}\nwaited={waited}\nresume={}\nmode={mode}\nmodel={model}\ncwd={cwd}\nmsg={msg}\n---\n",
+        resume.unwrap_or_else(|| "NONE".into())
+    );
+    let log = home.join("invocations.log");
+    let prev = fs::read_to_string(&log).unwrap_or_default();
+    fs::write(&log, format!("{prev}{line}")).unwrap();
+    let reply = msg.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "");
+    println!(
+        "{{\"type\":\"result\",\"is_error\":false,\"session_id\":\"{sid}\",\"result\":\"{reply}\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}"
+    );
+}
+"#;
+
+    fn fake_thread_claude() -> PathBuf {
+        static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        BIN.get_or_init(|| {
+            let dir = std::env::temp_dir().join("grouper-h3-fake-claude");
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("fake_thread_claude.rs");
+            std::fs::write(&src, FAKE_THREAD_CLAUDE).unwrap();
+            let exe = dir.join(if cfg!(windows) { "claude.exe" } else { "claude" });
+            let status = std::process::Command::new("rustc")
+                .arg(&src)
+                .arg("-O")
+                .arg("-o")
+                .arg(&exe)
+                .status()
+                .expect("rustc");
+            assert!(status.success(), "compiling fake claude failed");
+            exe
+        })
+        .clone()
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output()
+                .expect("tasklist");
+            return String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""));
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::Path::new(&format!("/proc/{pid}")).exists()
+        }
+    }
+
+    struct Quiet;
+    impl Events for Quiet {
+        fn status(&self, _status: Status) {}
+        fn presence(&self, _devices: Vec<DeviceInfo>) {}
+    }
+
+    fn harness_thread_spec(id: &str, brief: &str) -> ThreadSpec {
+        ThreadSpec {
+            thread_id: id.into(),
+            conversation_id: "c-harness".into(),
+            title: "Harness thread".into(),
+            provider_id: "claude-code@pc".into(),
+            model: "opus".into(),
+            system: String::new(),
+            brief: brief.into(),
+            permissions: HashMap::new(),
+            max_turns: 4,
+            device_name: "Gaming PC".into(),
+            ask_timeout_secs: Some(core_protocol::DEFAULT_ASK_TIMEOUT_SECS),
+            fallback_models: Vec::new(),
+            harness: Some(core_protocol::HarnessThread {
+                agent: "claude-code".into(),
+                model: "opus".into(),
+                session: None,
+            }),
+        }
+    }
+
+    struct HarnessRun {
+        dir: PathBuf,
+        threads: Arc<Threads>,
+        rx: mpsc::Receiver<NodeMessage>,
+    }
+
+    impl HarnessRun {
+        fn start(id: &str, brief: &str, hold: bool) -> Self {
+            let dir = std::env::temp_dir().join(format!("grouper-h3-thread-{id}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            if hold {
+                std::fs::write(home.join("hold"), "1").unwrap();
+            }
+            let bin = fake_thread_claude();
+            let opts = harness::ScanOptions::isolated(&home, vec![bin.parent().unwrap().to_path_buf()], 1_700_000_000);
+            let (tx, rx) = mpsc::channel(CONN_QUEUE_CAP);
+            let threads = Arc::new(Threads::new(tx, Arc::new(|| {})));
+            let events: Arc<dyn Events> = Arc::new(Quiet);
+            start_harness_thread(
+                harness_thread_spec(id, brief),
+                &dir.join("workspaces"),
+                &events,
+                &threads,
+                &Arc::new(Folders::default()),
+                opts,
+            );
+            Self { dir, threads, rx }
+        }
+
+        fn home(&self) -> PathBuf {
+            self.dir.join("home")
+        }
+
+        async fn recv(&mut self) -> NodeMessage {
+            tokio::time::timeout(Duration::from_secs(20), self.rx.recv())
+                .await
+                .expect("harness thread timed out")
+                .expect("output closed")
+        }
+    }
+
+    impl Drop for HarnessRun {
+        fn drop(&mut self) {
+            let ids: Vec<String> = self.threads.harness_runs.lock().unwrap().keys().cloned().collect();
+            for id in ids {
+                self.threads.stop_one(&id);
+            }
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    async fn wait_pid(home: &Path) -> u32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(home.join("pid")) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    if pid_alive(pid) {
+                        return pid;
+                    }
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("fake claude never started");
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_thread_start_runs_a_turn_and_a_message_resumes_the_session() {
+        let mut run = HarnessRun::start("t-resume", "Write the note.", true);
+        let pid = wait_pid(&run.home()).await;
+        assert!(pid_alive(pid), "first turn should be inside the fake CLI");
+        run.threads.push_input("t-resume", "user", "ship it");
+        std::fs::remove_file(run.home().join("hold")).unwrap();
+
+        let mut session = None;
+        let mut summary = None;
+        let mut saw_text = false;
+        while summary.is_none() {
+            match run.recv().await {
+                NodeMessage::ThreadHarnessSession { thread_id, session_id } => {
+                    assert_eq!(thread_id, "t-resume");
+                    session = Some(session_id);
+                }
+                NodeMessage::ThreadEvent { event: AgentEvent::Text { text }, .. } => {
+                    saw_text = true;
+                    assert!(text.contains("Write the note.") || text.contains("ship it"), "{text}");
+                }
+                NodeMessage::ThreadFinished { thread_id, ok, summary: done } => {
+                    assert_eq!(thread_id, "t-resume");
+                    assert!(ok, "{done}");
+                    summary = Some(done);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(session.as_deref(), Some("thread-sess-1"));
+        assert!(saw_text);
+        let summary = summary.unwrap();
+        assert!(summary.contains("ship it"), "{summary}");
+        assert!(summary.contains("[Message from the user]"), "{summary}");
+
+        let log = std::fs::read_to_string(run.home().join("invocations.log")).unwrap();
+        let turns: Vec<&str> = log.split("---\n").filter(|s| !s.trim().is_empty()).collect();
+        assert_eq!(turns.len(), 2, "{log}");
+        assert!(turns[0].contains("resume=NONE"), "{log}");
+        assert!(turns[0].contains("mode=acceptEdits"), "{log}");
+        assert!(turns[0].contains("model=opus"), "{log}");
+        assert!(turns[0].contains("msg=Write the note."), "{log}");
+        assert!(turns[0].contains("cwd="), "{log}");
+        assert!(
+            turns[0].contains("t-resume"),
+            "workdir should be the thread workspace: {log}"
+        );
+        assert!(turns[1].contains("resume=thread-sess-1"), "{log}");
+        assert!(turns[1].contains("mode=acceptEdits"), "{log}");
+        assert!(turns[1].contains("ship it"), "{log}");
+        assert!(run.threads.harness_runs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn harness_thread_stop_kills_the_cli_process() {
+        let mut run = HarnessRun::start("stop", "Stay running.", true);
+        let pid = wait_pid(&run.home()).await;
+        assert!(pid_alive(pid));
+        run.threads.stop_one("stop");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) {
+            if std::time::Instant::now() > deadline {
+                panic!("stop_thread left fake claude {pid} running");
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(run.threads.harness_runs.lock().unwrap().is_empty());
+        assert!(!run.home().join("invocations.log").exists(), "killed before the CLI finished the turn");
+        let late = tokio::time::timeout(Duration::from_millis(400), run.rx.recv()).await;
+        assert!(late.is_err() || late.unwrap().is_none(), "stop does not finish the thread with the CLI reply");
     }
 }

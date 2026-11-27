@@ -797,4 +797,168 @@ mod tests {
         assert!(!thread_system("Laptop", false, &[]).contains("Scoped folders"));
         assert!(!thread_system("Hub", true, &folders).contains("Scoped folders"));
     }
+
+    use crate::db::Db;
+    use crate::server::Hub;
+    use core_protocol::{ModelEntry, ProviderConfig};
+    use serde_json::json;
+
+    fn tmp_hub() -> (std::path::PathBuf, Arc<Hub>) {
+        let dir = std::env::temp_dir().join(format!(
+            "grouper-h3-hub-thread-{}-{}",
+            std::process::id(),
+            crate::db::random_hex(3)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir).unwrap();
+        (dir, Hub::new(db, dir.clone()))
+    }
+
+    fn add_harness(db: &Db, device_id: &str, slug: &str, model_id: &str, model: &str) {
+        db.upsert_provider(&ProviderConfig {
+            id: format!("{slug}@{device_id}"),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"harness": slug, "via_device": device_id, "signed_in": true}),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: model_id.into(),
+            provider_id: format!("{slug}@{device_id}"),
+            model: model.into(),
+            source: "auto".into(),
+            price_source: "none".into(),
+            roles: vec!["thread".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn harness_thread_on_the_wrong_device_is_an_error() {
+        let (dir, hub) = tmp_hub();
+        let (pc, _) = hub.db.add_device("Gaming PC", "windows", false).unwrap();
+        let (_laptop, _) = hub.db.add_device("Laptop", "windows", false).unwrap();
+        add_harness(&hub.db, &pc.id, "claude-code", "cc-opus", "opus");
+        let conv = hub.db.create_conversation("project", "P").unwrap();
+        let err = hub
+            .start_thread(
+                &conv,
+                ThreadRequest {
+                    title: "Wrong device".into(),
+                    device: "Laptop".into(),
+                    goal: "run there".into(),
+                    model: Some("cc-opus".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("runs on Gaming PC, not Laptop"), "{err}");
+        assert!(hub.db.threads(Some(&conv)).is_empty(), "a refused harness thread is not created");
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unconfinable_harness_thread_is_refused() {
+        let (dir, hub) = tmp_hub();
+        let (pc, _) = hub.db.add_device("Gaming PC", "windows", false).unwrap();
+        add_harness(&hub.db, &pc.id, "hermes", "hermes-nous", "nous");
+        let conv = hub.db.create_conversation("project", "P").unwrap();
+        let err = hub
+            .start_thread(
+                &conv,
+                ThreadRequest {
+                    title: "Hermes".into(),
+                    device: String::new(),
+                    goal: "try hermes".into(),
+                    model: Some("hermes-nous".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("can't be confined"), "{err}");
+        assert!(err.contains("hermes"), "{err}");
+        assert!(hub.db.threads(Some(&conv)).is_empty());
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn api_thread_is_unchanged_when_harness_threads_exist() {
+        let (dir, hub) = tmp_hub();
+        let (pc, _) = hub.db.add_device("Gaming PC", "windows", false).unwrap();
+        add_harness(&hub.db, &pc.id, "claude-code", "cc-opus", "opus");
+        hub.db
+            .upsert_provider(&ProviderConfig {
+                id: "scripted".into(),
+                kind: "scripted".into(),
+                base_url: None,
+                api_key: None,
+                options: json!({"inline": {"default": [{"type": "text", "text": "api-thread-ok"}]}}),
+            })
+            .unwrap();
+        hub.db
+            .upsert_model(&ModelEntry {
+                id: "api-thread".into(),
+                provider_id: "scripted".into(),
+                model: "scripted-1".into(),
+                roles: vec!["orchestrator".into(), "thread".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let conv = hub.db.create_conversation("project", "P").unwrap();
+        let info = hub
+            .start_thread(
+                &conv,
+                ThreadRequest {
+                    title: "API".into(),
+                    device: "hub".into(),
+                    goal: "answer from the API".into(),
+                    model: Some("api-thread".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.device_id, "hub");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let finished = loop {
+            let row = hub.db.thread(&info.id).unwrap();
+            if row.status != "running" {
+                break row;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("API thread still running");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(finished.status, "done", "{:?}", finished.summary);
+        assert_eq!(finished.summary.as_deref(), Some("api-thread-ok"));
+        assert!(hub.db.thread_harness_session(&info.id).is_none());
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn harness_thread_session_is_stored_from_the_device_report() {
+        let (dir, hub) = tmp_hub();
+        let (pc, _) = hub.db.add_device("Gaming PC", "windows", false).unwrap();
+        let conv = hub.db.create_conversation("project", "P").unwrap();
+        let thread = hub.db.create_thread(&conv, "H", &pc.id, "cc-opus", None, "brief").unwrap();
+        hub.note_thread_harness_session(&thread.id, "  thread-sess-1  ");
+        assert_eq!(hub.db.thread_harness_session(&thread.id).as_deref(), Some("thread-sess-1"));
+        hub.note_thread_harness_session(&thread.id, "   ");
+        assert_eq!(
+            hub.db.thread_harness_session(&thread.id).as_deref(),
+            Some("thread-sess-1"),
+            "a blank report does not clear the stored session"
+        );
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
