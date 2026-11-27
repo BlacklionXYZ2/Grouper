@@ -776,7 +776,7 @@ a {
 }
 
 ::placeholder {
-  color: var(--text-3);
+  color: var(--text-4);
   opacity: 1;
 }
 
@@ -1114,7 +1114,7 @@ a {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  color: var(--text-3);
+  color: var(--text-4);
   font-size: var(--type-caption-size);
   font-weight: var(--type-caption-weight);
   white-space: nowrap;
@@ -2771,7 +2771,7 @@ button.strip:hover {
 .sub-title {
   font-size: var(--type-micro-size);
   font-weight: 600;
-  color: var(--text-3);
+  color: var(--text-4);
   text-transform: uppercase;
   letter-spacing: 0.7px;
   margin: 0 0 8px;
@@ -2831,7 +2831,7 @@ button.strip:hover {
 .tool-row .tool-body .label {
   font-size: var(--type-micro-size);
   font-weight: 600;
-  color: var(--text-3);
+  color: var(--text-4);
 }
 
 .ok-word {
@@ -2906,7 +2906,7 @@ button.strip:hover {
 }
 
 .file-row .size {
-  color: var(--text-3);
+  color: var(--text-4);
   font-size: var(--type-caption-size);
 }
 
@@ -4341,7 +4341,7 @@ code.nowrap {
   }
 
   ::placeholder {
-    color: var(--text-3);
+    color: var(--text-4);
     opacity: 1;
   }
 
@@ -5711,7 +5711,7 @@ dialog.sheet-dialog.model-picker {
   margin: 14px 10px 2px;
   font-size: var(--type-micro-size);
   font-weight: 600;
-  color: var(--text-3);
+  color: var(--text-4);
   text-transform: uppercase;
   letter-spacing: 0.7px;
 }
@@ -6636,7 +6636,7 @@ dialog.command-palette::backdrop {
   font-weight: 600;
   letter-spacing: 0.7px;
   text-transform: uppercase;
-  color: var(--text-3);
+  color: var(--text-4);
 }
 
 .palette-group-items {
