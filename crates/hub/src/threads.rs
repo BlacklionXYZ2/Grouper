@@ -47,7 +47,7 @@ pub struct ThreadRequest {
 pub const MAX_THREAD_TURNS: u32 = 40;
 
 /// Where a harness thread has to run, and the CLI it names.
-struct HarnessPlacement {
+pub(crate) struct HarnessPlacement {
     agent: String,
     model: String,
     device_id: String,
@@ -56,7 +56,8 @@ struct HarnessPlacement {
 }
 
 impl HarnessPlacement {
-    fn spec(&self, session: Option<String>) -> HarnessThread {
+    /// Visible to the offline hand-over, which rebuilds the same spec with the stored session.
+    pub(crate) fn spec(&self, session: Option<String>) -> HarnessThread {
         HarnessThread {
             agent: self.agent.clone(),
             model: self.model.clone(),
@@ -812,7 +813,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir).unwrap();
-        (dir, Hub::new(db, dir.clone()))
+        let hub = Hub::new(db, dir.clone());
+        (dir, hub)
     }
 
     fn add_harness(db: &Db, device_id: &str, slug: &str, model_id: &str, model: &str) {
