@@ -141,3 +141,17 @@ Built as `docs/models-and-harnesses-design.md` describes. Open points, each with
   files. Adopt a formatter only on purpose, with a `rustfmt.toml`, in its own commit.
 - **Back up the master key** (`/secrets/master.key` in the `grouper-secrets` volume)
   somewhere safe; backups don't include it (`deploy/README.md` section 5).
+
+## Usage tab (27 November 2026)
+
+Built per `docs/usage-tab-spec.md` (Fable's spec with your decisions at the top). Waiting on you:
+
+- **Look at it:** sign in at `https://grouper.clockmillbarn.uk/#/usage` (or the new Usage tab on iPhone
+  once the Apple build is installed). Subscription meters appear only for devices running a Grouper node
+  with a harness signed in; this PC's node needs `grouper login` (or the Windows app) first.
+- **Grok meter and sign-in expiry:** Grok's stored token lasts about an hour and only the Grok CLI renews
+  it, so the card often says "sign-in expired". Options: leave it (it refreshes whenever you use Grok), or
+  let Grouper renew the token itself, which writes Grok's sign-in file and could collide with the CLI.
+  Recommendation: leave it.
+- **Grok's on-demand and prepaid amounts** are left out until their unit is known.
+
