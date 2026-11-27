@@ -131,6 +131,62 @@
   place-items: center;
 }
 
+/* Collapsible provider groups: the header is a disclosure button. */
+button.mp-provider {
+  width: 100%;
+  min-height: var(--h-row);
+  margin: 0;
+  padding: 6px 10px;
+  border: 2px solid transparent;
+  border-radius: var(--r-control);
+  background: none;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+}
+
+button.mp-provider:hover {
+  background: var(--surface-2);
+}
+
+button.mp-provider.active,
+button.mp-provider:focus-visible,
+.mp-showall.active,
+.mp-showall:focus-visible {
+  border-color: var(--focus);
+  outline: none;
+}
+
+button.mp-provider > .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--text-3);
+  flex: none;
+}
+
+.mp-rows {
+  display: grid;
+  gap: 2px;
+}
+
+.mp-showall {
+  min-height: var(--h-row);
+  padding: 6px 10px;
+  border: 2px solid transparent;
+  border-radius: var(--r-control);
+  background: none;
+  color: var(--text-2);
+  font-size: var(--type-caption-size);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mp-showall:hover {
+  background: var(--surface-2);
+}
+
 .mp-more-wrap {
   margin: 10px 2px 2px;
 }
@@ -252,6 +308,11 @@
   }
 
   .mp-more-btn {
+    min-height: 44px;
+  }
+
+  button.mp-provider,
+  .mp-showall {
     min-height: 44px;
   }
 

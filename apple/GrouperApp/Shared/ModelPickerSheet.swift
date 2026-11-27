@@ -15,12 +15,21 @@ struct ModelPickerSheet: View {
     let current: String?
     let onPick: (String?) -> Void
     @State private var query = ""
+    /// The owner's expand/collapse choice per provider, one "+id" or "-id" per line.
+    @AppStorage("grouper.mp.groups") private var groupPrefs = ""
+    /// Providers toggled while this sheet is open (their choice beats the defaults).
+    @State private var touched: Set<String> = []
+    /// Providers whose "Show all N" row was used.
+    @State private var showAll: Set<String> = []
+    private static let collapseAbove = 12
+    private static let showFirst = 50
     #if os(macOS)
     @FocusState private var searchFocused: Bool
     #endif
 
     var body: some View {
         NavigationStack {
+            let filtering = !Self.words(query).isEmpty
             let sections = Self.sections(models: model.models, providers: model.providers, devices: model.devices,
                                           role: role, words: Self.words(query), familyOf: { ModelFamily.of($0) })
             List {
@@ -39,10 +48,22 @@ struct ModelPickerSheet: View {
                 }
                 ForEach(sections) { section in
                     ForEach(section.groups) { group in
+                        let collapsible = isCollapsible(section: section, group: group)
+                        let expanded = !collapsible || filtering || isExpanded(group)
+                        let capped = expanded && !filtering && collapsible && group.models.count > Self.showFirst && !showAll.contains(group.providerId)
                         Section {
-                            ForEach(group.models) { entry in modelRow(entry) }
+                            if expanded {
+                                ForEach(capped ? Array(group.models.prefix(Self.showFirst)) : group.models) { entry in modelRow(entry) }
+                                if capped {
+                                    Button("Show all \(group.models.count)") { showAll.insert(group.providerId) }
+                                        .buttonStyle(.plain)
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(Theme.text2)
+                                        .grouperMinimumControlSize()
+                                }
+                            }
                         } header: {
-                            groupHeader(section: section, group: group)
+                            groupHeader(section: section, group: group, collapsible: collapsible, expanded: expanded, filtering: filtering)
                         }
                     }
                 }
@@ -114,7 +135,38 @@ struct ModelPickerSheet: View {
         .accessibilityAddTraits(current == nil ? .isSelected : [])
     }
 
-    private func groupHeader(section: PickerSection, group: PickerGroup) -> some View {
+    /// Only the "other models" provider groups collapse; the role-default section and the harness devices stay open.
+    private func isCollapsible(section: PickerSection, group: PickerGroup) -> Bool {
+        !group.isHarnessGroup && section.id != "primary"
+    }
+
+    private func storedPrefs() -> [String: Bool] {
+        var result: [String: Bool] = [:]
+        for line in groupPrefs.split(separator: "\n") {
+            guard let sign = line.first, sign == "+" || sign == "-" else { continue }
+            result[String(line.dropFirst())] = sign == "+"
+        }
+        return result
+    }
+
+    /// Touched this opening, then "holds the chosen model", then the saved choice, then the size default.
+    private func isExpanded(_ group: PickerGroup) -> Bool {
+        let stored = storedPrefs()[group.providerId]
+        if touched.contains(group.providerId) { return stored ?? true }
+        if let current, group.models.contains(where: { $0.id == current }) { return true }
+        if let stored { return stored }
+        return group.models.count <= Self.collapseAbove
+    }
+
+    private func toggle(_ group: PickerGroup) {
+        let next = !isExpanded(group)
+        var prefs = storedPrefs()
+        prefs[group.providerId] = next
+        groupPrefs = prefs.sorted { $0.key < $1.key }.map { ($0.value ? "+" : "-") + $0.key }.joined(separator: "\n")
+        touched.insert(group.providerId)
+    }
+
+    private func groupHeader(section: PickerSection, group: PickerGroup, collapsible: Bool, expanded: Bool, filtering: Bool) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             if group.isFirst {
                 Text(section.title).font(.headline).foregroundStyle(.primary)
@@ -133,24 +185,55 @@ struct ModelPickerSheet: View {
                         )
                     }
                 }
-            } else {
-                HStack(spacing: 6) {
-                    Text(group.providerId.isEmpty ? "Unknown provider" : group.providerId).font(.subheadline.weight(.semibold))
-                    if let provider = group.provider {
-                        TagBadge(text: provider.kind)
-                        TagBadge(text: provider.hasKey ? "Key set" : "No key", tint: provider.hasKey ? Theme.ok : Theme.text2, fill: provider.hasKey ? Theme.okSoft : Theme.surface2)
-                        if let via = provider.viaDevice, !via.isEmpty {
-                            TagBadge(text: "via \(model.deviceDisplayName(via))")
-                        }
-                    } else if model.providersLoaded {
-                        TagBadge(text: "Unknown provider", tint: Theme.warn, fill: Theme.warnSoft)
+            } else if collapsible && !filtering {
+                Button { toggle(group) } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.caption.weight(.semibold)).foregroundStyle(Theme.text3).frame(width: 12)
+                            .accessibilityHidden(true)
+                        providerHeaderLabel(group)
                     }
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .grouperMinimumControlSize()
+                .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+                .accessibilityHint("Shows or hides this provider's models")
+            } else {
+                // Plain label: the role-default section, or any group while searching (every match is shown).
+                HStack(spacing: 6) { providerHeaderLabel(group) }
             }
         }
         .textCase(nil)
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isHeader)
+        .modifier(HeaderAccessibility(combine: !(collapsible && !filtering)))
+    }
+
+    /// Provider name (uppercase mono, with the model count), then its badges.
+    @ViewBuilder private func providerHeaderLabel(_ group: PickerGroup) -> some View {
+        let name = group.providerId.isEmpty ? "Unknown provider" : group.providerId
+        Text("\(name.uppercased()) · \(group.models.count)")
+            .font(.caption.monospaced().weight(.semibold))
+            .foregroundStyle(Theme.text2)
+        if let provider = group.provider {
+            TagBadge(text: provider.kind)
+            TagBadge(text: provider.hasKey ? "Key set" : "No key", tint: provider.hasKey ? Theme.ok : Theme.text2, fill: provider.hasKey ? Theme.okSoft : Theme.surface2)
+            if let via = provider.viaDevice, !via.isEmpty {
+                TagBadge(text: "via \(model.deviceDisplayName(via))")
+            }
+        } else if model.providersLoaded {
+            TagBadge(text: "Unknown provider", tint: Theme.warn, fill: Theme.warnSoft)
+        }
+    }
+
+    private struct HeaderAccessibility: ViewModifier {
+        let combine: Bool
+        func body(content: Content) -> some View {
+            if combine {
+                content.accessibilityElement(children: .combine).accessibilityAddTraits(.isHeader)
+            } else {
+                content.accessibilityAddTraits(.isHeader)
+            }
+        }
     }
 
     @ViewBuilder private func modelRow(_ entry: ModelEntry) -> some View {
