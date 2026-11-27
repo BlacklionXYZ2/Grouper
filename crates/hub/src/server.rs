@@ -1600,9 +1600,9 @@ async fn handle_thread_frame(hub: &Arc<Hub>, device_id: &str, conn_id: u64, msg:
         NodeMessage::AskOrchestrator { thread_id, question } if hub.owns_thread(device_id, &thread_id) => {
             hub.thread_ask(&thread_id, &question).await;
         }
-        // Stored in step 2 of harness threads; the frame is accepted so an older build of this
-        // match stays exhaustive once the variant exists.
-        NodeMessage::ThreadHarnessSession { .. } => {}
+        NodeMessage::ThreadHarnessSession { thread_id, session_id } if hub.owns_thread(device_id, &thread_id) => {
+            hub.note_thread_harness_session(&thread_id, &session_id);
+        }
         _ => {}
     }
 }

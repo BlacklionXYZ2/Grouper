@@ -7,7 +7,7 @@
 //! orchestrator starts here, reports presence and status through [`Events`], pings,
 //! and reconnects with backoff.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -261,6 +261,8 @@ struct Threads {
     model_tasks: Mutex<HashMap<String, watch::Sender<bool>>>,
     /// Standard-chat harness turns executing on this device, keyed by conversation id.
     harness_tasks: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// Harness threads (one CLI session each), keyed by thread id.
+    harness_runs: Mutex<HashMap<String, HarnessThreadRun>>,
     /// Calls a local thread asked the hub to relay, keyed by device call id.
     model_waiters: Mutex<HashMap<String, device_provider::ModelWaiter>>,
     /// Random for each connection, so a reconnect cannot reuse an old approval id.
@@ -283,6 +285,7 @@ impl Threads {
             identity: Mutex::new(None),
             model_tasks: Mutex::new(HashMap::new()),
             harness_tasks: Mutex::new(HashMap::new()),
+            harness_runs: Mutex::new(HashMap::new()),
             model_waiters: Mutex::new(HashMap::new()),
             approval_nonce: u64::from_le_bytes(nonce),
             next: AtomicU64::new(1),
@@ -312,7 +315,43 @@ impl Threads {
         for (_, handle) in self.harness_tasks.lock().unwrap().drain() {
             handle.abort();
         }
+        for (_, run) in self.harness_runs.lock().unwrap().drain() {
+            run.abort();
+        }
         self.model_waiters.lock().unwrap().clear();
+    }
+
+    fn push_input(&self, thread_id: &str, from: &str, text: &str) {
+        if let Some(c) = self.controls.lock().unwrap().get(thread_id) {
+            c.send(from, text);
+            return;
+        }
+        if let Some(run) = self.harness_runs.lock().unwrap().get(thread_id) {
+            let _ = run.input.send(text.to_string());
+        }
+    }
+
+    fn stop_one(&self, thread_id: &str) {
+        if let Some(c) = self.controls.lock().unwrap().remove(thread_id) {
+            c.stop();
+        }
+        if let Some(run) = self.harness_runs.lock().unwrap().remove(thread_id) {
+            run.abort();
+        }
+        let prefix = format!("{thread_id}-");
+        self.approvals.lock().unwrap().retain(|id, _| !id.starts_with(&prefix));
+    }
+}
+
+/// One harness thread: aborting it drops the CLI child (`kill_on_drop`).
+struct HarnessThreadRun {
+    abort: tokio::task::AbortHandle,
+    input: mpsc::UnboundedSender<String>,
+}
+
+impl HarnessThreadRun {
+    fn abort(self) {
+        self.abort.abort();
     }
 }
 

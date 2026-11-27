@@ -407,6 +407,11 @@ impl Hub {
         brief.push_str(&offline_instruction(&device, w.disconnected));
 
         let model = self.db.find_model(&t.model).ok_or_else(|| format!("model {} is no longer registered", t.model))?;
+        if self.harness_placement(&model)?.is_some() {
+            return Err(format!(
+                "{device} hosts this harness thread; the hub can't run that CLI while the device is offline"
+            ));
+        }
         let pcfg = self
             .db
             .provider(&model.provider_id)
@@ -645,7 +650,10 @@ impl Hub {
             device_name: device.clone(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
             fallback_models: self.free_alternates(&model.provider_id, &model.model),
-            harness: None,
+            harness: match self.harness_placement(&model)? {
+                Some(place) => Some(place.spec(self.db.thread_harness_session(thread_id))),
+                None => None,
+            },
         };
         if !self.send_to_conn(&t.device_id, conn_id, HubMessage::StartThread { spec: Box::new(spec) }).await {
             self.wait_for_device(thread_id, "the device went offline during the hand-over", true).await;

@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, title TEXT NOT NULL, device_id TEXT NOT NULL,
   model TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, brief TEXT NOT NULL, summary TEXT,
-  created INTEGER NOT NULL, finished INTEGER);
+  created INTEGER NOT NULL, finished INTEGER, harness_session TEXT);
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, thread_id TEXT,
   ts INTEGER NOT NULL, body TEXT NOT NULL);
@@ -421,6 +421,7 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "models", "can_orchestrate", "ALTER TABLE models ADD COLUMN can_orchestrate INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "conversations", "model", "ALTER TABLE conversations ADD COLUMN model TEXT")?;
     ensure_column(&conn, "conversations", "harness_session", "ALTER TABLE conversations ADD COLUMN harness_session TEXT")?;
+    ensure_column(&conn, "threads", "harness_session", "ALTER TABLE threads ADD COLUMN harness_session TEXT")?;
     ensure_column(&conn, "usage", "billing", "ALTER TABLE usage ADD COLUMN billing TEXT NOT NULL DEFAULT 'api'")?;
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
@@ -1732,6 +1733,22 @@ impl Db {
             let _ = c.execute("DELETE FROM offline_threads WHERE thread_id = ?1", [id]);
         }
         done
+    }
+
+    /// CLI session id for a harness thread, reported by the device that runs it.
+    pub fn thread_harness_session(&self, id: &str) -> Option<String> {
+        self.c()
+            .query_row("SELECT harness_session FROM threads WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    pub fn set_thread_harness_session(&self, id: &str, session: &str) {
+        let _ = self.c().execute(
+            "UPDATE threads SET harness_session = ?1 WHERE id = ?2",
+            params![session, id],
+        );
     }
 
     // ---- events and usage
