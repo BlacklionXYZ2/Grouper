@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use core_agent::thread::{ApprovalDecision, ThreadHost, approval_timeout_phrase, spawn_thread};
 use core_agent::tools::{Workspace, file_tools};
 use core_protocol::{
-    AgentEvent, ApprovalTimeoutAction, EventBody, FolderInfo, FolderMode, HubMessage, ThreadInfo, ThreadSpec,
+    AgentEvent, ApprovalTimeoutAction, EventBody, FolderInfo, FolderMode, HarnessThread, HubMessage, ModelEntry,
+    ThreadInfo, ThreadSpec,
 };
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -49,6 +50,26 @@ pub struct ThreadRequest {
 }
 
 pub const MAX_THREAD_TURNS: u32 = 40;
+
+/// Where a harness thread has to run, and the CLI it names.
+pub(crate) struct HarnessPlacement {
+    agent: String,
+    model: String,
+    device_id: String,
+    device_name: String,
+    label: String,
+}
+
+impl HarnessPlacement {
+    /// Visible to the offline hand-over, which rebuilds the same spec with the stored session.
+    pub(crate) fn spec(&self, session: Option<String>) -> HarnessThread {
+        HarnessThread {
+            agent: self.agent.clone(),
+            model: self.model.clone(),
+            session: session.filter(|s| !s.trim().is_empty()),
+        }
+    }
+}
 
 /// The thread's system prompt. `folders` are the device's scoped folders (none on the hub).
 pub(crate) fn thread_system(device_name: &str, on_hub: bool, folders: &[FolderInfo]) -> String {
@@ -127,22 +148,108 @@ impl Hub {
             .map(|d| (d.id, d.name))
     }
 
+    /// `Ok(None)` for an API model. A harness that cannot be confined, or that names no device, is an error.
+    pub(crate) fn harness_placement(&self, model: &ModelEntry) -> Result<Option<HarnessPlacement>, String> {
+        let provider = self.db.provider(&model.provider_id).map_err(|e| e.to_string())?;
+        let harness_provider = provider.as_ref().is_some_and(|p| p.kind == "harness");
+        if !model.is_harness() && !harness_provider {
+            return Ok(None);
+        }
+        let Some(agent) = crate::harness::harness_agent_of(model, provider.as_ref()) else {
+            return Err(format!("harness model {} has no CLI agent configured", model.id));
+        };
+        let label = format!("{agent} ({})", model.model);
+        if crate::harness::UNCONFINABLE_HARNESSES.contains(&agent.as_str()) {
+            return Err(format!(
+                "{label} can't be confined to a safe mode yet, so Grouper won't run it as a thread. Pick Claude Code, Codex, Antigravity, Grok or pi, or an API model."
+            ));
+        }
+        let host = model
+            .device_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| provider.as_ref().and_then(|p| p.via_device()))
+            .ok_or_else(|| format!("{label} has no hosting device configured"))?;
+        let (device_id, device_name) = self
+            .resolve_device(host)
+            .ok_or_else(|| format!("{label} names unknown device {host:?}"))?;
+        Ok(Some(HarnessPlacement { agent, model: model.model.clone(), device_id, device_name, label }))
+    }
+
+    /// Naming a device other than the harness's own host is an error. An empty name keeps the host.
+    fn reject_other_harness_device(&self, requested: &str, place: &HarnessPlacement) -> Result<(), String> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return Ok(());
+        }
+        let (id, name) = self.resolve_device(requested).ok_or_else(|| format!("no device called {requested:?}"))?;
+        if id != place.device_id {
+            return Err(format!("{} runs on {}, not {name}", place.label, place.device_name));
+        }
+        Ok(())
+    }
+
+    /// Remember the CLI session id a device reported for one harness thread.
+    pub(crate) fn note_thread_harness_session(&self, thread_id: &str, session_id: &str) {
+        let session_id = session_id.trim();
+        if !session_id.is_empty() {
+            self.db.set_thread_harness_session(thread_id, session_id);
+        }
+    }
+
     pub async fn start_thread(self: &Arc<Self>, conversation_id: &str, req: ThreadRequest) -> Result<ThreadInfo, String> {
         if req.title.trim().is_empty() || req.goal.trim().is_empty() {
             return Err("title and goal are required".into());
         }
-        let (device_id, device_name, device_reason) =
-            self.resolve_thread_device(&req.device, req.task_type.as_deref(), &req.needs).await?;
-        let on_hub = device_id == HUB_DEVICE;
+        let named = match req.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(key) => Some(self.db.find_model(key).ok_or_else(|| format!("no model {key:?}"))?),
+            None => None,
+        };
+        let named_harness = match &named {
+            Some(model) => self.harness_placement(model)?,
+            None => None,
+        };
+        if let Some(place) = &named_harness {
+            self.reject_other_harness_device(&req.device, place)?;
+        }
+        let (mut device_id, mut device_name, device_reason) = if let Some(place) = &named_harness {
+            (place.device_id.clone(), place.device_name.clone(), None)
+        } else {
+            self.resolve_thread_device(&req.device, req.task_type.as_deref(), &req.needs).await?
+        };
+        let mut on_hub = device_id == HUB_DEVICE;
         // An offline device gets the thread anyway: it waits for the device while the
         // hub prepares the work up to a checkpoint (see `offline.rs`).
-        let online = self.is_online(&device_id).await;
+        let mut online = self.is_online(&device_id).await;
         // Running-thread caps and spent budgets (`limits.rs`); held until the thread is recorded.
-        let place = if online { (device_id.as_str(), device_name.as_str()) } else { (HUB_DEVICE, "the hub") };
-        let admission = crate::limits::admit(self, conversation_id, place.0, place.1, req.budget_usd).await?;
+        let place_for = |online: bool, id: &str, name: &str| {
+            if online { (id.to_string(), name.to_string()) } else { (HUB_DEVICE.to_string(), "the hub".to_string()) }
+        };
+        let admitted_on = place_for(online, &device_id, &device_name);
+        let mut admission =
+            crate::limits::admit(self, conversation_id, &admitted_on.0, &admitted_on.1, req.budget_usd).await?;
         let cheaper = req.model.is_none() && admission.budget.is_some();
         let route = self.route_model(req.model.as_deref(), req.task_type.as_deref(), &req.tags, cheaper).await?;
         let model = route.model;
+        let harness_place = if named_harness.is_some() {
+            named_harness
+        } else {
+            self.harness_placement(&model)?
+        };
+        if let Some(place) = &harness_place {
+            self.reject_other_harness_device(&req.device, place)?;
+            if device_id != place.device_id {
+                device_id = place.device_id.clone();
+                device_name = place.device_name.clone();
+                on_hub = false;
+                online = self.is_online(&device_id).await;
+                let next = place_for(online, &device_id, &device_name);
+                if next.0 != admitted_on.0 {
+                    admission =
+                        crate::limits::admit(self, conversation_id, &next.0, &next.1, req.budget_usd).await?;
+                }
+            }
+        }
         let offline = (!online).then(|| format!("{device_name} is offline; the hub prepares a checkpoint"));
         let reason = [device_reason, req.hub_reason.clone().filter(|_| on_hub), offline, route.reason]
             .into_iter()
@@ -186,9 +293,19 @@ impl Hub {
             device_name: device_name.clone(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
             fallback_models: self.free_alternates(&model.provider_id, &model.model),
+            harness: harness_place.as_ref().map(|place| place.spec(None)),
         };
 
-        if on_hub {
+        if harness_place.is_some() {
+            // The CLI lives on its own device, even when that device is this computer.
+            if !online {
+                self.wait_for_device(&info.id, &format!("{device_name} was offline when the thread started"), false)
+                    .await;
+            } else if !self.send_to(&device_id, HubMessage::StartThread { spec: Box::new(spec) }).await {
+                self.wait_for_device(&info.id, &format!("{device_name} went offline before the thread started"), false)
+                    .await;
+            }
+        } else if on_hub {
             self.run_on_hub(spec).await;
         } else if !online {
             self.wait_for_device(&info.id, &format!("{device_name} was offline when the thread started"), false).await;
@@ -206,6 +323,9 @@ impl Hub {
             let id = thread_id.clone();
             async move { hub.thread_finished(&id, false, &msg).await }
         };
+        if spec.harness.is_some() {
+            return fail("a harness thread runs on its own device, not as a hub API thread".into()).await;
+        }
         let pcfg = match self.db.provider(&spec.provider_id) {
             Ok(Some(provider)) => provider,
             Ok(None) => return fail(format!("no provider {}", spec.provider_id)).await,
@@ -732,5 +852,170 @@ mod tests {
         assert!(text.contains("`@<folder>/<path>`"), "{text}");
         assert!(!thread_system("Laptop", false, &[]).contains("Scoped folders"));
         assert!(!thread_system("Hub", true, &folders).contains("Scoped folders"));
+    }
+
+    use crate::db::Db;
+    use crate::server::Hub;
+    use core_protocol::{ModelEntry, ProviderConfig};
+    use serde_json::json;
+
+    fn tmp_hub() -> (std::path::PathBuf, Arc<Hub>) {
+        let dir = std::env::temp_dir().join(format!(
+            "grouper-h3-hub-thread-{}-{}",
+            std::process::id(),
+            crate::db::random_hex(3)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        (dir, hub)
+    }
+
+    fn add_harness(db: &Db, device_id: &str, slug: &str, model_id: &str, model: &str) {
+        db.upsert_provider(&ProviderConfig {
+            id: format!("{slug}@{device_id}"),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"harness": slug, "via_device": device_id, "signed_in": true}),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: model_id.into(),
+            provider_id: format!("{slug}@{device_id}"),
+            model: model.into(),
+            source: "auto".into(),
+            price_source: "none".into(),
+            roles: vec!["thread".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn harness_thread_on_the_wrong_device_is_an_error() {
+        let (dir, hub) = tmp_hub();
+        let (pc, _) = hub.db.add_device("Gaming PC", "windows", false).unwrap();
+        let (_laptop, _) = hub.db.add_device("Laptop", "windows", false).unwrap();
+        add_harness(&hub.db, &pc.id, "claude-code", "cc-opus", "opus");
+        let conv = hub.db.create_conversation("project", "P").unwrap();
+        let err = hub
+            .start_thread(
+                &conv,
+                ThreadRequest {
+                    title: "Wrong device".into(),
+                    device: "Laptop".into(),
+                    goal: "run there".into(),
+                    model: Some("cc-opus".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("runs on Gaming PC, not Laptop"), "{err}");
+        assert!(hub.db.threads(Some(&conv)).is_empty(), "a refused harness thread is not created");
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unconfinable_harness_thread_is_refused() {
+        let (dir, hub) = tmp_hub();
+        let (pc, _) = hub.db.add_device("Gaming PC", "windows", false).unwrap();
+        add_harness(&hub.db, &pc.id, "hermes", "hermes-nous", "nous");
+        let conv = hub.db.create_conversation("project", "P").unwrap();
+        let err = hub
+            .start_thread(
+                &conv,
+                ThreadRequest {
+                    title: "Hermes".into(),
+                    device: String::new(),
+                    goal: "try hermes".into(),
+                    model: Some("hermes-nous".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("can't be confined"), "{err}");
+        assert!(err.contains("hermes"), "{err}");
+        assert!(hub.db.threads(Some(&conv)).is_empty());
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn api_thread_is_unchanged_when_harness_threads_exist() {
+        let (dir, hub) = tmp_hub();
+        let (pc, _) = hub.db.add_device("Gaming PC", "windows", false).unwrap();
+        add_harness(&hub.db, &pc.id, "claude-code", "cc-opus", "opus");
+        hub.db
+            .upsert_provider(&ProviderConfig {
+                id: "scripted".into(),
+                kind: "scripted".into(),
+                base_url: None,
+                api_key: None,
+                options: json!({"inline": {"default": [{"type": "text", "text": "api-thread-ok"}]}}),
+            })
+            .unwrap();
+        hub.db
+            .upsert_model(&ModelEntry {
+                id: "api-thread".into(),
+                provider_id: "scripted".into(),
+                model: "scripted-1".into(),
+                roles: vec!["orchestrator".into(), "thread".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let conv = hub.db.create_conversation("project", "P").unwrap();
+        let info = hub
+            .start_thread(
+                &conv,
+                ThreadRequest {
+                    title: "API".into(),
+                    device: "hub".into(),
+                    goal: "answer from the API".into(),
+                    model: Some("api-thread".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.device_id, "hub");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let finished = loop {
+            let row = hub.db.thread(&info.id).unwrap();
+            if row.status != "running" {
+                break row;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("API thread still running");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(finished.status, "done", "{:?}", finished.summary);
+        assert_eq!(finished.summary.as_deref(), Some("api-thread-ok"));
+        assert!(hub.db.thread_harness_session(&info.id).is_none());
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn harness_thread_session_is_stored_from_the_device_report() {
+        let (dir, hub) = tmp_hub();
+        let (pc, _) = hub.db.add_device("Gaming PC", "windows", false).unwrap();
+        let conv = hub.db.create_conversation("project", "P").unwrap();
+        let thread = hub.db.create_thread(&conv, "H", &pc.id, "cc-opus", None, "brief").unwrap();
+        hub.note_thread_harness_session(&thread.id, "  thread-sess-1  ");
+        assert_eq!(hub.db.thread_harness_session(&thread.id).as_deref(), Some("thread-sess-1"));
+        hub.note_thread_harness_session(&thread.id, "   ");
+        assert_eq!(
+            hub.db.thread_harness_session(&thread.id).as_deref(),
+            Some("thread-sess-1"),
+            "a blank report does not clear the stored session"
+        );
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

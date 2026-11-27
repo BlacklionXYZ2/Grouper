@@ -1488,7 +1488,8 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                 msg @ (NodeMessage::ThreadEvent { .. }
                 | NodeMessage::ThreadFinished { .. }
                 | NodeMessage::ApprovalRequest { .. }
-                | NodeMessage::AskOrchestrator { .. }),
+                | NodeMessage::AskOrchestrator { .. }
+                | NodeMessage::ThreadHarnessSession { .. }),
             ) => {
                 handle_thread_frame(&hub, &device_id, conn_id, msg).await;
             }
@@ -1598,6 +1599,9 @@ async fn handle_thread_frame(hub: &Arc<Hub>, device_id: &str, conn_id: u64, msg:
         }
         NodeMessage::AskOrchestrator { thread_id, question } if hub.owns_thread(device_id, &thread_id) => {
             hub.thread_ask(&thread_id, &question).await;
+        }
+        NodeMessage::ThreadHarnessSession { thread_id, session_id } if hub.owns_thread(device_id, &thread_id) => {
+            hub.note_thread_harness_session(&thread_id, &session_id);
         }
         _ => {}
     }
