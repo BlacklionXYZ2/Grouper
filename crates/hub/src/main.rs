@@ -117,8 +117,18 @@ enum DeviceCmd {
         #[arg(long)]
         admin: bool,
     },
-    /// List registered devices.
+    /// List devices, one entry per machine with the credentials (tokens) it holds.
     List,
+    /// Make a device a credential of the same machine as another, so Devices lists them once.
+    /// Nothing is revoked and no token changes; `other` keeps its own rights.
+    Merge {
+        /// A device id on the machine to keep (`device list` shows ids).
+        keep: String,
+        /// A device id to join to it.
+        other: String,
+    },
+    /// Undo a merge for a device (and any merged into it).
+    Unmerge { id: String },
     /// Grant admin rights to a device's existing token (or remove them with --off).
     Admin {
         id: String,
@@ -170,11 +180,28 @@ async fn main() -> Result<()> {
             println!("Token (shown once, keep it secret):\n{token}");
         }
         Cmd::Device(DeviceCmd::List) => {
-            for d in db.devices() {
-                let state = if d.revoked { "revoked" } else { "active" };
-                let kind = if d.admin { "admin" } else { "device" };
-                println!("{}  {:<20} {:<8} {:<7} {}", d.id, d.name, d.platform, state, kind);
+            for machine in hub::devices::list_machines(&db) {
+                println!("{}  {}", machine.name, machine.platform);
+                for c in machine.credentials {
+                    println!("    {}  {:<7} {}", c.id, if c.admin { "admin" } else { "device" }, c.name);
+                }
             }
+            let others: Vec<_> = db.devices().into_iter().filter(|d| d.revoked || d.platform.eq_ignore_ascii_case("web")).collect();
+            if !others.is_empty() {
+                println!("Not listed as devices (browser sign-ins, revoked tokens):");
+                for d in others {
+                    let state = if d.revoked { "revoked" } else { "active" };
+                    println!("    {}  {:<20} {:<8} {}", d.id, d.name, d.platform, state);
+                }
+            }
+        }
+        Cmd::Device(DeviceCmd::Merge { keep, other }) => {
+            db.merge_devices(&keep, &other)?;
+            println!("{other} is now listed with {keep} as one machine. No token changed and nothing was revoked.");
+        }
+        Cmd::Device(DeviceCmd::Unmerge { id }) => {
+            db.unmerge_device(&id)?;
+            println!("{id} is no longer merged with other devices.");
         }
         Cmd::Device(DeviceCmd::Admin { id, off }) => {
             db.set_admin(&id, !off)?;

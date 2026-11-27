@@ -74,15 +74,24 @@ export function liveOf(threadId) {
   return store.live.get(threadId);
 }
 
+/**
+ * The Devices-list entry for a device id. The hub lists one entry per machine, so an id may be
+ * the entry's own or one of its `aliases` (the machine's other credentials, such as an app's sign-in).
+ */
+export function findDevice(id) {
+  if (!id) return undefined;
+  return store.devices.find((d) => d.id === id) || store.devices.find((d) => d.aliases?.includes(id));
+}
+
 export function deviceName(id) {
   if (!id) return 'unknown device';
   if (id === 'hub') return 'Hub';
-  return store.devices.find((d) => d.id === id)?.name || id;
+  return findDevice(id)?.name || id;
 }
 
 export function deviceOnline(id) {
   if (id === 'hub') return true;
-  return Boolean(store.devices.find((d) => d.id === id)?.online);
+  return Boolean(findDevice(id)?.online);
 }
 
 export function threadsIn(conversationId) {

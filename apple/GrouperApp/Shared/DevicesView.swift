@@ -117,7 +117,9 @@ struct DevicesView: View {
                                     Text(device.online ? "Online · \(HubMoveFormatting.platformDisplayName(device.platform))" : offlineText(device))
                                         .font(.caption)
                                         .foregroundStyle(device.online ? Theme.ok : Theme.text3)
-                                    Text(device.id == "hub" ? "Hub threads have file tools only." : "\(device.capabilities.count) tools")
+                                    Text(device.id == "hub" ? "Hub threads have file tools only."
+                                         : device.runsThreads == false ? "Signs in here; threads don't run on it."
+                                         : "\(device.capabilities.count) tools")
                                         .font(.caption)
                                         .foregroundStyle(Theme.text3)
                                 }

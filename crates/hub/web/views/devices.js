@@ -6,7 +6,7 @@
 
 import { h, icon, setChildren, keepFocus } from '../lib/dom.js';
 import { get, post, put, del, qs, enc, describe, isAbort } from '../lib/api.js';
-import { store, on, isAdmin } from '../lib/store.js';
+import { store, on, isAdmin, findDevice } from '../lib/store.js';
 import { loadDevices } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, announce, skeleton, skeletonBlocks, errorBanner } from '../lib/ui.js';
 import { ago, date, plural } from '../lib/format.js';
@@ -497,7 +497,7 @@ function renderList(container) {
 
     // 4. Normal Hub card (plus optional rolled-back banner if recent move failed)
     const hubInstall = installsData?.installs?.find((i) => i.is_hub);
-    const hubDevice = store.devices.find((d) => d.id === hubInfo?.hub_device_id || d.id === 'hub');
+    const hubDevice = findDevice(hubInfo?.hub_device_id) || store.devices.find((d) => d.id === 'hub');
     const hubName = hubInstall?.name || hubDevice?.name || 'Hub';
     const hubPlatform = hubInstall?.platform || hubDevice?.platform;
     const hubOnline = hubInstall ? hubInstall.online : store.online;
@@ -997,8 +997,8 @@ function renderList(container) {
               'a',
               { class: 'card device-card', href: `#/devices/${enc(d.id)}` },
               h('div', { class: 'name' }, h('span', { class: ['dot', d.online && 'on'], 'aria-hidden': 'true' }), d.name),
-              h('div', { class: 'meta' }, h('span', null, d.online ? 'Online' : `Offline · ${d.last_seen ? `seen ${ago(d.last_seen)}` : 'never seen'}`), h('span', null, d.platform)),
-              h('div', { class: 'row-sub' }, d.id === 'hub' ? 'Hub threads have file tools only.' : d.online ? plural(d.capabilities.length, 'tool') : 'Tools show when it connects'),
+              h('div', { class: 'meta' }, h('span', null, d.online ? 'Online' : `Offline · ${d.last_seen ? `seen ${ago(d.last_seen)}` : 'never seen'}`), h('span', null, platformLabel(d.platform))),
+              h('div', { class: 'row-sub' }, d.id === 'hub' ? 'Hub threads have file tools only.' : d.runs_threads === false ? 'Signs in here; threads don\u2019t run on it.' : d.online ? plural(d.capabilities.length, 'tool') : 'Tools show when it connects'),
               d.folders?.length ? h('div', { class: 'folders' }, d.folders.map((f) => h('span', { class: 'badge' }, `@${f.name} · ${f.mode === 'read_write' ? 'read/write' : 'read'}`))) : null,
             ),
           ),
@@ -1080,7 +1080,9 @@ function renderDetail(container, id) {
   let showUnavailable = false;
   const busy = new Set();
 
-  const device = () => store.devices.find((d) => d.id === id);
+  const device = () => findDevice(id);
+  // Tools and their permissions belong to the credential threads run on: the entry's own id, which an old link's id may only alias.
+  const toolsId = () => device()?.id || id;
 
   function renderBar() {
     const d = device();
@@ -1229,7 +1231,7 @@ function renderDetail(container, id) {
     t.permission = value;
     render();
     try {
-      await put(`/v1/devices/${enc(id)}/tools/${enc(t.name)}`, { permission: value });
+      await put(`/v1/devices/${enc(toolsId())}/tools/${enc(t.name)}`, { permission: value });
       toast(`${t.name} is now ${value[0].toUpperCase()}${value.slice(1)}.`);
     } catch (err) {
       t.permission = previous;
@@ -1243,7 +1245,7 @@ function renderDetail(container, id) {
   // Presence comes from the shared poller; this view re-reads only the tools.
   async function refresh({ withDevices = false } = {}) {
     try {
-      const [list] = await Promise.all([get(`/v1/tools${qs({ device: id, all: 'true' })}`, { signal: aborter.signal }), withDevices ? loadDevices() : null]);
+      const [list] = await Promise.all([get(`/v1/tools${qs({ device: toolsId(), all: 'true' })}`, { signal: aborter.signal }), withDevices ? loadDevices() : null]);
       // Keep a tool's optimistic level while its write is in flight.
       tools = (list || []).map((t) => (busy.has(t.name) ? tools?.find((x) => x.name === t.name) || t : t)).sort((a, b) => a.name.localeCompare(b.name));
       error = null;

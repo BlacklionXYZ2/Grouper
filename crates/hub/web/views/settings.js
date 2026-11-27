@@ -5,7 +5,7 @@
 
 import { h, icon, srOnly, setChildren } from '../lib/dom.js';
 import { get, put, del, enc, describe, isAbort } from '../lib/api.js';
-import { store, on, deviceName, isAdmin } from '../lib/store.js';
+import { store, on, deviceName, findDevice, isAdmin } from '../lib/store.js';
 import { stopLive, loadDevices } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { ago, date, dateTime } from '../lib/format.js';
@@ -988,7 +988,7 @@ export function renderSettings(container) {
 
   function resolveViaDeviceLabel(via) {
     if (!via) return null;
-    const match = store.devices.find((d) => d.id === via || d.name.toLowerCase() === via.toLowerCase());
+    const match = findDevice(via) || store.devices.find((d) => d.name.toLowerCase() === via.toLowerCase());
     return match ? `${match.name} (${match.online ? 'online' : 'offline'})` : deviceName(via);
   }
 

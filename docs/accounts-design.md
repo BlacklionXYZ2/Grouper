@@ -29,6 +29,17 @@ So:
   install's device (same device id, fresh token, old token revoked) instead of adding a new one.
 - **All devices link to the one Google account** that owns the hub; Devices shows them under
   that account from any platform.
+- **A device is a machine, not a token.** A machine can hold several credentials: the Mac app's
+  admin sign-in and its node's device token share the machine's one `install_id`; a phone has
+  just its sign-in. `GET /v1/devices` lists one entry per machine (named for the machine, with
+  the app's old "Grouper on " prefix dropped), online when any credential is connected,
+  `admin` when any is an admin token, `runs_threads` when it has a node credential. The entry's
+  `id` is the credential threads run on and `aliases` are the others, so approvals, tool
+  permissions, thread placement and revocation still work per credential, and merging never
+  gives a plain token admin rights. Browser sessions (platform `web`) are not devices (they are
+  listed in Settings). Rows that predate install ids are attached to the machine's id when it
+  next registers or signs in (the one live row of the same role, platform and name), or joined
+  by hand: `grouper-hub device merge <keep-id> <other-id>` (`device unmerge <id>` undoes it).
 - **The CLI signs in like `gh auth login`:** `grouper login` shows a short code and a link; you
   open it in a browser where you're signed in to Grouper with Google, check the device's name
   and platform, and approve; the CLI receives its own (non-admin) device token and saves it.
@@ -99,9 +110,10 @@ So:
 ### What sign-in returns
 
 - **Web:** an admin session cookie, the same as signing in with an admin token today.
-- **Apps:** an admin token minted for that app install (a device row named
-  "Grouper on <device name>", admin, revocable from Devices), stored in the Keychain. The
-  Mac app additionally auto-registers its non-admin node device (separate change).
+- **Apps:** an admin token minted for that app install (a device row named for the
+  device, admin, revocable from Devices), stored in the Keychain. The
+  Mac app additionally auto-registers its non-admin node device under the same `install_id`;
+  the hub lists the two as one Mac.
 - `POST /v1/auth/google/nonce` -> `{nonce, expires}` (unauthenticated, rate-limited).
 - `POST /v1/auth/google` `{id_token, setup_code?, client: "web"|"ios"|"macos"|"cli",
   device_name?}` -> web: sets the session cookie; apps: `{token, device}`.

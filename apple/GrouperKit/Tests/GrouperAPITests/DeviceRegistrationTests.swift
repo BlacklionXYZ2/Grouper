@@ -82,12 +82,12 @@ final class DeviceRegistrationTests: XCTestCase {
         let body = try XCTUnwrap(JSONSerialization.jsonObject(with: post.body) as? [String: String])
         XCTAssertEqual(body, ["name": "Mac", "platform": "macos"])
 
-        // With the install's node id: the hub reuses that install's node device.
-        let nodeID = InstallID.node("Ab3_-xYz0123456789abcdefghijKLMN")
-        _ = try await client.registerDevice(name: "Mac", platform: "macos", installId: nodeID)
+        // With the install's id (the one the app signs in with): the hub reuses that install's node device.
+        let installID = "Ab3_-xYz0123456789abcdefghijKLMN"
+        _ = try await client.registerDevice(name: "Mac", platform: "macos", installId: installID)
         let second = try XCTUnwrap(StubProtocol.requests.last { $0.method == "POST" })
         let secondBody = try XCTUnwrap(JSONSerialization.jsonObject(with: second.body) as? [String: String])
-        XCTAssertEqual(secondBody, ["name": "Mac", "platform": "macos", "install_id": "Ab3_-xYz0123456789abcdefghijKLMN-node"])
+        XCTAssertEqual(secondBody, ["name": "Mac", "platform": "macos", "install_id": installID])
 
         // An id the hub would refuse is left out rather than sent.
         _ = try await client.registerDevice(name: "Mac", platform: "macos", installId: "nope")

@@ -67,7 +67,9 @@ pub struct ToolSummary {
     pub description: String,
 }
 
-/// A registered device as the hub sees it.
+/// A device as the hub lists it: one machine, however many credentials (tokens) it holds.
+/// `id` is the credential threads run on (its node), and `aliases` are the machine's other
+/// credential ids, so any id the hub ever handed out still finds its machine.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DeviceInfo {
     pub id: String,
@@ -90,6 +92,17 @@ pub struct DeviceInfo {
     /// advertised. Empty when `usage_probes` is false.
     #[serde(default)]
     pub usage_probe_providers: Vec<String>,
+    /// Ids of the machine's other credentials (an app's sign-in next to its node). Left out when
+    /// the machine has just one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Whether any of the machine's credentials is an admin token.
+    #[serde(default)]
+    pub admin: bool,
+    /// Whether threads can run on the machine (it has a node credential). False for a phone
+    /// that only signs in. An older hub doesn't say, so this reads false there.
+    #[serde(default)]
+    pub runs_threads: bool,
 }
 
 /// What threads may do in a device's scoped folder.
@@ -1744,6 +1757,8 @@ mod tests {
         .unwrap();
         assert!(d.folders.is_empty());
         assert!(!serde_json::to_string(&d).unwrap().contains("folders"));
+        assert!(d.aliases.is_empty() && !d.admin && !d.runs_threads);
+        assert!(!serde_json::to_string(&d).unwrap().contains("aliases"));
     }
 
     #[test]
@@ -1868,6 +1883,9 @@ mod tests {
                 folders: vec![],
                 usage_probes: false,
                 usage_probe_providers: vec![],
+                aliases: vec![],
+                admin: false,
+                runs_threads: true,
             }],
         };
         let value = serde_json::to_value(&msg).unwrap();

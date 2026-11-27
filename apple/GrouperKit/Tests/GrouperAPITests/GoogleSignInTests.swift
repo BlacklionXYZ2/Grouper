@@ -254,10 +254,10 @@ final class GoogleSignInTests: XCTestCase {
         XCTAssertFalse(InstallID.isValid("abcdefghijklmnopé"), "ASCII only")
         XCTAssertFalse(InstallID.isValid(""))
 
-        let node = InstallID.node(first)
-        XCTAssertNotEqual(node, first)
-        XCTAssertTrue(InstallID.isValid(node))
-        XCTAssertEqual(InstallID.node(first), node, "stable per install")
+        // A bad id is left out of a request rather than sent.
+        XCTAssertEqual(InstallID.sendable(first), first)
+        XCTAssertNil(InstallID.sendable("nope"))
+        XCTAssertNil(InstallID.sendable(nil))
     }
 
     func testSignInLeavesOutAnEmptySetupCodeAndMapsRefusals() async throws {

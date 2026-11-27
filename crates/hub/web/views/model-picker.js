@@ -20,7 +20,7 @@
 
 import { h, icon, setChildren, setText, setAttr } from '../lib/dom.js';
 import { get, isAbort } from '../lib/api.js';
-import { store, on, isAdmin, deviceName } from '../lib/store.js';
+import { store, on, isAdmin, deviceName, findDevice } from '../lib/store.js';
 import { familyKey, familyMark, familyInfo } from '../lib/family.js';
 
 let providersCache = null; // the last GET /v1/providers, shared between openings
@@ -312,7 +312,7 @@ export function openModelPicker({ role, current = '', opener = null }) {
       const fam = familyInfo(familyKey(m));
       const harness = isHarnessModel(m, provider);
       const devId = harness ? harnessDeviceId(m, provider) : '';
-      const dev = devId ? store.devices.find((d) => d.id === devId) : null;
+      const dev = devId ? findDevice(devId) : null;
       const host = harness
         ? (devId ? deviceName(devId) : '')
         : (provider?.via_device ? deviceName(provider.via_device) : '');
@@ -358,7 +358,7 @@ export function openModelPicker({ role, current = '', opener = null }) {
       const famKey = familyKey(m);
       const cliName = harnessCliName(m, provider);
       const devId = harnessDeviceId(m, provider);
-      const dev = devId ? store.devices.find((d) => d.id === devId) : null;
+      const dev = devId ? findDevice(devId) : null;
       const devName = devId ? deviceName(devId) : 'unknown device';
       const canOrch = Boolean(m.can_orchestrate);
       const disabled = role === 'orchestrator' && !canOrch;
@@ -517,7 +517,7 @@ export function openModelPicker({ role, current = '', opener = null }) {
             { class: 'mp-group', role: 'group', 'aria-label': 'Harnesses (subscriptions)' },
             h('div', { class: 'mp-section', 'aria-hidden': 'true' }, 'Harnesses (subscriptions)'),
             deviceIds.map((devId, g) => {
-              const dev = devId ? store.devices.find((x) => x.id === devId) : null;
+              const dev = devId ? findDevice(devId) : null;
               const label = devId ? deviceName(devId) : 'Unknown device';
               const models = byDevice.get(devId).sort((a, b) => {
                 const ca = harnessCliName(a, providers.get(a.provider_id));

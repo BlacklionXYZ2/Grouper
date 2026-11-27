@@ -315,6 +315,8 @@ impl Hub {
         });
     }
 
+    /// Every credential (device row) as its own entry, the hub first. This is what routing,
+    /// approvals and tool permissions use; what people see is [`Hub::machines`].
     pub async fn devices(&self) -> Vec<DeviceInfo> {
         let live = self.live.lock().await;
         let mut out = vec![DeviceInfo {
@@ -327,12 +329,18 @@ impl Hub {
             folders: vec![],
             usage_probes: false,
             usage_probe_providers: vec![],
+            aliases: vec![],
+            admin: false,
+            runs_threads: true,
         }];
         out.extend(self.db.devices().into_iter().filter(|d| !d.revoked).map(|d| {
             let l = live.get(&d.id);
             let folders = self.db.device_folders(&d.id);
             let (usage_probes, usage_probe_providers) = self.db.device_usage_probes(&d.id);
             DeviceInfo {
+                aliases: vec![],
+                admin: d.admin,
+                runs_threads: !d.admin,
                 id: d.id,
                 name: d.name,
                 platform: d.platform,
@@ -453,8 +461,8 @@ impl Hub {
     }
 
     pub(crate) async fn broadcast_presence(&self, changed_device: &str) {
-        let devices = self.devices().await;
-        let changed = devices.iter().find(|d| d.id == changed_device).cloned();
+        let devices = self.machines().await;
+        let changed = devices.iter().find(|d| d.id == changed_device || d.aliases.iter().any(|a| a == changed_device)).cloned();
         let online = changed.as_ref().is_some_and(|d| d.online);
         self.broadcast(HubMessage::Presence { devices }).await;
         self.emit_live(
@@ -741,7 +749,7 @@ macro_rules! admin {
 
 async fn list_devices(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     authed!(hub, headers);
-    Json(hub.devices().await).into_response()
+    Json(hub.machines().await).into_response()
 }
 
 /// Most devices `POST /v1/devices` lets one hub keep registered (revoked devices don't count).

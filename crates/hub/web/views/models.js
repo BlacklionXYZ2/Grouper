@@ -4,7 +4,7 @@
 
 import { h, icon, setChildren, keepFocus } from '../lib/dom.js';
 import { get, post, put, del, qs, enc, describe, isAbort } from '../lib/api.js';
-import { store, isAdmin, deviceName } from '../lib/store.js';
+import { store, isAdmin, deviceName, findDevice } from '../lib/store.js';
 import { loadModels } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { num, usd, pct, duration, ago, plural } from '../lib/format.js';
@@ -328,7 +328,7 @@ export function renderModels(container, { id: targetId = null } = {}) {
   }
 
   function harnessDeviceSection(group, narrow, collapsed) {
-    const dev = group.deviceId ? store.devices.find((d) => d.id === group.deviceId) : null;
+    const dev = group.deviceId ? findDevice(group.deviceId) : null;
     const summaryId = `provider-summary-${group.key}`;
     const summary = h(
       'summary',

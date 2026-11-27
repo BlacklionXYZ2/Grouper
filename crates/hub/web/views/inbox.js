@@ -19,7 +19,7 @@
 
 import { h, icon, setChildren, setText, setAttr, syncList } from '../lib/dom.js';
 import { enc } from '../lib/api.js';
-import { store, on, deviceName, waitingThreads, byRequestOrder } from '../lib/store.js';
+import { store, on, deviceName, findDevice, waitingThreads, byRequestOrder } from '../lib/store.js';
 import { navigate } from '../lib/ui.js';
 import { bar, statusPill, skeletonBlocks, announce, isOffline } from '../lib/ui.js';
 import { ago } from '../lib/format.js';
@@ -75,7 +75,7 @@ function byChat(items, cidOf) {
 function deviceLine(id) {
   const name = deviceName(id);
   if (id === 'hub') return name;
-  const d = store.devices.find((x) => x.id === id);
+  const d = findDevice(id);
   if (!d) return name;
   if (d.online) return `${name} · online`;
   return `${name} · offline, ${d.last_seen ? `last seen ${ago(d.last_seen)}` : 'never seen'}`;
