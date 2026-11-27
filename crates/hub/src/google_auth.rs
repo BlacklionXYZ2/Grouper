@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -179,16 +180,19 @@ impl Db {
             .flatten()
     }
 
-    /// Set the owner when there is none (and drop setup codes). Returns whether it was set.
+    /// Set the owner when there is none (drop setup codes and link unattributed devices). Returns whether it was set.
     pub(crate) fn set_owner_if_none(&self, o: &Owner) -> Result<bool> {
-        let c = self.c();
-        let set = c.execute(
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let set = tx.execute(
             "INSERT OR IGNORE INTO hub_owner (id, provider, sub, email, name, claimed_at) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
             params![o.provider, o.sub, o.email, o.name, o.claimed_at as i64],
         )? == 1;
         if set {
-            c.execute("DELETE FROM setup_codes", [])?;
+            tx.execute("DELETE FROM setup_codes", [])?;
+            tx.execute("UPDATE devices SET account_sub = ?1 WHERE account_sub IS NULL", [&o.sub])?;
         }
+        tx.commit()?;
         Ok(set)
     }
 
@@ -212,6 +216,7 @@ impl Db {
             params![o.provider, o.sub, o.email, o.name, o.claimed_at as i64],
         )?;
         tx.execute("DELETE FROM setup_codes", [])?;
+        tx.execute("UPDATE devices SET account_sub = ?1 WHERE account_sub IS NULL", [&o.sub])?;
         tx.commit()?;
         Ok(Claim::Claimed)
     }
@@ -224,7 +229,11 @@ impl Db {
     /// Unlink the owner. Device tokens and sessions keep working. Returns who it was.
     pub fn reset_owner(&self) -> Result<Option<Owner>> {
         let owner = self.owner();
-        self.c().execute("DELETE FROM hub_owner", [])?;
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM hub_owner", [])?;
+        tx.execute("UPDATE devices SET account_sub = NULL", [])?;
+        tx.commit()?;
         Ok(owner)
     }
 
@@ -269,9 +278,9 @@ impl Db {
     }
 }
 
-/// At startup: if Google sign-in is on and nobody owns the hub yet, log a setup code and where to use it.
+/// At startup: if Google sign-in is on, not in local mode, and nobody owns the hub yet, log a setup code.
 pub fn announce_setup_code(hub: &Hub) {
-    if !hub.google.config().enabled() || hub.db.owner().is_some() {
+    if hub.is_local_mode() || !hub.google.config().enabled() || hub.db.owner().is_some() {
         return;
     }
     match hub.db.new_setup_code() {
@@ -372,6 +381,7 @@ pub(crate) struct GoogleAuth {
     issued: Mutex<Issued>,
     jwks: tokio::sync::Mutex<Jwks>,
     http: reqwest::Client,
+    local_mode: AtomicBool,
 }
 
 /// Why a sign-in was refused. The message is plain and never contains the token.
@@ -437,7 +447,16 @@ impl GoogleAuth {
             issued: Mutex::default(),
             jwks: tokio::sync::Mutex::default(),
             http: reqwest::Client::builder().timeout(FETCH_TIMEOUT).build().unwrap_or_default(),
+            local_mode: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn is_local(&self) -> bool {
+        self.local_mode.load(AtomicOrdering::Relaxed)
+    }
+
+    pub(crate) fn set_local(&self, local: bool) {
+        self.local_mode.store(local, AtomicOrdering::Relaxed);
     }
 
     pub(crate) fn config(&self) -> Config {
@@ -582,6 +601,15 @@ impl GoogleAuth {
 
     /// Check an ID token's signature and claims (not its nonce: the caller uses that up).
     async fn verify(&self, id_token: &str) -> Result<Identity, Refusal> {
+        self.verify_inner(id_token, true).await
+    }
+
+    /// Check an ID token's signature and claims without requiring a hub nonce (for in-process [`Hub::claim_local`]).
+    async fn verify_without_nonce(&self, id_token: &str) -> Result<Identity, Refusal> {
+        self.verify_inner(id_token, false).await
+    }
+
+    async fn verify_inner(&self, id_token: &str, require_nonce: bool) -> Result<Identity, Refusal> {
         let cfg = self.config();
         if !cfg.enabled() {
             return Err(disabled());
@@ -606,7 +634,7 @@ impl GoogleAuth {
             .verify(&RSA_PKCS1_2048_8192_SHA256, format!("{h}.{p}").as_bytes(), &signature)
             .map_err(|_| Refusal::token("the ID token's signature doesn't check out"))?;
         let claims = decode_json(p).ok_or_else(not_a_token)?;
-        check_claims(&claims, &cfg, now())
+        check_claims(&claims, &cfg, now(), require_nonce)
     }
 }
 
@@ -625,7 +653,7 @@ fn decode_json(part: &str) -> Option<Value> {
 }
 
 /// Google's rules for ID token claims (signature already checked).
-fn check_claims(c: &Value, cfg: &Config, now: u64) -> Result<Identity, Refusal> {
+fn check_claims(c: &Value, cfg: &Config, now: u64, require_nonce: bool) -> Result<Identity, Refusal> {
     let text = |k: &str| c[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let iss = c["iss"].as_str().unwrap_or_default();
     if !cfg.issuers.iter().any(|i| i == iss) {
@@ -658,7 +686,11 @@ fn check_claims(c: &Value, cfg: &Config, now: u64) -> Result<Identity, Refusal> 
     if !verified {
         return Err(Refusal::token("that Google account's email isn't verified"));
     }
-    let nonce = text("nonce").ok_or_else(|| Refusal::token("the ID token has no nonce; start the sign-in from this hub"))?;
+    let nonce = if require_nonce {
+        text("nonce").ok_or_else(|| Refusal::token("the ID token has no nonce; start the sign-in from this hub"))?
+    } else {
+        text("nonce").unwrap_or_default()
+    };
     Ok(Identity { sub, email, name: text("name").unwrap_or_default(), nonce })
 }
 
@@ -723,8 +755,76 @@ pub(crate) fn client_ip(headers: &HeaderMap, ext: &Extensions) -> IpAddr {
 
 // ---------------------------------------------------------------- sign-in
 
-/// After a verified ID token and nonce: is this person allowed in? Claims an unclaimed hub with a setup code.
+impl Hub {
+    /// Enable or disable embedded local mode (HTTP setup-code claim off, token sign-in loopback-only,
+    /// in-process [`Hub::claim_local`] enabled).
+    pub fn set_local_mode(&self, local: bool) {
+        self.google.set_local(local);
+    }
+
+    pub fn is_local_mode(&self) -> bool {
+        self.google.is_local()
+    }
+
+    /// Claim an embedded local hub in-process with a Google ID token (no setup code and no hub nonce).
+    /// Checks signature, issuer, audience, expiry/issue times and `email_verified`. If already claimed
+    /// by the same Google `sub`, refreshes name/email and returns the owner; another `sub` is refused.
+    pub async fn claim_local(&self, id_token: &str) -> Result<Owner> {
+        anyhow::ensure!(self.is_local_mode(), "claim_local is only available when the hub runs in local mode");
+        let id = self.google.verify_without_nonce(id_token).await.map_err(|r| anyhow::anyhow!("{}", r.message))?;
+        let _ = self.db.ensure_hub_device()?;
+        let candidate = id.owner();
+        if self.db.set_owner_if_none(&candidate)? {
+            tracing::info!(email = %id.email, "local hub claimed with Google");
+            return self.db.owner().ok_or_else(|| anyhow::anyhow!("owner missing after claim"));
+        }
+        match self.db.owner() {
+            Some(owner) if owner.provider == PROVIDER && owner.sub == id.sub => {
+                self.db.refresh_owner(&id.email, &id.name);
+                let _ = self
+                    .db
+                    .c()
+                    .execute("UPDATE devices SET account_sub = ?1 WHERE account_sub IS NULL", [&id.sub]);
+                self.db.owner().ok_or_else(|| anyhow::anyhow!("owner missing after refresh"))
+            }
+            Some(_) => {
+                tracing::info!(sub = %sub_tag(&id.sub), "local claim refused: not this hub's owner");
+                anyhow::bail!("this hub belongs to a different Google account")
+            }
+            None => anyhow::bail!("failed to store hub owner"),
+        }
+    }
+
+    /// Claim the embedded local hub with `id_token` and issue (or reuse by `install_id`) an admin token
+    /// for the embedding app (`macos`, `windows`, `linux`, `ios` or `cli`).
+    pub async fn claim_local_client(
+        &self,
+        id_token: &str,
+        client: &str,
+        device_name: Option<&str>,
+        install_id: Option<&str>,
+    ) -> Result<(Owner, crate::db::IssuedDevice)> {
+        let platform = match client {
+            p @ ("ios" | "macos" | "windows" | "linux" | "cli") => p,
+            _ => anyhow::bail!("client must be ios, macos, windows, linux or cli"),
+        };
+        let install_id = crate::server::check_install_id(install_id).map_err(anyhow::Error::msg)?;
+        let owner = self.claim_local(id_token).await?;
+        let name: String = device_name.unwrap_or("").trim().chars().take(MAX_DEVICE_NAME_CHARS).collect();
+        let name = if name.is_empty() { DEFAULT_DEVICE_NAME.to_string() } else { name };
+        let install = install_id.map(|id| crate::db::Install { id, kind: platform });
+        let issued = self.issue_device(&name, platform, true, install, None).await?;
+        Ok((owner, issued))
+    }
+}
+
+/// After a verified ID token and nonce: is this person allowed in? Claims an unclaimed hub with a setup code
+/// in server mode; in local mode HTTP claiming and setup codes are refused.
 fn authorize(hub: &Hub, id: &Identity, setup_code: Option<&str>) -> Result<(), Refusal> {
+    let code = setup_code.map(str::trim).filter(|c| !c.is_empty());
+    if hub.is_local_mode() && code.is_some() {
+        return Err(Refusal::new(StatusCode::FORBIDDEN, "setup-code claiming over HTTP is disabled in local mode"));
+    }
     match hub.db.owner() {
         Some(owner) if owner.provider == PROVIDER && owner.sub == id.sub => {
             hub.db.refresh_owner(&id.email, &id.name);
@@ -734,8 +834,12 @@ fn authorize(hub: &Hub, id: &Identity, setup_code: Option<&str>) -> Result<(), R
             tracing::info!(sub = %sub_tag(&id.sub), "Google sign-in refused: not this hub's owner");
             Err(Refusal::new(StatusCode::FORBIDDEN, "this hub belongs to a different Google account"))
         }
+        None if hub.is_local_mode() => Err(Refusal::new(
+            StatusCode::FORBIDDEN,
+            "this local hub has no owner yet; claim it in Grouper on this computer",
+        )),
         None => {
-            let code = setup_code.map(str::trim).filter(|c| !c.is_empty()).ok_or_else(|| {
+            let code = code.ok_or_else(|| {
                 Refusal::new(
                     StatusCode::FORBIDDEN,
                     "this hub has no owner yet: claim it with the setup code from the hub's log \
@@ -765,13 +869,14 @@ fn web_auth(hub: &Hub) -> Result<Auth, Refusal> {
     Ok(Auth { device_id, admin: true })
 }
 
-/// `GET /v1/auth/status`: whether the hub has an owner and which Google sign-ins are on.
+/// `GET /v1/auth/status`: whether the hub has an owner, which Google sign-ins are on, and whether it runs in local mode.
 async fn status(State(hub): State<Arc<Hub>>) -> Response {
     let cfg = hub.google.config();
     Json(json!({
         "claimed": hub.db.owner().is_some(),
         "google": cfg.enabled(),
         "google_web": !cfg.web_client_id.is_empty(),
+        "local": hub.is_local_mode(),
     }))
     .into_response()
 }
@@ -885,6 +990,12 @@ async fn start(State(hub): State<Arc<Hub>>, headers: HeaderMap, ext: Extensions,
         Err(r) => return r.into_response(),
     };
     let setup_code = start.setup_code.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    if hub.is_local_mode() && (setup_code.is_some() || hub.db.owner().is_none()) {
+        return err(
+            StatusCode::FORBIDDEN,
+            "claiming over HTTP is disabled in local mode; sign in through Grouper on this computer",
+        );
+    }
     let state = match hub.google.new_state(&origin, &nonce, setup_code) {
         Ok(s) => s,
         Err(r) => return r.into_response(),
@@ -1345,7 +1456,7 @@ mod tests {
     #[tokio::test]
     async fn status_and_claiming_with_a_setup_code() {
         let f = fixture().await;
-        assert_eq!(f.status().await, json!({"claimed": false, "google": true, "google_web": true}));
+        assert_eq!(f.status().await, json!({"claimed": false, "google": true, "google_web": true, "local": false}));
 
         // No code, a wrong code, an expired code: refused. Each try needs a fresh nonce.
         let (status, _, body) = f.sign_in(&mint(&claims(&f.nonce().await, OWNER)), "ios", None).await;
@@ -1636,14 +1747,14 @@ mod tests {
             c.client_ids.clear();
             c.web_client_id.clear();
         });
-        assert_eq!(f.status().await, json!({"claimed": false, "google": false, "google_web": false}));
+        assert_eq!(f.status().await, json!({"claimed": false, "google": false, "google_web": false, "local": false}));
         assert_eq!(f.http.post(f.url("/v1/auth/google/nonce")).send().await.unwrap().status(), S::NOT_FOUND);
         assert_eq!(f.http.post(f.url("/v1/auth/google/start")).send().await.unwrap().status(), S::NOT_FOUND);
         let (status, _, _) = f.sign_in(&mint(&claims("x", OWNER)), "ios", None).await;
         assert_eq!(status, S::NOT_FOUND);
         // App clients alone: on, but not in browsers.
         f.hub.google.configure(|c| c.client_ids = vec![CLIENT.into()]);
-        assert_eq!(f.status().await, json!({"claimed": false, "google": true, "google_web": false}));
+        assert_eq!(f.status().await, json!({"claimed": false, "google": true, "google_web": false, "local": false}));
     }
 
     #[tokio::test]
@@ -1785,5 +1896,117 @@ mod tests {
         assert!(html.contains("action=\"https://hub.example.com/v1/auth/google/return\""));
         assert!(html.contains("value=\"&quot;&gt;&lt;script&gt;x&lt;/script&gt;\""), "{html}");
         assert!(!html.contains("<script>x"));
+    }
+
+    #[tokio::test]
+    async fn hub_info_reports_account_hub_device_id_and_epoch_and_omits_missing_key() {
+        let f = fixture().await;
+        let before: Value = f.http.get(f.url("/v1/hub")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(before["account"], Value::Null);
+        let hub_dev = before["hub_device_id"].as_str().expect("hub_device_id").to_string();
+        assert!(!hub_dev.is_empty());
+        assert_eq!(before["epoch"], 1);
+        assert!(before.get("key_sha256").is_none(), "no identity key yet, so key_sha256 is omitted: {before}");
+        assert!(f.hub.db.devices().iter().any(|d| d.id == hub_dev && d.account_sub.is_none()));
+
+        f.claim().await;
+        let after: Value = f.http.get(f.url("/v1/hub")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(after["account"], format!("{OWNER}@example.com"));
+        assert_eq!(after["hub_device_id"], hub_dev);
+        assert_eq!(after["epoch"], 1);
+        assert!(after.get("key_sha256").is_none());
+        assert!(f.hub.db.devices().iter().all(|d| d.account_sub.as_deref() == Some(OWNER)));
+    }
+
+    #[tokio::test]
+    async fn claim_local_claims_without_setup_code_or_nonce_and_links_devices() {
+        let f = fixture().await;
+        let nonce_less = |sub: &str| {
+            let t = now();
+            mint(&json!({
+                "iss": ISS, "aud": CLIENT, "azp": CLIENT, "sub": sub, "email": format!("{sub}@example.com"),
+                "email_verified": true, "name": "Local Owner", "iat": t, "exp": t + 3600,
+            }))
+        };
+
+        // Server mode refuses `claim_local`.
+        assert!(f.hub.claim_local(&nonce_less(OWNER)).await.is_err());
+        assert!(f.hub.db.owner().is_none());
+
+        f.hub.set_local_mode(true);
+        assert_eq!(f.status().await, json!({"claimed": false, "google": true, "google_web": true, "local": true}));
+
+        // Invalid tokens are still rejected.
+        let bad_sig = mint_with(
+            &keys().1,
+            &json!({"alg": "RS256", "kid": KID}),
+            &json!({"iss": ISS, "aud": CLIENT, "sub": OWNER, "email": "x@example.com", "email_verified": true, "iat": now(), "exp": now() + 600}),
+        );
+        assert!(f.hub.claim_local(&bad_sig).await.is_err());
+        assert!(f.hub.db.owner().is_none());
+
+        // First Google sign-in claims with no setup code and no hub nonce, and links devices to the account.
+        let (owner, issued) = f
+            .hub
+            .claim_local_client(&nonce_less(OWNER), "windows", Some("Oscar's PC"), Some("win-install-0123456789abcdef"))
+            .await
+            .unwrap();
+        assert_eq!(owner.sub, OWNER);
+        assert_eq!(owner.email, format!("{OWNER}@example.com"));
+        assert!(issued.device.admin);
+        assert_eq!(issued.device.platform, "windows");
+        assert_eq!(issued.device.name, "Oscar's PC");
+        assert!(f.hub.db.authenticate(&issued.token).unwrap().admin);
+        assert!(f.hub.db.devices().iter().all(|d| d.account_sub.as_deref() == Some(OWNER)));
+
+        // Same owner again succeeds idempotently; another Google account is refused.
+        let again = f.hub.claim_local(&nonce_less(OWNER)).await.unwrap();
+        assert_eq!(again.sub, OWNER);
+        let err = f.hub.claim_local(&nonce_less(STRANGER)).await.unwrap_err().to_string();
+        assert!(err.contains("different Google account"), "{err}");
+        assert_eq!(f.hub.db.owner().unwrap().sub, OWNER);
+    }
+
+    #[tokio::test]
+    async fn local_mode_refuses_setup_code_claim_over_http() {
+        let f = fixture().await;
+        f.hub.set_local_mode(true);
+
+        // Local mode never announces a setup code at startup.
+        announce_setup_code(&f.hub);
+        let announced: i64 = f.hub.db.c().query_row("SELECT COUNT(*) FROM setup_codes", [], |r| r.get(0)).unwrap();
+        assert_eq!(announced, 0);
+
+        // Even if a setup code row exists in SQLite, HTTP claiming (with or without it) is refused.
+        let (code, _) = f.hub.db.new_setup_code().unwrap();
+        let (status, _, body) = f.sign_in(&mint(&claims(&f.nonce().await, OWNER)), "ios", Some(&code)).await;
+        assert_eq!(status, S::FORBIDDEN, "{body}");
+        let (status, _, body) = f.sign_in(&mint(&claims(&f.nonce().await, OWNER)), "ios", None).await;
+        assert_eq!(status, S::FORBIDDEN, "{body}");
+        assert!(f.hub.db.owner().is_none());
+
+        // Browser /start is also refused while unclaimed or when given a setup code.
+        for payload in [String::new(), json!({"setup_code": code}).to_string()] {
+            let r = f
+                .http
+                .post(f.url("/v1/auth/google/start"))
+                .header("origin", &f.base)
+                .body(payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), S::FORBIDDEN);
+        }
+        assert!(f.hub.db.owner().is_none());
+
+        // Once claimed in-process via claim_local, the owner can sign in over HTTP without a setup code,
+        // while setup_code over HTTP and strangers remain refused.
+        f.hub.claim_local(&mint(&claims("unused", OWNER))).await.unwrap();
+        let (status, _, _) = f.sign_in(&mint(&claims(&f.nonce().await, OWNER)), "ios", Some(&code)).await;
+        assert_eq!(status, S::FORBIDDEN);
+        let (status, _, body) = f.sign_in(&mint(&claims(&f.nonce().await, OWNER)), "ios", None).await;
+        assert_eq!(status, S::OK, "{body}");
+        let (status, _, _) = f.sign_in(&mint(&claims(&f.nonce().await, STRANGER)), "ios", None).await;
+        assert_eq!(status, S::FORBIDDEN);
     }
 }

@@ -1485,11 +1485,20 @@ async fn delete_memory(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id)
 }
 
 /// `GET /v1/hub`: public identity (no token needed; nothing private).
+/// `key_sha256` is omitted while no hub identity key exists (arrives with LAN TLS).
 async fn hub_info(State(hub): State<Arc<Hub>>) -> Response {
+    let (hub_device_id, epoch) = match hub.db.ensure_hub_device() {
+        Ok(state) => state,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
     Json(core_protocol::HubInfo {
         hub_id: hub.db.hub_id(),
         hub_version: HUB_VERSION.into(),
         protocol_version: PROTOCOL_VERSION,
+        account: hub.db.owner().map(|owner| owner.email),
+        hub_device_id,
+        epoch,
+        key_sha256: hub.db.identity_key_sha256(),
     })
     .into_response()
 }

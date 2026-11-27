@@ -17,10 +17,11 @@
 //!   CORS preflight the hub never grants) and an `Origin`/`Referer` from this host;
 //!   a cookie-authenticated WebSocket upgrade needs an `Origin` that is this host.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Once};
 
-use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -335,8 +336,42 @@ pub(crate) fn session_response(hub: &Hub, headers: &HeaderMap, auth: &Auth) -> R
     response
 }
 
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
+/// Whether the request came directly from loopback (not from another machine or a reverse proxy / tunnel).
+pub(crate) fn is_loopback_request(headers: &HeaderMap, ext: &Extensions) -> bool {
+    let Some(peer) = ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()) else {
+        return false;
+    };
+    if !is_loopback_ip(peer) || headers.contains_key("cf-ray") {
+        return false;
+    }
+    for name in ["cf-connecting-ip", "x-forwarded-for"] {
+        for val in headers.get_all(name) {
+            let Ok(s) = val.to_str() else { return false };
+            if !s.split(',').all(|part| part.trim().parse::<IpAddr>().is_ok_and(is_loopback_ip)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// `POST /v1/session`: trade a token for a session cookie.
-async fn login(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Json<LoginBody>) -> Response {
+async fn login(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    ext: Extensions,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    if hub.is_local_mode() && !is_loopback_request(&headers, &ext) {
+        return err(StatusCode::FORBIDDEN, "token sign-in is only accepted from loopback in local mode");
+    }
     let Some(auth) = hub.db.authenticate(&body.token) else {
         return err(StatusCode::UNAUTHORIZED, "that token isn't valid on this hub");
     };
@@ -953,5 +988,74 @@ mod tests {
             f.http.get(format!("{}/v1/devices", f.base)).header("cookie", &cookie1).send().await.unwrap().status(),
             S::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn local_mode_accepts_token_sign_in_only_from_loopback() {
+        let dir = std::env::temp_dir().join(format!("grouper-session-local-{}", random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (_, admin_token) = db.add_device("Desktop", "windows", true).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        hub.set_local_mode(true);
+
+        // Serve one router with real ConnectInfo on 127.0.0.1, and one simulating a LAN peer (192.168.1.44).
+        let lo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lo_base = format!("http://{}", lo_listener.local_addr().unwrap());
+        let lo_app = router(hub.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(lo_listener, lo_app).await });
+
+        let lan_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lan_base = format!("http://{}", lan_listener.local_addr().unwrap());
+        let lan_app = router(hub.clone()).layer(axum::middleware::from_fn(|mut req: Request, next: Next| async move {
+            req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 44], 51234))));
+            next.run(req).await
+        }));
+        tokio::spawn(async move { axum::serve(lan_listener, lan_app).await });
+
+        let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+
+        // Non-loopback peer is refused even with a valid admin token.
+        let r = http
+            .post(format!("{lan_base}/v1/session"))
+            .header("x-grouper", "1")
+            .header("origin", &lan_base)
+            .json(&json!({"token": admin_token}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::FORBIDDEN);
+        assert!(r.headers().get("set-cookie").is_none());
+
+        // Tunnel / reverse-proxy headers carrying a remote client IP over loopback are also refused.
+        for (hdr, val) in [("cf-connecting-ip", "203.0.113.9"), ("x-forwarded-for", "203.0.113.9"), ("cf-ray", "abc")] {
+            let r = http
+                .post(format!("{lo_base}/v1/session"))
+                .header("x-grouper", "1")
+                .header("origin", &lo_base)
+                .header(hdr, val)
+                .json(&json!({"token": admin_token}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), S::FORBIDDEN, "{hdr}");
+            assert!(r.headers().get("set-cookie").is_none(), "{hdr}");
+        }
+        let count: i64 = hub.db.c().query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "no session was created for non-loopback requests");
+
+        // Direct loopback token sign-in succeeds.
+        let r = http
+            .post(format!("{lo_base}/v1/session"))
+            .header("x-grouper", "1")
+            .header("origin", &lo_base)
+            .json(&json!({"token": admin_token}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        assert!(r.headers().get("set-cookie").is_some());
+
+        drop(hub);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -53,6 +53,8 @@ pub struct Device {
     /// permissions, answer approvals, manage providers and models, chat or steer
     /// threads. Plain device tokens can connect and read.
     pub admin: bool,
+    /// Google `sub` of the account this device belongs to, once the hub has an owner.
+    pub account_sub: Option<String>,
 }
 
 /// The app or CLI install a device belongs to: its random `install_id` and the kind of client
@@ -272,6 +274,18 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "devices", "install_id", "ALTER TABLE devices ADD COLUMN install_id TEXT")?;
     ensure_column(&conn, "devices", "install_kind", "ALTER TABLE devices ADD COLUMN install_kind TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS devices_install ON devices (install_id);")?;
+    // Link devices to the owning Google account (`hub_owner.sub`), and track which device is the hub.
+    ensure_column(&conn, "devices", "account_sub", "ALTER TABLE devices ADD COLUMN account_sub TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS devices_account ON devices (account_sub);
+         UPDATE devices SET account_sub = (SELECT sub FROM hub_owner WHERE id = 1)
+           WHERE account_sub IS NULL AND EXISTS (SELECT 1 FROM hub_owner WHERE id = 1);
+         CREATE TABLE IF NOT EXISTS hub_state (
+           id INTEGER PRIMARY KEY CHECK (id = 1),
+           hub_device_id TEXT NOT NULL REFERENCES devices(id),
+           epoch INTEGER NOT NULL CHECK (epoch >= 1)
+         );",
+    )?;
     conn.execute_batch(crate::link::SCHEMA)?;
     ensure_column(&conn, "push_subscriptions", "session_id", "ALTER TABLE push_subscriptions ADD COLUMN session_id TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS push_subscriptions_session ON push_subscriptions (session_id);")?;
@@ -299,6 +313,26 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) 
         conn.execute(alter_sql, [])?;
     }
     Ok(())
+}
+
+/// Default device name for the machine hosting a fresh hub: its hostname, sanitized, with a safe fallback.
+fn machine_device_name() -> String {
+    let raw = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_default();
+    let cleaned: String = raw.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("hub") {
+        "Grouper host".into()
+    } else {
+        cleaned.to_string()
+    }
 }
 
 impl Db {
@@ -341,6 +375,111 @@ impl Db {
         let id = random_hex(16);
         let _ = c.execute("INSERT OR IGNORE INTO hub_meta (key, value) VALUES ('hub_id', ?1)", [&id]);
         c.query_row("SELECT value FROM hub_meta WHERE key = 'hub_id'", [], |r| r.get(0)).unwrap_or(id)
+    }
+
+    /// Ensure this hub has a device row for the host machine and a `(hub_device_id, epoch)` assignment.
+    /// On a fresh hub, registers a non-admin device with the OS platform and machine hostname and sets
+    /// `hub_device_id` to it at `epoch = 1`.
+    pub fn ensure_hub_device(&self) -> Result<(String, u64)> {
+        let mut c = self.c();
+        if let Some((id, epoch)) = c
+            .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .optional()?
+        {
+            return Ok((id, epoch));
+        }
+        let tx = c.transaction()?;
+        if let Some((id, epoch)) = tx
+            .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .optional()?
+        {
+            return Ok((id, epoch));
+        }
+        let owner_sub: Option<String> = tx
+            .query_row("SELECT sub FROM hub_owner WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
+        let id = random_hex(6);
+        let secret = random_hex(32);
+        let name = machine_device_name();
+        let platform = std::env::consts::OS;
+        tx.execute(
+            "INSERT INTO devices (id, name, platform, secret_hash, created, admin, account_sub)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            params![id, name, platform, hash(&secret), ts(), owner_sub],
+        )?;
+        tx.execute("INSERT INTO hub_state (id, hub_device_id, epoch) VALUES (1, ?1, 1)", params![id])?;
+        tx.commit()?;
+        Ok((id, 1))
+    }
+
+    /// The device id currently acting as the hub (registering this machine on first use).
+    pub fn hub_device_id(&self) -> String {
+        self.ensure_hub_device().expect("hub device registration").0
+    }
+
+    /// Hub assignment counter: starts at 1 and rises by 1 whenever `hub_device_id` changes.
+    pub fn epoch(&self) -> u64 {
+        self.ensure_hub_device().expect("hub device registration").1
+    }
+
+    /// Reassign `hub_device_id` to an active device of the account. Increments `epoch` when
+    /// `hub_device_id` changes; assigning the current device is a no-op and returns the current `epoch`.
+    pub fn set_hub_device_id(&self, device_id: &str) -> Result<u64> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let Some((revoked, dev_account)): Option<(i64, Option<String>)> = tx
+            .query_row("SELECT revoked, account_sub FROM devices WHERE id = ?1", [device_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?
+        else {
+            bail!("no such device");
+        };
+        if revoked != 0 {
+            bail!("cannot assign a revoked device as the hub");
+        }
+        let owner_sub: Option<String> = tx
+            .query_row("SELECT sub FROM hub_owner WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
+        if let Some(sub) = &owner_sub {
+            match &dev_account {
+                Some(existing) if existing != sub => bail!("device belongs to a different account"),
+                None => {
+                    tx.execute("UPDATE devices SET account_sub = ?1 WHERE id = ?2", params![sub, device_id])?;
+                }
+                _ => {}
+            }
+        }
+        let current: Option<(String, i64)> = tx
+            .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let epoch = match current {
+            Some((cur_id, cur_epoch)) if cur_id == device_id => cur_epoch as u64,
+            Some((_, cur_epoch)) => {
+                let next = (cur_epoch as u64) + 1;
+                tx.execute(
+                    "UPDATE hub_state SET hub_device_id = ?1, epoch = ?2 WHERE id = 1",
+                    params![device_id, next as i64],
+                )?;
+                next
+            }
+            None => {
+                tx.execute("INSERT INTO hub_state (id, hub_device_id, epoch) VALUES (1, ?1, 1)", params![device_id])?;
+                1
+            }
+        };
+        tx.commit()?;
+        Ok(epoch)
+    }
+
+    /// Hex SHA-256 of the hub's identity key, if one exists. No hub identity key exists yet
+    /// (arrives with LAN TLS in package 13), so this returns `None` and `/v1/hub` omits `key_sha256`.
+    pub fn identity_key_sha256(&self) -> Option<String> {
+        None
     }
 
     /// The Web Push (VAPID) private key: a P-256 scalar, made on first use and kept in
@@ -432,6 +571,9 @@ impl Db {
         let platform = platform.trim().to_lowercase();
         let mut c = self.c();
         let tx = c.transaction()?;
+        let owner_sub: Option<String> = tx
+            .query_row("SELECT sub FROM hub_owner WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
         let existing: Option<String> = match &install {
             Some(i) => tx
                 .query_row(
@@ -443,19 +585,22 @@ impl Db {
                 .optional()?,
             None => None,
         };
-        let (id, ended_sessions) = match existing {
+        let (id, account_sub, ended_sessions) = match existing {
             Some(id) => {
                 tx.execute(
-                    "UPDATE devices SET secret_hash = ?1, name = ?2, platform = ?3 WHERE id = ?4",
-                    params![hash(&secret), name, platform, id],
+                    "UPDATE devices SET secret_hash = ?1, name = ?2, platform = ?3,
+                       account_sub = COALESCE(?4, account_sub) WHERE id = ?5",
+                    params![hash(&secret), name, platform, owner_sub, id],
                 )?;
+                let account_sub: Option<String> =
+                    tx.query_row("SELECT account_sub FROM devices WHERE id = ?1", [&id], |r| r.get(0))?;
                 let sessions = {
                     let mut st = tx.prepare("SELECT id_hash FROM sessions WHERE device_id = ?1")?;
                     st.query_map([&id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
                 };
                 tx.execute("DELETE FROM sessions WHERE device_id = ?1", [&id])?;
                 tx.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [&id])?;
-                (id, Some(sessions))
+                (id, account_sub, Some(sessions))
             }
             None => {
                 if let Some(max) = max_live {
@@ -466,17 +611,35 @@ impl Db {
                 }
                 let id = random_hex(6);
                 tx.execute(
-                    "INSERT INTO devices (id, name, platform, secret_hash, created, admin, install_id, install_kind)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![id, name, platform, hash(&secret), ts(), admin, install.map(|i| i.id), install.map(|i| i.kind)],
+                    "INSERT INTO devices (id, name, platform, secret_hash, created, admin, install_id, install_kind, account_sub)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        id,
+                        name,
+                        platform,
+                        hash(&secret),
+                        ts(),
+                        admin,
+                        install.map(|i| i.id),
+                        install.map(|i| i.kind),
+                        owner_sub,
+                    ],
                 )?;
-                (id, None)
+                (id, owner_sub, None)
             }
         };
         tx.commit()?;
         Ok(IssuedDevice {
             token: format!("{id}.{secret}"),
-            device: Device { id, name: name.into(), platform, revoked: false, last_seen: None, admin },
+            device: Device {
+                id,
+                name: name.into(),
+                platform,
+                revoked: false,
+                last_seen: None,
+                admin,
+                account_sub,
+            },
             reused: ended_sessions.is_some(),
             ended_sessions: ended_sessions.unwrap_or_default(),
         })
@@ -529,7 +692,9 @@ impl Db {
 
     pub fn devices(&self) -> Vec<Device> {
         let c = self.c();
-        let mut st = c.prepare("SELECT id, name, platform, revoked, last_seen, admin FROM devices ORDER BY created").unwrap();
+        let mut st = c
+            .prepare("SELECT id, name, platform, revoked, last_seen, admin, account_sub FROM devices ORDER BY created")
+            .unwrap();
         st.query_map([], |r| {
             Ok(Device {
                 id: r.get(0)?,
@@ -538,6 +703,7 @@ impl Db {
                 revoked: r.get::<_, i64>(3)? != 0,
                 last_seen: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                 admin: r.get::<_, i64>(5)? != 0,
+                account_sub: r.get(6)?,
             })
         })
         .unwrap()
@@ -1580,6 +1746,103 @@ mod tests {
             ..base
         })
         .unwrap();
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fresh_hub_registers_host_device_and_epoch_rises_on_reassignment() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let hub_dev_id = db.hub_device_id();
+        assert!(!hub_dev_id.is_empty());
+        assert_eq!(db.epoch(), 1);
+        assert_eq!(db.identity_key_sha256(), None);
+
+        let devices = db.devices();
+        assert_eq!(devices.len(), 1);
+        let host = &devices[0];
+        assert_eq!(host.id, hub_dev_id);
+        assert_eq!(host.platform, std::env::consts::OS);
+        assert_eq!(host.name, machine_device_name());
+        assert!(!host.admin);
+        assert_eq!(host.account_sub, None);
+
+        // Reopening preserves the same hub_device_id and epoch without duplicating the host device.
+        drop(db);
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.hub_device_id(), hub_dev_id);
+        assert_eq!(db.epoch(), 1);
+        assert_eq!(db.devices().len(), 1);
+
+        // Assigning the same device is a no-op; assigning another rises epoch by 1 each time.
+        assert_eq!(db.set_hub_device_id(&hub_dev_id).unwrap(), 1);
+        let (mac, _) = db.add_device("MacBook", "macos", false).unwrap();
+        assert_eq!(db.set_hub_device_id(&mac.id).unwrap(), 2);
+        assert_eq!(db.hub_device_id(), mac.id);
+        assert_eq!(db.epoch(), 2);
+        assert_eq!(db.set_hub_device_id(&hub_dev_id).unwrap(), 3);
+        assert_eq!(db.hub_device_id(), hub_dev_id);
+        assert_eq!(db.epoch(), 3);
+
+        // Non-existent and revoked devices cannot become the hub.
+        assert!(db.set_hub_device_id("missing").is_err());
+        db.revoke_device(&mac.id).unwrap();
+        assert!(db.set_hub_device_id(&mac.id).is_err());
+        assert_eq!(db.epoch(), 3);
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn migration_links_existing_devices_to_owner_and_tracks_new_devices() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("grouper.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE devices (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL,
+               secret_hash TEXT NOT NULL, created INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
+               last_seen INTEGER, admin INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE hub_owner (
+               id INTEGER PRIMARY KEY CHECK (id = 1), provider TEXT NOT NULL, sub TEXT NOT NULL,
+               email TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', claimed_at INTEGER NOT NULL);
+             INSERT INTO devices (id, name, platform, secret_hash, created, admin)
+               VALUES ('d1', 'Old PC', 'windows', 'h', 1, 0);
+             INSERT INTO hub_owner (id, provider, sub, email, name, claimed_at)
+               VALUES (1, 'google', 'sub-123', 'owner@example.com', 'Owner', 2);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Db::open(&dir).unwrap();
+        let devs = db.devices();
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].account_sub.as_deref(), Some("sub-123"));
+
+        // Registering the hub device and adding another device both link to the owner's sub.
+        let hub_dev_id = db.hub_device_id();
+        let (phone, _) = db.add_device("Phone", "ios", true).unwrap();
+        assert_eq!(phone.account_sub.as_deref(), Some("sub-123"));
+        for d in db.devices() {
+            assert_eq!(d.account_sub.as_deref(), Some("sub-123"), "device {}", d.id);
+        }
+        assert!(db.devices().iter().any(|d| d.id == hub_dev_id));
+
+        // Resetting the owner unlinks devices cleanly; claiming again re-links them.
+        db.reset_owner().unwrap();
+        assert!(db.devices().iter().all(|d| d.account_sub.is_none()));
+        db.set_owner_if_none(&crate::google_auth::Owner {
+            provider: "google".into(),
+            sub: "sub-456".into(),
+            email: "new@example.com".into(),
+            name: "New".into(),
+            claimed_at: 3,
+        })
+        .unwrap();
+        assert!(db.devices().iter().all(|d| d.account_sub.as_deref() == Some("sub-456")));
+
         drop(db);
         std::fs::remove_dir_all(dir).ok();
     }

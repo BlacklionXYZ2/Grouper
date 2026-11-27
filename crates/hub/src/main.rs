@@ -1,12 +1,10 @@
-mod backup;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use core_protocol::{ModelEntry, ProviderConfig};
-use hub::{db::Db, server};
+use hub::{backup, db::Db, host};
 
 /// Grouper hub: the always-on server every device connects to.
 #[derive(Parser)]
@@ -25,6 +23,9 @@ enum Cmd {
     Serve {
         #[arg(long, env = "GROUPER_BIND", default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
+        /// Run in local mode (HTTP setup-code claim off, token sign-in loopback-only).
+        #[arg(long)]
+        local: bool,
     },
     /// Manage registered devices.
     #[command(subcommand)]
@@ -135,35 +136,19 @@ async fn main() -> Result<()> {
     match &cli.cmd {
         Cmd::Backup { output, include_workspaces } => return backup::backup(&cli.data, output, *include_workspaces),
         Cmd::Restore { backup, force } => return backup::restore(&cli.data, backup, *force),
+        Cmd::Serve { bind, local } => {
+            let handle = host::start_with_options(&cli.data, &[*bind], host::Options { local: *local }).await?;
+            let _ = tokio::signal::ctrl_c().await;
+            handle.stop().await;
+            return Ok(());
+        }
         _ => {}
     }
-    let _serve_lock = if matches!(&cli.cmd, Cmd::Serve { .. }) {
-        Some(backup::lock_data_dir(&cli.data)?)
-    } else {
-        None
-    };
     let db = Db::open(&cli.data)?;
 
     match cli.cmd {
-        Cmd::Backup { .. } | Cmd::Restore { .. } => unreachable!("handled before opening the database"),
-        Cmd::Serve { bind } => {
-            let hub = server::Hub::new(db, cli.data.clone());
-            // Threads waiting for a device keep waiting; a hub part that was running stops at once.
-            hub.recover_waiting_threads();
-            // Threads that were running when the hub stopped can't be resumed.
-            for t in hub.db.threads(None).into_iter().filter(|t| t.status == "running") {
-                hub.db.finish_thread(&t.id, "failed", "The hub restarted while this thread was running.");
-            }
-            tokio::spawn(hub::usage::collector_loop(hub.clone()));
-            let listener = tokio::net::TcpListener::bind(bind).await?;
-            tracing::info!("grouper-hub listening on {bind}, data in {}", cli.data.display());
-            hub::google_auth::announce_setup_code(&hub);
-            // Peer addresses let sign-in rate limits tell clients apart.
-            axum::serve(listener, server::router(hub).into_make_service_with_connect_info::<SocketAddr>())
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
+        Cmd::Backup { .. } | Cmd::Restore { .. } | Cmd::Serve { .. } => {
+            unreachable!("handled before opening the database")
         }
         Cmd::Device(DeviceCmd::Add { name, platform, admin }) => {
             let (d, token) = db.add_device(&name, &platform, admin)?;

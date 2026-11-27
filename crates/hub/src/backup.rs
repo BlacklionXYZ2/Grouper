@@ -23,7 +23,7 @@ use fs2::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-use hub::secrets::Secrets;
+use crate::secrets::Secrets;
 
 const FORMAT_VERSION: u32 = 1;
 const MANIFEST_NAME: &str = "manifest.json";
@@ -96,7 +96,7 @@ struct OpenedBackup {
     cleanup: bool,
 }
 
-pub(crate) struct DataLock {
+pub struct DataLock {
     file: File,
     path: PathBuf,
     remove_on_drop: bool,
@@ -111,7 +111,7 @@ impl Drop for DataLock {
     }
 }
 
-pub(crate) fn lock_data_dir(data_dir: &Path) -> Result<DataLock> {
+pub fn lock_data_dir(data_dir: &Path) -> Result<DataLock> {
     create_private_dir_all(data_dir)?;
     let path = data_dir.join(LOCK_NAME);
     let remove_on_drop = !path.exists();
@@ -173,7 +173,7 @@ fn sibling_stage(target: &Path, label: &str) -> Result<PathBuf> {
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     create_private_dir_all(parent)?;
     let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("grouper");
-    let dir = parent.join(format!(".{name}.{label}-{}-{}", std::process::id(), hub::db::random_hex(4)));
+    let dir = parent.join(format!(".{name}.{label}-{}-{}", std::process::id(), crate::db::random_hex(4)));
     create_private_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
 }
@@ -187,7 +187,7 @@ impl Drop for OpenedBackup {
 }
 
 /// Write a snapshot of `data_dir` to `output` (a directory, or a `.tar.gz` / `.tgz` file).
-pub(crate) fn backup(data_dir: &Path, output: &Path, include_workspaces: bool) -> Result<()> {
+pub fn backup(data_dir: &Path, output: &Path, include_workspaces: bool) -> Result<()> {
     let db_path = data_dir.join(DB_NAME);
     if !db_path.is_file() {
         bail!(
@@ -219,7 +219,7 @@ pub(crate) fn backup(data_dir: &Path, output: &Path, include_workspaces: bool) -
 }
 
 /// Restore `backup` (a snapshot directory or `.tar.gz`) into `data_dir`.
-pub(crate) fn restore(data_dir: &Path, backup_path: &Path, force: bool) -> Result<()> {
+pub fn restore(data_dir: &Path, backup_path: &Path, force: bool) -> Result<()> {
     let _lock = lock_data_dir(data_dir).context("refusing restore while grouper-hub serve is using this data directory")?;
     if data_dir.exists() && !data_dir.is_dir() {
         bail!("{} is not a directory", data_dir.display());
@@ -1838,7 +1838,7 @@ mod tests {
             let path = std::env::temp_dir().join(format!(
                 "grouper-backup-{label}-{}-{}",
                 std::process::id(),
-                hub::db::random_hex(4)
+                crate::db::random_hex(4)
             ));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
@@ -1853,7 +1853,7 @@ mod tests {
     }
 
     fn setup_hub(dir: &Path) -> String {
-        let db = hub::db::Db::open(dir).unwrap();
+        let db = crate::db::Db::open(dir).unwrap();
         db.upsert_provider(&ProviderConfig {
             id: "openai".into(),
             kind: "openai".into(),
@@ -1946,7 +1946,7 @@ mod tests {
             }
         }
         // An open hub connection, as when `serve` is running, plus a writer committing rows.
-        let live = hub::db::Db::open(&data).unwrap();
+        let live = crate::db::Db::open(&data).unwrap();
         assert_eq!(live.hub_id(), hub_id);
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicI64::new(100));
@@ -2021,7 +2021,7 @@ mod tests {
         let restored = root.0.join("restored");
         copy_key(&data, &restored);
         restore(&restored, &snap, false).unwrap();
-        let db = hub::db::Db::open(&restored).unwrap();
+        let db = crate::db::Db::open(&restored).unwrap();
         assert_eq!(db.hub_id(), hub_id);
         assert_eq!(
             db.provider("openai").unwrap().unwrap().api_key.as_deref(),
@@ -2104,7 +2104,7 @@ mod tests {
         restore(&restored, &snap, false).unwrap();
         assert_eq!(fs::read(restored.join(MASTER_KEY_NAME)).unwrap(), key_bytes);
         assert!(!restored.join(MANIFEST_NAME).exists());
-        let db = hub::db::Db::open(&restored).unwrap();
+        let db = crate::db::Db::open(&restored).unwrap();
         assert_eq!(db.hub_id(), hub_id);
         assert_eq!(
             db.provider("openai").unwrap().unwrap().api_key.as_deref(),
@@ -2125,7 +2125,7 @@ mod tests {
         let from_archive = root.0.join("from-archive");
         copy_key(&data, &from_archive);
         restore(&from_archive, &archive, false).unwrap();
-        let db = hub::db::Db::open(&from_archive).unwrap();
+        let db = crate::db::Db::open(&from_archive).unwrap();
         assert_eq!(db.hub_id(), hub_id);
         assert_eq!(
             db.provider("openai").unwrap().unwrap().api_key.as_deref(),
@@ -2149,7 +2149,7 @@ mod tests {
 
         let dest = root.0.join("dest");
         let old_id = {
-            let db = hub::db::Db::open(&dest).unwrap();
+            let db = crate::db::Db::open(&dest).unwrap();
             db.hub_id()
         };
         assert_ne!(old_id, hub_id);
@@ -2157,7 +2157,7 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("not empty"), "{message}");
         assert!(message.contains("--force"), "{message}");
-        let db = hub::db::Db::open(&dest).unwrap();
+        let db = crate::db::Db::open(&dest).unwrap();
         assert_eq!(db.hub_id(), old_id);
         assert!(db.provider("openai").unwrap().is_none());
     }
@@ -2174,14 +2174,14 @@ mod tests {
 
         let dest = root.0.join("dest");
         let old_id = {
-            let db = hub::db::Db::open(&dest).unwrap();
+            let db = crate::db::Db::open(&dest).unwrap();
             db.hub_id()
         };
         fs::copy(data.join(MASTER_KEY_NAME), dest.join(MASTER_KEY_NAME)).unwrap();
         let key = fs::read(dest.join(MASTER_KEY_NAME)).unwrap();
         restore(&dest, &snap, true).unwrap();
         assert_eq!(fs::read(dest.join(MASTER_KEY_NAME)).unwrap(), key);
-        let db = hub::db::Db::open(&dest).unwrap();
+        let db = crate::db::Db::open(&dest).unwrap();
         assert_eq!(db.hub_id(), hub_id);
         drop(db);
 
@@ -2268,7 +2268,7 @@ mod tests {
         let again = root.0.join("again");
         copy_key(&data, &again);
         restore(&again, &snap, false).unwrap();
-        assert_eq!(hub::db::Db::open(&again).unwrap().hub_id(), hub_id);
+        assert_eq!(crate::db::Db::open(&again).unwrap().hub_id(), hub_id);
     }
 
     #[test]
@@ -2311,7 +2311,7 @@ mod tests {
         let old_marker = data.join("old-marker.txt");
         fs::write(&old_marker, b"previous").unwrap();
         restore(&data, &archive, true).unwrap();
-        assert_eq!(hub::db::Db::open(&data).unwrap().hub_id(), hub_id);
+        assert_eq!(crate::db::Db::open(&data).unwrap().hub_id(), hub_id);
         assert_eq!(
             fs::read(data.join("workspaces/thread1/nested/note.txt")).unwrap(),
             b"snapshot-me"

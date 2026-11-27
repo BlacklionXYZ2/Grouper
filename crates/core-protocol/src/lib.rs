@@ -879,12 +879,24 @@ pub struct LimitsReport {
 }
 
 /// `GET /v1/hub`: who this hub is. Public; nothing private in it. `hub_id` is random,
-/// made once per hub database, so a client cache can tell two hubs apart.
+/// made once per hub database, so a client cache can tell two hubs apart. `account` is the
+/// Google owner's email (or `null` when unclaimed), `hub_device_id` names the device row
+/// currently acting as the hub, and `epoch` rises whenever `hub_device_id` changes.
+/// `key_sha256` carries the hex SHA-256 of the hub's identity key when one exists; no
+/// identity key exists yet (arrives with LAN TLS), so it is omitted.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct HubInfo {
     pub hub_id: String,
     pub hub_version: String,
     pub protocol_version: u32,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub hub_device_id: String,
+    #[serde(default)]
+    pub epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_sha256: Option<String>,
 }
 
 /// A provider as listed to clients (keys never leave the hub this way).
@@ -1328,5 +1340,32 @@ mod tests {
         .unwrap();
         assert!(info.available);
         assert_eq!(info.input_schema, default_input_schema());
+    }
+
+    #[test]
+    fn hub_info_serializes_account_and_omits_missing_key_sha256() {
+        let unclaimed = HubInfo {
+            hub_id: "h1".into(),
+            hub_version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            account: None,
+            hub_device_id: "d1".into(),
+            epoch: 1,
+            key_sha256: None,
+        };
+        let v = serde_json::to_value(&unclaimed).unwrap();
+        assert_eq!(v["account"], Value::Null);
+        assert_eq!(v["hub_device_id"], "d1");
+        assert_eq!(v["epoch"], 1);
+        assert!(v.get("key_sha256").is_none(), "missing identity key must be omitted: {v}");
+        assert_eq!(serde_json::from_value::<HubInfo>(v).unwrap(), unclaimed);
+
+        // Older hubs without the local-first fields still deserialize cleanly.
+        let legacy: HubInfo =
+            serde_json::from_str(r#"{"hub_id":"h0","hub_version":"0.1.0","protocol_version":6}"#).unwrap();
+        assert_eq!(legacy.account, None);
+        assert_eq!(legacy.hub_device_id, "");
+        assert_eq!(legacy.epoch, 0);
+        assert_eq!(legacy.key_sha256, None);
     }
 }
