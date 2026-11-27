@@ -2981,8 +2981,10 @@ mod tests {
                 let old_u = old_for_pub.clone();
                 let new_u = new_for_pub.clone();
                 async move {
+                    // Keep this short: the paused target may hold the request, and the old hub's
+                    // own confirm request must get an answer before its client gives up.
                     let c = reqwest::Client::builder()
-                        .timeout(Duration::from_secs(2))
+                        .timeout(Duration::from_millis(200))
                         .build()
                         .unwrap();
                     if let Ok(info) = fetch_hub_info(&c, &new_u).await {
