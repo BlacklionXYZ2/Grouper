@@ -912,8 +912,8 @@ struct SignInBody {
 async fn sign_in(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Json<SignInBody>) -> Response {
     let platform = match body.client.as_str() {
         "web" => None,
-        p @ ("ios" | "macos" | "cli") => Some(p),
-        _ => return err(StatusCode::BAD_REQUEST, "client must be web, ios, macos or cli"),
+        p @ ("ios" | "macos" | "windows" | "linux" | "cli") => Some(p),
+        _ => return err(StatusCode::BAD_REQUEST, "client must be web, ios, macos, windows, linux or cli"),
     };
     let install_id = match crate::server::check_install_id(body.install_id.as_deref()) {
         Ok(id) => id,
