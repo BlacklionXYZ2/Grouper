@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
@@ -167,6 +167,8 @@ pub struct Hub {
     pub(crate) host_info: std::sync::Mutex<HashMap<String, core_protocol::NodeHostInfo>>,
     /// Streamable HTTP session store for `/mcp/orchestrator`. One per hub, created on first use.
     pub(crate) orchestrator_mcp: std::sync::OnceLock<crate::mcp_server::OrchestratorHttp>,
+    /// Loopback port serving `/mcp/orchestrator`. Zero until a listener is bound.
+    pub(crate) loopback_port: AtomicU16,
 }
 
 impl Hub {
@@ -201,7 +203,26 @@ impl Hub {
             migrate: crate::migrate::MigrateState::new(),
             host_info: std::sync::Mutex::new(HashMap::new()),
             orchestrator_mcp: std::sync::OnceLock::new(),
+            loopback_port: AtomicU16::new(0),
         })
+    }
+
+    /// Record the loopback port that serves `/mcp/orchestrator` for harness orchestrators.
+    pub(crate) fn set_loopback_port(&self, port: u16) {
+        self.loopback_port.store(port, Ordering::Relaxed);
+    }
+
+    pub(crate) fn loopback_port(&self) -> u16 {
+        self.loopback_port.load(Ordering::Relaxed)
+    }
+
+    /// Delete a chat, revoke its orchestrator tokens, and stop its worker.
+    pub async fn delete_conversation(self: &Arc<Self>, id: &str) -> anyhow::Result<bool> {
+        let deleted = self.db.delete_conversation(id)?;
+        if deleted {
+            self.orchestrators.lock().await.remove(id);
+        }
+        Ok(deleted)
     }
 
     /// Cloudflare tunnel supervisor state and status.
@@ -638,6 +659,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/usage/free-requests", get(free_requests_today))
         .route("/v1/chat", post(chat))
         .route("/v1/conversations", get(list_conversations))
+        .route("/v1/conversations/{id}", delete(delete_conversation_route))
         .route("/v1/conversations/{id}/model", post(set_conversation_model))
         .route("/v1/conversations/{id}/events", get(conversation_events))
         .route("/v1/threads", get(list_threads))
@@ -1021,6 +1043,15 @@ async fn chat(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(req): Json<C
 async fn list_conversations(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     authed!(hub, headers);
     Json(hub.db.conversations()).into_response()
+}
+
+async fn delete_conversation_route(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    admin!(hub, headers);
+    match hub.delete_conversation(&id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, "no such conversation"),
+        Err(error) => err(StatusCode::BAD_REQUEST, error),
+    }
 }
 
 #[derive(Deserialize)]

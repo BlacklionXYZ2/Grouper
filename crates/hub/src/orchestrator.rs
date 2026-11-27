@@ -216,16 +216,17 @@ pub(crate) async fn resolve_turn_model(
 async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     let Some(conv) = hub.db.conversation(conversation_id) else { return };
     let project = conv.mode == "project";
-    // Subscription-billed harnesses in standard chats never spend API budgets; API turns still check limits.
-    let standard_harness = !project
-        && hub
-            .db
-            .conversation_model(conversation_id)
-            .ok()
-            .flatten()
-            .or_else(|| hub.db.default_model("standard"))
-            .is_some_and(|m| m.is_harness());
-    if !standard_harness && crate::limits::refuse_turn(hub, conversation_id, &wakes) {
+    // Subscription-billed harnesses never spend API budgets. That includes a project chat
+    // whose orchestrator is a harness with `can_orchestrate`. API turns still check limits.
+    let role_for_default = if project { "orchestrator" } else { "standard" };
+    let subscription_harness = hub
+        .db
+        .conversation_model(conversation_id)
+        .ok()
+        .flatten()
+        .or_else(|| hub.db.default_model(role_for_default))
+        .is_some_and(|m| m.is_harness() && (!project || m.can_orchestrate));
+    if !subscription_harness && crate::limits::refuse_turn(hub, conversation_id, &wakes) {
         return;
     }
 
@@ -297,9 +298,10 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         return;
     };
 
-    if !project && model.is_harness() {
+    if model.is_harness() {
+        let orchestrator_prompt = project.then(|| ORCHESTRATOR_SYSTEM.to_string());
         match hub
-            .run_standard_harness_turn(conversation_id, &model, &text, &wakes)
+            .run_standard_harness_turn(conversation_id, &model, &text, &wakes, orchestrator_prompt)
             .await
         {
             Ok(reply) => {
@@ -918,6 +920,68 @@ mod harness_rule_tests {
             "expected clear error event, got: {events:?}"
         );
         assert!(events.iter().any(|e| matches!(&e.body, EventBody::TurnFinished { running_threads: 0 })));
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// An API orchestrator still runs the in-hub tool loop. It does not open a harness session
+    /// or mint an orchestrator MCP token.
+    #[tokio::test]
+    async fn project_api_orchestrator_is_unchanged() {
+        let dir = tmp("api-unchanged");
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "scripted".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({
+                "inline": {
+                    "rules": [
+                        {"last": "hello api orchestrator", "reply": [{"type": "text", "text": "Handled by the API orchestrator."}]}
+                    ]
+                }
+            }),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "api-orch".into(),
+            provider_id: "scripted".into(),
+            model: "scripted-api".into(),
+            roles: vec!["orchestrator".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let project_conv = db.create_conversation("project", "API project").unwrap();
+        db.set_conversation_model(&project_conv, Some("api-orch")).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        run_turn(&hub, &project_conv, vec![Wake::User("hello api orchestrator".into())]).await;
+
+        let events = hub.db.events(&project_conv, 0, None);
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.body,
+                EventBody::AssistantMessage { text } if text.contains("Handled by the API orchestrator.")
+            )),
+            "API orchestrator should still answer through the model loop, got: {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| !matches!(&e.body, EventBody::Error { .. })),
+            "API orchestrator turn raised an error: {events:?}"
+        );
+        assert_eq!(hub.db.conversation_harness_session(&project_conv), None);
+        let live_tokens: i64 = hub
+            .db
+            .c()
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tokens WHERE conversation_id = ?1 AND revoked = 0",
+                [&project_conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_tokens, 0);
 
         drop(hub);
         std::fs::remove_dir_all(dir).ok();

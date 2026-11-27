@@ -107,6 +107,12 @@ async fn start_inner(
     }
 
     let hub = Hub::new(db, data_dir.clone());
+    let loopback_port = local_addrs
+        .iter()
+        .find(|addr| addr.ip().is_loopback())
+        .map(|addr| addr.port())
+        .unwrap_or_else(|| local_addrs[0].port());
+    hub.set_loopback_port(loopback_port);
     hub.set_local_mode(options.local);
     if start_paused {
         hub.migrate().set_paused(true);

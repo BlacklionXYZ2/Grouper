@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use core_protocol::{
     DetectedHarness, HarnessCapabilities, HarnessModel, HarnessSignIn, HarnessUsage, NodeMessage,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -1151,8 +1151,19 @@ pub fn chat_workdir(workspace_root: Option<&Path>, conversation_id: &str) -> Res
     Ok(dir)
 }
 
+/// MCP attachment for one Claude Code orchestrator turn.
+///
+/// `mcp.bearer_token` is a secret: it is written only into the temp MCP config and is
+/// never logged or included in an error string.
+pub struct ClaudeOrchestrator<'a> {
+    pub mcp: &'a core_protocol::HarnessMcp,
+    pub allowed_tools: &'a [String],
+    pub system_prompt: Option<&'a str>,
+}
+
 /// Run one headless turn of `agent`, starting a new session when `session` is `None`
-/// or resuming `session` when `Some`.
+/// or resuming `session` when `Some`. `orchestrator` is set only for a project chat
+/// whose orchestrator is Claude Code.
 pub async fn turn(
     agent: &str,
     model: &str,
@@ -1160,12 +1171,14 @@ pub async fn turn(
     message: &str,
     workdir: &Path,
     level: HarnessLevel,
+    orchestrator: Option<&ClaudeOrchestrator<'_>>,
 ) -> Result<TurnResult, String> {
-    turn_with(&ScanOptions::host(), agent, model, session, message, workdir, level).await
+    turn_with(&ScanOptions::host(), agent, model, session, message, workdir, level, orchestrator).await
 }
 
 /// Like [`turn`], using explicit [`ScanOptions`] so tests can point at fake CLI binaries
 /// in an isolated directory without touching the host's `$PATH` or `$HOME`.
+#[allow(clippy::too_many_arguments)]
 pub async fn turn_with(
     opts: &ScanOptions,
     agent: &str,
@@ -1174,6 +1187,7 @@ pub async fn turn_with(
     message: &str,
     workdir: &Path,
     level: HarnessLevel,
+    orchestrator: Option<&ClaudeOrchestrator<'_>>,
 ) -> Result<TurnResult, String> {
     let slug = agent.trim();
     let Some(def) = HARNESS_DEFS.iter().find(|d| d.slug == slug) else {
@@ -1187,9 +1201,16 @@ pub async fn turn_with(
 
     let session_clean = session.map(str::trim).filter(|s| !s.is_empty());
     let model_clean = model.trim();
+    if orchestrator.is_some() && slug != "claude-code" {
+        return Err(format!(
+            "{slug} cannot orchestrate a project chat: only Claude Code can be limited to Grouper's MCP tools"
+        ));
+    }
 
     match slug {
-        "claude-code" => run_claude_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
+        "claude-code" => {
+            run_claude_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level, orchestrator).await
+        }
         "codex" => run_codex_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
         "antigravity" => run_antigravity_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
         "grok" => run_grok_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
@@ -1393,6 +1414,33 @@ fn tail_detail(out: &str, err: &str) -> String {
     }
 }
 
+/// Write the loopback MCP config Claude Code reads via `--mcp-config`.
+/// The bearer token is only in this file. Callers delete the file as soon as the process exits.
+fn write_claude_mcp_config(mcp: &core_protocol::HarnessMcp) -> Result<TempFileGuard, String> {
+    let guard = TempFileGuard::create("claude-mcp", "json")?;
+    // The server name `grouper` is the prefix Claude Code turns into `mcp__grouper__*`.
+    let body = json!({
+        "mcpServers": {
+            "grouper": {
+                "type": "http",
+                "url": mcp.url,
+                "headers": { "Authorization": format!("Bearer {}", mcp.bearer_token) }
+            }
+        }
+    });
+    let bytes = serde_json::to_vec(&body).map_err(|e| format!("encoding MCP config: {e}"))?;
+    std::fs::write(&guard.path, bytes).map_err(|e| format!("writing MCP config: {e}"))?;
+    Ok(guard)
+}
+
+fn redact_secret(text: String, secret: Option<&str>) -> String {
+    match secret {
+        Some(secret) if !secret.is_empty() => text.replace(secret, "[redacted]"),
+        _ => text,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_claude_turn(
     bin: &Path,
     opts: &ScanOptions,
@@ -1401,6 +1449,7 @@ async fn run_claude_turn(
     message: &str,
     workdir: &Path,
     level: HarnessLevel,
+    orchestrator: Option<&ClaudeOrchestrator<'_>>,
 ) -> Result<TurnResult, String> {
     // VERIFY: Claude Code `--permission-mode` values (`plan`, `acceptEdits`, `bypassPermissions`).
     let permission_mode = match level {
@@ -1422,6 +1471,33 @@ async fn run_claude_turn(
         args.push("--model".to_string());
         args.push(model.to_string());
     }
+    // The config holds the bearer token. It stays alive until the process exits, then Drop deletes it.
+    let mcp_config = match orchestrator {
+        Some(orch) => Some(write_claude_mcp_config(orch.mcp)?),
+        None => None,
+    };
+    let secret = orchestrator.map(|orch| orch.mcp.bearer_token.as_str());
+    if let (Some(orch), Some(cfg)) = (orchestrator, mcp_config.as_ref()) {
+        // VERIFY: Claude Code `--mcp-config <file>` loads this HTTP MCP server (`grouper`).
+        args.push("--mcp-config".to_string());
+        args.push(cfg.path.to_string_lossy().to_string());
+        let tools = if orch.allowed_tools.is_empty() {
+            "mcp__grouper__*".to_string()
+        } else {
+            orch.allowed_tools.join(",")
+        };
+        // VERIFY: Claude Code `--allowedTools mcp__grouper__*` confines the orchestrator to Grouper MCP tools.
+        args.push("--allowedTools".to_string());
+        args.push(tools);
+        // VERIFY: Claude Code `--disallowedTools` disables built-in shell, edit, read and web tools.
+        args.push("--disallowedTools".to_string());
+        args.push("Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Task,TodoWrite".to_string());
+        if let Some(prompt) = orch.system_prompt.map(str::trim).filter(|s| !s.is_empty()) {
+            // VERIFY: Claude Code `--append-system-prompt` appends the orchestrator prompt.
+            args.push("--append-system-prompt".to_string());
+            args.push(prompt.to_string());
+        }
+    }
     if let Some(sid) = session {
         // VERIFY: Claude Code `--resume <session_id>`.
         args.push("--resume".to_string());
@@ -1429,8 +1505,13 @@ async fn run_claude_turn(
     }
 
     let (code, out, err) = run_turn_process(bin, opts, &args, workdir, true).await?;
+    // Delete the temp MCP config (and the token in it) as soon as the process is gone.
+    drop(mcp_config);
     let Some(result) = last_json_object(&out) else {
-        return Err(format!("Claude Code failed (exit {code}): {}", tail_detail(&out, &err)));
+        return Err(redact_secret(
+            format!("Claude Code failed (exit {code}): {}", tail_detail(&out, &err)),
+            secret,
+        ));
     };
     let is_error = result.get("is_error").and_then(Value::as_bool).unwrap_or(false) || code != 0;
     if is_error {
@@ -1442,7 +1523,7 @@ async fn run_claude_turn(
             .or_else(|| result.get("subtype").and_then(Value::as_str))
             .map(String::from)
             .unwrap_or_else(|| tail_detail(&out, &err));
-        return Err(format!("Claude Code failed: {detail}"));
+        return Err(redact_secret(format!("Claude Code failed: {detail}"), secret));
     }
     let session_id = result
         .get("session_id")
@@ -2342,7 +2423,7 @@ fn main() {
             let workdir = chat_workdir(Some(&ws_root), &conv_id).unwrap();
             assert_eq!(std::fs::read_dir(&workdir).unwrap().count(), 0, "per-chat folder starts empty");
 
-            let t1 = turn_with(&opts, agent, model_name, None, "hello first", &workdir, HarnessLevel::Confined)
+            let t1 = turn_with(&opts, agent, model_name, None, "hello first", &workdir, HarnessLevel::Confined, None)
                 .await
                 .unwrap_or_else(|e| panic!("{agent} turn 1 failed: {e}"));
             assert_eq!(t1.session_id, expected_sid, "{agent} turn 1 session_id");
@@ -2357,11 +2438,148 @@ fn main() {
                 "hello second",
                 &workdir,
                 HarnessLevel::Confined,
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{agent} turn 2 failed: {e}"));
             assert_eq!(t2.session_id, expected_sid, "{agent} turn 2 session_id");
             assert_eq!(t2.text, format!("resumed:{expected_sid}:hello second"));
         }
+    }
+
+    const FAKE_ORCH_CLAUDE_SRC: &str = r#"
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+fn field_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
+}
+
+fn auth_len(body: &str) -> Option<usize> {
+    let key = "\"Authorization\":\"Bearer ";
+    let rest = body.get(body.find(key)? + key.len()..)?;
+    Some(rest.find('"')?)
+}
+
+fn json_str_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("\"{key}\":\"");
+    let rest = body.get(body.find(&pat)? + pat.len()..)?;
+    Some(&rest[..rest.find('"')?])
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).expect("HOME");
+    let config_path = field_after(&args, "--mcp-config").unwrap_or("").to_string();
+    let body = if config_path.is_empty() {
+        String::new()
+    } else {
+        fs::read_to_string(&config_path).unwrap_or_default()
+    };
+    let url = json_str_field(&body, "url").unwrap_or("");
+    let auth = auth_len(&body).unwrap_or(0);
+    let server_ok = body.contains("\"grouper\"");
+    let type_ok = body.contains("\"type\":\"http\"");
+    let resume = field_after(&args, "--resume").unwrap_or("NONE");
+    let allowed = field_after(&args, "--allowedTools").unwrap_or("");
+    let disallowed = field_after(&args, "--disallowedTools").unwrap_or("");
+    let prompt = field_after(&args, "--append-system-prompt").unwrap_or("");
+    let report = format!(
+        "config={config_path}\nurl={url}\nauth_len={auth}\nserver_ok={server_ok}\ntype_ok={type_ok}\nresume={resume}\nallowed={allowed}\ndisallowed={disallowed}\nprompt={prompt}\nargs<<\n{}\n",
+        args.join("\n")
+    );
+    fs::write(PathBuf::from(home).join("orch-report.txt"), report).unwrap();
+    let sid = if resume == "NONE" { "orch-sess".to_string() } else { resume.to_string() };
+    println!(
+        "{{\"type\":\"result\",\"is_error\":false,\"session_id\":\"{sid}\",\"result\":\"ok:{sid}\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}"
+    );
+}
+"#;
+
+    #[tokio::test]
+    async fn claude_orchestrator_turn_records_mcp_flags_and_deletes_config() {
+        let home = TempHome::new("orch-claude");
+        let bin_dir = home.path.join("fake-bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let src = bin_dir.join("fake_orch.rs");
+        std::fs::write(&src, FAKE_ORCH_CLAUDE_SRC).unwrap();
+        let exe = bin_dir.join(if cfg!(windows) { "claude.exe" } else { "claude" });
+        let status = Command::new("rustc")
+            .arg(&src)
+            .arg("-O")
+            .arg("-o")
+            .arg(&exe)
+            .status()
+            .expect("rustc available in cargo test");
+        assert!(status.success(), "compiling fake claude failed");
+
+        let opts = ScanOptions::isolated(&home.path, vec![bin_dir], FIXED_NOW);
+        let workdir = chat_workdir(Some(&home.path.join("ws")), "conv-orch").unwrap();
+        let token = "tok-orch-test";
+        let mcp = core_protocol::HarnessMcp {
+            url: "http://127.0.0.1:9/mcp/orchestrator".into(),
+            bearer_token: token.into(),
+        };
+        let allowed = vec!["mcp__grouper__*".to_string()];
+        let prompt = "You are the orchestrator. Delegate.";
+        let attach = ClaudeOrchestrator {
+            mcp: &mcp,
+            allowed_tools: &allowed,
+            system_prompt: Some(prompt),
+        };
+
+        let t1 = turn_with(
+            &opts,
+            "claude-code",
+            "sonnet",
+            None,
+            "first",
+            &workdir,
+            HarnessLevel::Confined,
+            Some(&attach),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("orchestrator turn 1 failed: {e}"));
+        assert_eq!(t1.session_id, "orch-sess");
+        let report1 = std::fs::read_to_string(home.path.join("orch-report.txt")).unwrap();
+        assert!(!report1.contains(token), "token must not be recorded: {report1}");
+        assert!(report1.contains("url=http://127.0.0.1:9/mcp/orchestrator"), "{report1}");
+        assert!(report1.contains(&format!("auth_len={}", token.len())), "{report1}");
+        assert!(report1.contains("server_ok=true"), "{report1}");
+        assert!(report1.contains("type_ok=true"), "{report1}");
+        assert!(report1.contains("allowed=mcp__grouper__*"), "{report1}");
+        assert!(
+            report1.contains("disallowed=Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit,Task,TodoWrite"),
+            "{report1}"
+        );
+        assert!(report1.contains("prompt=You are the orchestrator. Delegate."), "{report1}");
+        assert!(report1.contains("--mcp-config"), "{report1}");
+        assert!(report1.contains("--append-system-prompt"), "{report1}");
+        assert!(report1.contains("resume=NONE"), "{report1}");
+        let config_path = report1.lines().find_map(|line| line.strip_prefix("config=")).unwrap();
+        assert!(!config_path.is_empty(), "{report1}");
+        assert!(!std::path::Path::new(config_path).exists(), "temp MCP config must be deleted");
+
+        let t2 = turn_with(
+            &opts,
+            "claude-code",
+            "sonnet",
+            Some("orch-sess"),
+            "second",
+            &workdir,
+            HarnessLevel::Confined,
+            Some(&attach),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("orchestrator turn 2 failed: {e}"));
+        assert_eq!(t2.session_id, "orch-sess");
+        assert_eq!(t2.text, "ok:orch-sess");
+        let report2 = std::fs::read_to_string(home.path.join("orch-report.txt")).unwrap();
+        assert!(!report2.contains(token), "token must not be recorded on resume: {report2}");
+        assert!(report2.contains("resume=orch-sess"), "{report2}");
+        assert!(report2.contains("--resume"), "{report2}");
+        let config2 = report2.lines().find_map(|line| line.strip_prefix("config=")).unwrap();
+        assert!(!std::path::Path::new(config2).exists(), "temp MCP config must be deleted after resume");
     }
 }
