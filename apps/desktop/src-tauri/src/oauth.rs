@@ -2,11 +2,10 @@
 //! (`http://127.0.0.1:<port>/oauth/google/return`), which a Desktop-type client may use without
 //! a registered redirect. It must not use port 47600: that is the embedded hub.
 //!
-//! TODO(Desktop OAuth client): the owner has not created the Desktop client yet.
-//!   1. Keep `DEFAULT_DESKTOP_CLIENT_ID` empty until that client exists. Until then set
-//!      `GROUPER_GOOGLE_DESKTOP_CLIENT_ID` (and `GROUPER_GOOGLE_CLIENT_IDS`, which replaces the
-//!      hub's default audience list).
-//!   2. When the id is set, add the same id to `DEFAULT_CLIENT_IDS` in `crates/hub/src/google_auth.rs`.
+//! The Desktop OAuth client ("Grouper Desktop", Google Cloud project `grouper-515912`)
+//! exists; its id is `DEFAULT_DESKTOP_CLIENT_ID` below and is also listed in
+//! `DEFAULT_CLIENT_IDS` in `crates/hub/src/google_auth.rs` so the hub accepts its tokens.
+//! `GROUPER_GOOGLE_DESKTOP_CLIENT_ID` overrides the id when set.
 //!
 //! The client secret is never a plain field in `desktop.json`. Read it from the DPAPI setting,
 //! or from `GROUPER_GOOGLE_DESKTOP_CLIENT_SECRET` when that setting is absent.
@@ -28,10 +27,9 @@ use crate::settings::DesktopSettings;
 
 pub const DESKTOP_CLIENT_ID_ENV: &str = "GROUPER_GOOGLE_DESKTOP_CLIENT_ID";
 pub const DESKTOP_CLIENT_SECRET_ENV: &str = "GROUPER_GOOGLE_DESKTOP_CLIENT_SECRET";
-/// Filled in once the owner creates the Desktop OAuth client in Google Cloud Console.
-/// TODO: leave this empty until that client exists. When it is set, add the same id to
-/// `DEFAULT_CLIENT_IDS` in `crates/hub/src/google_auth.rs`.
-pub const DEFAULT_DESKTOP_CLIENT_ID: &str = "";
+/// Grouper's Desktop OAuth client ("Grouper Desktop", project `grouper-515912`).
+/// The same id is listed in `DEFAULT_CLIENT_IDS` in `crates/hub/src/google_auth.rs`.
+pub const DEFAULT_DESKTOP_CLIENT_ID: &str = "998648431961-cnsmfnl624ctrmrk8b5dp06g09h64qns.apps.googleusercontent.com";
 
 /// Hub listen port. Google's return listener must not bind this.
 const HUB_PORT: u16 = 47600;
@@ -408,7 +406,9 @@ mod tests {
     fn resolves_client_id_from_config_and_builds_loopback_auth_url() {
         let mut settings = DesktopSettings::default();
         if std::env::var_os(DESKTOP_CLIENT_ID_ENV).is_none() {
-            assert!(resolve_oauth_config(&settings).is_none());
+            // No env or settings override: the built-in default client resolves.
+            let default_resolved = resolve_oauth_config(&settings).unwrap();
+            assert_eq!(default_resolved.client_id, DEFAULT_DESKTOP_CLIENT_ID);
             settings.google_desktop_client_id = Some("test-desktop-id.apps.googleusercontent.com".into());
             let resolved = resolve_oauth_config(&settings).unwrap();
             assert_eq!(resolved.client_id, "test-desktop-id.apps.googleusercontent.com");
