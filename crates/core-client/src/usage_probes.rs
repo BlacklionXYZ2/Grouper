@@ -140,14 +140,10 @@ fn provider_present(provider: &str, home: Option<&Path>, cli_found: &dyn Fn(&str
         "antigravity" => ("antigravity", None),
         _ => return false,
     };
-    if cli_found(slug) || credential_file.is_some_and(|p| p.is_file()) {
-        return true;
-    }
+    let found = cli_found(slug) || credential_file.is_some_and(|p| p.is_file());
     #[cfg(target_os = "macos")]
-    if provider == "claude" && home.is_none() && read_claude_keychain_json().is_some() {
-        return true;
-    }
-    false
+    let found = found || (provider == "claude" && home.is_none() && read_claude_keychain_json().is_some());
+    found
 }
 
 fn probe_state() -> &'static tokio::sync::Mutex<Option<ProbeCache>> {
