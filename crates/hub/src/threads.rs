@@ -327,8 +327,7 @@ impl Hub {
         if !internal && !approval_id.starts_with(&format!("{thread_id}-")) {
             return false;
         }
-        self.request_approval_inner(device_id, thread_id, approval_id, None, tool, input, reason, local, None)
-            .await
+        self.request_approval_inner(device_id, thread_id, approval_id, None, tool, input, reason, local, None).await
     }
 
     /// Approval for a standard-chat harness turn, which has no thread. Same dock, push
@@ -353,7 +352,7 @@ impl Hub {
             input,
             reason,
             Some(local),
-            Some(conversation_id),
+            Some(conversation_id.to_string()),
         )
         .await
     }
