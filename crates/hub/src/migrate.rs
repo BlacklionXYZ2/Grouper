@@ -1109,16 +1109,11 @@ async fn drive_move(
         }
 
         if cfg.inject_failure != Some(InjectedFailure::SkipSwitchConfirm) {
-            // Check direct target URL (LAN/local mode) or configured public address.
-            let mut candidates = Vec::new();
-            if let Some(url) = &reported_target_url {
-                candidates.push(url.clone());
-            }
-            if let Some(pub_addr) = hub.db.configured_public_address()
-                && !candidates.contains(&pub_addr)
-            {
-                candidates.push(pub_addr);
-            }
+            // Check direct target URL (LAN/local mode) and public address (configured or default).
+            let candidates = confirm_candidates(
+                reported_target_url.as_deref(),
+                &hub.db.public_address(),
+            );
             let mut found = None;
             for addr in &candidates {
                 if let Ok(info) = fetch_hub_info(&client, addr).await {
@@ -1227,6 +1222,18 @@ async fn drive_move(
             pre_move_backup: Some(pre_move_marker),
         },
     );
+}
+
+fn confirm_candidates(reported_target_url: Option<&str>, public_address: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(url) = reported_target_url.map(str::trim).filter(|s| !s.is_empty()) {
+        candidates.push(url.trim_end_matches('/').to_string());
+    }
+    let pub_addr = public_address.trim().trim_end_matches('/');
+    if !pub_addr.is_empty() && !candidates.iter().any(|c| c == pub_addr) {
+        candidates.push(pub_addr.to_string());
+    }
+    candidates
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1466,7 +1473,7 @@ async fn post_move_status(
 pub struct TargetMoveOptions {
     pub data_dir: PathBuf,
     pub binds: Vec<SocketAddr>,
-    /// Public address to poll when confirming the switch; when `None`, confirms against our own bound address.
+    /// Public address to poll (in addition to local loopback) when confirming the switch; when `None`, confirms against our own bound address.
     pub confirm_address: Option<String>,
     pub confirm_timeout: Duration,
     pub poll_interval: Duration,
@@ -1758,25 +1765,52 @@ pub async fn execute_target_move(
     };
 
     let self_url = format!("http://{}", handle.binds()[0]);
-    let confirm_url = opts.confirm_address.clone().unwrap_or_else(|| self_url.clone());
+    let confirm_url = opts
+        .confirm_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string());
 
-    // Poll confirmation URL until we see our own `target_device_id` at `epoch >= new_epoch`,
-    // or abort if a higher epoch (`epoch + 2` rollback) appears.
+    // Poll local loopback (and `confirm_address` when set) until we see our own
+    // `target_device_id` at `epoch >= new_epoch`, or abort if a higher epoch (`epoch + 2` rollback) appears.
     let deadline = tokio::time::Instant::now() + opts.confirm_timeout;
+    let mut loopback_confirmed = false;
     let mut confirmed = false;
     while tokio::time::Instant::now() < deadline {
-        if let Ok(info) = fetch_hub_info(&client, &confirm_url).await {
-            if info.hub_device_id == commit.target_device_id && info.epoch >= commit.new_epoch {
-                confirmed = true;
-                break;
-            }
-            if info.hub_device_id != commit.target_device_id && info.epoch > commit.new_epoch {
-                handle.stop().await;
-                bail!(
-                    "old hub rolled back with higher epoch {} (ours was {}); discarding target copy",
-                    info.epoch,
-                    commit.new_epoch
-                );
+        if !loopback_confirmed
+            && let Ok(local_info) = fetch_hub_info(&client, &self_url).await
+            && local_info.hub_device_id == commit.target_device_id
+            && local_info.epoch >= commit.new_epoch
+        {
+            loopback_confirmed = true;
+        }
+        if loopback_confirmed {
+            match &confirm_url {
+                None => {
+                    confirmed = true;
+                    break;
+                }
+                Some(url) if url == &self_url => {
+                    confirmed = true;
+                    break;
+                }
+                Some(url) => {
+                    if let Ok(info) = fetch_hub_info(&client, url).await {
+                        if info.hub_device_id == commit.target_device_id && info.epoch >= commit.new_epoch {
+                            confirmed = true;
+                            break;
+                        }
+                        if info.hub_device_id != commit.target_device_id && info.epoch > commit.new_epoch {
+                            handle.stop().await;
+                            bail!(
+                                "old hub rolled back with higher epoch {} (ours was {}); discarding target copy",
+                                info.epoch,
+                                commit.new_epoch
+                            );
+                        }
+                    }
+                }
             }
         }
         tokio::time::sleep(opts.poll_interval).await;
@@ -1784,7 +1818,8 @@ pub async fn execute_target_move(
 
     if !confirmed {
         handle.stop().await;
-        let msg = format!("new hub did not confirm at {confirm_url} within {:?}", opts.confirm_timeout);
+        let check_url = confirm_url.as_deref().unwrap_or(&self_url);
+        let msg = format!("new hub did not confirm at {check_url} within {:?}", opts.confirm_timeout);
         report_status("failed", None, Some(msg.clone()), None).await;
         bail!("{msg}");
     }
@@ -1794,7 +1829,8 @@ pub async fn execute_target_move(
         new_hub.record_hub_since(now());
         new_hub.migrate().set_paused(false);
     }
-    report_status("switched", Some(100), None, Some(self_url)).await;
+    let switched_url = confirm_url.unwrap_or(self_url);
+    report_status("switched", Some(100), None, Some(switched_url)).await;
     Ok(handle)
 }
 
@@ -2874,6 +2910,203 @@ mod tests {
         let _ = node_stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), node_task).await;
         handle.stop().await;
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn confirm_candidates_includes_default_and_configured_public_address() {
+        let dir = std::env::temp_dir().join(format!("grouper-confirm-cands-{}", random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+
+        // With no custom public_address set, `db.public_address()` is DEFAULT_PUBLIC_ADDRESS.
+        assert_eq!(db.configured_public_address(), None);
+        assert_eq!(db.public_address(), crate::tunnel::DEFAULT_PUBLIC_ADDRESS);
+        assert_eq!(
+            confirm_candidates(None, &db.public_address()),
+            vec![crate::tunnel::DEFAULT_PUBLIC_ADDRESS.to_string()]
+        );
+        assert_eq!(
+            confirm_candidates(Some("http://127.0.0.1:47600/"), &db.public_address()),
+            vec![
+                "http://127.0.0.1:47600".to_string(),
+                crate::tunnel::DEFAULT_PUBLIC_ADDRESS.to_string(),
+            ]
+        );
+
+        // With a custom public_address in Settings, uses that and deduplicates matching reported URLs.
+        db.set_public_address(Some("https://hub.example.org/")).unwrap();
+        assert_eq!(
+            confirm_candidates(None, &db.public_address()),
+            vec!["https://hub.example.org".to_string()]
+        );
+        assert_eq!(
+            confirm_candidates(Some("https://hub.example.org"), &db.public_address()),
+            vec!["https://hub.example.org".to_string()]
+        );
+
+        drop(db);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn desktop_style_target_confirms_via_public_address_and_loopback() {
+        let root = std::env::temp_dir().join(format!("grouper-desktop-confirm-move-{}", random_hex(4)));
+        let old_dir = root.join("old-hub");
+        let new_dir = root.join("new-hub");
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let old_handle = host::start(&old_dir, &[loopback]).await.unwrap();
+        let old_hub = old_handle.hub().unwrap();
+        setup_test_owner(&old_hub, "sub-desktop-move").await;
+        old_hub.migrate().set_config(MigrateConfig {
+            confirm_timeout: Duration::from_secs(10),
+            copy_timeout: Duration::from_secs(15),
+            poll_interval: Duration::from_millis(30),
+            inject_failure: None,
+        });
+
+        let old_url = format!("http://{}", old_handle.binds()[0]);
+        let reserved = tokio::net::TcpListener::bind(loopback).await.unwrap();
+        let new_bind = reserved.local_addr().unwrap();
+        drop(reserved);
+        let new_expected_url = format!("http://{new_bind}");
+
+        // Simulated public tunnel endpoint: serves `/v1/hub` from `new_expected_url` once the target
+        // hub comes up on `new_bind`, falling back to `old_url` before the cutover.
+        let old_for_pub = old_url.clone();
+        let new_for_pub = new_expected_url.clone();
+        let pub_app = Router::new().route(
+            "/v1/hub",
+            get(move || {
+                let old_u = old_for_pub.clone();
+                let new_u = new_for_pub.clone();
+                async move {
+                    let c = reqwest::Client::builder()
+                        .timeout(Duration::from_millis(200))
+                        .build()
+                        .unwrap();
+                    if let Ok(info) = fetch_hub_info(&c, &new_u).await {
+                        return Json(info).into_response();
+                    }
+                    match fetch_hub_info(&c, &old_u).await {
+                        Ok(info) => Json(info).into_response(),
+                        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+                    }
+                }
+            }),
+        );
+        let pub_listener = tokio::net::TcpListener::bind(loopback).await.unwrap();
+        let pub_url = format!("http://{}", pub_listener.local_addr().unwrap());
+        let pub_task = tokio::spawn(async move {
+            let _ = axum::serve(pub_listener, pub_app).await;
+        });
+
+        old_hub.db.set_public_address(Some(&pub_url)).unwrap();
+        let (_admin, admin_token) = old_hub.db.add_device("Admin", "windows", true).unwrap();
+        let pc_install = "target_win_pc_install_1234";
+        let pc_node = old_hub
+            .db
+            .issue_device(
+                "Oscar's Windows PC",
+                "windows",
+                false,
+                Some(crate::db::Install { id: pc_install, kind: crate::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+        let target_id = pc_node.device.id.clone();
+
+        let (offer_tx, offer_rx) = oneshot::channel();
+        let (commit_tx, commit_rx) = oneshot::channel();
+        let events = Arc::new(TestTargetEvents {
+            offer_tx: Mutex::new(Some(offer_tx)),
+            commit_tx: Mutex::new(Some(commit_tx)),
+        });
+        let (node_stop_tx, node_stop_rx) = watch::channel(false);
+        let client_cfg = core_client::Config {
+            hub_url: old_url.clone(),
+            token: pc_node.token.clone(),
+            capabilities: vec![],
+            workspace_root: None,
+            allow_shell: false,
+            mcp_config: None,
+            folders: vec![],
+            usage_probes: false,
+        };
+        let host_info = NodeHostInfo {
+            can_host: true,
+            app_version: HUB_VERSION.into(),
+            free_bytes: Some(10_000_000_000),
+            cloudflared: true,
+        };
+        let node_task = tokio::spawn(core_client::run_with_host(
+            client_cfg,
+            Some(host_info),
+            Arc::new(NoopTools),
+            events,
+            node_stop_rx,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if old_hub.is_online(&target_id).await
+                    && old_hub.host_info_for(&target_id).is_some_and(|h| h.can_host)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("desktop target node connected");
+
+        let old_url_t = old_url.clone();
+        let target_tok_t = pc_node.token.clone();
+        let pub_url_t = pub_url.clone();
+        let new_dir_t = new_dir.clone();
+        let target_runner = tokio::spawn(async move {
+            let offer = tokio::time::timeout(Duration::from_secs(10), offer_rx).await.unwrap().unwrap();
+            let mut opts = TargetMoveOptions::new(new_dir_t, vec![new_bind]);
+            opts.confirm_address = Some(pub_url_t);
+            opts.confirm_timeout = Duration::from_secs(10);
+            opts.poll_interval = Duration::from_millis(30);
+            execute_target_move(&old_url_t, &target_tok_t, offer, opts, commit_rx).await
+        });
+
+        let http = reqwest::Client::new();
+        let id_token = fresh_owner_token(&http, &old_url, "sub-desktop-move").await;
+        let start = http
+            .post(format!("{old_url}/v1/hub/move"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"target_device": target_id, "id_token": id_token, "threads": "stop"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start.status(), reqwest::StatusCode::ACCEPTED);
+
+        let new_handle = tokio::time::timeout(Duration::from_secs(15), target_runner)
+            .await
+            .expect("desktop target move finished")
+            .unwrap()
+            .expect("desktop target move succeeded");
+
+        let mut move_rx = old_hub.migrate().subscribe();
+        tokio::time::timeout(Duration::from_secs(10), move_rx.wait_for(|s| s.state == MovePhase::Done))
+            .await
+            .expect("old hub confirmed via public address and finished")
+            .unwrap();
+
+        assert!(old_handle.is_stepped_down());
+        let step_info = old_hub.stepdown().info().unwrap();
+        assert_eq!(step_info.address, pub_url);
+        assert_eq!(step_info.peer_hub_device_id, target_id);
+        assert_eq!(step_info.peer_epoch, 2);
+
+        let _ = node_stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), node_task).await;
+        pub_task.abort();
+        new_handle.stop().await;
+        old_handle.stop().await;
         fs::remove_dir_all(&root).ok();
     }
 }
