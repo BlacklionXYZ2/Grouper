@@ -47,6 +47,10 @@ const FREE_LIMIT_DEDUPE_SECS: u64 = 60;
 
 pub use core_registry::cost::parse_time;
 
+#[cfg(test)]
+#[path = "usage_summary_tests.rs"]
+mod summary_tests;
+
 impl Db {
     /// Totals in the half-open time range `[since, until)`, optionally for one
     /// conversation and/or one provider id.
@@ -76,7 +80,7 @@ impl Db {
             )
         };
         // Providers without their keys, so the summary does not depend on the master key.
-        let providers: Vec<(String, String, Option<String>, Option<String>)> = {
+        let providers: Vec<ProviderRow> = {
             let c = self.c();
             let mut statement = c.prepare("SELECT id, kind, base_url, options FROM providers ORDER BY id")?;
             statement
@@ -94,8 +98,7 @@ impl Db {
         for model in &models {
             registry.entry((model.provider_id.as_str(), model.model.as_str())).or_insert(model);
         }
-        let provider_by_id: HashMap<&str, &(String, String, Option<String>, Option<String>)> =
-            providers.iter().map(|p| (p.0.as_str(), p)).collect();
+        let provider_by_id: HashMap<&str, &ProviderRow> = providers.iter().map(|p| (p.0.as_str(), p)).collect();
 
         let mut keys: Vec<UsageSummaryKey> = providers
             .iter()
@@ -411,6 +414,9 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
+
+/// A provider row without its key: id, kind, base URL, `options.via_device`.
+type ProviderRow = (String, String, Option<String>, Option<String>);
 
 fn add_totals(into: &mut UsageTotals, from: &UsageTotals) {
     into.calls += from.calls;

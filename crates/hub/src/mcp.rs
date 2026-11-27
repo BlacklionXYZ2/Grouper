@@ -273,6 +273,14 @@ mod tests {
         assert!(!reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: []})).as_ref()));
         assert!(reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: true})).as_ref()));
         assert!(reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: ["claude", "codex"]})).as_ref()));
+
+        // The advertised providers: sanitised, lower-cased, no repeats; `true` means every provider the hub knows.
+        let providers = |value: Value| reported_usage_probe_providers(meta(value).as_ref());
+        assert!(reported_usage_probe_providers(None).is_empty());
+        assert!(providers(json!({})).is_empty());
+        assert!(providers(json!({USAGE_PROBES_META_KEY: false})).is_empty());
+        assert_eq!(providers(json!({USAGE_PROBES_META_KEY: ["Claude", "grok", "claude", "bad name", "", 7, "antigravity"]})), ["claude", "grok", "antigravity"]);
+        assert_eq!(providers(json!({USAGE_PROBES_META_KEY: true})), ["claude", "codex", "grok", "antigravity"]);
     }
 
     #[test]
