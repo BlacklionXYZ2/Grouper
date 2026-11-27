@@ -281,10 +281,15 @@
 }
 
 .tv-plan-title {
+  /* Instrument-style eyebrow: mono micro, uppercase. */
   margin: 0;
-  font-size: var(--type-ui-size);
+  font-family: var(--mono);
+  font-size: var(--type-micro-size);
+  line-height: var(--type-micro-lh);
   font-weight: 600;
-  color: var(--text);
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-3);
 }
 
 .tv-plan-count {

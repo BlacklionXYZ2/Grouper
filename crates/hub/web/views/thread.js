@@ -861,8 +861,8 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
     const { call, result } = row;
     setChildren(
       row.body,
-      call.input !== null && call.input !== undefined ? [h('span', { class: 'label' }, 'Input'), h('pre', { class: 'code', 'aria-label': `${call.name} input` }, pretty(call.input))] : null,
-      result ? [h('span', { class: 'label' }, 'Output'), h('pre', { class: 'code', 'aria-label': `${call.name} output` }, result.output || '(empty)')] : null,
+      call.input !== null && call.input !== undefined ? [h('span', { class: 'label' }, 'Tool input'), h('pre', { class: 'code', 'aria-label': `${call.name} input` }, pretty(call.input))] : null,
+      result ? [h('span', { class: 'label' }, 'Tool output'), h('pre', { class: 'code', 'aria-label': `${call.name} output` }, result.output || '(empty)')] : null,
     );
     setToolState(row, t());
   }

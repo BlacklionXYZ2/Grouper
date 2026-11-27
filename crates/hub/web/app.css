@@ -2830,8 +2830,13 @@ button.strip:hover {
 }
 
 .tool-row .tool-body .label {
+  /* Same as .label-mono: the TOOL INPUT / TOOL OUTPUT eyebrow. */
+  font-family: var(--mono);
   font-size: var(--type-micro-size);
+  line-height: var(--type-micro-lh);
   font-weight: 600;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
   color: var(--text-4);
 }
 
@@ -5734,9 +5739,12 @@ dialog.sheet-dialog.model-picker {
 
 .mp-provider-id {
   font-family: var(--mono);
-  font-size: var(--type-caption-size);
+  font-size: var(--type-micro-size);
+  line-height: var(--type-micro-lh);
   font-weight: 600;
-  color: var(--text);
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-2);
 }
 
 .mp-option {
@@ -6633,6 +6641,7 @@ dialog.command-palette::backdrop {
 
 .palette-group {
   margin: 10px 10px 4px;
+  font-family: var(--mono);
   font-size: var(--type-micro-size);
   font-weight: 600;
   letter-spacing: 0.7px;
