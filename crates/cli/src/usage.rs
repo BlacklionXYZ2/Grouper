@@ -8,7 +8,7 @@ use crate::Api;
 
 #[derive(Args)]
 pub struct UsageArgs {
-    /// Start of the range: a relative duration such as 7d, a UTC date, or a Unix timestamp.
+    /// Start of the range: a relative duration such as 7d, a UTC date, a Unix timestamp, or an RFC 3339 time.
     #[arg(long)]
     since: Option<String>,
     /// End of the range (a date includes that whole UTC day).
@@ -161,6 +161,18 @@ fn display_provider(provider: &str) -> String {
     }
 }
 
+/// What a window row is called: `Claude 5h`, `Claude 7d:fable`, or with the provider's own scope
+/// label `Antigravity Gemini Models 5h` (the label, then the span without its `:<scope>`).
+fn window_title(provider: &str, row: &UsageSnapshot) -> String {
+    match row.label.as_deref().map(str::trim).filter(|label| !label.is_empty()) {
+        Some(label) => {
+            let span = row.window.split(':').next().unwrap_or(&row.window);
+            format!("{provider} {label} {span}")
+        }
+        None => format!("{provider} {}", row.window),
+    }
+}
+
 fn format_reset_time(resets_at: u64, now: u64) -> String {
     let days = (resets_at / 86_400) as i64;
     let sod = resets_at % 86_400;
@@ -227,7 +239,7 @@ fn format_balances(rows: &[UsageSnapshot], devices: &HashMap<String, (String, bo
                 .resets_at
                 .map(|ts| format!(" (resets {})", format_reset_time(ts, now)))
                 .unwrap_or_default();
-            let _ = writeln!(out, "{provider} {}: {pct}{reset}  {tag}", row.window);
+            let _ = writeln!(out, "{}: {pct}{reset}  {tag}", window_title(&provider, row));
         }
     }
 
@@ -388,5 +400,31 @@ mod tests {
         assert!(rendered.contains("Codex 7d: 18.5% (resets 2026-11-28 14:05 UTC)  [Mac, offline, 1h ago]"), "{rendered}");
         assert!(rendered.contains("Codex: unavailable: HTTP 403  [PC, 5s ago]"), "{rendered}");
         assert!(rendered.contains("openrouter"), "{rendered}");
+    }
+
+    #[test]
+    fn labelled_windows_print_the_label_then_the_span() {
+        let now = 1_795_608_000;
+        let row = |window: &str, label: Option<&str>| UsageSnapshot {
+            account: "antigravity".into(),
+            provider: "antigravity".into(),
+            kind: "window".into(),
+            window: window.into(),
+            used_pct: Some(1.0),
+            used_amount: None,
+            limit_amount: None,
+            currency: None,
+            resets_at: None,
+            source: "probe".into(),
+            device_id: None,
+            fetched_at: now,
+            label: label.map(String::from),
+            account_key: None,
+        };
+        let rows = vec![row("5h:gemini", Some("Gemini Models")), row("7d:third_party", Some("Claude and GPT Models")), row("7d:fable", None)];
+        let rendered = format_balances(&rows, &HashMap::new(), now);
+        assert!(rendered.contains("Antigravity Gemini Models 5h: 1%"), "{rendered}");
+        assert!(rendered.contains("Antigravity Claude and GPT Models 7d: 1%"), "{rendered}");
+        assert!(rendered.contains("Antigravity 7d:fable: 1%"), "{rendered}");
     }
 }

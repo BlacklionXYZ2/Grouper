@@ -184,7 +184,7 @@ CREATE TABLE IF NOT EXISTS tools (
   available INTEGER NOT NULL DEFAULT 1, input_schema TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (device_id, name));
 CREATE TABLE IF NOT EXISTS providers (
-  id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}');
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}', color TEXT);
 CREATE TABLE IF NOT EXISTS models (
   id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, input_price REAL NOT NULL DEFAULT 0,
   output_price REAL NOT NULL DEFAULT 0, cache_read_price REAL, cache_write_price REAL,
@@ -217,7 +217,7 @@ CREATE TABLE IF NOT EXISTS usage (
 CREATE TABLE IF NOT EXISTS usage_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL,
   window TEXT NOT NULL, used_pct REAL, used_amount REAL, limit_amount REAL, currency TEXT, resets_at INTEGER,
-  source TEXT NOT NULL, device_id TEXT, fetched_at INTEGER NOT NULL);
+  source TEXT NOT NULL, device_id TEXT, fetched_at INTEGER NOT NULL, label TEXT, account_key TEXT);
 CREATE INDEX IF NOT EXISTS usage_snapshots_latest ON usage_snapshots
   (provider, account, kind, window, fetched_at DESC);
 ";
@@ -423,6 +423,16 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "conversations", "harness_session", "ALTER TABLE conversations ADD COLUMN harness_session TEXT")?;
     ensure_column(&conn, "threads", "harness_session", "ALTER TABLE threads ADD COLUMN harness_session TEXT")?;
     ensure_column(&conn, "usage", "billing", "ALTER TABLE usage ADD COLUMN billing TEXT NOT NULL DEFAULT 'api'")?;
+    // Key colour (a name from `core_protocol::KEY_COLORS`); existing providers get one in creation order.
+    ensure_column(&conn, "providers", "color", "ALTER TABLE providers ADD COLUMN color TEXT")?;
+    assign_missing_provider_colors(&conn)?;
+    // The provider's own name for a usage window's scope (Antigravity group, Grok product).
+    ensure_column(&conn, "usage_snapshots", "label", "ALTER TABLE usage_snapshots ADD COLUMN label TEXT")?;
+    // Opaque fingerprint of the subscription account a reading came from (merges cards across devices).
+    ensure_column(&conn, "usage_snapshots", "account_key", "ALTER TABLE usage_snapshots ADD COLUMN account_key TEXT")?;
+    // Subscription usage probes the device advertised on its last connection.
+    ensure_column(&conn, "devices", "usage_probes", "ALTER TABLE devices ADD COLUMN usage_probes INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "devices", "usage_probe_providers", "ALTER TABLE devices ADD COLUMN usage_probe_providers TEXT NOT NULL DEFAULT '[]'")?;
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
     ensure_column(&conn, "devices", "folders", "ALTER TABLE devices ADD COLUMN folders TEXT NOT NULL DEFAULT '[]'")?;
@@ -466,6 +476,102 @@ fn migrate_dotted_tool_names(conn: &Connection) -> Result<()> {
         "UPDATE OR IGNORE tools SET name = replace(name, '.', '_') WHERE instr(name, '.') > 0;
          DELETE FROM tools WHERE instr(name, '.') > 0;",
     )?;
+    Ok(())
+}
+
+/// The key colour a provider takes first because it clearly belongs to one maker: Anthropic pink,
+/// OpenAI blue, Google teal, DeepSeek cyan, Mistral rose (`docs/usage-tab-spec.md` 4.4).
+///
+/// An endpoint on a known maker host decides. With an endpoint on any other host (OpenRouter, a
+/// local server, a proxy) only an id that is exactly the maker's name counts. With no endpoint the
+/// provider kind decides (`anthropic` is Anthropic, `openai` is OpenAI's own endpoint), then the id.
+fn maker_color(id: &str, kind: &str, base_url: Option<&str>) -> Option<&'static str> {
+    const MAKERS: [(&str, &[&str], &[&str]); 5] = [
+        ("pink", &["anthropic.com"], &["anthropic", "claude"]),
+        ("blue", &["openai.com"], &["openai"]),
+        ("teal", &["googleapis.com", "google.com"], &["google", "gemini"]),
+        ("cyan", &["deepseek.com"], &["deepseek"]),
+        ("rose", &["mistral.ai"], &["mistral"]),
+    ];
+    let id = id.trim().to_ascii_lowercase();
+    let host = base_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .and_then(|url| url::Url::parse(url).ok())
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    for (color, hosts, words) in MAKERS {
+        let matched = match &host {
+            Some(host) => {
+                hosts.iter().any(|h| host == h || host.ends_with(&format!(".{h}"))) || words.contains(&id.as_str())
+            }
+            None => {
+                (kind == "anthropic" && color == "pink")
+                    || (kind == "openai" && color == "blue" && id != "scripted")
+                    || words.iter().any(|w| id.contains(w))
+            }
+        };
+        if matched {
+            return Some(color);
+        }
+    }
+    None
+}
+
+/// The colour for a provider, given how many other keys use each colour: the maker's colour if it is
+/// unused, else the first unused colour in the fixed order, else the colour the fewest keys use.
+fn pick_key_color(used: &HashMap<String, usize>, preferred: Option<&'static str>) -> &'static str {
+    let count = |color: &str| used.get(color).copied().unwrap_or(0);
+    if let Some(color) = preferred.filter(|color| count(color) == 0) {
+        return color;
+    }
+    if let Some(color) = core_protocol::KEY_COLORS.iter().copied().find(|color| count(color) == 0) {
+        return color;
+    }
+    // `min_by_key` keeps the first of equals, so ties go to the earlier colour in the fixed order.
+    core_protocol::KEY_COLORS.iter().copied().min_by_key(|color| count(color)).unwrap_or("teal")
+}
+
+/// Give provider `id` a colour if it is a non-harness provider without a valid one. Returns its colour.
+/// Harness providers (subscription entries) get none. Runs inside whatever transaction `conn` is in.
+fn assign_provider_color(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let row: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row("SELECT kind, base_url, color FROM providers WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?;
+    let Some((kind, base_url, color)) = row else { return Ok(None) };
+    if kind == "harness" {
+        return Ok(None);
+    }
+    if let Some(color) = color.as_deref().and_then(core_protocol::parse_key_color) {
+        return Ok(Some(color.to_string()));
+    }
+    let mut used: HashMap<String, usize> = HashMap::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT color, COUNT(*) FROM providers WHERE id != ?1 AND kind != 'harness' AND color IS NOT NULL GROUP BY color",
+        )?;
+        let rows = statement.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)))?;
+        for row in rows {
+            let (color, count) = row?;
+            used.insert(color, count);
+        }
+    }
+    let color = pick_key_color(&used, maker_color(id, &kind, base_url.as_deref()));
+    conn.execute("UPDATE providers SET color = ?1 WHERE id = ?2", params![color, id])?;
+    Ok(Some(color.to_string()))
+}
+
+/// Colour every non-harness provider that has none, oldest first, so a hub that predates key
+/// colours ends up with distinct colours that stay put. Safe to repeat.
+fn assign_missing_provider_colors(conn: &Connection) -> Result<()> {
+    let ids: Vec<String> = {
+        let mut statement = conn.prepare("SELECT id FROM providers WHERE kind != 'harness' ORDER BY rowid")?;
+        statement.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in ids {
+        assign_provider_color(conn, &id)?;
+    }
     Ok(())
 }
 
@@ -1240,13 +1346,74 @@ impl Db {
             .filter(|key| !key.is_empty())
             .map(|key| self.secrets.seal(key))
             .transpose()?;
-        self.c().execute(
+        // The colour column is left out of the conflict update, so a full provider PUT keeps it; a new
+        // provider gets one in the same transaction.
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute(
             "INSERT INTO providers (id, kind, base_url, api_key, options) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, base_url = excluded.base_url,
                api_key = COALESCE(excluded.api_key, providers.api_key), options = excluded.options",
             params![p.id, p.kind, p.base_url, api_key, options],
         )?;
+        assign_provider_color(&tx, &p.id)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Key colours by provider id (providers without one, such as harnesses, are absent).
+    pub fn provider_colors(&self) -> HashMap<String, String> {
+        let c = self.c();
+        let Ok(mut statement) = c.prepare("SELECT id, color FROM providers WHERE color IS NOT NULL") else {
+            return HashMap::new();
+        };
+        statement
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    /// Set provider `id`'s key colour to a palette name, or with `None` clear it and pick one
+    /// automatically. `Ok(false)` means no such provider; a name outside the palette is an error.
+    pub fn set_provider_color(&self, id: &str, color: Option<&str>) -> Result<bool> {
+        let canonical = match color {
+            Some(name) => Some(
+                core_protocol::parse_key_color(name)
+                    .with_context(|| format!("color must be one of {}", core_protocol::KEY_COLORS.join(", ")))?,
+            ),
+            None => None,
+        };
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let changed = tx.execute("UPDATE providers SET color = ?1 WHERE id = ?2", params![canonical, id])?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        if canonical.is_none() {
+            assign_provider_color(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Remember the subscription usage probes a device advertised on its latest connection.
+    pub fn set_device_usage_probes(&self, id: &str, enabled: bool, providers: &[String]) {
+        let json = serde_json::to_string(providers).unwrap_or_else(|_| "[]".into());
+        let _ = self.c().execute(
+            "UPDATE devices SET usage_probes = ?1, usage_probe_providers = ?2 WHERE id = ?3",
+            params![enabled, json, id],
+        );
+    }
+
+    /// The probes a device advertised on its last connection (kept while it is offline).
+    pub fn device_usage_probes(&self, id: &str) -> (bool, Vec<String>) {
+        self.c()
+            .query_row("SELECT usage_probes, usage_probe_providers FROM devices WHERE id = ?1", [id], |r| {
+                Ok((r.get::<_, bool>(0)?, r.get::<_, String>(1)?))
+            })
+            .ok()
+            .map(|(enabled, json)| (enabled, serde_json::from_str(&json).unwrap_or_default()))
+            .unwrap_or_default()
     }
 
     pub fn providers(&self) -> Result<Vec<ProviderConfig>> {
@@ -2601,7 +2768,7 @@ mod tests {
         let conn = Connection::open(dir.join("grouper.db")).unwrap();
         conn.execute_batch(
             "CREATE TABLE providers (
-               id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}');
+               id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}', color TEXT);
              CREATE TABLE models (
                id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL,
                input_price REAL NOT NULL DEFAULT 0, output_price REAL NOT NULL DEFAULT 0,

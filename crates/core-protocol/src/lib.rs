@@ -82,6 +82,14 @@ pub struct DeviceInfo {
     /// Scoped folders the device last reported (names and modes, never paths).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<FolderInfo>,
+    /// Whether the device's latest connection advertised opted-in subscription usage
+    /// probes. Kept after it disconnects, so an offline device still shows it.
+    #[serde(default)]
+    pub usage_probes: bool,
+    /// The probe providers (`claude`, `codex`, `grok`, `antigravity`) that connection
+    /// advertised. Empty when `usage_probes` is false.
+    #[serde(default)]
+    pub usage_probe_providers: Vec<String>,
 }
 
 /// What threads may do in a device's scoped folder.
@@ -1235,6 +1243,90 @@ pub struct ProviderInfo {
     /// Kind-specific non-secret options (API keys never leave the hub here).
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub options: Value,
+    /// Key colour, one of [`KEY_COLORS`]. Stored on the hub, never part of [`ProviderConfig`],
+    /// so a full provider `PUT` keeps it. Harness providers have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// The ten key colours, in the order auto-assignment takes them (`docs/usage-tab-spec.md` 4.4).
+pub const KEY_COLORS: [&str; 10] =
+    ["teal", "purple", "orange", "pink", "blue", "green", "amber", "rose", "indigo", "cyan"];
+
+/// The canonical (lower-case) key colour named by `name`, ignoring case and surrounding space.
+pub fn parse_key_color(name: &str) -> Option<&'static str> {
+    let name = name.trim();
+    KEY_COLORS.iter().copied().find(|color| color.eq_ignore_ascii_case(name))
+}
+
+/// Counts and cost for one slice of metered usage: [`UsageTotal`] without its key.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct UsageTotals {
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cost: f64,
+}
+
+/// One model used through a key in `GET /v1/usage/summary`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageSummaryModel {
+    /// The provider's model string as recorded with the call.
+    pub model: String,
+    /// Registry display name, else the model string.
+    pub name: String,
+    pub free: bool,
+    pub local: bool,
+    /// False when the registry entry has no price and is neither free nor local.
+    pub priced: bool,
+    pub totals: UsageTotals,
+}
+
+/// One API key (provider) in `GET /v1/usage/summary`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageSummaryKey {
+    pub provider: String,
+    /// Provider kind (`anthropic`, `openai`, …), or `unknown` for a removed provider.
+    pub kind: String,
+    /// Key colour name; `None` (JSON `null`) for a removed provider.
+    pub color: Option<String>,
+    pub local: bool,
+    pub removed: bool,
+    pub totals: UsageTotals,
+    pub models: Vec<UsageSummaryModel>,
+}
+
+/// Subscription-billed usage of one harness provider in `GET /v1/usage/summary`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageSummarySubscription {
+    /// Harness provider id, `<harness>@<device_id>`.
+    pub provider: String,
+    /// Probe provider name the readings use (`claude`, `codex`, `grok`, `antigravity`),
+    /// or the harness slug when it has no probe.
+    pub harness: String,
+    pub device_id: Option<String>,
+    pub totals: UsageTotals,
+}
+
+/// `GET /v1/usage/summary`: one call for the Usage tab's donut and key list.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageSummary {
+    pub since: u64,
+    pub until: u64,
+    /// Metered API usage only (`billing = 'api'`).
+    pub total: UsageTotals,
+    /// API calls in range whose model has no price set.
+    pub unpriced_calls: u64,
+    pub keys: Vec<UsageSummaryKey>,
+    pub subscriptions: Vec<UsageSummarySubscription>,
 }
 
 /// Body of `POST /v1/devices/{id}/call`.
@@ -1774,6 +1866,8 @@ mod tests {
                 }],
                 last_seen: Some(123),
                 folders: vec![],
+                usage_probes: false,
+                usage_probe_providers: vec![],
             }],
         };
         let value = serde_json::to_value(&msg).unwrap();
