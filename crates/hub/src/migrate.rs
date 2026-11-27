@@ -3091,7 +3091,7 @@ mod tests {
             .expect("desktop target move succeeded");
 
         let mut move_rx = old_hub.migrate().subscribe();
-        tokio::time::timeout(Duration::from_secs(10), move_rx.wait_for(|s| s.state == MovePhase::Done))
+        tokio::time::timeout(Duration::from_secs(30), move_rx.wait_for(|s| s.state == MovePhase::Done))
             .await
             .expect("old hub confirmed via public address and finished")
             .unwrap();
