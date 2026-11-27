@@ -10,9 +10,9 @@
   flex-direction: column;
   max-height: min(70dvh, 620px);
   background: var(--surface);
-  border: 1px solid var(--border-strong);
-  border-top: 2px solid color-mix(in srgb, var(--fam-qwen) 68%, var(--border-strong));
-  border-radius: var(--radius);
+  border: 1px solid var(--line-3);
+  border-top: 2px solid color-mix(in srgb, var(--fam-qwen) 68%, var(--line-3));
+  border-radius: var(--r-card);
   box-shadow: var(--shadow);
   overflow: hidden;
 }
@@ -55,10 +55,10 @@
 
 .dock-title {
   margin: 0;
-  font-size: 17px;
+  font-size: var(--type-heading-size);
   font-weight: 600;
-  line-height: 1.3;
-  letter-spacing: -0.01em;
+  line-height: var(--type-heading-lh);
+  letter-spacing: var(--type-heading-track);
   color: var(--text);
 }
 
@@ -75,9 +75,9 @@
   flex: none;
   width: 30px;
   height: 30px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: color-mix(in srgb, var(--fam-qwen) 14%, var(--surface));
-  border: 1px solid color-mix(in srgb, var(--fam-qwen) 36%, var(--border));
+  border: 1px solid color-mix(in srgb, var(--fam-qwen) 36%, var(--line-2));
   color: var(--fam-qwen);
   margin-top: 1px;
 }
@@ -99,8 +99,8 @@
 }
 
 .dock-tool {
-  font-size: 14px;
-  line-height: 1.4;
+  font-size: var(--type-ui-size);
+  line-height: var(--type-ui-lh);
   color: var(--text-2);
   overflow-wrap: anywhere;
 }
@@ -111,7 +111,7 @@
 }
 
 .dock-sep {
-  color: var(--text-3);
+  color: var(--text-4);
 }
 
 .dock-device {
@@ -123,8 +123,8 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 4px 5px;
-  font-size: 12.5px;
-  line-height: 1.4;
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-lh);
   color: var(--text-3);
 }
 
@@ -141,17 +141,17 @@
 .dock-thread .fam-mark {
   width: 18px;
   height: 18px;
-  font-size: 9.5px;
-  border-radius: 5px;
+  font-size: var(--type-micro-size);
+  border-radius: var(--r-chip);
 }
 
 .dock-model .mono {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
 }
 
 .dock-chat {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   color: var(--text-3);
 }
 
@@ -161,7 +161,7 @@
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding: 12px 16px;
   display: grid;
   gap: 10px;
@@ -171,18 +171,18 @@
 
 .dock-reason-plain {
   margin: 0;
-  font-size: 15px;
-  line-height: 1.5;
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-lh);
   color: var(--text);
   overflow-wrap: anywhere;
 }
 
 /* Risk-rule requests keep an explicit danger callout with warning icon + prefix. */
 .dock-reason.risk {
-  font-size: 15px;
-  line-height: 1.5;
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-lh);
   padding: 10px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--danger-soft);
   border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
   color: var(--text);
@@ -199,9 +199,9 @@
 }
 
 .dock-reason.risk .reason-kind {
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
+  letter-spacing: var(--type-caption-track);
   text-transform: uppercase;
   color: var(--danger);
   margin-bottom: 2px;
@@ -209,8 +209,8 @@
 
 /* "View exact input": full-width rounded disclosure row with chevron. */
 .dock-input {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-control);
   background: var(--surface-2);
 }
 
@@ -225,13 +225,13 @@
   width: 100%;
   min-height: 40px;
   padding: 8px 12px;
-  border-radius: calc(var(--radius-sm) - 1px);
-  font-size: 13.5px;
+  border-radius: calc(var(--r-control) - 1px);
+  font-size: var(--type-ui-size);
   font-weight: 500;
   color: var(--text);
   cursor: pointer;
   list-style: none;
-  transition: background 0.15s var(--ease);
+  transition: background var(--dur-fast) var(--ease-out);
 }
 
 .dock-input > summary:hover {
@@ -241,7 +241,7 @@
 .dock-input > summary:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: -2px;
-  border-radius: calc(var(--radius-sm) - 1px);
+  border-radius: calc(var(--r-control) - 1px);
 }
 
 .dock-input > summary::-webkit-details-marker,
@@ -267,11 +267,11 @@
   height: 16px;
   color: var(--text-3);
   margin-left: auto;
-  transition: rotate 0.15s var(--ease);
+  transition: rotate var(--dur-fast) var(--ease-out);
 }
 
 .dock-input[open] > summary {
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
   border-bottom-left-radius: 0;
   border-bottom-right-radius: 0;
 }
@@ -284,7 +284,7 @@
   margin: 0;
   max-height: 200px;
   border: none;
-  border-radius: 0 0 calc(var(--radius-sm) - 1px) calc(var(--radius-sm) - 1px);
+  border-radius: 0 0 calc(var(--r-control) - 1px) calc(var(--r-control) - 1px);
   background: var(--bg);
   padding: 10px 12px;
 }
@@ -299,7 +299,7 @@
 }
 
 .approval-dock.is-settled .dock-foot {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding-top: 12px;
 }
 
@@ -312,9 +312,9 @@
 .approval-actions .btn {
   min-height: 44px;
   padding: 8px 16px;
-  font-size: 15px;
+  font-size: var(--type-body-size);
   font-weight: 600;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
 }
 
 .approval-actions .btn .icon {
@@ -326,7 +326,7 @@
    --text-3 on --surface-2 stays >= 5.4:1 light / 7.1:1 dark so the label remains legible. */
 .dock-approve:disabled {
   background: var(--surface-2);
-  border-color: var(--border);
+  border-color: var(--line-2);
   color: var(--text-3);
   opacity: 0.85;
   cursor: not-allowed;
@@ -337,8 +337,8 @@
 }
 
 .dock-gate {
-  font-size: 12px;
-  line-height: 1.4;
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-lh);
   color: var(--text-3);
   text-align: center;
 }
@@ -349,13 +349,13 @@
   justify-content: space-between;
   gap: 8px;
   padding-top: 2px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
 }
 
 .dock-nav {
   min-height: 28px;
   padding: 2px 8px;
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 500;
   color: var(--text-2);
 }
@@ -366,16 +366,16 @@
 }
 
 .dock-pos {
-  font-size: 12px;
+  font-size: var(--type-caption-size);
   font-weight: 600;
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 
 .dock-time {
-  font-size: 12px;
-  line-height: 1.4;
-  color: var(--text-3);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-lh);
+  color: var(--text-4);
 }
 
 .approval-links {
@@ -388,7 +388,7 @@
 }
 
 .dock-link {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 500;
   min-height: 28px;
   padding: 2px 0;
@@ -419,8 +419,8 @@
 }
 
 .dock-notify {
-  font-size: 12px;
-  line-height: 1.4;
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-lh);
   color: var(--text-3);
 }
 
@@ -433,7 +433,7 @@
 /* ---- Needs you (#/inbox): align tokens, radii and row density */
 
 .inbox-h2 {
-  font-size: 13px;
+  font-size: var(--type-ui-size);
   font-weight: 600;
   color: var(--text);
 }
@@ -444,7 +444,7 @@
 }
 
 .inbox-chat {
-  font-size: 12.5px;
+  font-size: var(--type-caption-size);
   font-weight: 600;
   color: var(--text-3);
 }
@@ -472,7 +472,7 @@
 @media (max-width: 760px) {
   .approval-dock {
     max-height: min(66dvh, 540px);
-    border-radius: var(--radius);
+    border-radius: var(--r-card);
   }
 
   .dock-top {
