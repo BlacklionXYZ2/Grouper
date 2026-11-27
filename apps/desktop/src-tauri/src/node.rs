@@ -146,7 +146,8 @@ fn env_flag(name: &str) -> bool {
 }
 
 /// Ensure this PC has a valid, non-admin node token on the embedded local hub, reusing any saved
-/// token that still authenticates as a plain device or issuing/reusing the install's node row.
+/// token that still authenticates as a plain device of this install or issuing/reusing the
+/// install's node row (which is also the hub row when started with `settings.install_id`).
 pub fn ensure_local_node_token(
     hub_handle: &HubHandle,
     hub_url: &str,
@@ -156,19 +157,19 @@ pub fn ensure_local_node_token(
     if let Ok(Some(saved)) = settings.node_token_for(hub_url)
         && let Some(auth) = hub.db.authenticate(&saved)
         && !auth.admin
+        && hub.db.device_install_id(&auth.device_id).as_deref() == Some(settings.install_id.as_str())
     {
         return Ok(saved);
     }
 
     let name = machine_device_name();
-    let node_install = settings.node_install_id();
     let issued = hub
         .db
         .issue_device(
             &name,
             std::env::consts::OS,
             false,
-            Some(Install { id: &node_install, kind: NODE_INSTALL }),
+            Some(Install { id: &settings.install_id, kind: NODE_INSTALL }),
             Some(hub::server::MAX_DEVICES),
         )
         .context("issuing local node device token")?;
@@ -211,7 +212,7 @@ pub async fn resolve_remote_node_token(
         .json(&json!({
             "name": machine_device_name(),
             "platform": std::env::consts::OS,
-            "install_id": settings.node_install_id(),
+            "install_id": settings.install_id,
         }))
         .send()
         .await
@@ -272,11 +273,13 @@ mod tests {
         let app_dir = root.join("app");
         std::fs::create_dir_all(&app_dir).unwrap();
 
+        let mut settings = DesktopSettings::load(&app_dir).unwrap();
         let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let hub_handle = hub::host::start(&hub_dir, &[loopback]).await.unwrap();
+        let hub_handle = hub::host::start_with_install(&hub_dir, &[loopback], Some(&settings.install_id))
+            .await
+            .unwrap();
         let hub_url = format!("http://{}", hub_handle.binds()[0]);
 
-        let mut settings = DesktopSettings::load(&app_dir).unwrap();
         let token = ensure_local_node_token(&hub_handle, &hub_url, &mut settings).unwrap();
         settings.save(&app_dir).unwrap();
 
@@ -287,6 +290,17 @@ mod tests {
         let hub_arc = hub_handle.hub().unwrap();
         let auth = hub_arc.db.authenticate(&token).expect("node token authenticates");
         assert!(!auth.admin, "node must never hold an admin credential");
+        assert_eq!(auth.device_id, hub_arc.db.hub_device_id(), "node row and hub row are the same device");
+        assert_eq!(
+            hub_arc.db.device_install_id(&auth.device_id).as_deref(),
+            Some(settings.install_id.as_str())
+        );
+
+        let installs = hub_arc.install_devices().await;
+        assert_eq!(installs.installs.len(), 1);
+        assert!(installs.installs[0].is_hub);
+        assert!(!installs.installs[0].selectable);
+        assert!(installs.move_targets().is_empty());
 
         let node = NodeHandle::start_with_options(
             &hub_url,

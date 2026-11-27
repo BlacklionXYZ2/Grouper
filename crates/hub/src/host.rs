@@ -56,13 +56,23 @@ pub struct HubHandle {
 
 /// Start the hub in local mode on `binds` (`127.0.0.1:47600`, `127.0.0.1:0` in tests, etc.).
 pub async fn start(data_dir: impl AsRef<Path>, binds: &[SocketAddr]) -> Result<HubHandle> {
-    start_inner(data_dir, binds, Options::default(), false).await
+    start_inner(data_dir, binds, Options::default(), false, None).await
+}
+
+/// Start the hub in local mode bound to an embedding app's `install_id`, adopting or creating
+/// the host device row under that `install_id` so the hub, its node, and the app UI stay one install.
+pub async fn start_with_install(
+    data_dir: impl AsRef<Path>,
+    binds: &[SocketAddr],
+    install_id: Option<&str>,
+) -> Result<HubHandle> {
+    start_inner(data_dir, binds, Options::default(), false, install_id).await
 }
 
 /// Start the hub in local mode initially paused for a hub-move switch (refuses writes with 503
 /// until [`crate::migrate::MigrateState::set_paused`] is cleared).
 pub async fn start_paused(data_dir: impl AsRef<Path>, binds: &[SocketAddr]) -> Result<HubHandle> {
-    start_inner(data_dir, binds, Options::default(), true).await
+    start_inner(data_dir, binds, Options::default(), true, None).await
 }
 
 /// Start the hub with explicit [`Options`] (used by `grouper-hub serve` for server mode).
@@ -71,7 +81,7 @@ pub async fn start_with_options(
     binds: &[SocketAddr],
     options: Options,
 ) -> Result<HubHandle> {
-    start_inner(data_dir, binds, options, false).await
+    start_inner(data_dir, binds, options, false, None).await
 }
 
 async fn start_inner(
@@ -79,12 +89,13 @@ async fn start_inner(
     binds: &[SocketAddr],
     options: Options,
     start_paused: bool,
+    install_id: Option<&str>,
 ) -> Result<HubHandle> {
     ensure!(!binds.is_empty(), "at least one bind address is required");
     let data_dir = data_dir.as_ref().to_path_buf();
     let lock = lock_data_dir(&data_dir)?;
     let db = Db::open(&data_dir)?;
-    let _ = db.ensure_hub_device()?;
+    let _ = db.ensure_hub_device_for_install(install_id)?;
 
     let mut listeners = Vec::with_capacity(binds.len());
     let mut local_addrs = Vec::with_capacity(binds.len());
@@ -269,6 +280,69 @@ mod tests {
             http.get(format!("http://{}/v1/hub", handle2.binds()[0])).send().await.unwrap().json().await.unwrap();
         assert_eq!(info2["hub_device_id"], hub_dev_id);
         assert_eq!(info2["epoch"], 1);
+        handle2.stop().await;
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn start_with_install_reuses_hub_row_on_restart_and_groups_into_one_install() {
+        let root = std::env::temp_dir().join(format!("grouper-host-install-{}", crate::db::random_hex(4)));
+        let data = root.join("data");
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let install_id = "desktop_install_0123456789abcdef";
+
+        let handle = start_with_install(&data, &[loopback], Some(install_id)).await.unwrap();
+        let hub = handle.hub().unwrap();
+        let hub_dev_id = hub.db.hub_device_id();
+        assert_eq!(hub.db.device_install_id(&hub_dev_id).as_deref(), Some(install_id));
+
+        // Issuing a local node row reuses the hub row; issuing an admin row joins the same install.
+        let node = hub
+            .db
+            .issue_device(
+                "Oscar-PC",
+                std::env::consts::OS,
+                false,
+                Some(crate::db::Install { id: install_id, kind: crate::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+        assert!(node.reused, "node row should reuse the install's hub row");
+        assert_eq!(node.device.id, hub_dev_id);
+        let admin = hub
+            .db
+            .issue_device(
+                "Oscar-PC",
+                std::env::consts::OS,
+                true,
+                Some(crate::db::Install { id: install_id, kind: "windows" }),
+                None,
+            )
+            .unwrap();
+
+        let installs = hub.install_devices().await;
+        assert_eq!(installs.installs.len(), 1);
+        let only = &installs.installs[0];
+        assert!(only.is_hub);
+        assert!(!only.selectable);
+        assert_eq!(only.reason.as_deref(), Some("current_hub"));
+        assert_eq!(only.device_ids.len(), 2);
+        assert!(only.device_ids.contains(&hub_dev_id));
+        assert!(only.device_ids.contains(&admin.device.id));
+        assert_eq!(only.rows.len(), 2);
+        assert!(installs.move_targets().is_empty());
+
+        handle.stop().await;
+
+        // Restarting with the same install_id reuses the exact same hub row and epoch.
+        let handle2 = start_with_install(&data, &[loopback], Some(install_id)).await.unwrap();
+        let http = reqwest::Client::new();
+        let info: Value =
+            http.get(format!("http://{}/v1/hub", handle2.binds()[0])).send().await.unwrap().json().await.unwrap();
+        assert_eq!(info["hub_device_id"], hub_dev_id);
+        assert_eq!(info["epoch"], 1);
+        assert_eq!(handle2.hub().unwrap().db.devices().len(), 2);
         handle2.stop().await;
 
         std::fs::remove_dir_all(&root).ok();

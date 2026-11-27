@@ -28,6 +28,21 @@ const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOST_META_PREFIX: &str = "device_host:";
 const HUB_SINCE_KEY: &str = "hub_since";
 
+/// One underlying device row inside an [`InstallDevice`] group.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InstallDeviceRow {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub admin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_kind: Option<String>,
+    pub online: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
+    pub is_hub: bool,
+}
+
 /// One install-level device entry returned by `GET /v1/devices/installs`.
 /// An app's admin client row and plain node row share an `install_id` and appear once.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -36,6 +51,9 @@ pub struct InstallDevice {
     pub device_id: String,
     /// All non-revoked device row ids belonging to this install.
     pub device_ids: Vec<String>,
+    /// All non-revoked device rows belonging to this install (admin UI row, node row, etc.).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<InstallDeviceRow>,
     /// The node device id that accepts WebSocket connections and move tickets, if present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_device_id: Option<String>,
@@ -73,6 +91,13 @@ pub struct InstallDevicesResponse {
     pub hub_since: Option<u64>,
     pub estimated_snapshot_bytes: u64,
     pub installs: Vec<InstallDevice>,
+}
+
+impl InstallDevicesResponse {
+    /// Installs eligible and ready to be offered as hub-move targets right now (never includes the hub's own install).
+    pub fn move_targets(&self) -> Vec<&InstallDevice> {
+        self.installs.iter().filter(|d| !d.is_hub && d.selectable).collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -351,11 +376,16 @@ impl Hub {
         let hub_device_created = rows.iter().find(|r| r.id == hub_device_id).map(|r| r.created);
         let hub_since = self.hub_since(hub_device_created);
 
-        // Group by install_id when present; rows without an install_id stay separate.
+        // Group by canonical install_id when present (normalizing legacy `<install_id>-node` rows
+        // so an app's admin, node, and hub rows always collapse into one install); rows without an
+        // install_id stay separate.
         let mut groups: BTreeMap<String, Vec<DeviceRow>> = BTreeMap::new();
         for row in rows {
-            let key = match &row.install_id {
-                Some(install) => format!("i:{install}"),
+            let key = match row.install_id.as_deref() {
+                Some(install) => {
+                    let canon = crate::db::canonical_install_id(install, row.install_kind.as_deref(), row.admin);
+                    format!("i:{canon}")
+                }
                 None => format!("d:{}", row.id),
             };
             groups.entry(key).or_default().push(row);
@@ -372,8 +402,33 @@ impl Hub {
         let mut installs = Vec::with_capacity(groups.len());
         for (_, group) in groups {
             let is_hub = group.iter().any(|r| r.id == hub_device_id);
-            let install_id = group.iter().find_map(|r| r.install_id.clone());
+            let install_id = group
+                .iter()
+                .find_map(|r| {
+                    let raw = r.install_id.as_deref()?;
+                    let canon = crate::db::canonical_install_id(raw, r.install_kind.as_deref(), r.admin);
+                    (raw == canon).then(|| raw.to_string())
+                })
+                .or_else(|| {
+                    group.iter().find_map(|r| {
+                        let raw = r.install_id.as_deref()?;
+                        Some(crate::db::canonical_install_id(raw, r.install_kind.as_deref(), r.admin).to_string())
+                    })
+                });
             let device_ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
+            let install_rows: Vec<InstallDeviceRow> = group
+                .iter()
+                .map(|r| InstallDeviceRow {
+                    id: r.id.clone(),
+                    name: r.name.clone(),
+                    platform: r.platform.clone(),
+                    admin: r.admin,
+                    install_kind: r.install_kind.clone(),
+                    online: live.contains_key(&r.id),
+                    last_seen: r.last_seen,
+                    is_hub: r.id == hub_device_id,
+                })
+                .collect();
 
             // Pick the node row (plain device or install_kind == "node") for WebSocket / move tickets.
             let node_row = group
@@ -449,6 +504,7 @@ impl Hub {
             installs.push(InstallDevice {
                 device_id: rep.id.clone(),
                 device_ids,
+                rows: install_rows,
                 node_device_id,
                 install_id,
                 name: rep.name.clone(),
@@ -901,6 +957,140 @@ mod tests {
         assert!(!phone.eligible);
         assert!(!phone.selectable);
         assert_eq!(phone.reason.as_deref(), Some("cannot_host"));
+
+        srv.abort();
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn embedded_hub_and_node_share_one_install_and_hub_is_excluded_from_move_targets() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let pc_install = "pc_install_0123456789abcdef0123";
+        let (hub_dev_id, epoch) = db.ensure_hub_device_for_install(Some(pc_install)).unwrap();
+        assert_eq!(epoch, 1);
+
+        // Same PC registers its admin client row and its node row (reusing the hub row).
+        let pc_admin = db
+            .issue_device("Oscar's PC", "windows", true, Some(crate::db::Install { id: pc_install, kind: "windows" }), None)
+            .unwrap();
+        let pc_node = db
+            .issue_device(
+                "Oscar's PC",
+                "windows",
+                false,
+                Some(crate::db::Install { id: pc_install, kind: crate::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(pc_node.device.id, hub_dev_id, "node on same install reuses hub row");
+
+        // Second computer using legacy `<install_id>-node` for its node row still groups with its admin row.
+        let laptop_install = "laptop_install_0123456789abcdef";
+        let laptop_legacy_node = format!("{laptop_install}-node");
+        let laptop_admin = db
+            .issue_device("Laptop", "macos", true, Some(crate::db::Install { id: laptop_install, kind: "macos" }), None)
+            .unwrap();
+        let laptop_node = db
+            .issue_device(
+                "Laptop",
+                "macos",
+                false,
+                Some(crate::db::Install { id: &laptop_legacy_node, kind: crate::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(hub.clone());
+        let srv = tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let connect_host = |token: String| async move {
+            let mut req = format!("ws://{addr}{}", core_protocol::CONNECT_PATH).into_client_request().unwrap();
+            req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            let hello = core_protocol::NodeMessage::Hello {
+                protocol_version: core_protocol::PROTOCOL_VERSION,
+                client_version: HUB_VERSION.into(),
+                host: Some(NodeHostInfo {
+                    can_host: true,
+                    app_version: HUB_VERSION.into(),
+                    free_bytes: Some(1_000_000_000),
+                    cloudflared: true,
+                }),
+            };
+            ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
+            while let Some(Ok(WsMsg::Text(text))) = ws.next().await {
+                if matches!(serde_json::from_str::<core_protocol::HubMessage>(&text), Ok(core_protocol::HubMessage::Welcome { .. })) {
+                    break;
+                }
+            }
+            ws
+        };
+
+        // Both the hub's own node and the second PC's node are connected and report can_host: true.
+        let _pc_ws = connect_host(pc_node.token.clone()).await;
+        let _laptop_ws = connect_host(laptop_node.token.clone()).await;
+
+        let http = reqwest::Client::new();
+        let resp: InstallDevicesResponse = http
+            .get(format!("http://{addr}/v1/devices/installs"))
+            .bearer_auth(&pc_admin.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        // Only 2 install entries total: the PC (hub + node + admin) and the Laptop (admin + legacy node).
+        assert_eq!(resp.installs.len(), 2, "{:?}", resp.installs);
+
+        let pc_entry = &resp.installs[0];
+        assert!(pc_entry.is_hub);
+        assert_eq!(pc_entry.install_id.as_deref(), Some(pc_install));
+        assert_eq!(pc_entry.device_id, hub_dev_id);
+        assert_eq!(pc_entry.node_device_id.as_deref(), Some(hub_dev_id.as_str()));
+        assert_eq!(pc_entry.device_ids.len(), 2);
+        assert_eq!(pc_entry.rows.len(), 2);
+        assert!(pc_entry.rows.iter().any(|r| r.id == hub_dev_id && !r.admin && r.is_hub && r.online));
+        assert!(pc_entry.rows.iter().any(|r| r.id == pc_admin.device.id && r.admin && !r.is_hub));
+        assert!(!pc_entry.selectable);
+        assert_eq!(pc_entry.reason.as_deref(), Some("current_hub"));
+
+        let laptop_entry = &resp.installs[1];
+        assert!(!laptop_entry.is_hub);
+        assert_eq!(laptop_entry.install_id.as_deref(), Some(laptop_install));
+        assert_eq!(laptop_entry.device_ids.len(), 2);
+        assert!(laptop_entry.device_ids.contains(&laptop_admin.device.id));
+        assert!(laptop_entry.device_ids.contains(&laptop_node.device.id));
+        assert_eq!(laptop_entry.rows.len(), 2);
+        assert!(laptop_entry.selectable);
+
+        // Move targets list excludes the hub's own install and offers only the other host install.
+        let targets = resp.move_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].install_id.as_deref(), Some(laptop_install));
+        assert!(targets.iter().all(|t| !t.is_hub && t.install_id.as_deref() != Some(pc_install)));
+
+        // Existing per-row /v1/devices endpoint continues working.
+        let raw_devices: Value = http
+            .get(format!("http://{addr}/v1/devices"))
+            .bearer_auth(&pc_admin.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(raw_devices.as_array().unwrap().len() >= 4);
 
         srv.abort();
         drop(hub);
