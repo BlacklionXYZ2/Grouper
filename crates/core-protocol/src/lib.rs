@@ -171,6 +171,72 @@ pub struct NodeHostInfo {
     pub cloudflared: bool,
 }
 
+/// Sign-in state of a CLI harness on a device, derived locally from credential file
+/// presence and expiry. Tokens and secret values never leave the device.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessSignIn {
+    SignedIn,
+    Expired,
+    NotSignedIn,
+}
+
+impl HarnessSignIn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SignedIn => "signed_in",
+            Self::Expired => "expired",
+            Self::NotSignedIn => "not_signed_in",
+        }
+    }
+
+    pub fn is_signed_in(self) -> bool {
+        matches!(self, Self::SignedIn)
+    }
+}
+
+/// Capabilities of an installed CLI harness on a device.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HarnessCapabilities {
+    /// Can act as a project-chat orchestrator via MCP (tool confinement + session resume).
+    #[serde(default)]
+    pub can_orchestrate: bool,
+    /// Supports resuming a continuous session across turns.
+    #[serde(default)]
+    pub supports_resume: bool,
+    /// Supports connecting to external MCP servers.
+    #[serde(default)]
+    pub supports_mcp: bool,
+}
+
+/// One model reported for an installed CLI harness.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HarnessModel {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Scan result for one CLI harness detected on a device.
+/// Contains CLI identifiers, sign-in state, capabilities and model IDs only — never tokens.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DetectedHarness {
+    /// Canonical harness slug (`claude-code`, `codex`, `antigravity`, `grok`, `hermes`, `pi`, `opencode`).
+    pub harness: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub sign_in: HarnessSignIn,
+    /// Command to run on the device to authenticate when `sign_in != SignedIn`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_command: Option<String>,
+    #[serde(default)]
+    pub capabilities: HarnessCapabilities,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<HarnessModel>,
+}
+
 /// Device → hub.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -228,6 +294,11 @@ pub enum NodeMessage {
         /// Optional direct URL where the new hub is reachable (for LAN/local confirmation).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_url: Option<String>,
+    },
+    /// CLI harnesses detected on this device, sent on connect and whenever the scan changes.
+    /// Carries CLI names, sign-in states, capabilities and model lists only; never tokens.
+    HarnessReport {
+        harnesses: Vec<DetectedHarness>,
     },
 }
 
@@ -720,6 +791,10 @@ pub struct ModelEntry {
     /// Hosting device id for harness models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    /// For harness models: whether the harness can orchestrate a project chat via MCP
+    /// (requires tool confinement and continuous session resume).
+    #[serde(default)]
+    pub can_orchestrate: bool,
     /// How this row was registered: `"manual"` (default) or `"auto"`.
     #[serde(default = "default_model_source")]
     pub source: String,
@@ -762,6 +837,7 @@ impl Default for ModelEntry {
             modalities: Vec::new(),
             kind: default_model_kind(),
             device_id: None,
+            can_orchestrate: false,
             source: default_model_source(),
             hidden: false,
             hidden_reason: None,

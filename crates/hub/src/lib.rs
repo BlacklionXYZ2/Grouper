@@ -6,6 +6,7 @@ pub mod devices;
 pub mod discover;
 pub mod files;
 pub mod google_auth;
+pub mod harness;
 pub mod host;
 pub mod limits;
 pub mod link;

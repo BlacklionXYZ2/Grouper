@@ -31,6 +31,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 pub mod folders;
 mod device_provider;
 mod handover;
+pub mod harness;
 pub mod mcp_host;
 mod mcp_server;
 pub mod usage_probes;
@@ -504,8 +505,9 @@ async fn connect_once(
     let mcp = ServerSession::start(
         DeviceServer::new(config, handler.clone(), host.clone(), folders.clone()),
         out_tx.clone(),
-        on_overflow,
+        on_overflow.clone(),
     );
+    let _harnesses = harness::HarnessSession::start(host.subscribe(), out_tx.clone(), on_overflow);
     let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.tick().await;
 
