@@ -51,6 +51,7 @@ import { renderInbox } from './views/inbox.js';
 import { renderLink, rememberPendingLink, takePendingLink } from './views/link.js';
 import { startNotifications, stopNotifications, forgetNotifications } from './lib/push.js';
 import { mountPalette, openPalette } from './views/palette.js';
+import { mountStatusline } from './views/statusline.js';
 
 const root = document.getElementById('app');
 const LAST_CONV = 'grouper.lastConversation';
@@ -253,6 +254,7 @@ function buildShell() {
     mainKey = '';
   }, { signal });
   mountPalette(signal);
+  mountStatusline(shell, signal);
 }
 
 function focusMain() {

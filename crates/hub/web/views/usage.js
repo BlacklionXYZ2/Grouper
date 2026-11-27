@@ -85,7 +85,7 @@ function agoLong(unix) {
 const clockOf = (secs) => new Date(secs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
 /** "resets in 38 min", "resets in 2h 14m", "resets Thu 3 Dec, 09:00" (spec 5.2). */
-function resetWords(resetsAt, { long = false } = {}) {
+export function resetWords(resetsAt, { long = false } = {}) {
   const s = Math.round(resetsAt - nowSecs());
   if (s < 3600) {
     const m = Math.max(1, Math.round(s / 60));
@@ -101,7 +101,7 @@ function resetWords(resetsAt, { long = false } = {}) {
 
 // ---- subscription naming
 
-const PLAN_PROVIDERS = {
+export const PLAN_PROVIDERS = {
   claude: { name: 'Claude', fam: 'claude', app: 'Claude Code' },
   codex: { name: 'ChatGPT', fam: 'gpt', app: 'Codex' },
   grok: { name: 'Grok', fam: 'grok', app: 'Grok' },
@@ -112,7 +112,7 @@ const ACCOUNT_NAMES = { supergrok: 'SuperGrok' };
 const providerName = (p) => PLAN_PROVIDERS[p]?.name || p;
 
 /** "Claude Max", "ChatGPT Plus", "SuperGrok", "Antigravity". */
-function planTitle(s) {
+export function planTitle(s) {
   const provider = providerName(s.provider);
   const acct = String(s.account || '').toLowerCase();
   if (ACCOUNT_NAMES[acct]) return ACCOUNT_NAMES[acct];
@@ -126,14 +126,14 @@ function planTitle(s) {
 
 const SPAN_SECS = { m: 60, h: 3600, d: 86400 };
 
-function parseWindow(w) {
+export function parseWindow(w) {
   const [base, ...rest] = String(w || '').split(':');
   const m = /^(\d+)([mhd])$/.exec(base);
   return { span: m ? Number(m[1]) * SPAN_SECS[m[2]] : Infinity, raw: base, n: m ? Number(m[1]) : 0, unit: m ? m[2] : '', scope: rest.join(':') };
 }
 
 /** `5h` -> "5-hour", `7d` -> "Weekly", `30d` -> "Monthly", `3h` -> "3-hour", `14d` -> "14-day". */
-function spanLabel(p) {
+export function spanLabel(p) {
   if (!p.unit) return p.raw || 'Window';
   if (p.unit === 'd' && p.n === 7) return 'Weekly';
   if (p.unit === 'd' && p.n === 30) return 'Monthly';

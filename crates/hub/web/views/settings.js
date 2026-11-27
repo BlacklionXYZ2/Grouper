@@ -9,6 +9,7 @@ import { store, on, deviceName, isAdmin } from '../lib/store.js';
 import { stopLive, loadDevices } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { ago, date, dateTime } from '../lib/format.js';
+import { statuslineOn, setStatuslineOn } from './statusline.js';
 import { keySwatch, colorPicker, colorUse, setProviderColor, keyColorLabel } from './key-color.js';
 import {
   support as notifySupport,
@@ -155,6 +156,13 @@ export function renderSettings(container) {
         ),
       ),
       h('p', { class: 'hint' }, 'Reduced motion and reduced transparency follow your system settings.'),
+      h(
+        'label',
+        { class: 'remote-toggle-row switch', for: 'statusline-on' },
+        h('span', { class: 'remote-toggle-label' }, 'Show status line'),
+        h('input', { id: 'statusline-on', name: 'statusline_on', type: 'checkbox', switch: true, checked: statuslineOn(), 'aria-describedby': 'statusline-help', onchange: (e) => setStatuslineOn(e.target.checked) }),
+      ),
+      h('p', { class: 'hint', id: 'statusline-help' }, 'A strip along the bottom of wide windows with your connection and subscription meters. Only shown while a subscription is being read.'),
     ),
   );
 
