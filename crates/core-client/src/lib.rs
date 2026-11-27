@@ -350,6 +350,43 @@ struct HarnessThreadRun {
     input: mpsc::UnboundedSender<String>,
 }
 
+/// What the harness thread should do after a CLI turn.
+enum HarnessInbox {
+    /// `message_thread` or a step-in arrived; run another turn on the same session.
+    Message(String),
+    /// Nothing queued. The run has been removed so a late message cannot land in the gap.
+    Finished,
+    /// `stop_thread` already dropped the sender (and aborted the task).
+    Stopped,
+}
+
+/// Next queued message, or the decision to end. The empty check and the removal share
+/// `harness_runs`'s lock, which is also what [`Threads::push_input`] holds while it sends,
+/// so a message cannot arrive after we decide the inbox is empty.
+fn poll_harness_inbox(
+    rx: &mut mpsc::UnboundedReceiver<String>,
+    threads: &std::sync::Weak<Threads>,
+    thread_id: &str,
+) -> HarnessInbox {
+    match rx.try_recv() {
+        Ok(message) => return HarnessInbox::Message(message),
+        Err(mpsc::error::TryRecvError::Disconnected) => return HarnessInbox::Stopped,
+        Err(mpsc::error::TryRecvError::Empty) => {}
+    }
+    let Some(t) = threads.upgrade() else {
+        return HarnessInbox::Stopped;
+    };
+    let mut runs = t.harness_runs.lock().unwrap();
+    match rx.try_recv() {
+        Ok(message) => HarnessInbox::Message(message),
+        Err(mpsc::error::TryRecvError::Disconnected) => HarnessInbox::Stopped,
+        Err(mpsc::error::TryRecvError::Empty) => {
+            runs.remove(thread_id);
+            HarnessInbox::Finished
+        }
+    }
+}
+
 impl HarnessThreadRun {
     fn abort(self) {
         self.abort.abort();
@@ -506,11 +543,14 @@ fn start_thread(
     });
 }
 
-/// Run a harness thread: the brief is turn 1 in the thread workspace at
-/// [`HarnessLevel::Workspace`](harness::HarnessLevel::Workspace). Messages that arrive
-/// during a turn are further turns on the same CLI session. An empty inbox after a turn
-/// ends the thread, and that reply is the summary. Aborting the task drops the child
-/// (`kill_on_drop`), which is how `stop_thread` kills the process.
+/// Run a harness thread with [`harness::turn`] at [`HarnessLevel::Workspace`](harness::HarnessLevel::Workspace).
+///
+/// `opts` is [`harness::ScanOptions::host`] in production, which is what `harness::turn` uses.
+/// Tests pass an isolated scan so the turn runs a fake CLI. The brief is turn 1 and the
+/// working directory is the thread workspace. `message_thread` and a step-in queued during
+/// a turn are further turns that resume the same session. An empty inbox after a turn ends
+/// the thread, and that reply is the summary. The run is registered before the first turn,
+/// and aborting it drops the child (`kill_on_drop`), which is how `stop_thread` kills the process.
 fn start_harness_thread(
     spec: ThreadSpec,
     workspace_root: &Path,
@@ -525,7 +565,7 @@ fn start_harness_thread(
         events.thread(&id, &title, "failed");
         threads.send(NodeMessage::ThreadFinished { thread_id: id.clone(), ok: false, summary: msg });
     };
-    let Some(harness) = spec.harness.clone() else {
+    let Some(harness_spec) = spec.harness.clone() else {
         return fail("not a harness thread".into());
     };
     let ws = match Workspace::create_scoped(workspace_root.join(&id), folders.clone(), &spec.device_name) {
@@ -534,27 +574,35 @@ fn start_harness_thread(
     };
     let workdir = ws.root().to_path_buf();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let weak = Arc::downgrade(threads);
     let task_events = events.clone();
     let thread_id = id.clone();
     let brief = spec.brief.clone();
+    let task_title = title.clone();
     let join = tokio::spawn(async move {
-        let mut session = harness.session.filter(|s| !s.trim().is_empty());
+        // Registered (or shut down) before any CLI process exists.
+        if ready_rx.await.is_err() {
+            return;
+        }
+        let mut session = harness_spec.session.filter(|s| !s.trim().is_empty());
         let mut last_reply = String::new();
         let mut upcoming = Some(brief);
         loop {
             let message = if let Some(m) = upcoming.take() {
                 m
             } else {
-                match input_rx.try_recv() {
-                    Ok(m) => m,
-                    Err(_) => break,
+                match poll_harness_inbox(&mut input_rx, &weak, &thread_id) {
+                    HarnessInbox::Message(m) => m,
+                    HarnessInbox::Finished => break,
+                    HarnessInbox::Stopped => return,
                 }
             };
+            // Same call as `harness::turn`, plus the scan options so a test can supply a fake CLI.
             let result = harness::turn_with(
                 &opts,
-                &harness.agent,
-                &harness.model,
+                &harness_spec.agent,
+                &harness_spec.model,
                 session.as_deref(),
                 &message,
                 &workdir,
@@ -579,16 +627,15 @@ fn start_harness_thread(
                     last_reply = out.text;
                 }
                 Err(error) => {
-                    task_events.thread(&thread_id, &title, "failed");
+                    task_events.thread(&thread_id, &task_title, "failed");
                     t.harness_runs.lock().unwrap().remove(&thread_id);
                     t.send(NodeMessage::ThreadFinished { thread_id, ok: false, summary: error });
                     return;
                 }
             }
         }
-        task_events.thread(&thread_id, &title, "done");
+        task_events.thread(&thread_id, &task_title, "done");
         if let Some(t) = weak.upgrade() {
-            t.harness_runs.lock().unwrap().remove(&thread_id);
             t.send(NodeMessage::ThreadFinished { thread_id, ok: true, summary: last_reply });
         }
     });
@@ -605,6 +652,7 @@ fn start_harness_thread(
     };
     if inserted {
         events.thread(&spec.thread_id, &spec.title, "running");
+        let _ = ready_tx.send(());
     }
 }
 
