@@ -60,7 +60,7 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 | `apple/GrouperApp` | SwiftUI apps for iPhone and Mac (first draft, not yet built: see its README; needs Xcode 26) |
 | `apple/GrouperKit` | Swift package wrapping the Rust core, plus the `grouper-mac` demo node |
 | `examples/scripted-demo.json` | Script for the fake model, to try everything without API keys |
-| `Dockerfile`, `deploy/` | Hub container for the Linux VM on the PC (later a VPS) |
+| `Dockerfile`, `deploy/` | Server mode (parked): Docker hub for a Linux VM or a VPS. The PC move is [deploy/MOVE-TO-PC.md](deploy/MOVE-TO-PC.md) |
 
 ## Try it without API keys
 
@@ -192,10 +192,13 @@ scripts/build-apple.sh
 cd apple/GrouperKit && GROUPER_TOKEN=<token> swift run grouper-mac
 ```
 
-## Run the hub in the VM on the PC
+## Run the hub
 
-See [deploy/README.md](deploy/README.md): a Hyper-V VM made by script, the hub in
-Docker, and a Cloudflare Tunnel to `https://grouper.clockmillbarn.uk`.
+On this PC the hub is the Windows app. [deploy/MOVE-TO-PC.md](deploy/MOVE-TO-PC.md)
+moves the VM's data there.
+
+Server mode (parked) is [deploy/README.md](deploy/README.md): a Hyper-V VM made by
+script, the hub in Docker, and a Cloudflare Tunnel to `https://grouper.clockmillbarn.uk`.
 
 ## Scoped folders
 

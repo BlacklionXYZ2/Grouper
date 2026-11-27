@@ -5,6 +5,11 @@
 //! miss those pages. The master key is never written into the snapshot: provider keys
 //! stay ciphertext, and restore checks that the key this process can see decrypts them
 //! before it replaces anything.
+//!
+//! Restoring onto another computer points `hub_device_id` at a new device for this
+//! machine and raises `epoch` by one, so step-down can tell the old hub from this one.
+//! Restoring onto the computer that already owns that hub device leaves it unchanged.
+//! Device rows and their tokens come across either way.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -241,8 +246,87 @@ pub fn restore(data_dir: &Path, backup_path: &Path, force: bool) -> Result<()> {
     }
     let sealed = decrypt_provider_keys(&opened.root, data_dir)?;
     let aside = install_with_rollback(data_dir, &opened.root, force)?;
-    print_restore_done(data_dir, &manifest.hub_id, sealed, aside.as_deref());
+    let reassigned = match adopt_hub_device_for_this_machine(data_dir) {
+        Ok(value) => value,
+        Err(error) => {
+            let undo = undo_install(data_dir, aside.as_deref());
+            return Err(match undo {
+                Ok(()) => error.context(
+                    "restore failed while recording this computer as the hub; the previous data directory was put back",
+                ),
+                Err(undo_error) => error.context(format!(
+                    "restore failed while recording this computer as the hub, and putting the previous data back also failed ({undo_error}). \
+                     Previous files are in {}.",
+                    aside
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| data_dir.display().to_string())
+                )),
+            });
+        }
+    };
+    print_restore_done(
+        data_dir,
+        &manifest.hub_id,
+        sealed,
+        aside.as_deref(),
+        reassigned.as_ref(),
+    );
     Ok(())
+}
+
+/// The name `ensure_hub_device` stores for the computer it is running on.
+/// Same rules as `machine_device_name` in `db.rs` (that function is private).
+fn host_device_name() -> String {
+    let raw = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_default();
+    let cleaned: String = raw.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("hub") {
+        "Grouper host".into()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn host_device_matches_this_machine(name: &str, platform: &str, host_name: &str) -> bool {
+    platform.eq_ignore_ascii_case(std::env::consts::OS) && name == host_name
+}
+
+/// If the restored hub device is another computer, register this one and assign it
+/// at `epoch + 1`. The same computer is left as the snapshot recorded it.
+/// Returns the new id and epoch when the assignment changes.
+fn adopt_hub_device_for_this_machine(data_dir: &Path) -> Result<Option<(String, u64)>> {
+    let db = crate::db::Db::open(data_dir)
+        .context("opening the restored database to record which computer is the hub")?;
+    let (current_id, epoch) = db.ensure_hub_device()?;
+    let host_name = host_device_name();
+    let same_machine = db.devices().iter().any(|device| {
+        device.id == current_id
+            && !device.revoked
+            && host_device_matches_this_machine(&device.name, &device.platform, &host_name)
+    });
+    if same_machine {
+        return Ok(None);
+    }
+    // Equivalent to the row `ensure_hub_device` inserts on a fresh hub: this
+    // computer's hostname and OS, not an admin token. The secret is not kept.
+    let (device, _token) = db.add_device(&host_name, std::env::consts::OS, false)?;
+    let new_epoch = db.set_hub_device_id(&device.id)?;
+    if new_epoch != epoch + 1 {
+        bail!(
+            "restored hub epoch {epoch} did not advance by one when assigning this computer (hub device {})",
+            device.id
+        );
+    }
+    Ok(Some((device.id, new_epoch)))
 }
 
 fn fill_staging(staging: &Path, data_dir: &Path, include_workspaces: bool) -> Result<Filled> {
@@ -837,9 +921,15 @@ fn print_restore_done(
     hub_id: &Option<String>,
     sealed: usize,
     aside: Option<&Path>,
+    reassigned: Option<&(String, u64)>,
 ) {
     let hub = hub_id.as_deref().unwrap_or("(no hub_id)");
     println!("Restored hub {hub} into {}.", data_dir.display());
+    if let Some((id, epoch)) = reassigned {
+        println!(
+            "This computer is not the hub in the backup. Hub device is now {id} at epoch {epoch}, so a hub still running on the old computer can tell it was replaced."
+        );
+    }
     if let Some(path) = aside {
         println!(
             "Moved the previous contents of {} to {} (not deleted).",
@@ -2402,5 +2492,81 @@ mod tests {
         assert_eq!(fs::metadata(restored.join(DB_NAME)).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::metadata(restored.join(WORKSPACES).join("t")).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(restored.join(WORKSPACES).join("t/file")).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn restore_on_the_same_machine_keeps_hub_device_and_token() {
+        let _env = isolate_master_key();
+        let root = TempDir::new("same-machine");
+        let data = root.0.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let hub_id = setup_hub(&data);
+        let (hub_device, epoch, token) = {
+            let db = crate::db::Db::open(&data).unwrap();
+            let (hub_device, epoch) = db.ensure_hub_device().unwrap();
+            let (_device, token) = db.add_device("Phone", "ios", false).unwrap();
+            (hub_device, epoch, token)
+        };
+
+        let snap = root.0.join("snap");
+        backup(&data, &snap, false).unwrap();
+        let restored = root.0.join("restored");
+        copy_key(&data, &restored);
+        restore(&restored, &snap, false).unwrap();
+
+        let db = crate::db::Db::open(&restored).unwrap();
+        assert_eq!(db.hub_id(), hub_id);
+        let (restored_device, restored_epoch) = db.ensure_hub_device().unwrap();
+        assert_eq!(restored_device, hub_device);
+        assert_eq!(restored_epoch, epoch);
+        assert!(db.authenticate(&token).is_some());
+    }
+
+    #[test]
+    fn restore_on_another_machine_assigns_this_hub_device_at_next_epoch() {
+        let _env = isolate_master_key();
+        let root = TempDir::new("other-machine");
+        let data = root.0.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let hub_id = setup_hub(&data);
+        let (old_hub_device, old_epoch, token) = {
+            let db = crate::db::Db::open(&data).unwrap();
+            let (hub_device, epoch) = db.ensure_hub_device().unwrap();
+            // The snapshot must look like another computer's hub device. `platform`
+            // is never this OS, so the check does not depend on the hostname.
+            db.c()
+                .execute(
+                    "UPDATE devices SET name = 'grouper-vm', platform = 'foreign' WHERE id = ?1",
+                    [&hub_device],
+                )
+                .unwrap();
+            db.c().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            let (_device, token) = db.add_device("Phone", "ios", false).unwrap();
+            let epoch_now = db.epoch();
+            assert_eq!(epoch_now, epoch);
+            (hub_device, epoch_now, token)
+        };
+
+        let snap = root.0.join("snap");
+        backup(&data, &snap, false).unwrap();
+        let restored = root.0.join("restored");
+        copy_key(&data, &restored);
+        restore(&restored, &snap, false).unwrap();
+
+        let db = crate::db::Db::open(&restored).unwrap();
+        assert_eq!(db.hub_id(), hub_id);
+        let (new_device, new_epoch) = db.ensure_hub_device().unwrap();
+        assert_ne!(new_device, old_hub_device);
+        assert_eq!(new_epoch, old_epoch + 1);
+        let host = db
+            .devices()
+            .into_iter()
+            .find(|device| device.id == new_device)
+            .expect("new hub device");
+        assert_eq!(host.name, host_device_name());
+        assert_eq!(host.platform, std::env::consts::OS);
+        assert!(!host.admin);
+        assert!(db.devices().iter().any(|device| device.id == old_hub_device && !device.revoked));
+        assert!(db.authenticate(&token).is_some());
     }
 }
