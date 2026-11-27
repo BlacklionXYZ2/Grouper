@@ -182,7 +182,7 @@ struct ModelPickerSheet: View {
             }
             .padding(.leading, 6)
             .background(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2).fill(family.color).frame(width: 4)
+                RoundedRectangle(cornerRadius: 2).fill(family.solidColor).frame(width: 4)
             }
             .contentShape(Rectangle())
         }
@@ -217,7 +217,7 @@ struct ModelPickerSheet: View {
             }
             .padding(.leading, 6)
             .background(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2).fill(family.color).frame(width: 4)
+                RoundedRectangle(cornerRadius: 2).fill(family.solidColor).frame(width: 4)
             }
             .opacity(isDisabled ? 0.58 : 1)
             .contentShape(Rectangle())

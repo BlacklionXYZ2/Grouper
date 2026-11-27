@@ -140,7 +140,7 @@ struct StatusStyle {
 struct FamilyDot: View {
     let family: ModelFamily
     var body: some View {
-        Circle().fill(family.color)
+        Circle().fill(family.solidColor)
             .frame(width: Theme.Size.familyDot, height: Theme.Size.familyDot)
             .accessibilityHidden(true)
     }

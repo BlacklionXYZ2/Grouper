@@ -201,7 +201,7 @@ struct MacRootView: View {
                     .background(Theme.brandSoft, in: RoundedRectangle(cornerRadius: Theme.Radius.xs))
                 Spacer(minLength: 4)
                 if let newest = needsYou.map(\.ts).max() {
-                    RelativeAgeText(seconds: newest).font(Theme.Typeface.meta).foregroundStyle(Theme.text3)
+                    RelativeAgeText(seconds: newest).font(Theme.Typeface.meta).foregroundStyle(Theme.text4)
                 }
             }
         }

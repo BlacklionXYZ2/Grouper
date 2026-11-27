@@ -52,12 +52,24 @@ enum Theme {
     /// Selected row, model chips.
     static let surfaceSelect = swatch(0xE0E8F4, 0x1F2D41, 0xD4E0EF, 0x1C2C44)
 
-    // MARK: Text (each at least 4.5:1 on every surface above, 7:1 under Increase Contrast)
+    // MARK: Text, four tiers (each at least 4.5:1 on every surface above, 7:1 under Increase Contrast)
 
     static let text = swatch(0x0F1722, 0xF3F6F9, 0x05090F, 0xFFFFFF)
-    static let text2 = swatch(0x46505E, 0xC5CFDC, 0x222B38, 0xE1E7EF)
-    /// Timestamps, placeholders, meta.
-    static let text3 = swatch(0x5A6471, 0xA4ADBB, 0x2E3846, 0xCDD5E0)
+    /// Row labels, secondary copy. Light is one step darker than before (design-system 2.2).
+    static let text2 = swatch(0x39434F, 0xC5CFDC, 0x222B38, 0xE1E7EF)
+    /// Captions, sub-lines, activity lines. Light is one step darker than before.
+    static let text3 = swatch(0x4C5663, 0xA4ADBB, 0x2E3846, 0xCDD5E0)
+    /// Timestamps, placeholders, units, uppercase labels. Under Increase Contrast it equals `text3`.
+    static let text4 = swatch(0x5A6471, 0x8C96A5, 0x2E3846, 0xCDD5E0)
+
+    // MARK: Hairlines (design-system 2.3: one ink per theme at fixed alphas, written out as solids)
+
+    /// Dividers inside a card, table rules (dark 6%, light 8%).
+    static let line1 = swatch(0xECECED, 0x222831, 0x778190, 0x6B7584)
+    /// Card and panel edges (dark 8%, light 14%). Today's `border` stays as the public name.
+    static let line2 = swatch(0xDDDFE0, 0x262C36, 0x778190, 0x6B7584)
+    /// Composer, dock, floating edges (dark 14%; light keeps `borderStrong`).
+    static let line3 = swatch(0xC3CBD6, 0x323842, 0x4F5967, 0xA3ADBB)
 
     // MARK: Borders
 
@@ -111,6 +123,10 @@ enum Theme {
     /// Failed, destructive.
     static let danger = swatch(0xB42318, 0xF87171, 0x8F170E, 0xFF9C92)
     static let dangerSoft = swatch(0xFBE4E1, 0x3F1D22, 0xFAE2DF, 0x3E1A1E)
+    /// Neutral notices: offline copy, stale reading. The blue hue under a second name; a tinted
+    /// banner with an icon, never an outline (so it can't be mistaken for `focus`).
+    static let info = swatch(0x1F5FCC, 0x7FB0FF, 0x164AA3, 0xA9C9FF)
+    static let infoSoft = swatch(0xE7F0FC, 0x223048, 0xE7F0FC, 0x223048)
     /// Solid destructive buttons, with white text.
     static let dangerFill = swatch(0xB42318, 0xC9362B, 0x8F170E, 0xA8241A)
     /// Focus rings: blue, so focus never reads as the accent.
@@ -126,32 +142,21 @@ enum Theme {
     // MARK: Key colours (docs/usage-tab-spec.md 4.4)
 
     /// The ten colours an API key can wear on the Usage tab (swatch, donut segment, share bars),
-    /// by the name the hub stores. They reuse the family hues (`--key-teal: var(--fam-gemini)` and
-    /// so on in app.css), so light, dark and Increase Contrast values are already defined.
-    /// Names: teal (gemini), purple (qwen), orange (llama), pink (claude), blue (gpt), green
-    /// (nemotron), amber (ernie), rose (mistral), indigo (radium), cyan (deepseek).
+    /// by the name the hub stores. Key colours are only ever fills, so they are step 3 (`solid`)
+    /// of the identity-hue ramp (`--key-teal: var(--hue-teal-solid)` in app.css).
     static func keyColor(_ name: String?) -> Color {
         Color.grouperDynamic(keySwatch(name))
     }
 
     /// Grey: "Other", removed keys, and a key whose colour the hub has not sent.
-    static let keyUnknown = Color.grouperDynamic(keySwatch(nil))
+    static let keyUnknown = Color.grouperDynamic(neutralSwatch)
 
     static func keySwatch(_ name: String?) -> ThemeSwatch {
-        switch name?.lowercased() {
-        case "teal": return ThemeSwatch(light: 0x0B6B73, dark: 0x4FE3E6, lightHighContrast: 0x06525A, darkHighContrast: 0x7FF0F2)
-        case "purple": return ThemeSwatch(light: 0x5B3FC4, dark: 0xA78BFA, lightHighContrast: 0x47309F, darkHighContrast: 0xC4B0FF)
-        case "orange": return ThemeSwatch(light: 0x9A4A06, dark: 0xF9A85A, lightHighContrast: 0x7A3A04, darkHighContrast: 0xFFC48A)
-        case "pink": return ThemeSwatch(light: 0xA12D86, dark: 0xF28AD8, lightHighContrast: 0x82216B, darkHighContrast: 0xF8B0E6)
-        case "blue": return ThemeSwatch(light: 0x1F5FCC, dark: 0x7FB0FF, lightHighContrast: 0x164AA3, darkHighContrast: 0xA9C9FF)
-        case "green": return ThemeSwatch(light: 0x436E00, dark: 0x9FD24A, lightHighContrast: 0x395C00, darkHighContrast: 0xBFE57A)
-        case "amber": return ThemeSwatch(light: 0x805B00, dark: 0xE8C04A, lightHighContrast: 0x6A4B00, darkHighContrast: 0xF5D77A)
-        case "rose": return ThemeSwatch(light: 0xBD2F4A, dark: 0xFF8FA0, lightHighContrast: 0x981F38, darkHighContrast: 0xFFB3BF)
-        case "indigo": return ThemeSwatch(light: 0x4D4FC9, dark: 0x8891F0, lightHighContrast: 0x3A3CA8, darkHighContrast: 0xB0B6FF)
-        case "cyan": return ThemeSwatch(light: 0x0A6F8C, dark: 0x5CC8E8, lightHighContrast: 0x06566D, darkHighContrast: 0x8ADCF2)
-        default: return ThemeSwatch(light: 0x5B6573, dark: 0xA3ADBA, lightHighContrast: 0x434B57, darkHighContrast: 0xC2CAD4)
-        }
+        IdentityHue(name: name)?.solidSwatch ?? neutralSwatch
     }
+
+    /// Outside the ramp: unknown models, "Other", removed keys.
+    static let neutralSwatch = ThemeSwatch(light: 0x5B6573, dark: 0xA3ADBA, lightHighContrast: 0x434B57, darkHighContrast: 0xC2CAD4)
 
     /// How strongly a family colour tints a status pill over `surface` (app.css --fam-pill).
     static func familyPillOpacity(_ scheme: ColorScheme) -> Double { scheme == .dark ? 0.16 : 0.12 }
@@ -167,6 +172,10 @@ enum Theme {
         static let sm: CGFloat = 8
         /// Badges.
         static let xs: CGFloat = 6
+        /// The composer only: the roundest object on the screen (`--r-composer`).
+        static let composer: CGFloat = 24
+        /// Corner-radius value for full rounding (`--r-full`); for shapes prefer `Capsule` or `Circle`.
+        static let full: CGFloat = 999
         /// Tab bar container (the system tab bar draws its own on iOS).
         static let tabBar: CGFloat = 18
     }
@@ -216,6 +225,85 @@ enum Theme {
 
     private static func swatch(_ light: UInt32, _ dark: UInt32, _ lightHC: UInt32, _ darkHC: UInt32) -> Color {
         Color.grouperDynamic(ThemeSwatch(light: light, dark: dark, lightHighContrast: lightHC, darkHighContrast: darkHC))
+    }
+}
+
+/// The ten identity-hue ramps (design-system 2.6), by hue and not by model family, so the
+/// mapping from family (later: provider) to hue lives in one table, `ModelFamily.identityHue`.
+/// Four steps each: 1 `bg` (tinted pill and chip), 2 `border`, 3 `solid` (dots, marks, donut
+/// segments, meter and share bars), 4 `text` (today's `--fam-*` value). Increase Contrast keeps
+/// today's high-contrast values for `text` and uses them for `solid` too; `bg` and `border`
+/// have no contrast variant.
+enum IdentityHue: String, CaseIterable, Sendable {
+    case teal, purple, orange, pink, blue, green, amber, rose, indigo, cyan
+
+    /// From the colour name the hub stores for an API key (case-insensitive).
+    init?(name: String?) {
+        guard let name, let hue = IdentityHue(rawValue: name.lowercased()) else { return nil }
+        self = hue
+    }
+
+    var bgSwatch: ThemeSwatch {
+        ThemeSwatch(light: row.lightBg, dark: row.darkBg, lightHighContrast: row.lightBg, darkHighContrast: row.darkBg)
+    }
+    var borderSwatch: ThemeSwatch {
+        ThemeSwatch(light: row.lightBorder, dark: row.darkBorder, lightHighContrast: row.lightBorder, darkHighContrast: row.darkBorder)
+    }
+    var solidSwatch: ThemeSwatch {
+        ThemeSwatch(light: row.lightSolid, dark: row.darkSolid, lightHighContrast: row.lightHC, darkHighContrast: row.darkHC)
+    }
+    var textSwatch: ThemeSwatch {
+        ThemeSwatch(light: row.lightText, dark: row.darkText, lightHighContrast: row.lightHC, darkHighContrast: row.darkHC)
+    }
+
+    /// Step 1: tinted pill and chip background.
+    var bg: Color { Color.grouperDynamic(bgSwatch) }
+    /// Step 2: pill outline.
+    var border: Color { Color.grouperDynamic(borderSwatch) }
+    /// Step 3: dots, family marks, donut segments, meter and share bars.
+    var solid: Color { Color.grouperDynamic(solidSwatch) }
+    /// Step 4: model name in a chip, pill text, glyph on a tinted mark.
+    var text: Color { Color.grouperDynamic(textSwatch) }
+
+    private struct Row {
+        let darkBg, darkBorder, darkSolid, darkText: UInt32
+        let lightBg, lightBorder, lightSolid, lightText: UInt32
+        let lightHC, darkHC: UInt32
+    }
+
+    private var row: Row {
+        switch self {
+        case .teal: return Row(darkBg: 0x183940, darkBorder: 0x1A686B, darkSolid: 0x1DD0CB, darkText: 0x4FE3E6,
+                               lightBg: 0xE2F3F2, lightBorder: 0x93D0CE, lightSolid: 0x0E9793, lightText: 0x0B6B73,
+                               lightHC: 0x06525A, darkHC: 0x7FF0F2)
+        case .purple: return Row(darkBg: 0x2B2646, darkBorder: 0x4D367C, darkSolid: 0x9759F5, darkText: 0xA78BFA,
+                                 lightBg: 0xEFEAFC, lightBorder: 0xC4AFF5, lightSolid: 0x7C4DE8, lightText: 0x5B3FC4,
+                                 lightHC: 0x47309F, darkHC: 0xC4B0FF)
+        case .orange: return Row(darkBg: 0x3B322E, darkBorder: 0x76553E, darkSolid: 0xF8A360, darkText: 0xF9A85A,
+                                 lightBg: 0xF9EEE5, lightBorder: 0xE7BE9E, lightSolid: 0xCA6F28, lightText: 0x9A4A06,
+                                 lightHC: 0x7A3A04, darkHC: 0xFFC48A)
+        case .pink: return Row(darkBg: 0x38293F, darkBorder: 0x6E3D69, darkSolid: 0xE66BC8, darkText: 0xF28AD8,
+                               lightBg: 0xF9E9F5, lightBorder: 0xE7ADD8, lightSolid: 0xC948A8, lightText: 0xA12D86,
+                               lightHC: 0x82216B, darkHC: 0xF8B0E6)
+        case .blue: return Row(darkBg: 0x223048, darkBorder: 0x345181, darkSolid: 0x5B9BFF, darkText: 0x7FB0FF,
+                               lightBg: 0xE7F0FC, lightBorder: 0xA7C5F4, lightSolid: 0x3B7FE6, lightText: 0x1F5FCC,
+                               lightHC: 0x164AA3, darkHC: 0xA9C9FF)
+        case .green: return Row(darkBg: 0x283726, darkBorder: 0x456329, darkSolid: 0x84C52E, darkText: 0x9FD24A,
+                                lightBg: 0xEBF3E2, lightBorder: 0xB6D091, lightSolid: 0x5C970A, lightText: 0x436E00,
+                                lightHC: 0x395C00, darkHC: 0xBFE57A)
+        case .amber: return Row(darkBg: 0x373424, darkBorder: 0x6B5A23, darkSolid: 0xE0B020, darkText: 0xE8C04A,
+                                lightBg: 0xF5F0E2, lightBorder: 0xDBC591, lightSolid: 0xAF7F0A, lightText: 0x805B00,
+                                lightHC: 0x6A4B00, darkHC: 0xF5D77A)
+        case .rose: return Row(darkBg: 0x3A2833, darkBorder: 0x743C4A, darkSolid: 0xF4677E, darkText: 0xFF8FA0,
+                               lightBg: 0xFBE9EC, lightBorder: 0xEFAEB9, lightSolid: 0xDC4A64, lightText: 0xBD2F4A,
+                               lightHC: 0x981F38, darkHC: 0xFFB3BF)
+        case .indigo: return Row(darkBg: 0x252B45, darkBorder: 0x3C4379, darkSolid: 0x7078EE, darkText: 0x8891F0,
+                                 lightBg: 0xECECFB, lightBorder: 0xB7B8EF, lightSolid: 0x5F62DC, lightText: 0x4D4FC9,
+                                 lightHC: 0x3A3CA8, darkHC: 0xB0B6FF)
+        case .cyan: return Row(darkBg: 0x1C3543, darkBorder: 0x255D73, darkSolid: 0x38B6DE, darkText: 0x5CC8E8,
+                               lightBg: 0xE3F2F6, lightBorder: 0x94CDDD, lightSolid: 0x1290B4, lightText: 0x0A6F8C,
+                               lightHC: 0x06566D, darkHC: 0x8ADCF2)
+        }
     }
 }
 
