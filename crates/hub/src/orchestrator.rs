@@ -216,16 +216,17 @@ pub(crate) async fn resolve_turn_model(
 async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     let Some(conv) = hub.db.conversation(conversation_id) else { return };
     let project = conv.mode == "project";
-    // Subscription-billed harnesses in standard chats never spend API budgets; API turns still check limits.
-    let standard_harness = !project
-        && hub
-            .db
-            .conversation_model(conversation_id)
-            .ok()
-            .flatten()
-            .or_else(|| hub.db.default_model("standard"))
-            .is_some_and(|m| m.is_harness());
-    if !standard_harness && crate::limits::refuse_turn(hub, conversation_id, &wakes) {
+    // Subscription-billed harnesses never spend API budgets. That includes a project chat
+    // whose orchestrator is a harness with `can_orchestrate`. API turns still check limits.
+    let role_for_default = if project { "orchestrator" } else { "standard" };
+    let subscription_harness = hub
+        .db
+        .conversation_model(conversation_id)
+        .ok()
+        .flatten()
+        .or_else(|| hub.db.default_model(role_for_default))
+        .is_some_and(|m| m.is_harness() && (!project || m.can_orchestrate));
+    if !subscription_harness && crate::limits::refuse_turn(hub, conversation_id, &wakes) {
         return;
     }
 
@@ -297,9 +298,10 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         return;
     };
 
-    if !project && model.is_harness() {
+    if model.is_harness() {
+        let orchestrator_prompt = project.then(|| ORCHESTRATOR_SYSTEM.to_string());
         match hub
-            .run_standard_harness_turn(conversation_id, &model, &text, &wakes)
+            .run_standard_harness_turn(conversation_id, &model, &text, &wakes, orchestrator_prompt)
             .await
         {
             Ok(reply) => {

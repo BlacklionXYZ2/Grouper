@@ -493,15 +493,19 @@ fn probe_provider_for_agent(agent: &str) -> Option<&'static str> {
 }
 
 impl Hub {
-    /// Execute one standard-chat turn on the device hosting `model`, resuming the
+    /// Execute one harness turn on the device hosting `model`, resuming the
     /// conversation's stored `harness_session` (or seeding a new session with a compact
     /// copy of earlier visible turns when switching into a harness mid-chat).
+    ///
+    /// `orchestrator_prompt` is set for a project chat. The harness must then be on this
+    /// hub's own device, and the turn carries the chat's loopback MCP token.
     pub(crate) async fn run_standard_harness_turn(
         self: &Arc<Self>,
         conversation_id: &str,
         model: &ModelEntry,
         message: &str,
         wakes: &[Wake],
+        orchestrator_prompt: Option<String>,
     ) -> std::result::Result<HarnessTurnReply, String> {
         let provider = self
             .db
@@ -530,6 +534,16 @@ impl Hub {
             .resolve_device(host_ref)
             .ok_or_else(|| format!("{label} names unknown device {host_ref:?}"))?;
 
+        if orchestrator_prompt.is_some() {
+            let hub_id = self.db.hub_device_id();
+            if device_id != hub_id {
+                let hub_name = self.resolve_device(&hub_id).map(|(_, name)| name).unwrap_or(hub_id);
+                return Err(format!(
+                    "{label} is on {device_name}, not this hub's computer ({hub_name}). A harness can orchestrate a project chat only from the hub's own device."
+                ));
+            }
+        }
+
         let conn_id = {
             let live = self.live.lock().await;
             let Some(conn) = live.get(&device_id) else {
@@ -551,6 +565,30 @@ impl Hub {
             format_switched_message(&prior, message)
         } else {
             message.to_string()
+        };
+
+        let (mcp, allowed_tools, system_prompt) = if let Some(prompt) = orchestrator_prompt {
+            let port = self.loopback_port();
+            if port == 0 {
+                return Err(
+                    "this hub has no loopback port, so it cannot give the harness its orchestrator MCP endpoint"
+                        .into(),
+                );
+            }
+            let token = self
+                .db
+                .replace_orchestrator_token(conversation_id)
+                .map_err(|e| e.to_string())?;
+            (
+                Some(core_protocol::HarnessMcp {
+                    url: format!("http://127.0.0.1:{port}/mcp/orchestrator"),
+                    bearer_token: token,
+                }),
+                vec!["mcp__grouper__*".to_string()],
+                Some(prompt),
+            )
+        } else {
+            (None, Vec::new(), None)
         };
 
         let (tx, rx) = oneshot::channel();
@@ -583,6 +621,9 @@ impl Hub {
                     model: model.model.clone(),
                     session_id: stored_session,
                     message: wire_message,
+                    mcp,
+                    allowed_tools,
+                    system_prompt,
                 },
             )
             .await;
@@ -1090,6 +1131,7 @@ fn main() {
                     model,
                     session_id,
                     message,
+                    ..
                 }) = serde_json::from_str::<HubMessage>(&t)
                 {
                     seen_for_dev
@@ -1105,6 +1147,7 @@ fn main() {
                         &message,
                         &workdir,
                         HarnessLevel::Confined,
+                        None,
                     )
                     .await
                     {

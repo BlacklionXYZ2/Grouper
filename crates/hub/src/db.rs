@@ -1069,6 +1069,43 @@ impl Db {
             .is_ok_and(|n| n > 0)
     }
 
+    /// Revoke every live orchestrator token for a chat. Returns how many changed.
+    pub fn revoke_conversation_orchestrator_tokens(&self, conversation_id: &str) -> usize {
+        self.c()
+            .execute(
+                "UPDATE orchestrator_tokens SET revoked = 1 WHERE conversation_id = ?1 AND revoked = 0",
+                [conversation_id],
+            )
+            .unwrap_or(0)
+    }
+
+    /// Revoke the chat's current orchestrator tokens and mint a replacement.
+    /// The raw token is returned once; only its hash is stored.
+    pub fn replace_orchestrator_token(&self, conversation_id: &str) -> Result<String> {
+        self.revoke_conversation_orchestrator_tokens(conversation_id);
+        self.mint_orchestrator_token(conversation_id)
+    }
+
+    /// Delete a chat and revoke its orchestrator tokens.
+    pub fn delete_conversation(&self, id: &str) -> Result<bool> {
+        if self.conversation(id).is_none() {
+            return Ok(false);
+        }
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute(
+            "UPDATE orchestrator_tokens SET revoked = 1 WHERE conversation_id = ?1 AND revoked = 0",
+            [id],
+        )?;
+        tx.execute("DELETE FROM history WHERE conversation_id = ?1", [id])?;
+        tx.execute("DELETE FROM events WHERE conversation_id = ?1", [id])?;
+        tx.execute("DELETE FROM threads WHERE conversation_id = ?1", [id])?;
+        tx.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM hub_meta WHERE key = ?1", [format!("conv_harness_provider:{id}")])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn touch(&self, id: &str) {
         let _ = self.c().execute("UPDATE devices SET last_seen = ?1 WHERE id = ?2", params![ts(), id]);
     }
