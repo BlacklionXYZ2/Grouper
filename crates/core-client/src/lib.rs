@@ -8,7 +8,7 @@
 //! and reconnects with backoff.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -327,7 +327,8 @@ impl Threads {
             return;
         }
         if let Some(run) = self.harness_runs.lock().unwrap().get(thread_id) {
-            let _ = run.input.send(text.to_string());
+            // Same shape the API loop queues, so a resumed CLI turn can see who spoke.
+            let _ = run.input.send(format!("[Message from the {from}]\n{text}"));
         }
     }
 
@@ -436,6 +437,20 @@ fn start_thread(
     host: &Arc<McpHost>,
     folders: &Arc<Folders>,
 ) {
+    if spec.harness.is_some() {
+        let Some(root) = config.workspace_root.clone() else {
+            let id = spec.thread_id.clone();
+            events.thread(&id, &spec.title, "failed");
+            threads.send(NodeMessage::ThreadFinished {
+                thread_id: id,
+                ok: false,
+                summary: "This device doesn't run threads.".into(),
+            });
+            return;
+        };
+        start_harness_thread(spec, &root, events, threads, folders, harness::ScanOptions::host());
+        return;
+    }
     let id = spec.thread_id.clone();
     let fail = |msg: String| {
         threads.send(NodeMessage::ThreadFinished { thread_id: id.clone(), ok: false, summary: msg });
@@ -489,6 +504,108 @@ fn start_thread(
             t.send(NodeMessage::ThreadFinished { thread_id: id, ok: result.ok, summary: result.summary });
         }
     });
+}
+
+/// Run a harness thread: the brief is turn 1 in the thread workspace at
+/// [`HarnessLevel::Workspace`](harness::HarnessLevel::Workspace). Messages that arrive
+/// during a turn are further turns on the same CLI session. An empty inbox after a turn
+/// ends the thread, and that reply is the summary. Aborting the task drops the child
+/// (`kill_on_drop`), which is how `stop_thread` kills the process.
+fn start_harness_thread(
+    spec: ThreadSpec,
+    workspace_root: &Path,
+    events: &Arc<dyn Events>,
+    threads: &Arc<Threads>,
+    folders: &Arc<Folders>,
+    opts: harness::ScanOptions,
+) {
+    let id = spec.thread_id.clone();
+    let title = spec.title.clone();
+    let fail = |msg: String| {
+        events.thread(&id, &title, "failed");
+        threads.send(NodeMessage::ThreadFinished { thread_id: id.clone(), ok: false, summary: msg });
+    };
+    let Some(harness) = spec.harness.clone() else {
+        return fail("not a harness thread".into());
+    };
+    let ws = match Workspace::create_scoped(workspace_root.join(&id), folders.clone(), &spec.device_name) {
+        Ok(w) => w,
+        Err(e) => return fail(format!("workspace: {e}")),
+    };
+    let workdir = ws.root().to_path_buf();
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
+    let weak = Arc::downgrade(threads);
+    let task_events = events.clone();
+    let thread_id = id.clone();
+    let brief = spec.brief.clone();
+    let join = tokio::spawn(async move {
+        let mut session = harness.session.filter(|s| !s.trim().is_empty());
+        let mut last_reply = String::new();
+        let mut upcoming = Some(brief);
+        loop {
+            let message = if let Some(m) = upcoming.take() {
+                m
+            } else {
+                match input_rx.try_recv() {
+                    Ok(m) => m,
+                    Err(_) => break,
+                }
+            };
+            let result = harness::turn_with(
+                &opts,
+                &harness.agent,
+                &harness.model,
+                session.as_deref(),
+                &message,
+                &workdir,
+                harness::HarnessLevel::Workspace,
+                None,
+            )
+            .await;
+            let Some(t) = weak.upgrade() else { return };
+            match result {
+                Ok(out) => {
+                    if !out.session_id.trim().is_empty() {
+                        session = Some(out.session_id.clone());
+                        t.send(NodeMessage::ThreadHarnessSession {
+                            thread_id: thread_id.clone(),
+                            session_id: out.session_id,
+                        });
+                    }
+                    t.send(NodeMessage::ThreadEvent {
+                        thread_id: thread_id.clone(),
+                        event: AgentEvent::Text { text: out.text.clone() },
+                    });
+                    last_reply = out.text;
+                }
+                Err(error) => {
+                    task_events.thread(&thread_id, &title, "failed");
+                    t.harness_runs.lock().unwrap().remove(&thread_id);
+                    t.send(NodeMessage::ThreadFinished { thread_id, ok: false, summary: error });
+                    return;
+                }
+            }
+        }
+        task_events.thread(&thread_id, &title, "done");
+        if let Some(t) = weak.upgrade() {
+            t.harness_runs.lock().unwrap().remove(&thread_id);
+            t.send(NodeMessage::ThreadFinished { thread_id, ok: true, summary: last_reply });
+        }
+    });
+    let abort = join.abort_handle();
+    let inserted = {
+        let mut runs = threads.harness_runs.lock().unwrap();
+        if threads.closed.load(Ordering::SeqCst) {
+            abort.abort();
+            false
+        } else {
+            runs.insert(id, HarnessThreadRun { abort, input: input_tx });
+            true
+        }
+    };
+    if inserted {
+        events.thread(&spec.thread_id, &spec.title, "running");
+    }
 }
 
 const MAX_HARNESS_TASKS: usize = 16;
@@ -682,16 +799,10 @@ async fn connect_once(
                         start_thread(*spec, config, handler, events, &threads, host, folders)
                     }
                     Ok(HubMessage::ThreadInput { thread_id, from, text }) => {
-                        if let Some(c) = threads.controls.lock().unwrap().get(&thread_id) {
-                            c.send(&from, &text);
-                        }
+                        threads.push_input(&thread_id, &from, &text);
                     }
                     Ok(HubMessage::StopThread { thread_id }) => {
-                        if let Some(c) = threads.controls.lock().unwrap().remove(&thread_id) {
-                            c.stop();
-                        }
-                        let prefix = format!("{thread_id}-");
-                        threads.approvals.lock().unwrap().retain(|id, _| !id.starts_with(&prefix));
+                        threads.stop_one(&thread_id);
                     }
                     Ok(HubMessage::ApprovalResult { approval_id, approved, timeout_secs }) => {
                         if let Some(tx) = threads.approvals.lock().unwrap().remove(&approval_id) {
