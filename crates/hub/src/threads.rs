@@ -17,6 +17,11 @@ pub(crate) fn denial_key(tool: &str, input: &Value) -> String {
     format!("{tool}\0{input}")
 }
 
+/// Thread id to store on an approval event. Empty means a standard-chat turn with no thread.
+fn approval_event_thread(thread_id: &str) -> Option<&str> {
+    if thread_id.is_empty() { None } else { Some(thread_id) }
+}
+
 use crate::offline::WAITING_DEVICE;
 use crate::orchestrator::Wake;
 use crate::server::{ApprovalAnswer, ApprovalRoute, HUB_DEVICE, Hub};
@@ -91,6 +96,17 @@ fn render_brief(r: &ThreadRequest) -> String {
         }
     }
     s
+}
+
+/// The timeout task lives outside `request_approval_inner`. Spawning it there makes rustc
+/// cycle on the orchestrator worker's `Send` check (E0391): that worker asks for an
+/// approval, and a timed-out approval can wake the same worker.
+fn spawn_approval_timer(hub: Arc<Hub>, approval_id: String, generation: u64, secs: u64) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        hub.approval_timed_out(approval_id, generation, secs).await;
+    })
+    .abort_handle()
 }
 
 impl Hub {
@@ -302,6 +318,7 @@ impl Hub {
             input,
             reason,
             None,
+            None,
         )
         .await
     }
@@ -321,7 +338,34 @@ impl Hub {
         if !internal && !approval_id.starts_with(&format!("{thread_id}-")) {
             return false;
         }
-        self.request_approval_inner(device_id, thread_id, approval_id, None, tool, input, reason, local).await
+        self.request_approval_inner(device_id, thread_id, approval_id, None, tool, input, reason, local, None).await
+    }
+
+    /// Approval for a standard-chat harness turn, which has no thread. Same dock, push
+    /// and timeout path as [`Self::request_approval`]. `thread_id` on the route is empty.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_conversation_approval(
+        self: &Arc<Self>,
+        device_id: &str,
+        conversation_id: &str,
+        approval_id: &str,
+        tool: &str,
+        input: Value,
+        reason: &str,
+        local: oneshot::Sender<ApprovalAnswer>,
+    ) -> bool {
+        self.request_approval_inner(
+            device_id,
+            "",
+            approval_id,
+            None,
+            tool,
+            input,
+            reason,
+            Some(local),
+            Some(conversation_id.to_string()),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -335,16 +379,26 @@ impl Hub {
         input: Value,
         reason: &str,
         local: Option<oneshot::Sender<ApprovalAnswer>>,
+        conversation_id: Option<String>,
     ) -> bool {
         let internal = local.is_some();
         let generation = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut approvals = self.approvals.lock().await;
-        // Re-read status while holding the route lock. If a finisher changed it
-        // first we reject; if it changes after this check, its clear pass removes us.
-        let Some(t) = self.db.thread(thread_id) else { return false };
-        if t.status != "running" && !(internal && t.status == WAITING_DEVICE) {
-            return false;
-        }
+        // A standard-chat turn has no thread. A thread approval still requires a live thread:
+        // re-read status while holding the route lock. If a finisher changed it first we reject;
+        // if it changes after this check, its clear pass removes us.
+        let (conversation_id, stored_thread) = if let Some(cid) = conversation_id {
+            if self.db.conversation(&cid).is_none() {
+                return false;
+            }
+            (cid, String::new())
+        } else {
+            let Some(t) = self.db.thread(thread_id) else { return false };
+            if t.status != "running" && !(internal && t.status == WAITING_DEVICE) {
+                return false;
+            }
+            (t.conversation_id, thread_id.to_string())
+        };
         if approvals.contains_key(approval_id) {
             return false;
         }
@@ -357,7 +411,7 @@ impl Hub {
         // another thread): refuse it without asking again. A device gets the usual
         // `ApprovalResult { approved: false }` from its caller when this returns false.
         let key = denial_key(tool, &input);
-        if self.denied_calls.lock().unwrap().get(&t.conversation_id).is_some_and(|d| d.contains(&key)) {
+        if self.denied_calls.lock().unwrap().get(&conversation_id).is_some_and(|d| d.contains(&key)) {
             drop(approvals);
             tracing::info!(thread = thread_id, tool, "refused a call the user already denied in this conversation");
             return match local {
@@ -374,8 +428,8 @@ impl Hub {
             approval_id.into(),
             ApprovalRoute {
                 device_id: device_id.into(),
-                conversation_id: t.conversation_id.clone(),
-                thread_id: thread_id.into(),
+                conversation_id: conversation_id.clone(),
+                thread_id: stored_thread.clone(),
                 tool: tool.into(),
                 input: input.clone(),
                 reason: reason.into(),
@@ -389,8 +443,8 @@ impl Hub {
         );
         drop(approvals);
         self.emit(
-            &t.conversation_id,
-            Some(thread_id),
+            &conversation_id,
+            approval_event_thread(&stored_thread),
             EventBody::ApprovalRequested {
                 approval_id: approval_id.into(),
                 device_id: device_id.into(),
@@ -402,14 +456,9 @@ impl Hub {
         // The limit at request time. Turning it off before the timer fires leaves
         // the approval pending (`approval_timed_out` checks again).
         if let Some(secs) = timeout_secs {
-            let hub = Arc::clone(self);
             let timer_id = approval_id.to_string();
             let route_id = timer_id.clone();
-            let task = tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                hub.approval_timed_out(timer_id, generation, secs).await;
-            });
-            let timer = task.abort_handle();
+            let timer = spawn_approval_timer(Arc::clone(self), timer_id, generation, secs);
             let mut approvals = self.approvals.lock().await;
             match approvals.get_mut(&route_id) {
                 Some(route) if route.generation == generation => route.timer = Some(timer),
@@ -433,8 +482,11 @@ impl Hub {
         drop(approvals);
         let action = self.db.limits().approval_timeout_action;
         let phrase = approval_timeout_phrase(secs);
+        let has_thread = !route.thread_id.is_empty();
         tracing::info!(approval_id, thread = %route.thread_id, secs, action = action.as_str(), "approval timed out");
-        if action == ApprovalTimeoutAction::Stop {
+        // A standard-chat harness approval has no thread. Stopping nothing must still
+        // answer the waiter; otherwise the turn never hears the timeout.
+        if action == ApprovalTimeoutAction::Stop && has_thread {
             let summary = format!("Stopped: no answer to an approval within {phrase}.");
             if self.stop_thread_as(&route.thread_id, "approval", &summary).await.is_err() {
                 return;
@@ -457,16 +509,19 @@ impl Hub {
                 .await;
             }
         }
-        let reason = if action == ApprovalTimeoutAction::Stop { "timeout_stop" } else { "timeout" };
+        let reason = if action == ApprovalTimeoutAction::Stop && has_thread { "timeout_stop" } else { "timeout" };
         self.emit(
             &route.conversation_id,
-            Some(&route.thread_id),
+            approval_event_thread(&route.thread_id),
             EventBody::ApprovalResolved {
                 approval_id: approval_id.clone(),
                 approved: false,
                 reason: Some(reason.into()),
             },
         );
+        if !has_thread {
+            return;
+        }
         let text = if action == ApprovalTimeoutAction::Stop {
             format!("No answer within {phrase}; stopping the thread.")
         } else {
