@@ -155,6 +155,10 @@ pub struct Hub {
     pub(crate) push: crate::push::PushState,
     /// Device link rate limits ([`crate::link`]).
     pub(crate) link: crate::link::LinkState,
+    /// Cloudflare tunnel supervisor state ([`crate::tunnel`]).
+    pub(crate) tunnel: crate::tunnel::TunnelState,
+    /// Step-down detection state ([`crate::stepdown`]).
+    pub(crate) stepdown: crate::stepdown::StepDownState,
 }
 
 impl Hub {
@@ -183,7 +187,24 @@ impl Hub {
             google: crate::google_auth::GoogleAuth::from_env(),
             push: crate::push::PushState::new(hub.clone(), initial_push_subs),
             link: Default::default(),
+            tunnel: crate::tunnel::TunnelState::new(),
+            stepdown: crate::stepdown::StepDownState::new(),
         })
+    }
+
+    /// Cloudflare tunnel supervisor state and status.
+    pub fn tunnel(&self) -> &crate::tunnel::TunnelState {
+        &self.tunnel
+    }
+
+    /// Step-down state (whether a newer hub for this account replaced us).
+    pub fn stepdown(&self) -> &crate::stepdown::StepDownState {
+        &self.stepdown
+    }
+
+    /// Whether this hub has stepped down after detecting a higher-epoch peer hub.
+    pub fn is_stepped_down(&self) -> bool {
+        self.stepdown.is_stepped_down()
     }
 
     /// [`Db::issue_device`], then the live side of a reused device: its old token's browser sessions
@@ -585,6 +606,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::google_auth::routes())
         .merge(crate::link::routes())
         .merge(crate::push::routes())
+        .merge(crate::tunnel::routes())
         .merge(crate::web::routes())
         .with_state(hub)
         .layer(axum::middleware::from_fn(crate::session::guard))

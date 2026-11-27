@@ -41,6 +41,8 @@ struct Running {
     hub: Arc<Hub>,
     shutdown: watch::Sender<bool>,
     collector: JoinHandle<()>,
+    tunnel: JoinHandle<()>,
+    stepdown: JoinHandle<()>,
     servers: Vec<JoinHandle<io::Result<()>>>,
     _lock: DataLock,
 }
@@ -93,6 +95,8 @@ pub async fn start_with_options(
     }
 
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let tunnel = tokio::spawn(crate::tunnel::supervisor_loop(hub.clone(), shutdown_rx.clone()));
+    let stepdown = tokio::spawn(crate::stepdown::stepdown_loop(hub.clone(), shutdown_rx.clone()));
     let mut servers = Vec::with_capacity(listeners.len());
     for (listener, bound) in listeners {
         tracing::info!("grouper-hub listening on {bound}, data in {}", data_dir.display());
@@ -111,7 +115,7 @@ pub async fn start_with_options(
     Ok(HubHandle {
         data_dir,
         binds: local_addrs,
-        running: Mutex::new(Some(Running { hub, shutdown, collector, servers, _lock: lock })),
+        running: Mutex::new(Some(Running { hub, shutdown, collector, tunnel, stepdown, servers, _lock: lock })),
     })
 }
 
@@ -149,16 +153,27 @@ impl HubHandle {
         hub.claim_local_client(id_token, client, device_name, install_id).await
     }
 
+    /// Whether this hub has stepped down after detecting a newer hub for the same account.
+    pub fn is_stepped_down(&self) -> bool {
+        self.hub().is_some_and(|h| h.is_stepped_down())
+    }
+
     /// Stop all listeners, background loops and live connections, releasing the data-directory lock.
     /// Calling `stop` more than once is a safe no-op.
     pub async fn stop(&self) {
-        let Some(Running { hub, shutdown, collector, servers, _lock }) =
+        let Some(Running { hub, shutdown, collector, mut tunnel, mut stepdown, servers, _lock }) =
             self.running.lock().unwrap_or_else(|e| e.into_inner()).take()
         else {
             return;
         };
         let _ = shutdown.send(true);
         collector.abort();
+        if tokio::time::timeout(STOP_GRACE, &mut tunnel).await.is_err() {
+            tunnel.abort();
+        }
+        if tokio::time::timeout(STOP_GRACE, &mut stepdown).await.is_err() {
+            stepdown.abort();
+        }
         for (_, live) in hub.live.lock().await.drain() {
             live.close.trigger(CloseReason::Replaced);
         }
@@ -175,6 +190,8 @@ impl Drop for HubHandle {
         if let Some(running) = self.running.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = running.shutdown.send(true);
             running.collector.abort();
+            running.tunnel.abort();
+            running.stepdown.abort();
             for server in running.servers {
                 server.abort();
             }
