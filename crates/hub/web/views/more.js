@@ -1,5 +1,5 @@
-// "More" on narrow screens: the sections that don't fit the tab bar (Chat / Devices /
-// More). Needs you comes first, with a live count. Rows use the filled nav icons.
+// "More" on narrow screens: the sections that don't fit the tab bar (Chat / Usage /
+// Devices / More). Needs you comes first, with a live count. Rows use the filled nav icons.
 
 import { h, icon, setText, setAttr } from '../lib/dom.js';
 import { store, on, needsYouCount } from '../lib/store.js';
@@ -55,7 +55,6 @@ export function renderMore(container) {
           { class: 'list card' },
           needsRow,
           item('#/models', 'Models', 'models-fill', 'Registry, stats, proposals, rules', store.pendingProposals),
-          item('#/usage', 'Usage & limits', 'usage-fill', 'Spend, balances, budgets'),
           item('#/memory', 'Memory', 'memory-fill', 'What Grouper remembers'),
           item('#/skills', 'Skills', 'skills-fill', 'Saved procedures'),
           item('#/settings', 'Settings', 'settings-fill', 'This browser, the hub, appearance'),

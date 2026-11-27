@@ -16,8 +16,11 @@
 //   #/inbox                Needs you: approvals and waiting threads across all chats
 //   #/models               the registry
 //   #/models/<id>          the registry with that model's provider group open, its row shown and focused
-//   #/usage                usage and limits; `?provider=<id>` filters the breakdown
-//   #/usage?conversation=<id>  one chat's usage (also takes `&provider=<id>`)
+//   #/usage                the two summaries (API costs, Subscriptions); `?provider=<id>` opens
+//                          with that key focused
+//   #/usage?conversation=<id>  one chat's usage (API costs scoped to it, then its threads)
+//   #/usage/breakdown      the breakdown table (`?provider=<id>` filters it)
+//   #/usage/limits         limits and budgets
 //   #/devices #/devices/<id> #/memory #/skills #/settings #/more
 //   #/link?code=<c>        approve or deny a device's sign-in (`grouper login`); signed out,
 //                          it goes through sign-in and comes back here
@@ -332,7 +335,7 @@ function buildNav() {
   const sections = [
     navLink('#/devices', 'Devices', 'devices-fill', ['devices']),
     navLink('#/models', 'Models', 'models-fill', ['models'], 'waiting'),
-    navLink('#/usage', 'Usage & limits', 'usage-fill', ['usage']),
+    navLink('#/usage', 'Usage', 'usage-fill', ['usage']),
     navLink('#/memory', 'Memory', 'memory-fill', ['memory']),
     navLink('#/skills', 'Skills', 'skills-fill', ['skills']),
     navLink('#/settings', 'Settings', 'settings-fill', ['settings']),
@@ -367,9 +370,11 @@ function buildNav() {
   };
   const tabs = [
     tab('#/chat', 'Chat', 'chat', ['chat'], 'need you'),
+    // Usage is a tab of its own (usage-tab-spec 2); it has no badge in this round.
+    tab('#/usage', 'Usage', 'usage', ['usage']),
     tab('#/devices', 'Devices', 'devices', ['devices']),
     // The inbox is reached from More on phones for now, so More stays lit there.
-    tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings', 'inbox'], 'pending'),
+    tab('#/more', 'More', 'more', ['more', 'models', 'memory', 'skills', 'settings', 'inbox'], 'pending'),
   ];
   setChildren(els.tabbar, tabs.map((t) => t.a));
   nav = { newChat, needsItem, needsWords, needsBadge, needsAge, chatList, chatEmpty, more, sections, status, tabs };
@@ -526,9 +531,14 @@ export function parseRoute() {
     return { view: 'thread-redirect', thread: a, approval: query.get('approval') || undefined };
   }
   if (view === 'usage') {
+    // #/usage/breakdown and #/usage/limits are their own pages (the old table and editor).
+    if (a === 'breakdown' || a === 'limits') {
+      return { view: 'usage', sub: a, conversation: null, provider: query.get('provider') || null };
+    }
     const conversation = query.get('conversation') || (a === 'conversation' ? b : a) || null;
-    // The provider filter changes in place: it's not part of the route key below.
-    return { view: 'usage', conversation, provider: query.get('provider') || null };
+    // The focused key (summary) or provider filter (breakdown) changes in place: it's
+    // not part of the route key below.
+    return { view: 'usage', sub: 'summary', conversation, provider: query.get('provider') || null };
   }
   if (view === 'claim') {
     return { view: 'claim', code: query.get('code') || '', error: query.get('error') || '' };
@@ -672,7 +682,7 @@ function route() {
       : r.view === 'thread-redirect'
         ? `thread-redirect:${r.thread || ''}`
         : r.view === 'usage'
-          ? `usage:${r.conversation || ''}`
+          ? `usage:${r.sub}:${r.conversation || ''}`
           : `${r.view}:${r.id || ''}`;
   if (key !== mainKey) {
     mainChanged = true;

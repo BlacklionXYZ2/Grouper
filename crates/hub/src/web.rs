@@ -42,6 +42,7 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "css/brand.css",
     "css/link.css",
     "css/hub.css",
+    "css/usage.css",
     "icon.svg",
     "logo.svg",
     "logo-glyph.svg",
@@ -62,6 +63,7 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "views/chat.js",
     "views/devices.js",
     "views/inbox.js",
+    "views/key-color.js",
     "views/link.js",
     "views/login.js",
     "views/memory.js",
@@ -73,6 +75,9 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "views/skills.js",
     "views/thread.js",
     "views/threads-panel.js",
+    "views/usage-breakdown.js",
+    "views/usage-common.js",
+    "views/usage-limits.js",
     "views/usage.js",
 ];
 
