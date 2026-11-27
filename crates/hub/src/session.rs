@@ -8,6 +8,8 @@
 //!   request came over HTTPS, as `X-Forwarded-Proto: https` says behind Cloudflare). The
 //!   hub keeps only a SHA-256 of the id, in `sessions`, with the token's device, and the
 //!   session expires after 30 days. The token itself is never stored by the browser.
+//!   A session opened by `POST /v1/auth/google/return` also stores that Google account's
+//!   `sub`; `created` is when the sign-in happened. Token sessions leave `google_sub` empty.
 //! - `GET /v1/session` says who the caller is; `DELETE /v1/session` logs out.
 //! - [`crate::server::Hub::auth`] accepts the cookie wherever a Bearer token is
 //!   accepted. A Bearer header, when present, is used alone, as before. The session
@@ -51,7 +53,7 @@ static PLAIN_HTTP_WARNING: Once = Once::new();
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
   id_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL, created INTEGER NOT NULL,
-  last_used INTEGER NOT NULL, expires INTEGER NOT NULL);
+  last_used INTEGER NOT NULL, expires INTEGER NOT NULL, google_sub TEXT);
 CREATE INDEX IF NOT EXISTS sessions_device ON sessions (device_id);
 ";
 
@@ -64,20 +66,64 @@ fn well_formed(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A live browser session. `google_sub` is set only when `POST /v1/auth/google/return` opened it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveSession {
+    pub google_sub: Option<String>,
+    pub created: u64,
+}
+
 impl Db {
-    /// Start a session for `device_id`. Returns the raw id (for the cookie only) and
-    /// when it expires. Expired sessions are cleared on the way.
-    pub fn create_session(&self, device_id: &str) -> anyhow::Result<(String, u64)> {
+    fn insert_session(&self, device_id: &str, google_sub: Option<&str>) -> anyhow::Result<(String, u64)> {
         let id = random_hex(32);
         let created = now();
         let expires = created + SESSION_TTL_SECS;
         let c = self.c();
         c.execute("DELETE FROM sessions WHERE expires <= ?1", [created as i64])?;
         c.execute(
-            "INSERT INTO sessions (id_hash, device_id, created, last_used, expires) VALUES (?1, ?2, ?3, ?3, ?4)",
-            params![hash(&id), device_id, created as i64, expires as i64],
+            "INSERT INTO sessions (id_hash, device_id, created, last_used, expires, google_sub)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
+            params![hash(&id), device_id, created as i64, expires as i64, google_sub],
         )?;
         Ok((id, expires))
+    }
+
+    /// Start a session for `device_id`. Returns the raw id (for the cookie only) and
+    /// when it expires. Expired sessions are cleared on the way. This is not a Google sign-in.
+    pub fn create_session(&self, device_id: &str) -> anyhow::Result<(String, u64)> {
+        self.insert_session(device_id, None)
+    }
+
+    /// Start the session `POST /v1/auth/google/return` just verified. `google_sub` is that
+    /// account's `sub`. `created` is the sign-in time a hub move checks against.
+    pub fn create_google_session(&self, device_id: &str, google_sub: &str) -> anyhow::Result<(String, u64)> {
+        self.insert_session(device_id, Some(google_sub))
+    }
+
+    /// A live, unexpired session whose device is not revoked.
+    pub(crate) fn live_session(&self, id: &str) -> Option<LiveSession> {
+        if !well_formed(id) {
+            return None;
+        }
+        let key = hash(id);
+        let (google_sub, created, expires): (Option<String>, i64, i64) = self
+            .c()
+            .query_row(
+                "SELECT s.google_sub, s.created, s.expires FROM sessions s
+                 JOIN devices d ON d.id = s.device_id WHERE s.id_hash = ?1 AND d.revoked = 0",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        if expires <= now() as i64 {
+            return None;
+        }
+        Some(LiveSession {
+            google_sub: google_sub.filter(|s| !s.is_empty()),
+            created: created as u64,
+        })
     }
 
     /// Who a session belongs to, if it exists, hasn't expired and its device's token
@@ -303,10 +349,17 @@ pub(crate) fn login_csrf_refusal(headers: &HeaderMap) -> Option<&'static str> {
     csrf_refusal(&Method::POST, "/v1/session", headers)
 }
 
-/// Start a browser session for `auth`: the `Set-Cookie` values to send and when it expires.
-pub(crate) fn start_session(hub: &Hub, headers: &HeaderMap, auth: &Auth) -> anyhow::Result<(Vec<HeaderValue>, u64)> {
-    let (id, expires) = hub.db.create_session(&auth.device_id)?;
-    tracing::info!(device = %auth.device_id, admin = auth.admin, "web session started");
+fn issue_session(
+    hub: &Hub,
+    headers: &HeaderMap,
+    auth: &Auth,
+    google_sub: Option<&str>,
+) -> anyhow::Result<(Vec<HeaderValue>, u64)> {
+    let (id, expires) = match google_sub {
+        Some(sub) => hub.db.create_google_session(&auth.device_id, sub)?,
+        None => hub.db.create_session(&auth.device_id)?,
+    };
+    tracing::info!(device = %auth.device_id, admin = auth.admin, google = google_sub.is_some(), "web session started");
     let secure = is_https(headers);
     if !secure {
         PLAIN_HTTP_WARNING.call_once(|| {
@@ -319,6 +372,26 @@ pub(crate) fn start_session(hub: &Hub, headers: &HeaderMap, auth: &Auth) -> anyh
         cookies.push(clear_legacy_cookie());
     }
     Ok((cookies, expires))
+}
+
+/// Start a browser session for `auth`: the `Set-Cookie` values to send and when it expires.
+pub(crate) fn start_session(hub: &Hub, headers: &HeaderMap, auth: &Auth) -> anyhow::Result<(Vec<HeaderValue>, u64)> {
+    issue_session(hub, headers, auth, None)
+}
+
+/// Start the session created by `POST /v1/auth/google/return`, recording `google_sub`.
+pub(crate) fn start_google_session(
+    hub: &Hub,
+    headers: &HeaderMap,
+    auth: &Auth,
+    google_sub: &str,
+) -> anyhow::Result<(Vec<HeaderValue>, u64)> {
+    issue_session(hub, headers, auth, Some(google_sub))
+}
+
+/// The first live session cookie on this request. A bearer token is not consulted.
+pub(crate) fn first_live_cookie_session(hub: &Hub, headers: &HeaderMap) -> Option<LiveSession> {
+    cookie_sessions(headers).into_iter().find_map(|id| hub.db.live_session(id))
 }
 
 /// Start a session and answer the way `POST /v1/session` does: who signed in, plus the cookie.
@@ -521,6 +594,31 @@ mod tests {
         set_cookie.split(';').next().unwrap().to_string()
     }
 
+    #[test]
+    fn opening_an_old_database_adds_google_sub_to_sessions() {
+        let dir = std::env::temp_dir().join(format!("grouper-session-migrate-{}", random_hex(4)));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(dir.join("grouper.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   id_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL, created INTEGER NOT NULL,
+                   last_used INTEGER NOT NULL, expires INTEGER NOT NULL);
+                 INSERT INTO sessions (id_hash, device_id, created, last_used, expires)
+                 VALUES ('aa', 'dev', 10, 10, 20);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&dir).unwrap();
+        let sub: Option<String> = db
+            .c()
+            .query_row("SELECT google_sub FROM sessions WHERE id_hash = 'aa'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sub, None);
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn session_create_use_and_logout() {
         let f = fixture().await;
@@ -546,6 +644,8 @@ mod tests {
         let stored: String = f.hub.db.c().query_row("SELECT id_hash FROM sessions", [], |r| r.get(0)).unwrap();
         assert_eq!(stored, hash(raw));
         assert_ne!(stored, raw);
+        let google_sub: Option<String> = f.hub.db.c().query_row("SELECT google_sub FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(google_sub, None, "trading a token for a cookie is not a Google sign-in");
 
         // The cookie works on reads and, with the CSRF header and a same-site Origin, on admin writes.
         let r = f.http.get(format!("{}/v1/session", f.base)).header("cookie", &cookie).send().await.unwrap();
