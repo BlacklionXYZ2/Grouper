@@ -1,0 +1,32 @@
+# Example systemd user unit for running a Grouper hub on Linux.
+#
+# Install:
+#   grouper hub init
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/grouper-hub.service ~/.config/systemd/user/grouper-hub.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now grouper-hub.service
+#
+# Optional: keep the hub running after you log out:
+#   sudo loginctl enable-linger "$USER"
+#
+# Logs:
+#   journalctl --user -u grouper-hub.service -f
+
+[Unit]
+Description=Grouper Hub (local-first AI orchestrator)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the binary path if `grouper` is installed elsewhere (e.g. /usr/local/bin/grouper).
+ExecStart=%h/.cargo/bin/grouper hub run --bind 127.0.0.1:47600 --data %h/.local/share/grouper/hub
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+# Optional: keep the master key outside the data directory (mode 0600).
+# Environment=GROUPER_MASTER_KEY_FILE=%h/.config/grouper/master.key
+
+[Install]
+WantedBy=default.target
