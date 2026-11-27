@@ -418,6 +418,10 @@ fn main() {
         .init();
 
     tauri::Builder::default()
+        // First plugin: a second launch never starts another process. It focuses this window.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = show_main_window(app);
+        }))
         .invoke_handler(tauri::generate_handler![setup, choose])
         .setup(|app| {
             let data_dir = app_data_dir()?;
