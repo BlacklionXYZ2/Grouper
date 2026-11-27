@@ -5,7 +5,12 @@ import WidgetKit
 
 @main
 struct GrouperWidgets: WidgetBundle {
-    var body: some Widget { ThreadLiveActivity() }
+    var body: some Widget {
+        ThreadLiveActivity()
+        // The Usage tab: API costs and subscription usage (UsageWidgets.swift).
+        ApiCostsWidget()
+        SubscriptionUsageWidget()
+    }
 }
 
 struct ThreadLiveActivity: Widget {

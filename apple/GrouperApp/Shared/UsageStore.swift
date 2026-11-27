@@ -54,12 +54,19 @@ final class UsageStore: ObservableObject {
     @Published var showAllModels: Set<String> = []
 
     private var hub = ""
+    /// What the Subscriptions board needs to name devices and spot a reading that is off. The page
+    /// sets it before it loads snapshots, so the widgets' copy of the board matches the page's.
+    private var boardDevices: [DeviceInfo] = []
+    private var boardProviders: [ProviderInfo] = []
     private var summaryRequest = 0
     private var snapshotsRequest = 0
     private var lastReadNow: Date?
 
     /// A device reading older than this triggers a fresh read when the tab opens (spec 7.4).
     private static let readIfOlderThan: TimeInterval = 120
+    /// The widgets show Day, Week and Month whichever the page is on; the other two are reloaded
+    /// when they are older than this.
+    private static let otherPeriodMaxAge: TimeInterval = 300
 
     /// Loads the saved copy for this hub, once per hub.
     func attach(hub: String) {
@@ -77,6 +84,35 @@ final class UsageStore: ObservableObject {
         UsageCacheStorage.save(UsageCacheFile(
             hub: hub, summaries: Array(summaries.values), snapshots: snapshots,
             snapshotsAt: snapshotsAt?.timeIntervalSince1970, limits: limits))
+        publishToWidgets()
+    }
+
+    /// The page's devices and providers, for the board the widgets show.
+    func setBoardContext(devices: [DeviceInfo], providers: [ProviderInfo]) {
+        boardDevices = devices
+        boardProviders = providers
+    }
+
+    /// Writes the compact copy the Home Screen and Lock Screen widgets read (App Group file) and asks
+    /// WidgetKit to redraw them, only when something changed. iPhone only: the Mac has no widgets here.
+    private func publishToWidgets() {
+        #if os(iOS)
+        let existing = WidgetSnapshotStore.load()
+        var next = existing ?? WidgetSnapshot()
+        next.costs = WidgetSnapshot.compactCosts(Array(summaries.values))
+        if let snapshots {
+            let board = SubscriptionBoard.build(snapshots: snapshots, devices: boardDevices, providers: boardProviders)
+            next.accounts = board.cards.map(WidgetAccount.init)
+            next.accountsAt = snapshotsAt?.timeIntervalSince1970
+        }
+        if let existing {
+            var same = existing
+            same.writtenAt = next.writtenAt
+            if same == next { return }
+        }
+        next.writtenAt = Date().timeIntervalSince1970
+        if WidgetSnapshotStore.save(next) { WidgetSnapshotStore.reloadTimelines() }
+        #endif
     }
 
     // MARK: - Loading
@@ -97,10 +133,29 @@ final class UsageStore: ObservableObject {
             // The budget line is a nicety: its failure never fails the summary.
             if let report = try? await client.limits() { limits = report }
             persist()
+            #if os(iOS)
+            await refreshOtherPeriods(client: client, current: period)
+            #endif
         } catch {
             guard token == summaryRequest else { return }
             summaryState = Task.isCancelled ? .idle : .failed(error.localizedDescription)
         }
+    }
+
+    /// Keeps the two periods the page is not on loaded, for the widgets. Best effort: a failure
+    /// leaves the older copy, and each period is skipped while its copy is young.
+    private func refreshOtherPeriods(client: HubClient, current: UsagePeriod) async {
+        for other in UsagePeriod.allCases where other != current {
+            if Task.isCancelled { return }
+            if let have = summaries[other.rawValue],
+               Date().timeIntervalSince1970 - have.fetchedAt < Self.otherPeriodMaxAge { continue }
+            let now = Date()
+            let range = other.range(now: now)
+            guard let fetched = try? await client.usageSummary(since: range.since, until: range.until) else { continue }
+            summaries[other.rawValue] = UsageCacheFile.TimedSummary(
+                period: other.rawValue, fetchedAt: now.timeIntervalSince1970, summary: fetched)
+        }
+        persist()
     }
 
     /// Loads the plan snapshots. With `readIfOld`, a reading older than two minutes (or none) also

@@ -52,11 +52,13 @@ struct UsageView: View {
             store.attach(hub: model.hubURL)
             await model.refreshDevices()
             await model.loadProviders()
+            store.setBoardContext(devices: model.devices, providers: model.providers)
             await store.refreshSnapshots(client: model.client, readIfOld: true)
             // Reset countdowns tick by themselves; the numbers are re-read once a minute while the page is open.
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(60))
                 if Task.isCancelled { break }
+                store.setBoardContext(devices: model.devices, providers: model.providers)
                 await store.refreshSnapshots(client: model.client, readIfOld: false)
                 await store.refreshSummary(client: model.client, period: period)
             }
@@ -73,6 +75,7 @@ struct UsageView: View {
     private func refreshAll() async {
         await model.refreshDevices()
         guard model.online else { return }
+        store.setBoardContext(devices: model.devices, providers: model.providers)
         await store.manualRefresh(client: model.client, period: period)
         await model.loadProviders()
     }

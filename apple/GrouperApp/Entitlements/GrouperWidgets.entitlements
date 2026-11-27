@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Reads the usage snapshot the app writes. The widget has no Keychain access group and
+         no token: it never talks to the hub. -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.uk.clockmillbarn.grouper</string>
+    </array>
+</dict>
+</plist>
