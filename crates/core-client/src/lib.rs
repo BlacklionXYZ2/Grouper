@@ -173,9 +173,13 @@ pub struct Config {
     /// Scoped folders threads here may reach as `@<name>/<path>` (see
     /// [`core_agent::folders`]). The caller loads them ([`folders::load`]).
     pub folders: Vec<FolderSpec>,
-    /// Opt in to read-only subscription usage probes (Claude Code, Codex).
-    /// Off by default because these call unofficial provider endpoints.
+    /// Read-only subscription usage probes (Claude Code, Codex, Grok, Antigravity). The CLI and
+    /// desktop app turn this on by default (usage belongs to the whole account); `false` is the
+    /// device owner's local off switch. Never settable from the hub.
     pub usage_probes: bool,
+    /// Which providers to probe when `usage_probes` is on. `None`: every supported provider
+    /// (Antigravity only if its CLI is installed here).
+    pub usage_probe_providers: Option<Vec<String>>,
 }
 
 enum Outcome {

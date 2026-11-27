@@ -2173,6 +2173,7 @@ mod tests {
             mcp_config: None,
             folders: vec![],
             usage_probes: false,
+            usage_probe_providers: None,
         };
         let target_host_info = NodeHostInfo {
             can_host: true,
@@ -2386,6 +2387,7 @@ mod tests {
                 mcp_config: None,
                 folders: vec![],
                 usage_probes: false,
+                usage_probe_providers: None,
             };
             let host_info = NodeHostInfo {
                 can_host: true,
@@ -2539,6 +2541,7 @@ mod tests {
             mcp_config: None,
             folders: vec![],
             usage_probes: false,
+            usage_probe_providers: None,
         };
         let host_info = NodeHostInfo {
             can_host: true,
@@ -2664,6 +2667,7 @@ mod tests {
             mcp_config: None,
             folders: vec![],
             usage_probes: false,
+            usage_probe_providers: None,
         };
         let host_info = NodeHostInfo {
             can_host: true,
@@ -3034,6 +3038,7 @@ mod tests {
             mcp_config: None,
             folders: vec![],
             usage_probes: false,
+            usage_probe_providers: None,
         };
         let host_info = NodeHostInfo {
             can_host: true,

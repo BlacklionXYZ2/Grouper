@@ -98,7 +98,10 @@ impl NodeHandle {
             .unwrap_or_else(|| app_data_dir.join("node-workspaces"));
 
         let allow_shell = !env_flag(NO_SHELL_ENV);
-        let usage_probes = env_flag(USAGE_PROBES_ENV);
+        // On by default (usage belongs to the whole account); `GROUPER_USAGE_PROBES=0` is the local off switch.
+        let usage_probes = std::env::var(USAGE_PROBES_ENV)
+            .ok()
+            .is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"));
         let folders = match core_client::folders::load(folders_config, &[]) {
             Ok(list) => list,
             Err(err) => {
@@ -127,6 +130,7 @@ impl NodeHandle {
             mcp_config,
             folders,
             usage_probes,
+            usage_probe_providers: None,
         };
 
         let events = Arc::new(DesktopNodeEvents::new(move_target));

@@ -191,6 +191,7 @@ impl GrouperClient {
                     Vec::new()
                 }),
                 usage_probes: false,
+                usage_probe_providers: None,
             },
             handler,
             listener,

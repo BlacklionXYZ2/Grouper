@@ -374,6 +374,8 @@ fn usual_install_dirs(def: &HarnessDef, opts: &ScanOptions) -> Vec<PathBuf> {
                 dirs.push(home.join(".antigravity").join("bin"));
                 dirs.push(home.join(".gemini").join("antigravity-cli").join("bin"));
                 dirs.push(home.join("AppData").join("Local").join("Programs").join("Antigravity").join("bin"));
+                // The `agy` installer's per-user folder on Windows (`%LOCALAPPDATA%gyin`).
+                dirs.push(home.join("AppData").join("Local").join("agy").join("bin"));
             }
             "grok" => {
                 dirs.push(home.join(".grok").join("bin"));
@@ -404,6 +406,7 @@ fn usual_install_dirs(def: &HarnessDef, opts: &ScanOptions) -> Vec<PathBuf> {
                 let local = PathBuf::from(local);
                 dirs.push(local.join("Microsoft").join("WinGet").join("Links"));
                 dirs.push(local.join("Programs").join("Antigravity").join("bin"));
+                dirs.push(local.join("agy").join("bin"));
                 dirs.push(local.join("Programs").join("claude"));
             }
             dirs.push(PathBuf::from(r"C:\Program Files\nodejs"));
@@ -427,6 +430,20 @@ fn find_harness_binary(def: &HarnessDef, opts: &ScanOptions) -> Option<PathBuf> 
     let names = candidate_binary_names(def.binary);
     find_in_dirs(&opts.path_dirs, &names)
         .or_else(|| find_in_dirs(&usual_install_dirs(def, opts), &names))
+}
+
+/// Where this device's CLI for a harness slug lives (PATH first, then the usual install
+/// folders), or `None` when it is not installed. Used by the usage probes so the binary
+/// path always comes from the same scan the harness report uses, never from a caller.
+pub(crate) fn locate_cli(slug: &str) -> Option<PathBuf> {
+    let def = HARNESS_DEFS.iter().find(|d| d.slug == slug)?;
+    find_harness_binary(def, &ScanOptions::host())
+}
+
+/// The first line of `<cli> --version` for a harness slug, if it is installed and answers.
+/// Runs the CLI (bounded by [`CLI_CMD_TIMEOUT`]); callers should cache the result.
+pub(crate) fn cli_version(slug: &str) -> Option<String> {
+    detect_version(&locate_cli(slug)?)
 }
 
 // ---- Sign-in state checks (presence + expiry only, zero token retention)

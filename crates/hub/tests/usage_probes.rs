@@ -89,6 +89,7 @@ async fn usage_probe_tool_is_unlisted_and_snapshots_persist_when_device_goes_off
         mcp_config: Some(dir.join("mcp.json")),
         folders: vec![],
         usage_probes: false,
+        usage_probe_providers: None,
     };
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let client = tokio::spawn(core_client::run(config, Arc::new(NoTools), Arc::new(Quiet), stopped));
@@ -132,6 +133,8 @@ async fn usage_probe_tool_is_unlisted_and_snapshots_persist_when_device_goes_off
                     provider: "claude".into(),
                     kind: "window".into(),
                     window: "5h".into(),
+                    label: None,
+                    account_key: None,
                     used_pct: Some(42.0),
                     used_amount: None,
                     limit_amount: None,

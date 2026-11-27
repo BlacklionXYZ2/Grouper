@@ -76,6 +76,7 @@ async fn device_tools_reach_the_registry_and_run_over_mcp() {
         mcp_config: Some(mcp_config),
         folders: Vec::new(),
         usage_probes: false,
+        usage_probe_providers: None,
     };
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let client = tokio::spawn(core_client::run(config, Arc::new(Tools), Arc::new(Quiet), stopped));

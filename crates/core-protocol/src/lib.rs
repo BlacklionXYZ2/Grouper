@@ -1043,6 +1043,13 @@ pub struct UsageSnapshot {
     pub provider: String,
     pub kind: String,
     pub window: String,
+    /// The provider's own name for a window's scope (Antigravity group, Grok product). Max 64 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Opaque fingerprint of the subscription account the reading came from (same account on two
+    /// devices -> same value). Hex of the first 16 bytes of SHA-256("grouper-sub-account:" + provider + ":" + stable account id). Never the raw id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_key: Option<String>,
     #[serde(default)]
     pub used_pct: Option<f64>,
     #[serde(default)]

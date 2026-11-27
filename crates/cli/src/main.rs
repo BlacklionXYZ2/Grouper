@@ -72,11 +72,24 @@ enum Cmd {
         /// Scoped folders file. Default: <config dir>/grouper/folders.json.
         #[arg(long, env = "GROUPER_FOLDERS_CONFIG")]
         folders_config: Option<PathBuf>,
-        /// Enable read-only subscription usage probes (Claude Code, Codex). Off by default:
-        /// calls unofficial provider endpoints using the CLIs' local sign-in credentials.
-        /// Tokens stay on this device and are never sent to the hub.
-        #[arg(long, env = "GROUPER_USAGE_PROBES")]
-        usage_probes: bool,
+        /// Read-only subscription usage probes, ON by default for Claude Code, Codex, Grok and
+        /// Antigravity (usage belongs to the whole account). `--usage-probes=claude,grok` limits
+        /// them to those providers; a bare `--usage-probes` means all. They use the CLIs' local
+        /// sign-ins; tokens stay on this device and are never sent to the hub. Switch off with
+        /// `--no-usage-probes`. This can only be set here, never from another device.
+        #[arg(
+            long,
+            env = "GROUPER_USAGE_PROBES",
+            value_name = "PROVIDERS",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "all",
+            value_parser = core_client::usage_probes::UsageProbeSetting::from_flag
+        )]
+        usage_probes: Option<core_client::usage_probes::UsageProbeSetting>,
+        /// Don't read subscription usage on this device at all.
+        #[arg(long, conflicts_with = "usage_probes")]
+        no_usage_probes: bool,
     },
     /// List a thread's workspace files, or download one: grouper files <thread> [<path> [-o <out>]]
     Files {
@@ -921,7 +934,7 @@ async fn main() -> Result<()> {
 async fn run_authed_cmd(api: Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Login { .. } | Cmd::Logout | Cmd::Hub(_) => unreachable!(),
-        Cmd::Connect { workspace, no_shell, mcp_config, folders, folders_config, usage_probes } => {
+        Cmd::Connect { workspace, no_shell, mcp_config, folders, folders_config, usage_probes, no_usage_probes } => {
             let workspace = workspace.unwrap_or_else(|| {
                 dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Grouper").join("workspaces")
             });
@@ -930,8 +943,19 @@ async fn run_authed_cmd(api: Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()
             for f in &folders {
                 println!("scoped folder @{} ({}): {}", f.name, f.mode.as_str(), f.path.display());
             }
-            if usage_probes {
-                println!("subscription usage probes: enabled (read-only, unofficial Claude/Codex endpoints)");
+            let probe_setting = if no_usage_probes {
+                core_client::usage_probes::UsageProbeSetting::off()
+            } else {
+                usage_probes.unwrap_or_default()
+            };
+            if probe_setting.enabled {
+                println!(
+                    "subscription usage probes: on for {} (read-only; switch off with --no-usage-probes)",
+                    probe_setting.providers.as_ref().map_or_else(
+                        || core_client::usage_probes::SUPPORTED_PROVIDERS.join(", "),
+                        |p| p.join(", ")
+                    )
+                );
             }
             let config = core_client::Config {
                 hub_url: api.base.clone(),
@@ -952,7 +976,8 @@ async fn run_authed_cmd(api: Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()
                 allow_shell: !no_shell,
                 mcp_config,
                 folders,
-                usage_probes,
+                usage_probes: probe_setting.enabled,
+                usage_probe_providers: probe_setting.providers,
             };
             let (tx, rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
@@ -1724,6 +1749,52 @@ mod tests {
 
         let take = Cli::try_parse_from(["grouper", "hub", "take"]).expect("hub take");
         assert!(matches!(take.cmd, Cmd::Hub(hub::HubCmd::Take)));
+    }
+
+    #[test]
+    fn usage_probe_flags_parse_and_default_to_on() {
+        use core_client::usage_probes::UsageProbeSetting;
+        let _lock = credentials::test_env::lock();
+        let _env = credentials::test_env::VarGuard::unset("GROUPER_USAGE_PROBES");
+        let connect = |args: &[&str]| {
+            let mut full = vec!["grouper", "connect"];
+            full.extend_from_slice(args);
+            Cli::try_parse_from(full).map(|cli| match cli.cmd {
+                Cmd::Connect { usage_probes, no_usage_probes, no_shell, .. } => (usage_probes, no_usage_probes, no_shell),
+                _ => panic!("not connect"),
+            })
+        };
+        let all = UsageProbeSetting { enabled: true, providers: None };
+
+        // Not given: no setting here, which resolves to "on for every provider".
+        assert_eq!(connect(&[]).unwrap(), (None, false, false));
+        assert_eq!(UsageProbeSetting::default(), all);
+        // Bare flag: all providers (and it doesn't swallow the next flag).
+        assert_eq!(connect(&["--usage-probes", "--no-shell"]).unwrap(), (Some(all.clone()), false, true));
+        // A list.
+        let (list, _, _) = connect(&["--usage-probes=claude,codex,grok,antigravity"]).unwrap();
+        assert_eq!(list.unwrap().providers.unwrap(), ["claude", "codex", "grok", "antigravity"]);
+        assert_eq!(connect(&["--usage-probes=grok"]).unwrap().0.unwrap().providers.unwrap(), ["grok"]);
+        assert!(connect(&["--usage-probes=claude,bogus"]).is_err());
+        // The local off switch, which can't be combined with the flag.
+        assert_eq!(connect(&["--no-usage-probes"]).unwrap(), (None, true, false));
+        assert!(connect(&["--no-usage-probes", "--usage-probes"]).is_err());
+
+        // The environment variable takes the same values.
+        {
+            let _env = credentials::test_env::VarGuard::set("GROUPER_USAGE_PROBES", "0");
+            assert_eq!(connect(&[]).unwrap().0, Some(UsageProbeSetting::off()));
+        }
+        {
+            let _env = credentials::test_env::VarGuard::set("GROUPER_USAGE_PROBES", "claude,grok");
+            assert_eq!(connect(&[]).unwrap().0.unwrap().providers.unwrap(), ["claude", "grok"]);
+        }
+
+        // `grouper hub run` has the same flags.
+        let run = Cli::try_parse_from(["grouper", "hub", "run", "--usage-probes=grok"]).expect("hub run");
+        assert!(matches!(run.cmd, Cmd::Hub(hub::HubCmd::Run { usage_probes: Some(ref s), .. }) if s.providers.as_deref() == Some(&["grok".to_string()][..])));
+        let run = Cli::try_parse_from(["grouper", "hub", "run", "--no-usage-probes"]).expect("hub run");
+        assert!(matches!(run.cmd, Cmd::Hub(hub::HubCmd::Run { no_usage_probes: true, usage_probes: None, .. })));
     }
 
     #[test]
