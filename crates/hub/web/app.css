@@ -73,7 +73,7 @@
   --inspector-w: clamp(384px, 30vw, 420px);
   --tabbar-h: 0px;
   --bar-h: 52px;
-  --ease: cubic-bezier(0.2, 0.7, 0.2, 1); /* old curve; moves to --ease-out in step 7 */
+  --ease: var(--ease-out); /* alias (design system 2.11, step 7) */
 
   /* Design-system tokens (docs/design-system/design-system.md 2.7-2.11). Theme-independent,
      so declared once. Rules adopt them area by area; the old names stay as aliases. */
