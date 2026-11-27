@@ -38,11 +38,11 @@ pub struct HarnessReportOutcome {
     pub hidden: usize,
 }
 
-/// Canonical provider id for a harness CLI on a specific device (`claude-code@<device_id>`).
 /// Harness CLIs whose headless mode can't be confined (Hermes runs every tool; OpenCode always
 /// passes `--auto`). Each turn asks the owner unless that device's chat tool for the agent is Bypass.
 pub(crate) const UNCONFINABLE_HARNESSES: &[&str] = &["hermes", "opencode"];
 
+/// Canonical provider id for a harness CLI on a specific device (`claude-code@<device_id>`).
 pub fn provider_id(harness: &str, device_id: &str) -> String {
     format!("{}@{}", harness.trim(), device_id.trim())
 }

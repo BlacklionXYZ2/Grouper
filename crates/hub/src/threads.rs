@@ -98,6 +98,17 @@ fn render_brief(r: &ThreadRequest) -> String {
     s
 }
 
+/// The timeout task lives outside `request_approval_inner`. Spawning it there makes rustc
+/// cycle on the orchestrator worker's `Send` check (E0391): that worker asks for an
+/// approval, and a timed-out approval can wake the same worker.
+fn spawn_approval_timer(hub: Arc<Hub>, approval_id: String, generation: u64, secs: u64) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        hub.approval_timed_out(approval_id, generation, secs).await;
+    })
+    .abort_handle()
+}
+
 impl Hub {
     pub(crate) fn owns_thread(&self, device_id: &str, thread_id: &str) -> bool {
         self.db.thread(thread_id).is_some_and(|t| t.device_id == device_id)
@@ -368,7 +379,7 @@ impl Hub {
         input: Value,
         reason: &str,
         local: Option<oneshot::Sender<ApprovalAnswer>>,
-        conversation_id: Option<&str>,
+        conversation_id: Option<String>,
     ) -> bool {
         let internal = local.is_some();
         let generation = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -377,10 +388,10 @@ impl Hub {
         // re-read status while holding the route lock. If a finisher changed it first we reject;
         // if it changes after this check, its clear pass removes us.
         let (conversation_id, stored_thread) = if let Some(cid) = conversation_id {
-            if self.db.conversation(cid).is_none() {
+            if self.db.conversation(&cid).is_none() {
                 return false;
             }
-            (cid.to_string(), String::new())
+            (cid, String::new())
         } else {
             let Some(t) = self.db.thread(thread_id) else { return false };
             if t.status != "running" && !(internal && t.status == WAITING_DEVICE) {
@@ -445,14 +456,9 @@ impl Hub {
         // The limit at request time. Turning it off before the timer fires leaves
         // the approval pending (`approval_timed_out` checks again).
         if let Some(secs) = timeout_secs {
-            let hub = Arc::clone(self);
             let timer_id = approval_id.to_string();
             let route_id = timer_id.clone();
-            let task = tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                hub.approval_timed_out(timer_id, generation, secs).await;
-            });
-            let timer = task.abort_handle();
+            let timer = spawn_approval_timer(Arc::clone(self), timer_id, generation, secs);
             let mut approvals = self.approvals.lock().await;
             match approvals.get_mut(&route_id) {
                 Some(route) if route.generation == generation => route.timer = Some(timer),
