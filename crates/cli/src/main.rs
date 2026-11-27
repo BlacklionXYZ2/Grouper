@@ -1421,7 +1421,7 @@ fn print_probe_report(report: &core_client::core_protocol::ProbeReport) {
     }
 }
 
-fn print_sync_result(result: &hub::sync::SyncResult) {
+fn print_sync_result(result: &::hub::sync::SyncResult) {
     if let Some(err) = &result.error {
         eprintln!("{}: sync failed: {err}", result.provider_id);
         return;
@@ -1454,7 +1454,7 @@ async fn sync_models_cmd(api: &Api, provider: Option<&str>) -> Result<()> {
             .filter(|p| {
                 matches!(p.kind.as_str(), "openai" | "anthropic")
                     && p.via_device.is_none()
-                    && (p.has_key || p.base_url.as_deref().is_some_and(hub::registry::is_local_url))
+                    && (p.has_key || p.base_url.as_deref().is_some_and(::hub::registry::is_local_url))
             })
             .map(|p| p.id)
             .collect(),
@@ -1467,7 +1467,7 @@ async fn sync_models_cmd(api: &Api, provider: Option<&str>) -> Result<()> {
     for id in targets {
         match api.post(&format!("/v1/providers/{}/sync", url_segment(&id)), &json!({})).await {
             Ok(body) => {
-                let result: hub::sync::SyncResult = serde_json::from_value(body)?;
+                let result: ::hub::sync::SyncResult = serde_json::from_value(body)?;
                 if result.error.is_some() {
                     failed += 1;
                 }
@@ -1770,8 +1770,8 @@ mod tests {
             }
         });
 
-        let dir = std::env::temp_dir().join(format!("grouper-cli-sync-{}", hub::db::random_hex(4)));
-        let handle = hub::host::start(&dir, &[std::net::SocketAddr::from(([127, 0, 0, 1], 0))]).await.unwrap();
+        let dir = std::env::temp_dir().join(format!("grouper-cli-sync-{}", ::hub::db::random_hex(4)));
+        let handle = ::hub::host::start(&dir, &[std::net::SocketAddr::from(([127, 0, 0, 1], 0))]).await.unwrap();
         let hub_addr = handle.binds()[0];
         let h = handle.hub().unwrap();
         let (_, admin_token) = h.db.add_device("Admin", "windows", true).unwrap();
@@ -1784,7 +1784,11 @@ mod tests {
         })
         .unwrap();
 
-        let api = Api::new(format!("http://{hub_addr}"), admin_token);
+        let api = Api {
+            base: format!("http://{hub_addr}"),
+            token: admin_token,
+            http: reqwest::Client::new(),
+        };
         sync_models_cmd(&api, Some("openai")).await.unwrap();
         let models = h.db.visible_models();
         assert_eq!(models.len(), 2);
