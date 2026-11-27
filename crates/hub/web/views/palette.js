@@ -39,6 +39,16 @@ export function paletteShortcut() {
   return mac ? { label: '⌘K', keys: 'Meta+K' } : { label: 'Ctrl K', keys: 'Control+K' };
 }
 
+/** One keycap per key: ['Ctrl', 'K'] draws two caps, never "Ctrl+K" in one. */
+export function keycaps(keys) {
+  const list = Array.isArray(keys) ? keys : String(keys).split(' ').filter(Boolean);
+  return h('span', { class: 'kbd-group', 'aria-hidden': 'true' }, list.map((key) => h('kbd', { class: 'kbd' }, key)));
+}
+
+function footItem(keys, word) {
+  return h('span', { class: 'palette-foot-item' }, keycaps(keys), word);
+}
+
 function isPhone() {
   return typeof matchMedia === 'function' && matchMedia(PHONE).matches;
 }
@@ -920,7 +930,14 @@ export function mountPalette(signal) {
   emptyEl = h('p', { class: 'palette-empty', hidden: true }, 'No matches');
   loadingEl = h('p', { class: 'palette-loading', hidden: true });
   liveEl = h('div', { class: 'visually-hidden', 'aria-live': 'polite', 'aria-atomic': 'true' });
-  const kbd = h('kbd', { class: 'palette-kbd', 'aria-hidden': 'true' }, shortcut.label);
+  const kbd = keycaps(shortcut.label.replace(/^⌘/, '⌘ '));
+  const foot = h(
+    'div',
+    { class: 'palette-foot', 'aria-hidden': 'true' },
+    footItem(['↑', '↓'], 'navigate'),
+    footItem(['↵'], 'open'),
+    footItem(['esc'], 'close'),
+  );
   const closeBtn = h('button', { type: 'button', class: 'icon-btn palette-close', 'aria-label': 'Close', onclick: () => closePalette({ restore: true }) }, icon('close'));
   const frame = h(
     'div',
@@ -928,6 +945,7 @@ export function mountPalette(signal) {
     h('div', { class: 'palette-search' }, icon('search'), input, kbd),
     closeBtn,
     h('div', { class: 'palette-scroll' }, emptyEl, list, loadingEl),
+    foot,
     liveEl,
   );
   dialog = h('dialog', {
