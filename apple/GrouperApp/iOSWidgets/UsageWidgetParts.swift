@@ -99,7 +99,7 @@ struct MeterBar: View {
     var body: some View {
         let state = meter.state(now: now)
         let fraction = state == .notInUse || state == .resetPassed ? 0 : min(1, max(0, (meter.usedPct ?? 0) / 100))
-        let fill: Color = state == .usedUp ? Theme.danger : (state == .nearlyUsed ? Theme.warn : family.color)
+        let fill: Color = state == .usedUp ? Theme.danger : (state == .nearlyUsed ? Theme.warn : family.solidColor)
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 Capsule().fill(Theme.surface3)
@@ -232,7 +232,7 @@ struct FreshnessLine: View {
                   systemImage: "exclamationmark.triangle.fill")
                 .font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.warn).lineLimit(1).minimumScaleFactor(0.7)
         } else {
-            Text(freshness.updatedText).font(.system(size: 10)).foregroundStyle(Theme.text3).lineLimit(1)
+            Text(freshness.updatedText).font(.system(size: 10)).foregroundStyle(Theme.text4).lineLimit(1)
         }
     }
 }

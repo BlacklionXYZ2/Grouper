@@ -345,7 +345,7 @@ struct ChatView: View {
     }
 
     private func messageField(_ placeholder: String) -> some View {
-        TextField("Message", text: $message, prompt: Text(placeholder).foregroundStyle(Theme.text3), axis: .vertical)
+        TextField("Message", text: $message, prompt: Text(placeholder).foregroundStyle(Theme.text4), axis: .vertical)
             .lineLimit(1...4)
             .textFieldStyle(.plain)
             .font(Theme.Typeface.body)
