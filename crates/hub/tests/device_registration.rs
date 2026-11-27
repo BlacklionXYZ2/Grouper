@@ -86,7 +86,7 @@ impl Fixture {
             Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => return Err(resp.status().as_u16()),
             Err(e) => panic!("connect failed: {e}"),
         };
-        let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into() };
+        let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into(), host: None };
         ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
         Ok(ws)
     }

@@ -159,6 +159,8 @@ pub struct Hub {
     pub(crate) tunnel: crate::tunnel::TunnelState,
     /// Step-down detection state ([`crate::stepdown`]).
     pub(crate) stepdown: crate::stepdown::StepDownState,
+    /// Last-seen host capability metadata per device id ([`crate::devices`]).
+    pub(crate) host_info: std::sync::Mutex<HashMap<String, core_protocol::NodeHostInfo>>,
 }
 
 impl Hub {
@@ -189,6 +191,7 @@ impl Hub {
             link: Default::default(),
             tunnel: crate::tunnel::TunnelState::new(),
             stepdown: crate::stepdown::StepDownState::new(),
+            host_info: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -607,6 +610,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::link::routes())
         .merge(crate::push::routes())
         .merge(crate::tunnel::routes())
+        .merge(crate::devices::routes())
         .merge(crate::web::routes())
         .with_state(hub)
         .layer(axum::middleware::from_fn(crate::session::guard))
@@ -1202,9 +1206,9 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
         .map_err(|_| "no hello")?
         .ok_or("closed before hello")?
         .map_err(|e| e.to_string())?;
-    match first {
+    let hello_host = match first {
         Message::Text(t) => match serde_json::from_str::<NodeMessage>(&t) {
-            Ok(NodeMessage::Hello { protocol_version, client_version }) => {
+            Ok(NodeMessage::Hello { protocol_version, client_version, host }) => {
                 if protocol_version != PROTOCOL_VERSION {
                     let msg = HubMessage::Error {
                         message: format!("protocol {protocol_version} unsupported, hub speaks {PROTOCOL_VERSION}"),
@@ -1213,10 +1217,14 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                     return Err("protocol mismatch".into());
                 }
                 tracing::info!(device = %device_id, %client_version, "connected");
+                host
             }
             _ => return Err("first frame was not hello".into()),
         },
         _ => return Err("first frame was not text".into()),
+    };
+    if let Some(ref info) = hello_host {
+        hub.record_host_info(&device_id, info.clone());
     }
 
     let providers = hub.db.providers().map_err(|error| error.to_string())?;
@@ -1365,6 +1373,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                     hub.workspace_file_result(&device_id, conn_id, &thread_id, path, ok, error).await;
                 }
             }
+            Ok(NodeMessage::HubMoveStatus { .. }) => {}
             Ok(NodeMessage::Hello { .. }) => {
                 if let Err(mpsc::error::TrySendError::Full(_)) =
                     tx.try_send(HubMessage::Error { message: "already said hello".into() })
@@ -1839,7 +1848,7 @@ mod tests {
             let mut req = format!("ws://{addr}{}", core_protocol::CONNECT_PATH).into_client_request().unwrap();
             req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
             let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-            let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into() };
+            let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into(), host: None };
             ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
             ws
         };
@@ -2363,7 +2372,7 @@ mod tests {
         let mut dev_req = format!("ws://{addr}{}", core_protocol::CONNECT_PATH).into_client_request().unwrap();
         dev_req.headers_mut().insert("authorization", format!("Bearer {worker_token}").parse().unwrap());
         let (mut dev_ws, _) = tokio_tungstenite::connect_async(dev_req).await.unwrap();
-        let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into() };
+        let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into(), host: None };
         dev_ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
 
         let online_ev: Event = tokio::time::timeout(Duration::from_secs(5), async {
