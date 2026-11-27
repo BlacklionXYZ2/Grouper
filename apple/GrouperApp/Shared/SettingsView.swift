@@ -3,6 +3,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var editingHubAddress = false
     #if os(macOS)
     @EnvironmentObject private var node: MacNodeController
     @State private var savingDeviceToken = false
@@ -11,9 +12,33 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("Connection") {
-                LabeledContent("Hub", value: model.hubURL)
+                Button {
+                    editingHubAddress = true
+                } label: {
+                    LabeledContent("Hub address") {
+                        HStack(spacing: 6) {
+                            Text(model.hubURL)
+                                .foregroundStyle(Theme.text2)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Theme.text3)
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Changes the hub address")
+                if !model.isDefaultHubAddress {
+                    Button("Use default") {
+                        model.resetHubAddressToDefault()
+                    }
+                }
                 LabeledContent("Status", value: model.online ? "Connected" : "Offline")
                 Button("Check now") { Task { await model.connect(save: false) } }
+                    .disabled(model.adminToken.isEmpty)
             }
             AccountSettingsSection()
             #if os(macOS)
@@ -78,6 +103,99 @@ struct SettingsView: View {
         #endif
         .grouperListBackground()
         .navigationTitle("Settings")
+        .sheet(isPresented: $editingHubAddress) {
+            HubAddressEditorSheet()
+                .environmentObject(model)
+        }
+    }
+}
+
+/// Sheet for editing the hub address from Settings or when sign-in can't reach or join the hub.
+struct HubAddressEditorSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft = ""
+    @State private var validationError: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField(HubAddress.defaultAddress, text: $draft)
+                        #if os(iOS)
+                        .textContentType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                        #endif
+                        .autocorrectionDisabled()
+                        .accessibilityLabel("Hub address")
+                        .onSubmit { save() }
+                    Button("Use default") {
+                        draft = HubAddress.defaultAddress
+                        validationError = nil
+                    }
+                    .disabled(HubAddress.isDefault(draft))
+                } header: {
+                    Text("Hub address")
+                } footer: {
+                    Text(footerText)
+                }
+                if let validationError {
+                    Section {
+                        Text(validationError)
+                            .foregroundStyle(Theme.danger)
+                            .accessibilityLabel("Invalid hub address. \(validationError)")
+                    }
+                }
+            }
+            #if os(macOS)
+            .formStyle(.grouped)
+            #endif
+            .grouperListBackground()
+            .navigationTitle("Hub address")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(saveButtonTitle) { save() }
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .onAppear {
+                draft = model.hubURL
+                validationError = nil
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 440, minHeight: 240)
+        #endif
+    }
+
+    private var saveButtonTitle: String {
+        if model.signedIn && !DeviceRegistration.sameHub(model.hubURL, draft) {
+            return "Save & Sign In"
+        }
+        return "Save"
+    }
+
+    private var footerText: String {
+        if model.signedIn {
+            return "Default: \(HubAddress.defaultAddress). Changing the hub address signs out and signs back in at the new address. HTTPS is required except for localhost and local network addresses."
+        }
+        return "Default: \(HubAddress.defaultAddress). HTTPS is required except for localhost and local network addresses."
+    }
+
+    private func save() {
+        if let error = model.changeHubAddress(to: draft) {
+            validationError = error
+            return
+        }
+        validationError = nil
+        dismiss()
     }
 }
 

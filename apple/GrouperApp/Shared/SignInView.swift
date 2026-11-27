@@ -1,75 +1,56 @@
 import GrouperAPI
 import SwiftUI
 
-/// What the sign-in screen offers for the hub address as typed (docs/accounts-design.md,
-/// "Google is the only way you sign in").
-private enum SignInMode: Equatable {
-    /// No address yet.
-    case enterHub
-    /// Asking the hub whether it allows Google sign-in.
+/// What the sign-in screen shows for the configured hub (docs/local-first-design.md).
+/// The screen never shows a hub URL field or an admin token field by default.
+private enum SignInState: Equatable {
+    /// Asking the hub whether it is claimed and allows Google sign-in.
     case checking
-    /// No hub answered at that address.
+    /// No hub answered at the configured address.
     case unreachable
-    /// The hub allows Google sign-in and the app has a client ID: the only visible way in.
+    /// The hub allows Google sign-in and the app has a client ID: the one visible way in.
     case google
-    /// The hub has no Google sign-in (or the app has no client ID): the admin-token field, as before.
-    case token
+    /// The hub answered, but Google sign-in isn't available on this hub or build.
+    case unavailable
 }
 
 struct SignInView: View {
     @EnvironmentObject private var model: AppModel
     @State private var signingIn = false
     @State private var setupCode = ""
-    /// Recovery only: the toolbar's ⋯ menu shows the token field under Google sign-in.
+    /// Recovery only: the toolbar's ⋯ menu shows the token field.
     @State private var showRecovery = false
-    /// A hub address was saved when this screen opened, so the field starts collapsed.
-    @State private var hubWasSaved = !(UserDefaults.standard.string(forKey: "grouper.hubURL") ?? "").isEmpty
-    @State private var editingHub = false
+    /// Opens the hub address editor when the hub is unreachable, owned by another account,
+    /// or reached via the ⋯ menu.
+    @State private var editingHubAddress = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section { brandHeader }
                     .listRowBackground(Color.clear)
-                // First run: the address is the first thing to type. Once one is saved it's
-                // pre-filled and tucked under "Hub" below (hub discovery will replace it).
-                if !hubWasSaved {
-                    Section("Hub") { hubField }
-                }
-                switch mode {
-                case .enterHub:
-                    Section {
-                        Text("Enter your hub's address, then sign in with Google.")
-                            .font(.callout).foregroundStyle(Theme.text2)
-                    }
+                switch state {
                 case .checking:
                     Section {
-                        HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Checking the hub…") }
-                            .foregroundStyle(Theme.text2)
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Checking your Grouper hub…")
+                        }
+                        .foregroundStyle(Theme.text2)
                     }
                 case .unreachable:
-                    Section {
-                        Text("Couldn't reach a Grouper hub at this address. Check it, and that the hub is running.")
-                            .font(.callout).foregroundStyle(Theme.text2)
-                        Button("Try again") { Task { await model.checkAuthStatus(for: model.hubURL) } }
-                    }
+                    unreachableSection
                 case .google:
                     googleSignIn
-                case .token:
-                    Section("Admin token") { tokenSignIn }
-                }
-                if hubWasSaved {
+                case .unavailable:
                     Section {
-                        DisclosureGroup(isExpanded: $editingHub) {
-                            hubField
-                        } label: {
-                            LabeledContent("Hub") {
-                                Text(hubHost).lineLimit(1).truncationMode(.middle)
-                            }
-                        }
+                        Text(unavailableMessage)
+                            .font(.callout)
+                            .foregroundStyle(Theme.text2)
+                        Button("Change hub address") { editingHubAddress = true }
                     }
                 }
-                if showRecovery, mode != .token {
+                if showRecovery {
                     Section {
                         tokenSignIn
                     } header: {
@@ -78,40 +59,55 @@ struct SignInView: View {
                         Text("Only for getting back in when Google sign-in isn't working: an admin token made on the hub.")
                     }
                 }
-                if let error = model.errorMessage {
-                    Section { Text(error).foregroundStyle(Theme.danger).accessibilityLabel("Sign in failed. \(error)") }
+                if let error = model.errorMessage, state != .unreachable || showRecovery {
+                    Section {
+                        Text(error)
+                            .foregroundStyle(Theme.danger)
+                            .accessibilityLabel("Sign in failed. \(error)")
+                    }
                 }
             }
             #if os(macOS)
             .formStyle(.grouped)
             #endif
             .grouperListBackground()
-            .navigationTitle("Connect to Grouper")
-            // A saved hub that's gone, or an emptied address: open the field so it can be fixed.
-            .onChange(of: mode, initial: true) { _, newMode in
-                if hubWasSaved, newMode == .unreachable || newMode == .enterHub { editingHub = true }
-            }
+            .navigationTitle("Sign in")
             .toolbar {
-                // Token sign-in is a recovery route, kept off the main screen (owner decision).
-                if mode != .token {
-                    ToolbarItem(placement: .primaryAction) {
-                        Menu {
-                            Button(showRecovery ? "Hide recovery token" : "Sign in with a recovery token", systemImage: "key") {
-                                showRecovery.toggle()
-                            }
-                        } label: {
-                            Label("More", systemImage: "ellipsis.circle")
+                // Recovery token sign-in and hub address override stay off the main screen.
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        Button(showRecovery ? "Hide recovery token" : "Sign in with a recovery token", systemImage: "key") {
+                            showRecovery.toggle()
                         }
-                        .accessibilityLabel("More sign-in options")
+                        Button("Change hub address…", systemImage: "network") {
+                            editingHubAddress = true
+                        }
+                    } label: {
+                        Label("More", systemImage: "ellipsis.circle")
                     }
+                    .accessibilityLabel("More sign-in options")
                 }
             }
-            // Ask the hub whether it is claimed and allows Google, once typing pauses.
-            .task(id: model.hubURL) {
-                try? await Task.sleep(for: .milliseconds(400))
-                guard !Task.isCancelled else { return }
-                await model.checkAuthStatus(for: model.hubURL)
+            .sheet(isPresented: $editingHubAddress) {
+                HubAddressEditorSheet()
+                    .environmentObject(model)
             }
+            .task(id: model.hubURL) {
+                await model.checkAuthStatus()
+            }
+            #if os(iOS)
+            // Phone waiting screen: recheck the hub every few seconds while open so it continues
+            // as soon as a computer finishes setting up the hub.
+            .task(id: unreachablePollKey) {
+                guard state == .unreachable else { return }
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(5))
+                    guard !Task.isCancelled, !model.signedIn, !editingHubAddress else { continue }
+                    await model.checkAuthStatus(force: true)
+                    if !model.hubUnreachable { break }
+                }
+            }
+            #endif
         }
     }
 
@@ -128,25 +124,54 @@ struct SignInView: View {
         .accessibilityElement(children: .combine)
     }
 
-    private var hubField: some View {
-        TextField("https://grouper.example", text: $model.hubURL)
+    @ViewBuilder private var unreachableSection: some View {
+        Section {
+            Text("Can't reach your Grouper hub")
+                .font(.headline)
+                .foregroundStyle(Theme.text)
             #if os(iOS)
-            .textContentType(.URL)
-            .textInputAutocapitalization(.never)
-            .keyboardType(.URL)
+            Text("Grouper runs on one of your computers. Install it on a Mac or PC and sign in with your Google account, or check that your hub is online.")
+                .font(.callout)
+                .foregroundStyle(Theme.text2)
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Checking again automatically…")
+            }
+            .font(.caption)
+            .foregroundStyle(Theme.text3)
+            #else
+            Text("Check that your hub is running and reachable at \(HubAddress.displayHost(model.hubURL)).")
+                .font(.callout)
+                .foregroundStyle(Theme.text2)
             #endif
-            .autocorrectionDisabled()
-            .accessibilityLabel("Hub address")
+            Button("Try again") {
+                Task { await model.checkAuthStatus(force: true) }
+            }
+            Button("Change hub address") {
+                editingHubAddress = true
+            }
+        }
     }
 
-    /// The saved hub as a short label: its host, or the address as typed.
-    private var hubHost: String {
-        let typed = model.hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        return URL(string: typed)?.host() ?? typed
-    }
-
-    /// The setup code while the hub is unclaimed, and "Sign in with Google".
+    /// The setup code only when the hub reports it's unclaimed, any different-account refusal,
+    /// and the single "Sign in with Google" button.
     @ViewBuilder private var googleSignIn: some View {
+        if model.refusedDifferentAccount {
+            Section {
+                Label(
+                    "The hub at \(HubAddress.displayHost(model.hubURL)) belongs to a different Google account.",
+                    systemImage: "person.crop.circle.badge.xmark"
+                )
+                .font(.callout)
+                .foregroundStyle(Theme.danger)
+                Text("Sign in with that Google account, or change the hub address.")
+                    .font(.caption)
+                    .foregroundStyle(Theme.text2)
+                Button("Change hub address") {
+                    editingHubAddress = true
+                }
+            }
+        }
         if model.authStatus?.claimed == false {
             Section {
                 TextField("XXXX-XXXX-XXXX", text: $setupCode)
@@ -171,20 +196,29 @@ struct SignInView: View {
         }
     }
 
-    private var mode: SignInMode {
-        // Without a client ID this app can't sign in with Google at all: tokens, as before.
-        guard GoogleSignIn.oauth != nil else { return .token }
-        let hub = model.hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if hub.isEmpty { return .enterHub }
-        if model.authStatusCheckedFor != hub { return .checking }
+    private var state: SignInState {
+        if model.authStatusCheckedFor != model.hubURL { return .checking }
         if model.hubUnreachable { return .unreachable }
-        return model.googleSignInAvailable ? .google : .token
+        return model.googleSignInAvailable ? .google : .unavailable
+    }
+
+    #if os(iOS)
+    private var unreachablePollKey: String {
+        "\(model.hubURL)|\(state == .unreachable)"
+    }
+    #endif
+
+    private var unavailableMessage: String {
+        if GoogleSignIn.oauth == nil {
+            return "Google sign-in isn't configured in this build."
+        }
+        return "Google sign-in isn't turned on for the hub at \(HubAddress.displayHost(model.hubURL))."
     }
 
     private var busy: Bool { signingIn || model.googleBusy }
 
     private var canSignInWithGoogle: Bool {
-        guard !busy, !model.hubURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard !busy else { return false }
         return model.authStatus?.claimed != false || SetupCode.normalized(setupCode) != nil
     }
 
@@ -201,7 +235,7 @@ struct SignInView: View {
         } label: {
             HStack { Spacer(); if signingIn { ProgressView() } else { Text("Connect") }; Spacer() }
         }
-        .disabled(busy || model.hubURL.isEmpty || model.adminToken.isEmpty)
+        .disabled(busy || model.adminToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         .buttonStyle(GrouperActionButtonStyle(kind: .primary))
     }
 }
