@@ -91,6 +91,20 @@ public actor HubClient {
     public func limits() async throws -> LimitsReport { try await get(["v1", "limits"]) }
     public func usageSnapshots() async throws -> [UsageSnapshot] { try await get(["v1", "usage", "snapshots"]) }
 
+    /// `GET /v1/usage/summary` (docs/usage-tab-spec.md 7.2): the donut and key list for `[since, until)`,
+    /// as Unix seconds (the client works out local midnights, see `UsagePeriod.range`).
+    public func usageSummary(since: Int64, until: Int64, conversationId: String? = nil) async throws -> UsageSummary {
+        var query = [URLQueryItem(name: "since", value: String(since)), URLQueryItem(name: "until", value: String(until))]
+        if let conversationId { query.append(URLQueryItem(name: "conversation", value: conversationId)) }
+        return try await get(["v1", "usage", "summary"], query: query)
+    }
+
+    /// `PUT /v1/providers/{id}/color`: gives a key one of the ten colour names (`KeyColorName`), or
+    /// nil to let the hub pick one again. 400 for a name outside the palette, 404 for an unknown key.
+    public func setProviderColor(id: String, color: String?) async throws -> ProviderInfo {
+        try await send(["v1", "providers", id, "color"], method: "PUT", body: ProviderColorRequest(color: color))
+    }
+
     public func events(conversationId: String, after: Int64 = 0, threadId: String? = nil) async throws -> [Event] {
         var query = [URLQueryItem(name: "after", value: String(after))]
         if let threadId { query.append(URLQueryItem(name: "thread", value: threadId)) }
@@ -338,5 +352,14 @@ private struct ApprovalDecision: Codable { let approve: Bool }
 private struct PermissionRequest: Codable { let permission: Permission }
 private struct ToolCallRequest: Codable { let tool: String; let args: JSONValue }
 private struct DeviceRegistrationRequest: Codable { let name: String; let platform: String; let installId: String? }
+/// `{"color": "purple"}`, or `{"color": null}` to re-run the hub's automatic choice (nil must be sent, not left out).
+private struct ProviderColorRequest: Encodable {
+    let color: String?
+    enum CodingKeys: String, CodingKey { case color }
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let color { try container.encode(color, forKey: .color) } else { try container.encodeNil(forKey: .color) }
+    }
+}
 private struct ProposalDecision: Codable { let accept: Bool }
 private struct RuleEnabled: Codable { let enabled: Bool }

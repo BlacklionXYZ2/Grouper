@@ -43,6 +43,20 @@ public struct DeviceInfo: Codable, Equatable, Identifiable, Sendable {
     public let capabilities: [ToolSummary]
     public let lastSeen: UInt64?
     public let folders: [FolderInfo]
+    /// Whether the device reads its subscription usage (`usage_probes`, docs/usage-tab-spec.md 7.3).
+    /// Nil when the hub does not say (an older hub), which is not the same as off.
+    public let usageProbes: Bool?
+    /// Which providers it reads (`claude`, `codex`, `grok`, `antigravity`). Empty with
+    /// `usageProbes` on means every provider the device supports.
+    public let usageProbeProviders: [String]
+
+    public init(id: String, name: String, platform: String, online: Bool, capabilities: [ToolSummary] = [],
+                lastSeen: UInt64? = nil, folders: [FolderInfo] = [], usageProbes: Bool? = nil,
+                usageProbeProviders: [String] = []) {
+        self.id = id; self.name = name; self.platform = platform; self.online = online
+        self.capabilities = capabilities; self.lastSeen = lastSeen; self.folders = folders
+        self.usageProbes = usageProbes; self.usageProbeProviders = usageProbeProviders
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -53,6 +67,8 @@ public struct DeviceInfo: Codable, Equatable, Identifiable, Sendable {
         capabilities = try c.decodeIfPresent([ToolSummary].self, forKey: .capabilities) ?? []
         lastSeen = try c.decodeIfPresent(UInt64.self, forKey: .lastSeen)
         folders = try c.decodeIfPresent([FolderInfo].self, forKey: .folders) ?? []
+        usageProbes = try c.decodeIfPresent(Bool.self, forKey: .usageProbes)
+        usageProbeProviders = try c.decodeIfPresent([String].self, forKey: .usageProbeProviders) ?? []
     }
 }
 
@@ -89,6 +105,9 @@ public struct ProviderInfo: Codable, Equatable, Identifiable, Sendable {
     public let viaDevice: String?
     /// Kind-specific non-secret options (e.g. harness `display_name`, `signed_in`, `sign_in`).
     public let options: JSONValue?
+    /// The key's colour name (`teal`, `purple`, …; `KeyColorName`), or nil on a hub that
+    /// does not send one yet. Stored on the hub so every device agrees (docs/usage-tab-spec.md 4.4).
+    public let color: String?
 }
 
 public struct ProviderConfig: Codable, Equatable, Identifiable, Sendable {
@@ -226,6 +245,21 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
     public let source: String
     public let deviceId: String?
     public let fetchedAt: UInt64
+    /// The provider's own name for the scope of a window (Antigravity's group, Grok's product).
+    public let label: String?
+    /// Opaque fingerprint of the subscription account behind the reading; readings with the
+    /// same provider and key are one account, however many devices report it.
+    public let accountKey: String?
+
+    public init(account: String, provider: String, kind: String, window: String, usedPct: Double? = nil,
+                usedAmount: Double? = nil, limitAmount: Double? = nil, currency: String? = nil,
+                resetsAt: UInt64? = nil, source: String = "probe", deviceId: String? = nil,
+                fetchedAt: UInt64, label: String? = nil, accountKey: String? = nil) {
+        self.account = account; self.provider = provider; self.kind = kind; self.window = window
+        self.usedPct = usedPct; self.usedAmount = usedAmount; self.limitAmount = limitAmount
+        self.currency = currency; self.resetsAt = resetsAt; self.source = source; self.deviceId = deviceId
+        self.fetchedAt = fetchedAt; self.label = label; self.accountKey = accountKey
+    }
 }
 
 public enum ApprovalTimeoutAction: String, Codable, Equatable, Sendable { case deny, stop }
