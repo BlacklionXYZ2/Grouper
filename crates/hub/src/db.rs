@@ -73,6 +73,25 @@ pub fn valid_install_id(id: &str) -> bool {
     (16..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Legacy desktop builds suffixed the node row's `install_id` with `"-node"`.
+pub(crate) fn legacy_node_install_id(install_id: &str) -> String {
+    let base: String = install_id.chars().take(48).collect();
+    format!("{base}-node")
+}
+
+/// Canonical `install_id` for grouping: strips the legacy `"-node"` suffix from non-admin node
+/// rows when the base itself is a valid `install_id`.
+pub(crate) fn canonical_install_id<'a>(install_id: &'a str, install_kind: Option<&str>, admin: bool) -> &'a str {
+    if !admin
+        && (install_kind == Some(NODE_INSTALL) || install_kind.is_none())
+        && let Some(base) = install_id.strip_suffix("-node")
+        && valid_install_id(base)
+    {
+        return base;
+    }
+    install_id
+}
+
 /// A new device would pass the hub's device limit.
 #[derive(Debug)]
 pub struct DeviceCapReached(pub usize);
@@ -337,6 +356,32 @@ fn machine_device_name() -> String {
     }
 }
 
+/// Pick the best live device row to act as the hub for `install_id` (or its legacy `<base>-node`
+/// companion id), preferring an exact-match non-admin node row, then any non-admin row, then an admin row.
+fn find_install_hub_candidate(
+    tx: &rusqlite::Transaction<'_>,
+    install_id: &str,
+    legacy_node: &str,
+) -> Result<Option<(String, i64)>> {
+    Ok(tx
+        .query_row(
+            "SELECT id, admin FROM devices
+             WHERE (install_id = ?1 OR (install_id = ?2 AND admin = 0)) AND revoked = 0
+             ORDER BY
+               CASE
+                 WHEN install_id = ?1 AND admin = 0 AND install_kind = ?3 THEN 0
+                 WHEN install_id = ?2 AND admin = 0 AND install_kind = ?3 THEN 1
+                 WHEN admin = 0 THEN 2
+                 ELSE 3
+               END,
+               created DESC
+             LIMIT 1",
+            params![install_id, legacy_node, NODE_INSTALL],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
 impl Db {
     pub fn open(data_dir: &Path) -> Result<Self> {
         let conn = open_connection(data_dir)?;
@@ -383,39 +428,156 @@ impl Db {
     /// On a fresh hub, registers a non-admin device with the OS platform and machine hostname and sets
     /// `hub_device_id` to it at `epoch = 1`.
     pub fn ensure_hub_device(&self) -> Result<(String, u64)> {
+        self.ensure_hub_device_for_install(None)
+    }
+
+    /// Ensure this hub has a `(hub_device_id, epoch)` assignment, optionally bound to an embedding
+    /// app's `install_id`.
+    ///
+    /// When `install_id` is `Some`:
+    /// - If `hub_state` is absent, adopts an existing live device row for `install_id` (preferring a
+    ///   non-admin node row, including legacy `<install_id>-node` rows) or inserts one tagged with
+    ///   `(install_id, NODE_INSTALL)` so the hub and its local node share one row.
+    /// - If `hub_state` already points to an unattached synthetic hub row (`install_id IS NULL`),
+    ///   adopts the install's existing node row (retiring the unused synthetic row) or attaches
+    ///   `install_id` to the current hub row without bumping `epoch`.
+    /// - If `hub_state` already points to a row of the same install (or a different explicit install),
+    ///   reuses it without creating a duplicate row or bumping `epoch`.
+    pub fn ensure_hub_device_for_install(&self, install_id: Option<&str>) -> Result<(String, u64)> {
+        let install_id = match install_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => {
+                if !valid_install_id(id) {
+                    bail!("install_id must be 16 to 64 characters of letters, digits, - and _");
+                }
+                Some(id)
+            }
+            None => None,
+        };
+
         let mut c = self.c();
-        if let Some((id, epoch)) = c
-            .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
-            })
-            .optional()?
+        if install_id.is_none()
+            && let Some((id, epoch)) = c
+                .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })
+                .optional()?
         {
             return Ok((id, epoch));
         }
+
         let tx = c.transaction()?;
-        if let Some((id, epoch)) = tx
-            .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
-            })
-            .optional()?
-        {
-            return Ok((id, epoch));
-        }
         let owner_sub: Option<String> = tx
             .query_row("SELECT sub FROM hub_owner WHERE id = 1", [], |r| r.get(0))
             .optional()?;
+        let existing_state: Option<(String, u64)> = tx
+            .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .optional()?;
+
+        if let Some((cur_id, cur_epoch)) = existing_state {
+            let Some(inst) = install_id else {
+                return Ok((cur_id, cur_epoch));
+            };
+            let legacy_node = legacy_node_install_id(inst);
+            let cur_row: Option<(Option<String>, Option<String>, i64, Option<i64>, i64)> = tx
+                .query_row(
+                    "SELECT install_id, install_kind, admin, last_seen, revoked FROM devices WHERE id = ?1",
+                    [&cur_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?;
+
+            if let Some((cur_inst, cur_kind, cur_admin, cur_last_seen, cur_revoked)) = cur_row
+                && cur_revoked == 0
+            {
+                match cur_inst.as_deref().filter(|s| !s.is_empty()) {
+                    Some(id) if id == inst => {
+                        return Ok((cur_id, cur_epoch));
+                    }
+                    Some(id) if id == legacy_node => {
+                        tx.execute(
+                            "UPDATE devices SET install_id = ?1, account_sub = COALESCE(account_sub, ?2) WHERE id = ?3",
+                            params![inst, owner_sub, cur_id],
+                        )?;
+                        tx.commit()?;
+                        return Ok((cur_id, cur_epoch));
+                    }
+                    Some(_) => {
+                        return Ok((cur_id, cur_epoch));
+                    }
+                    None => {
+                        if let Some((cand_id, cand_admin)) = find_install_hub_candidate(&tx, inst, &legacy_node)?
+                            && cur_admin == 0
+                            && cur_kind.is_none()
+                            && cur_last_seen.is_none()
+                            && cand_admin == 0
+                        {
+                            tx.execute(
+                                "UPDATE devices SET install_id = ?1, account_sub = COALESCE(account_sub, ?2) WHERE id = ?3",
+                                params![inst, owner_sub, cand_id],
+                            )?;
+                            tx.execute("UPDATE hub_state SET hub_device_id = ?1 WHERE id = 1", params![cand_id])?;
+                            tx.execute("UPDATE devices SET revoked = 1 WHERE id = ?1", [&cur_id])?;
+                            tx.commit()?;
+                            return Ok((cand_id, cur_epoch));
+                        }
+                        if cur_admin == 0 && cur_kind.is_none() {
+                            tx.execute(
+                                "UPDATE devices SET install_id = ?1, install_kind = ?2, account_sub = COALESCE(account_sub, ?3) WHERE id = ?4",
+                                params![inst, NODE_INSTALL, owner_sub, cur_id],
+                            )?;
+                        } else {
+                            tx.execute(
+                                "UPDATE devices SET install_id = ?1, account_sub = COALESCE(account_sub, ?2) WHERE id = ?3",
+                                params![inst, owner_sub, cur_id],
+                            )?;
+                        }
+                        tx.commit()?;
+                        return Ok((cur_id, cur_epoch));
+                    }
+                }
+            }
+            return Ok((cur_id, cur_epoch));
+        }
+
+        if let Some(inst) = install_id {
+            let legacy_node = legacy_node_install_id(inst);
+            if let Some((existing_id, _)) = find_install_hub_candidate(&tx, inst, &legacy_node)? {
+                tx.execute(
+                    "UPDATE devices SET install_id = ?1, account_sub = COALESCE(account_sub, ?2) WHERE id = ?3",
+                    params![inst, owner_sub, existing_id],
+                )?;
+                tx.execute("INSERT INTO hub_state (id, hub_device_id, epoch) VALUES (1, ?1, 1)", params![existing_id])?;
+                tx.commit()?;
+                return Ok((existing_id, 1));
+            }
+        }
+
         let id = random_hex(6);
         let secret = random_hex(32);
         let name = machine_device_name();
         let platform = std::env::consts::OS;
+        let install_kind = install_id.map(|_| NODE_INSTALL);
         tx.execute(
-            "INSERT INTO devices (id, name, platform, secret_hash, created, admin, account_sub)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-            params![id, name, platform, hash(&secret), ts(), owner_sub],
+            "INSERT INTO devices (id, name, platform, secret_hash, created, admin, install_id, install_kind, account_sub)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
+            params![id, name, platform, hash(&secret), ts(), install_id, install_kind, owner_sub],
         )?;
         tx.execute("INSERT INTO hub_state (id, hub_device_id, epoch) VALUES (1, ?1, 1)", params![id])?;
         tx.commit()?;
         Ok((id, 1))
+    }
+
+    /// The `install_id` recorded on a device row, if any.
+    pub fn device_install_id(&self, id: &str) -> Option<String> {
+        self.c()
+            .query_row("SELECT install_id FROM devices WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|s| !s.is_empty())
     }
 
     /// The device id currently acting as the hub (registering this machine on first use).
@@ -1847,5 +2009,77 @@ mod tests {
 
         drop(db);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn ensure_hub_device_for_install_adopts_existing_and_reuses_on_restart() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let install_id = "pc_install_1234567890abcdef";
+
+        // Invalid install_id is rejected.
+        assert!(db.ensure_hub_device_for_install(Some("short")).is_err());
+
+        // Fresh hub creates a single non-admin node row tagged with install_id.
+        let (hub_dev_id, epoch) = db.ensure_hub_device_for_install(Some(install_id)).unwrap();
+        assert_eq!(epoch, 1);
+        assert_eq!(db.device_install_id(&hub_dev_id).as_deref(), Some(install_id));
+        assert_eq!(db.devices().len(), 1);
+
+        // Issuing the local node for the same install reuses the hub row instead of creating a second row.
+        let node = db
+            .issue_device("Oscar-PC", "windows", false, Some(Install { id: install_id, kind: NODE_INSTALL }), None)
+            .unwrap();
+        assert!(node.reused);
+        assert_eq!(node.device.id, hub_dev_id);
+        assert_eq!(db.devices().len(), 1);
+
+        // Issuing the admin UI row for the same install keeps two rows total (node/hub + admin).
+        let admin = db
+            .issue_device("Oscar-PC", "windows", true, Some(Install { id: install_id, kind: "windows" }), None)
+            .unwrap();
+        assert_ne!(admin.device.id, hub_dev_id);
+        assert_eq!(db.devices().len(), 2);
+
+        // Reopening and ensuring with the same install_id reuses the row and keeps epoch = 1.
+        drop(db);
+        let db = Db::open(&dir).unwrap();
+        let (restarted_id, restarted_epoch) = db.ensure_hub_device_for_install(Some(install_id)).unwrap();
+        assert_eq!(restarted_id, hub_dev_id);
+        assert_eq!(restarted_epoch, 1);
+        assert_eq!(db.devices().len(), 2);
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+
+        // Pre-existing node row before hub_state exists is adopted rather than creating a separate hub row.
+        let dir2 = tmp();
+        let db2 = Db::open(&dir2).unwrap();
+        let existing_node = db2
+            .issue_device("Existing PC", "windows", false, Some(Install { id: install_id, kind: NODE_INSTALL }), None)
+            .unwrap();
+        let (adopted_id, adopted_epoch) = db2.ensure_hub_device_for_install(Some(install_id)).unwrap();
+        assert_eq!(adopted_id, existing_node.device.id);
+        assert_eq!(adopted_epoch, 1);
+        assert_eq!(db2.devices().len(), 1);
+        drop(db2);
+        std::fs::remove_dir_all(dir2).ok();
+
+        // Upgrading a legacy DB with an unattached hub row + `<install_id>-node` row adopts the node row
+        // and retires the unused synthetic hub row without bumping epoch.
+        let dir3 = tmp();
+        let db3 = Db::open(&dir3).unwrap();
+        let (orphan_id, _) = db3.ensure_hub_device().unwrap();
+        let legacy_id = legacy_node_install_id(install_id);
+        let legacy_node = db3
+            .issue_device("Legacy PC", "windows", false, Some(Install { id: &legacy_id, kind: NODE_INSTALL }), None)
+            .unwrap();
+        let (upgraded_id, upgraded_epoch) = db3.ensure_hub_device_for_install(Some(install_id)).unwrap();
+        assert_eq!(upgraded_id, legacy_node.device.id);
+        assert_eq!(upgraded_epoch, 1);
+        assert_eq!(db3.device_install_id(&upgraded_id).as_deref(), Some(install_id));
+        let orphan = db3.devices().into_iter().find(|d| d.id == orphan_id).unwrap();
+        assert!(orphan.revoked, "unused synthetic hub row should be revoked on adoption");
+        drop(db3);
+        std::fs::remove_dir_all(dir3).ok();
     }
 }
