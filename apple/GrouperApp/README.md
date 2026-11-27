@@ -89,9 +89,8 @@ Only the `GrouperAPI` parts (model family rules, the thread-as-chat fold, elapse
 time, `ProviderInfo.viaDevice`) are built and tested, on the Windows toolchain.
 
 - **No Threads tab or Threads destination.** Threads belong to their chat. The
-  phone keeps Chat, Devices and More (the tab set is still an owner decision; see
-  the `TODO(owner decision: phone tabs)` in `iOS/GrouperIOSApp.swift`). The Chat
-  tab carries the needs-you badge.
+  phone has Chat, Usage, Devices and More (owner decision, 27 November 2026; see
+  `docs/usage-tab-spec.md`). The Chat tab carries the needs-you badge.
 - **Threads button in the chat toolbar** (count, orange dot when something needs
   you) opens the chat's threads: a sheet on iPhone, an inspector on Mac
   (`Shared/ThreadsPanel.swift`). Rows show the title, live elapsed time, the model
