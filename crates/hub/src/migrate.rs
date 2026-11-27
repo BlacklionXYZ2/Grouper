@@ -10,7 +10,7 @@
 //!
 //! Admin & move endpoints:
 //! - `GET /v1/hub/move` (authed) — current [`MoveStatus`].
-//! - `POST /v1/hub/move` (admin + fresh Google sign-in TODO) — preflight and start a move.
+//! - `POST /v1/hub/move` (admin + fresh Google sign-in) — preflight and start a move.
 //! - `DELETE /v1/hub/move` (admin) — cancel an active move before the Switch commit point.
 //! - `GET /v1/hub/move/{ticket}/snapshot` (target device token) — one-time backup archive download.
 //! - `POST /v1/hub/move/{ticket}/secrets` (target device token) — one-time X25519-encrypted secrets hand-over.
@@ -61,6 +61,7 @@ const ENV_MASTER_KEY: &str = "GROUPER_MASTER_KEY";
 const ENV_MASTER_KEY_FILE: &str = "GROUPER_MASTER_KEY_FILE";
 const HEADER_SNAPSHOT_SHA256: &str = "x-snapshot-sha256";
 const STOP_TUNNEL_TIMEOUT: Duration = Duration::from_secs(5);
+const FRESH_SIGNIN_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// State of the hub move state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,7 +513,7 @@ fn sha256_file(path: &Path) -> Result<(u64, String)> {
     Ok((size, hex::encode(hasher.finalize())))
 }
 
-// ------------------------------------------------------------------ pause middleware & fresh sign-in TODO
+// ------------------------------------------------------------------ pause middleware & fresh sign-in
 
 /// Axum middleware that refuses mutating requests with HTTP 503 while a hub move is paused.
 pub(crate) async fn pause_guard(State(hub): State<Arc<Hub>>, req: Request, next: Next) -> Response {
@@ -535,24 +536,13 @@ pub(crate) async fn pause_guard(State(hub): State<Arc<Hub>>, req: Request, next:
     err(StatusCode::SERVICE_UNAVAILABLE, "Your hub is moving")
 }
 
-/// Check that the caller presented a fresh Google sign-in per section 4a (a hub-issued nonce not
-/// older than 5 minutes).
-///
-/// TODO(fresh-google-signin): `crate::google_auth::GoogleAuth` currently keeps `verify`,
-/// `consume_nonce`, and `Identity` private and tracks nonces only with a 10-minute expiry
-/// (`NONCE_TTL_SECS = 600`) without recording issue time or exposing a 5-minute freshness check.
-/// Once `google_auth` exposes a fresh-owner ID-token verifier (e.g.
-/// `verify_fresh_owner(id_token, max_age_secs = 300)`), enforce it here and require a non-empty
-/// verified `id_token` matching `hub.db.owner().sub`.
-fn verify_fresh_google_signin(_hub: &Hub, id_token: Option<&str>) -> Result<(), (StatusCode, String)> {
-    if let Some(raw) = id_token
-        && raw.trim().is_empty()
-    {
-        return Err((StatusCode::BAD_REQUEST, "id_token must not be empty".to_string()));
-    }
-    // TODO(fresh-google-signin): enforce fresh Google ID token verification here once
-    // `google_auth` exposes a <=5-minute nonce + owner check.
-    Ok(())
+/// Require a fresh Google sign-in per section 4a: one-time hub nonce consumed, `iat` within
+/// 5 minutes, and `sub` equal to the hub owner's.
+async fn verify_fresh_google_signin(hub: &Hub, id_token: Option<&str>) -> Result<(), (StatusCode, String)> {
+    let raw = id_token.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+        (StatusCode::UNAUTHORIZED, "a fresh Google sign-in is required to move the hub".to_string())
+    })?;
+    crate::google_auth::verify_fresh(hub, raw, FRESH_SIGNIN_MAX_AGE).await
 }
 
 // ------------------------------------------------------------------ old hub move driver
@@ -590,7 +580,7 @@ impl Hub {
         self: &Arc<Self>,
         req: StartMoveRequest,
     ) -> Result<MoveStatus, (StatusCode, String)> {
-        verify_fresh_google_signin(self, req.id_token.as_deref())?;
+        verify_fresh_google_signin(self, req.id_token.as_deref()).await?;
 
         if self.is_stepped_down() {
             return Err((
@@ -1792,6 +1782,31 @@ mod tests {
     use core_protocol::{NodeHostInfo, ProviderConfig};
     use crate::google_auth::Owner;
 
+    async fn setup_test_owner(hub: &Hub, sub: &str) {
+        crate::google_auth::tests::configure_hub_for_test(hub).await;
+        hub.db
+            .set_owner_if_none(&Owner {
+                provider: "google".into(),
+                sub: sub.into(),
+                email: format!("{sub}@example.com"),
+                name: "Test Owner".into(),
+                claimed_at: now(),
+            })
+            .unwrap();
+    }
+
+    async fn fetch_nonce(http: &reqwest::Client, base: &str) -> String {
+        let resp = http.post(format!("{base}/v1/auth/google/nonce")).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        body["nonce"].as_str().unwrap().to_string()
+    }
+
+    async fn fresh_owner_token(http: &reqwest::Client, base: &str, sub: &str) -> String {
+        let nonce = fetch_nonce(http, base).await;
+        crate::google_auth::tests::mint_for_test(&nonce, sub)
+    }
+
     #[test]
     fn secrets_x25519_encryption_round_trips_and_rejects_tampering_or_wrong_key() {
         let target = TargetKeyPair::generate().unwrap();
@@ -1889,6 +1904,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("grouper-migrate-preflight-{}", random_hex(4)));
         let handle = host::start(&dir, &["127.0.0.1:0".parse().unwrap()]).await.unwrap();
         let hub = handle.hub().unwrap();
+        setup_test_owner(&hub, "sub-preflight").await;
         let (hub_dev_id, _) = hub.db.ensure_hub_device().unwrap();
         let (_admin, admin_token) = hub.db.add_device("Admin", "windows", true).unwrap();
         let (phone, _) = hub.db.add_device("iPhone", "ios", false).unwrap();
@@ -1944,10 +1960,11 @@ mod tests {
             (old_mac.id.as_str(), "Update Grouper"),
             (tight_pc.id.as_str(), "free disk space"),
         ] {
+            let id_token = fresh_owner_token(&http, &base, "sub-preflight").await;
             let resp = http
                 .post(format!("{base}/v1/hub/move"))
                 .bearer_auth(&admin_token)
-                .json(&json!({"target_device": target}))
+                .json(&json!({"target_device": target, "id_token": id_token}))
                 .send()
                 .await
                 .unwrap();
@@ -2027,6 +2044,7 @@ mod tests {
 
         let old_handle = host::start(&old_dir, &[loopback]).await.unwrap();
         let old_hub = old_handle.hub().unwrap();
+        crate::google_auth::tests::configure_hub_for_test(&old_hub).await;
         old_hub.migrate().set_config(MigrateConfig {
             confirm_timeout: Duration::from_secs(10),
             copy_timeout: Duration::from_secs(15),
@@ -2143,11 +2161,13 @@ mod tests {
 
         // Start the move via admin HTTP API.
         let http = reqwest::Client::new();
+        let id_token = fresh_owner_token(&http, &old_url, "sub-oscar").await;
         let start_resp = http
             .post(format!("{old_url}/v1/hub/move"))
             .bearer_auth(&phone_admin_token)
             .json(&json!({
                 "target_device": target_id,
+                "id_token": id_token,
                 "threads": "stop"
             }))
             .send()
@@ -2249,6 +2269,7 @@ mod tests {
 
         let old_handle = host::start(&old_dir, &[loopback]).await.unwrap();
         let old_hub = old_handle.hub().unwrap();
+        crate::google_auth::tests::configure_hub_for_test(&old_hub).await;
         old_hub
             .db
             .set_owner_if_none(&Owner {
@@ -2352,10 +2373,11 @@ mod tests {
             });
 
             let mut status_rx = old_hub.migrate().subscribe();
+            let id_token = fresh_owner_token(&http, &old_url, "sub-rollback").await;
             let start = http
                 .post(format!("{old_url}/v1/hub/move"))
                 .bearer_auth(&admin_token)
-                .json(&json!({"target_device": target_dev.id, "threads": "stop"}))
+                .json(&json!({"target_device": target_dev.id, "id_token": id_token, "threads": "stop"}))
                 .send()
                 .await
                 .unwrap();
@@ -2430,6 +2452,7 @@ mod tests {
 
         let old_handle = host::start(&old_dir, &[loopback]).await.unwrap();
         let old_hub = old_handle.hub().unwrap();
+        setup_test_owner(&old_hub, "sub-cancel").await;
         old_hub.migrate().set_config(MigrateConfig {
             confirm_timeout: Duration::from_secs(5),
             copy_timeout: Duration::from_secs(10),
@@ -2488,10 +2511,11 @@ mod tests {
 
         let http = reqwest::Client::new();
         let mut status_rx = old_hub.migrate().subscribe();
+        let id_token = fresh_owner_token(&http, &old_url, "sub-cancel").await;
         let start = http
             .post(format!("{old_url}/v1/hub/move"))
             .bearer_auth(&admin_token)
-            .json(&json!({"target_device": target_dev.id, "threads": "stop"}))
+            .json(&json!({"target_device": target_dev.id, "id_token": id_token, "threads": "stop"}))
             .send()
             .await
             .unwrap();
@@ -2542,6 +2566,155 @@ mod tests {
         let _ = node_stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), node_task).await;
         old_handle.stop().await;
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn post_hub_move_enforces_fresh_owner_google_signin() {
+        let root = std::env::temp_dir().join(format!("grouper-move-fresh-auth-{}", random_hex(4)));
+        let old_dir = root.join("hub");
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let handle = host::start(&old_dir, &[loopback]).await.unwrap();
+        let hub = handle.hub().unwrap();
+        setup_test_owner(&hub, "sub-oscar").await;
+        hub.migrate().set_config(MigrateConfig {
+            confirm_timeout: Duration::from_secs(5),
+            copy_timeout: Duration::from_secs(10),
+            poll_interval: Duration::from_millis(25),
+            inject_failure: None,
+        });
+
+        let (_admin, admin_token) = hub.db.add_device("Admin", "windows", true).unwrap();
+        let (target_dev, target_token) = hub.db.add_device("Target Mac", "macos", false).unwrap();
+        let base = format!("http://{}", handle.binds()[0]);
+
+        // Connect an eligible online target so only `id_token` decides whether `/v1/hub/move` accepts.
+        let (offer_tx, _offer_rx) = oneshot::channel();
+        let (commit_tx, _commit_rx) = oneshot::channel();
+        let events = Arc::new(TestTargetEvents {
+            offer_tx: Mutex::new(Some(offer_tx)),
+            commit_tx: Mutex::new(Some(commit_tx)),
+        });
+        let (node_stop_tx, node_stop_rx) = watch::channel(false);
+        let client_cfg = core_client::Config {
+            hub_url: base.clone(),
+            token: target_token,
+            capabilities: vec![],
+            workspace_root: None,
+            allow_shell: false,
+            mcp_config: None,
+            folders: vec![],
+            usage_probes: false,
+        };
+        let host_info = NodeHostInfo {
+            can_host: true,
+            app_version: HUB_VERSION.into(),
+            free_bytes: Some(10_000_000_000),
+            cloudflared: true,
+        };
+        let node_task = tokio::spawn(core_client::run_with_host(
+            client_cfg,
+            Some(host_info),
+            Arc::new(NoopTools),
+            events,
+            node_stop_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if hub.is_online(&target_dev.id).await
+                    && hub.host_info_for(&target_dev.id).is_some_and(|h| h.can_host)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("target connected");
+
+        let http = reqwest::Client::new();
+        let post_move = |payload: serde_json::Value| {
+            http.post(format!("{base}/v1/hub/move"))
+                .bearer_auth(&admin_token)
+                .json(&payload)
+                .send()
+        };
+
+        // 1. Missing or blank token -> 401 Unauthorized.
+        for payload in [
+            json!({"target_device": target_dev.id}),
+            json!({"target_device": target_dev.id, "id_token": null}),
+            json!({"target_device": target_dev.id, "id_token": "   "}),
+        ] {
+            let resp = post_move(payload).await.unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+            assert!(!hub.is_move_paused());
+            assert_eq!(hub.migrate().status().state, MovePhase::Idle);
+        }
+
+        // 2. Stale `iat` (>= 5 minutes old, even with valid signature, fresh hub nonce, and unexpired `exp`) -> 401.
+        for age_secs in [300u64, 360u64] {
+            let nonce = fetch_nonce(&http, &base).await;
+            let stale_tok = crate::google_auth::tests::mint_for_test_at(&nonce, "sub-oscar", now() - age_secs);
+            let resp = post_move(json!({"target_device": target_dev.id, "id_token": stale_tok})).await.unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED, "age_secs={age_secs}");
+            assert!(!hub.is_move_paused());
+            assert_eq!(hub.migrate().status().state, MovePhase::Idle);
+        }
+
+        // 3. Reused nonce from `POST /v1/auth/google` -> 401 Unauthorized.
+        let login_tok = fresh_owner_token(&http, &base, "sub-oscar").await;
+        let signin_resp = http
+            .post(format!("{base}/v1/auth/google"))
+            .json(&json!({"id_token": login_tok, "client": "ios"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(signin_resp.status(), reqwest::StatusCode::OK);
+        let replay_login = post_move(json!({"target_device": target_dev.id, "id_token": login_tok})).await.unwrap();
+        assert_eq!(replay_login.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(!hub.is_move_paused());
+
+        // 4. Wrong `sub` (valid signature + fresh hub nonce + fresh `iat`, another Google account) -> 403 Forbidden.
+        let wrong_sub_tok = fresh_owner_token(&http, &base, "sub-stranger").await;
+        let wrong_sub_resp = post_move(json!({"target_device": target_dev.id, "id_token": wrong_sub_tok})).await.unwrap();
+        assert_eq!(wrong_sub_resp.status(), reqwest::StatusCode::FORBIDDEN);
+        assert!(!hub.is_move_paused());
+        assert_eq!(hub.migrate().status().state, MovePhase::Idle);
+
+        // 5. Valid fresh owner token -> 202 Accepted, and replaying that same move token after cancel -> 401.
+        let mut status_rx = hub.migrate().subscribe();
+        let valid_tok = fresh_owner_token(&http, &base, "sub-oscar").await;
+        let ok_resp = post_move(json!({"target_device": target_dev.id, "id_token": valid_tok, "threads": "stop"}))
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), reqwest::StatusCode::ACCEPTED);
+
+        tokio::time::timeout(Duration::from_secs(5), status_rx.wait_for(|s| s.state == MovePhase::Copying))
+            .await
+            .expect("entered copying")
+            .unwrap();
+        let cancel = http
+            .delete(format!("{base}/v1/hub/move"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), reqwest::StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(5), status_rx.wait_for(|s| s.state == MovePhase::RolledBack))
+            .await
+            .expect("cancelled cleanly")
+            .unwrap();
+
+        let replay_move = post_move(json!({"target_device": target_dev.id, "id_token": valid_tok, "threads": "stop"}))
+            .await
+            .unwrap();
+        assert_eq!(replay_move.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let _ = node_stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), node_task).await;
+        handle.stop().await;
         fs::remove_dir_all(&root).ok();
     }
 }
