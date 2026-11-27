@@ -1,4 +1,5 @@
 mod credentials;
+mod hub;
 mod usage;
 
 use std::collections::{HashMap, HashSet};
@@ -167,6 +168,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<LimitsCmd>,
     },
+    /// Run and manage a local hub on this machine (Linux / headless host).
+    #[command(subcommand)]
+    Hub(hub::HubCmd),
 }
 
 #[derive(Subcommand)]
@@ -384,7 +388,7 @@ impl ToolHandler for CliTools {
     }
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     std::process::Command::new("hostname")
         .output()
         .ok()
@@ -890,8 +894,8 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .init();
     let cli = Cli::parse();
-    match &cli.cmd {
-        Cmd::Login { name, no_browser } => return login(cli.hub.as_deref(), name.as_deref(), *no_browser).await,
+    match cli.cmd {
+        Cmd::Login { name, no_browser } => return login(cli.hub.as_deref(), name.as_deref(), no_browser).await,
         Cmd::Logout => {
             match credentials::remove()? {
                 Some(hub) => println!("Signed out of {hub} on this computer."),
@@ -899,15 +903,19 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        _ => {}
+        Cmd::Hub(cmd) => return hub::run(cli.hub.as_deref(), cli.token.as_deref(), cmd).await,
+        cmd => {
+            let cache = cli.cache;
+            let (hub, token) = credentials::resolve(cli.hub, cli.token, credentials::DEFAULT_HUB)?;
+            let api = Api { base: hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
+            return run_authed_cmd(api, cache, cmd).await;
+        }
     }
+}
 
-    let cache = cli.cache;
-    let (hub, token) = credentials::resolve(cli.hub, cli.token, credentials::DEFAULT_HUB)?;
-    let api = Api { base: hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
-
-    match cli.cmd {
-        Cmd::Login { .. } | Cmd::Logout => unreachable!(),
+async fn run_authed_cmd(api: Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Login { .. } | Cmd::Logout | Cmd::Hub(_) => unreachable!(),
         Cmd::Connect { workspace, no_shell, mcp_config, folders, folders_config, usage_probes } => {
             let workspace = workspace.unwrap_or_else(|| {
                 dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("Grouper").join("workspaces")
@@ -1625,5 +1633,23 @@ mod tests {
             let from_flag = Cli::try_parse_from(["grouper", "--hub", "https://flag.example", "devices"]).expect("devices");
             assert_eq!(from_flag.hub.as_deref(), Some("https://flag.example"));
         }
+    }
+
+    #[test]
+    fn hub_subcommands_parse() {
+        let init = Cli::try_parse_from(["grouper", "hub", "init", "--data", "/tmp/grouper-hub"]).expect("hub init");
+        assert!(matches!(init.cmd, Cmd::Hub(hub::HubCmd::Init { data: Some(p) }) if p == std::path::Path::new("/tmp/grouper-hub")));
+
+        let run = Cli::try_parse_from(["grouper", "hub", "run"]).expect("hub run");
+        assert!(matches!(run.cmd, Cmd::Hub(hub::HubCmd::Run { bind, .. }) if bind.to_string() == hub::DEFAULT_BIND));
+
+        let status = Cli::try_parse_from(["grouper", "hub", "status"]).expect("hub status");
+        assert!(matches!(status.cmd, Cmd::Hub(hub::HubCmd::Status)));
+
+        let mv = Cli::try_parse_from(["grouper", "hub", "move", "my-mac"]).expect("hub move");
+        assert!(matches!(mv.cmd, Cmd::Hub(hub::HubCmd::Move { device }) if device == "my-mac"));
+
+        let take = Cli::try_parse_from(["grouper", "hub", "take"]).expect("hub take");
+        assert!(matches!(take.cmd, Cmd::Hub(hub::HubCmd::Take)));
     }
 }

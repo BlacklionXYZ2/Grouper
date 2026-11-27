@@ -184,6 +184,7 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 | `grouper limits`, `grouper limits set <key> <value\|off>` | Thread caps, budgets, approval and ask timeouts (all off by default) |
 | `grouper sync` | Refresh the local cache; `log`, `conversations` and `threads` read it when the hub is unreachable |
 | `grouper devices`, `grouper call <device> <tool>` | Presence and direct device tools |
+| `grouper hub init\|run\|status\|move\|take` | Set up and run a local hub + in-process node on Linux or any headless machine, inspect status/tunnel, or print the web UI link to move the hub |
 
 ## Swift demo node
 
@@ -196,6 +197,18 @@ cd apple/GrouperKit && GROUPER_TOKEN=<token> swift run grouper-mac
 
 On this PC the hub is the Windows app. [deploy/MOVE-TO-PC.md](deploy/MOVE-TO-PC.md)
 moves the VM's data there.
+
+On Linux or any headless computer, use the CLI hub commands:
+
+```bash
+grouper hub init                 # creates ~/.local/share/grouper/hub (or --data <dir>)
+grouper hub run                  # binds 127.0.0.1:47600 + starts an in-process node; Ctrl+C stops cleanly
+grouper hub status               # shows hub running state, account id, hub_device_id, epoch and tunnel status
+grouper hub move <device>        # prints the web UI link (Devices → Change hub…) to confirm with Google sign-in
+grouper hub take                 # same, targeting this machine
+```
+
+An example systemd user unit is in [deploy/grouper-hub.service](deploy/grouper-hub.service).
 
 Server mode (parked) is [deploy/README.md](deploy/README.md): a Hyper-V VM made by
 script, the hub in Docker, and a Cloudflare Tunnel to `https://grouper.clockmillbarn.uk`.

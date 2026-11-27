@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 core-client.workspace = true
 core-sync.workspace = true
+hub = { path = "../hub" }
 anyhow.workspace = true
 base64 = "0.22"
 clap.workspace = true
