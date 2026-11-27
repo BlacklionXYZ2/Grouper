@@ -70,6 +70,41 @@ Hub threads get file tools only. A sandboxed shell means running each thread's c
 a throwaway container, which needs the hub container to control Docker (mounting the
 Docker socket, or a separate runner). Yes or no, and if yes, which approach.
 
+## Local-first: what only Oscar can do (27 November 2026)
+
+The hub can now run inside the Windows app on your PC (see `docs/local-first-design.md`,
+`docs/local-first-review-2026-11-27.md`, and the step-by-step `deploy/MOVE-TO-PC.md`). These steps
+need you:
+
+1. **Google Cloud (project `grouper-515912`):** create an OAuth client of type **Desktop app**. Send
+   the client ID (it is public); keep the client secret in a file, never in chat. An agent then puts
+   the ID in `DEFAULT_DESKTOP_CLIENT_ID` (`apps/desktop/src-tauri/src/oauth.rs`) and
+   `DEFAULT_CLIENT_IDS` (`crates/hub/src/google_auth.rs`).
+2. **Google Auth Platform → Branding:** point the privacy policy link at
+   `https://grouper.clockmillbarn.uk/privacy`.
+3. **Cloudflare → Caching → Configuration → Browser Cache TTL → "Respect Existing Headers"**, so a
+   deploy shows up without a hard refresh.
+4. **Move the hub to the PC:** follow `deploy/MOVE-TO-PC.md` (VM backup, copy `master.key`
+   separately, stop the VM hub and its `cloudflared`, restore on the PC, point the tunnel at
+   `http://127.0.0.1:47600`, sign in with Google in the Windows app, paste the tunnel token in
+   Settings → Remote access).
+5. **The PC's CLI sign-in was lost** (an agent's test overwrote `%APPDATA%\grouper\credentials.json`
+   on 26 Nov): run `grouper login` once.
+6. **Try on real devices:** the Windows installer (CI artifact `Grouper-windows-x64-setup`), the Mac
+   app (`Grouper-macOS-arm64`), and the iPhone app (keyboard dismissal, Google-only sign-in, plan
+   checklist in threads).
+
+Open design points (no action yet):
+
+- **A second desktop joining a PC hub through the tunnel:** the desktop app hands its window a
+  session by trading its admin token at `POST /v1/session`, but a hub in local mode accepts token
+  sign-in only from its own machine, so a second desktop in client mode must sign in with Google in
+  the window instead. Fine for now; revisit when a second computer joins.
+- **Default domain for other users:** apps default to `grouper.clockmillbarn.uk`; anyone else would
+  reach your hub and be refused. Choose per-user discovery (e.g. the Drive record) before anyone
+  else gets the app.
+- **Mac as hub** (design package 11) waits until a real PC → other-machine move has worked.
+
 ## Housekeeping (no decision needed, just actions)
 
 - **Hub model:** the online hub now uses free OpenRouter models, swapping to another free
