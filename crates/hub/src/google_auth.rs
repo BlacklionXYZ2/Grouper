@@ -46,6 +46,10 @@ use crate::server::{Hub, err};
 
 /// Grouper's own Google OAuth client IDs (iOS app, Mac app), trusted when `GROUPER_GOOGLE_CLIENT_IDS` is unset.
 // Grouper's official OAuth clients (project grouper-515912): iPhone app, Mac app, web. Public identifiers.
+// TODO(desktop OAuth): when `DEFAULT_DESKTOP_CLIENT_ID` in `apps/desktop/src-tauri/src/oauth.rs`
+// is filled in, add that same client id to this list so the hub accepts the Windows desktop token.
+// Until then `GROUPER_GOOGLE_DESKTOP_CLIENT_ID` and `GROUPER_GOOGLE_CLIENT_IDS` supply it
+// (`GROUPER_GOOGLE_CLIENT_IDS` replaces this list).
 const DEFAULT_CLIENT_IDS: &[&str] = &[
     "998648431961-aeomun58v9i625ofsprfc5oroalv233t.apps.googleusercontent.com",
     "998648431961-cnc9c9930iacdrs9u7b25cgtp7g26f9q.apps.googleusercontent.com",

@@ -1,18 +1,18 @@
-//! Desktop Google OAuth 2.0 sign-in with loopback redirect (`http://localhost:47600/oauth/google/return`).
+//! Desktop Google OAuth 2.0 sign-in. The return listener binds `127.0.0.1` on a free port
+//! (`http://127.0.0.1:<port>/oauth/google/return`), which a Desktop-type client may use without
+//! a registered redirect. It must not use port 47600: that is the embedded hub.
 //!
-//! TODO(Q5: Desktop OAuth client — docs/local-first-design.md §7 Q5):
-//!   1. Create a "Desktop app" OAuth 2.0 client in GCP project `grouper-515912` and set
-//!      `DEFAULT_DESKTOP_CLIENT_ID` below (or supply `GROUPER_GOOGLE_DESKTOP_CLIENT_ID` via env /
-//!      `google_desktop_client_id` in `%LOCALAPPDATA%\Grouper\desktop.json`).
-//!   2. Add that Desktop client ID to `DEFAULT_CLIENT_IDS` in `crates/hub/src/google_auth.rs` so
-//!      hubs trust ID tokens minted for the Windows desktop client without `GROUPER_GOOGLE_CLIENT_IDS`.
-//!   3. Add `"windows"` alongside `"macos"` / `"cli"` in `POST /v1/auth/google` (`crates/hub/src/google_auth.rs`)
-//!      for remote-hub sign-in (`claim_local_client` already accepts `"windows"`).
+//! TODO(Desktop OAuth client): the owner has not created the Desktop client yet.
+//!   1. Keep `DEFAULT_DESKTOP_CLIENT_ID` empty until that client exists. Until then set
+//!      `GROUPER_GOOGLE_DESKTOP_CLIENT_ID` (and `GROUPER_GOOGLE_CLIENT_IDS`, which replaces the
+//!      hub's default audience list).
+//!   2. When the id is set, add the same id to `DEFAULT_CLIENT_IDS` in `crates/hub/src/google_auth.rs`.
 //!
-//! Until Q5 is completed, local-hub sign-in works via `http://127.0.0.1:47600/#/token-signin` from loopback.
+//! The client secret is never a plain field in `desktop.json`. Read it from the DPAPI setting,
+//! or from `GROUPER_GOOGLE_DESKTOP_CLIENT_SECRET` when that setting is absent.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -28,12 +28,14 @@ use crate::settings::DesktopSettings;
 
 pub const DESKTOP_CLIENT_ID_ENV: &str = "GROUPER_GOOGLE_DESKTOP_CLIENT_ID";
 pub const DESKTOP_CLIENT_SECRET_ENV: &str = "GROUPER_GOOGLE_DESKTOP_CLIENT_SECRET";
-/// Filled in once the owner creates the Desktop OAuth client in Google Cloud Console (see TODO above).
+/// Filled in once the owner creates the Desktop OAuth client in Google Cloud Console.
+/// TODO: leave this empty until that client exists. When it is set, add the same id to
+/// `DEFAULT_CLIENT_IDS` in `crates/hub/src/google_auth.rs`.
 pub const DEFAULT_DESKTOP_CLIENT_ID: &str = "";
 
-pub const LOOPBACK_PORT: u16 = 47600;
+/// Hub listen port. Google's return listener must not bind this.
+const HUB_PORT: u16 = 47600;
 pub const LOOPBACK_RETURN_PATH: &str = "/oauth/google/return";
-pub const LOOPBACK_REDIRECT_URI: &str = "http://localhost:47600/oauth/google/return";
 
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -66,18 +68,13 @@ pub fn resolve_oauth_config(settings: &DesktopSettings) -> Option<DesktopOAuthCo
             (!d.is_empty()).then(|| d.to_string())
         })?;
 
-    let client_secret = std::env::var(DESKTOP_CLIENT_SECRET_ENV)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            settings
-                .google_desktop_client_secret
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(String::from)
-        });
+    // DPAPI setting first. The env var is only the fallback when nothing is stored.
+    let client_secret = settings.google_desktop_client_secret().ok().flatten().filter(|v| !v.is_empty()).or_else(|| {
+        std::env::var(DESKTOP_CLIENT_SECRET_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    });
 
     Some(DesktopOAuthConfig { client_id, client_secret })
 }
@@ -92,6 +89,7 @@ pub fn pkce_pair() -> (String, String) {
 
 pub fn build_authorization_url(
     client_id: &str,
+    redirect_uri: &str,
     state: &str,
     nonce: &str,
     code_challenge: &str,
@@ -100,7 +98,7 @@ pub fn build_authorization_url(
         GOOGLE_AUTH_URL,
         [
             ("client_id", client_id),
-            ("redirect_uri", LOOPBACK_REDIRECT_URI),
+            ("redirect_uri", redirect_uri),
             ("response_type", "code"),
             ("scope", "openid email profile"),
             ("code_challenge", code_challenge),
@@ -111,6 +109,45 @@ pub fn build_authorization_url(
         ],
     )?;
     Ok(url.into())
+}
+
+/// One-shot loopback listener for Google's redirect. Binds a free port on `127.0.0.1` and
+/// closes after the first OAuth return so it never occupies the hub's port.
+pub struct GoogleReturnListener {
+    listener: TcpListener,
+    port: u16,
+}
+
+impl GoogleReturnListener {
+    pub async fn bind() -> Result<Self> {
+        for _ in 0..8 {
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .context("binding 127.0.0.1:0 for Google OAuth return")?;
+            let port = listener.local_addr().context("reading Google OAuth return port")?.port();
+            if port != 0 && port != HUB_PORT {
+                return Ok(Self { listener, port });
+            }
+        }
+        bail!("could not bind a loopback port other than the hub port {HUB_PORT}");
+    }
+
+    /// `http://127.0.0.1:<port>/oauth/google/return` — a loopback redirect with a path, valid for
+    /// a Desktop-type OAuth client (no redirect URI is registered in Google Cloud).
+    pub fn redirect_uri(&self) -> String {
+        format!("http://127.0.0.1:{port}{LOOPBACK_RETURN_PATH}", port = self.port)
+    }
+
+    /// Answer Google's redirect, then drop the socket. Browser favicon probes are ignored and
+    /// do not count as the return. Any other request ends the listener.
+    pub async fn accept_return(self, expected_state: &str) -> Result<CallbackGrant> {
+        loop {
+            let (mut stream, _) = self.listener.accept().await.context("accepting Google OAuth return")?;
+            if let Some(result) = handle_callback_stream(&mut stream, expected_state).await {
+                return result;
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -132,8 +169,7 @@ pub fn parse_loopback_request(raw: &[u8], expected_state: &str) -> Result<Callba
     let target = parts.next().unwrap_or("");
     ensure!(matches!(method, "GET" | "POST"), "unsupported HTTP method on OAuth callback");
 
-    let parsed_uri = url::Url::parse(&format!("http://localhost:{LOOPBACK_PORT}{target}"))
-        .context("malformed callback URI")?;
+    let parsed_uri = url::Url::parse(&format!("http://127.0.0.1{target}")).context("malformed callback URI")?;
     ensure!(
         parsed_uri.path() == LOOPBACK_RETURN_PATH,
         "unexpected path {} on loopback listener",
@@ -165,49 +201,25 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Fetch a Google ID token via the system browser and `http://localhost:47600/oauth/google/return`.
-/// Caller must ensure port 47600 is free while this runs (pause the embedded hub first if needed).
+/// Fetch a Google ID token via the system browser and a one-shot `127.0.0.1` redirect.
+/// The embedded hub can keep listening on port 47600 while this runs.
 pub async fn obtain_google_id_token(cfg: &DesktopOAuthConfig, nonce: &str) -> Result<String> {
-    let v4 = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, LOOPBACK_PORT)))
-        .await
-        .with_context(|| format!("binding 127.0.0.1:{LOOPBACK_PORT} for Google OAuth return"))?;
-    let v6 = TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, LOOPBACK_PORT))).await.ok();
-
+    let listener = GoogleReturnListener::bind().await?;
+    let redirect_uri = listener.redirect_uri();
     let state = hub::db::random_hex(16);
     let (verifier, challenge) = pkce_pair();
-    let auth_url = build_authorization_url(&cfg.client_id, &state, nonce, &challenge)?;
+    let auth_url = build_authorization_url(&cfg.client_id, &redirect_uri, &state, nonce, &challenge)?;
 
     open_system_browser(&auth_url)?;
 
-    let grant = tokio::time::timeout(CALLBACK_TIMEOUT, accept_valid_callback(&v4, v6.as_ref(), &state))
+    let grant = tokio::time::timeout(CALLBACK_TIMEOUT, listener.accept_return(&state))
         .await
         .context("timed out waiting for Google sign-in in your browser")??;
-    drop(v6);
-    drop(v4);
 
     match grant {
         CallbackGrant::IdToken(id_token) => Ok(id_token),
-        CallbackGrant::AuthorizationCode(code) => exchange_code_for_id_token(cfg, &code, &verifier).await,
-    }
-}
-
-async fn accept_valid_callback(
-    v4: &TcpListener,
-    v6: Option<&TcpListener>,
-    expected_state: &str,
-) -> Result<CallbackGrant> {
-    loop {
-        let mut stream = match v6 {
-            Some(v6_listener) => {
-                tokio::select! {
-                    r = v4.accept() => r?.0,
-                    r = v6_listener.accept() => r?.0,
-                }
-            }
-            None => v4.accept().await?.0,
-        };
-        if let Some(result) = handle_callback_stream(&mut stream, expected_state).await {
-            return result;
+        CallbackGrant::AuthorizationCode(code) => {
+            exchange_code_for_id_token(cfg, &code, &verifier, &redirect_uri).await
         }
     }
 }
@@ -272,6 +284,7 @@ async fn exchange_code_for_id_token(
     cfg: &DesktopOAuthConfig,
     code: &str,
     code_verifier: &str,
+    redirect_uri: &str,
 ) -> Result<String> {
     let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
     let mut form = vec![
@@ -279,7 +292,7 @@ async fn exchange_code_for_id_token(
         ("code", code),
         ("code_verifier", code_verifier),
         ("grant_type", "authorization_code"),
-        ("redirect_uri", LOOPBACK_REDIRECT_URI),
+        ("redirect_uri", redirect_uri),
     ];
     if let Some(secret) = cfg.client_secret.as_deref() {
         form.push(("client_secret", secret));
@@ -335,12 +348,11 @@ pub async fn sign_in_remote_hub(
 
     let id_token = obtain_google_id_token(cfg, nonce).await?;
 
-    // See TODO(Q5): `POST /v1/auth/google` currently accepts `"cli"` / `"macos"` / `"ios"`.
     let sign_in_resp = http
         .post(format!("{base}/v1/auth/google"))
         .json(&json!({
             "id_token": id_token,
-            "client": "cli",
+            "client": "windows",
             "device_name": device_name,
             "install_id": install_id,
         }))
@@ -404,14 +416,63 @@ mod tests {
 
         let (verifier, challenge) = pkce_pair();
         assert!(verifier.len() >= 43);
-        let url_str = build_authorization_url("cid.apps.googleusercontent.com", "st123", "n456", &challenge).unwrap();
+        let redirect = "http://127.0.0.1:54321/oauth/google/return";
+        let url_str =
+            build_authorization_url("cid.apps.googleusercontent.com", redirect, "st123", "n456", &challenge).unwrap();
         let parsed = url::Url::parse(&url_str).unwrap();
         let qp: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(qp.get("redirect_uri").map(String::as_str), Some("http://localhost:47600/oauth/google/return"));
+        assert_eq!(qp.get("redirect_uri").map(String::as_str), Some(redirect));
+        assert!(!url_str.contains(":47600"));
         assert_eq!(qp.get("code_challenge_method").map(String::as_str), Some("S256"));
         assert_eq!(qp.get("scope").map(String::as_str), Some("openid email profile"));
         assert_eq!(qp.get("state").map(String::as_str), Some("st123"));
         assert_eq!(qp.get("nonce").map(String::as_str), Some("n456"));
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_uses_a_random_port_and_stops_after_one_request() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = GoogleReturnListener::bind().await.unwrap();
+        let other = GoogleReturnListener::bind().await.unwrap();
+        let port = listener.port;
+        assert_ne!(port, 0);
+        assert_ne!(port, HUB_PORT);
+        assert_ne!(other.port, 0);
+        assert_ne!(other.port, HUB_PORT);
+        assert_ne!(port, other.port);
+        assert_eq!(listener.redirect_uri(), format!("http://127.0.0.1:{port}{LOOPBACK_RETURN_PATH}"));
+        drop(other);
+
+        let task = tokio::spawn(async move { listener.accept_return("expected-state").await });
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req = format!(
+            "GET /oauth/google/return?code=abc123&state=expected-state HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0);
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+
+        let grant = task.await.unwrap().unwrap();
+        assert_eq!(grant, CallbackGrant::AuthorizationCode("abc123".into()));
+
+        let mut stopped = false;
+        for _ in 0..20 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(stopped, "listener must stop after one Google return");
     }
 
     #[test]
