@@ -1112,7 +1112,7 @@ fn main() {
                 .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
                 .output()
                 .expect("tasklist");
-            return String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""));
+            String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
         }
         #[cfg(not(windows))]
         {
@@ -1204,12 +1204,11 @@ fn main() {
     async fn wait_pid(home: &Path) -> u32 {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
-            if let Ok(text) = std::fs::read_to_string(home.join("pid")) {
-                if let Ok(pid) = text.trim().parse::<u32>() {
-                    if pid_alive(pid) {
-                        return pid;
-                    }
-                }
+            if let Ok(text) = std::fs::read_to_string(home.join("pid"))
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid_alive(pid)
+            {
+                return pid;
             }
             if std::time::Instant::now() > deadline {
                 panic!("fake claude never started");

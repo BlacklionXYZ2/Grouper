@@ -650,10 +650,9 @@ impl Hub {
             device_name: device.clone(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
             fallback_models: self.free_alternates(&model.provider_id, &model.model),
-            harness: match self.harness_placement(&model)? {
-                Some(place) => Some(place.spec(self.db.thread_harness_session(thread_id))),
-                None => None,
-            },
+            harness: self
+                .harness_placement(&model)?
+                .map(|place| place.spec(self.db.thread_harness_session(thread_id))),
         };
         if !self.send_to_conn(&t.device_id, conn_id, HubMessage::StartThread { spec: Box::new(spec) }).await {
             self.wait_for_device(thread_id, "the device went offline during the hand-over", true).await;
