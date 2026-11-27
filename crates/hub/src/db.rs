@@ -144,7 +144,11 @@ CREATE TABLE IF NOT EXISTS models (
   output_price REAL NOT NULL DEFAULT 0, cache_read_price REAL, cache_write_price REAL,
   context_window INTEGER NOT NULL DEFAULT 0,
   use_cases TEXT NOT NULL DEFAULT '', free INTEGER NOT NULL DEFAULT 0, roles TEXT NOT NULL DEFAULT '',
-  modalities TEXT NOT NULL DEFAULT '');
+  modalities TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'api', device_id TEXT,
+  source TEXT NOT NULL DEFAULT 'manual', hidden INTEGER NOT NULL DEFAULT 0, hidden_reason TEXT,
+  missed_syncs INTEGER NOT NULL DEFAULT 0, last_seen INTEGER, display_name TEXT,
+  price_source TEXT NOT NULL DEFAULT 'manual', tools TEXT NOT NULL DEFAULT 'unknown');
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created INTEGER NOT NULL, model TEXT);
 CREATE TABLE IF NOT EXISTS history (
@@ -192,9 +196,64 @@ fn csv_list(value: String) -> Vec<String> {
     value.split(',').filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
-fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
+fn device_ref_map(conn: &Connection) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(mut st) = conn.prepare("SELECT id, name FROM devices WHERE revoked = 0") else {
+        return map;
+    };
+    let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) else {
+        return map;
+    };
+    for (id, name) in rows.filter_map(Result::ok) {
+        map.insert(id.clone(), id.clone());
+        map.entry(name.to_ascii_lowercase()).or_insert(id);
+    }
+    map
+}
+
+fn resolve_device_ref(device_map: &HashMap<String, String>, host: &str) -> String {
+    let host = host.trim();
+    device_map
+        .get(host)
+        .or_else(|| device_map.get(&host.to_ascii_lowercase()))
+        .cloned()
+        .unwrap_or_else(|| host.to_string())
+}
+
+fn model_row(r: &rusqlite::Row, device_map: &HashMap<String, String>) -> rusqlite::Result<ModelEntry> {
     let roles: String = r.get(10)?;
     let modalities: String = r.get(12)?;
+    let stored_kind: String = r.get(13)?;
+    let stored_device_id: Option<String> = r.get::<_, Option<String>>(14)?.filter(|s| !s.is_empty());
+    let source: String = r.get(15)?;
+    let hidden: bool = r.get::<_, i64>(16)? != 0;
+    let hidden_reason: Option<String> = if hidden {
+        r.get::<_, Option<String>>(17)?.filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let last_seen: Option<u64> = r.get::<_, Option<i64>>(18)?.map(|v| v as u64);
+    let display_name: Option<String> = r.get::<_, Option<String>>(19)?.filter(|s| !s.is_empty());
+    let price_source: String = r.get(20)?;
+    let tools: String = r.get(21)?;
+    let provider_kind: Option<String> = r.get(22)?;
+    let provider_options: Option<String> = r.get(23)?;
+    let is_harness_provider = provider_kind.as_deref() == Some("harness");
+    let kind = if is_harness_provider {
+        "harness".to_string()
+    } else if stored_kind.is_empty() {
+        "api".to_string()
+    } else {
+        stored_kind
+    };
+    let device_id = stored_device_id.or_else(|| {
+        if !is_harness_provider {
+            return None;
+        }
+        let opts: Value = provider_options.as_deref().and_then(|s| serde_json::from_str(s).ok())?;
+        let via = opts.get("via_device").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
+        Some(resolve_device_ref(device_map, via))
+    });
     Ok(ModelEntry {
         id: r.get(0)?,
         provider_id: r.get(1)?,
@@ -209,10 +268,22 @@ fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
         roles: csv_list(roles),
         local: r.get::<_, i64>(11)? != 0,
         modalities: csv_list(modalities),
+        kind,
+        device_id,
+        source: if source.is_empty() { "manual".into() } else { source },
+        hidden,
+        hidden_reason,
+        last_seen,
+        display_name,
+        price_source: if price_source.is_empty() { "manual".into() } else { price_source },
+        tools: if tools.is_empty() { "unknown".into() } else { tools },
     })
 }
-const MODEL_COLS: &str = "id, provider_id, model, input_price, output_price, cache_read_price, cache_write_price, \
-                           context_window, use_cases, free, roles, local, modalities";
+const MODEL_SELECT: &str = "SELECT m.id, m.provider_id, m.model, m.input_price, m.output_price, m.cache_read_price, \
+                            m.cache_write_price, m.context_window, m.use_cases, m.free, m.roles, m.local, m.modalities, \
+                            m.kind, m.device_id, m.source, m.hidden, m.hidden_reason, m.last_seen, m.display_name, \
+                            m.price_source, m.tools, p.kind, p.options \
+                            FROM models m LEFT JOIN providers p ON p.id = m.provider_id";
 
 fn conversation_row(r: &rusqlite::Row) -> rusqlite::Result<ConversationInfo> {
     Ok(ConversationInfo {
@@ -287,6 +358,16 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
         }
     }
     ensure_column(&conn, "models", "modalities", "ALTER TABLE models ADD COLUMN modalities TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&conn, "models", "kind", "ALTER TABLE models ADD COLUMN kind TEXT NOT NULL DEFAULT 'api'")?;
+    ensure_column(&conn, "models", "device_id", "ALTER TABLE models ADD COLUMN device_id TEXT")?;
+    ensure_column(&conn, "models", "source", "ALTER TABLE models ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")?;
+    ensure_column(&conn, "models", "hidden", "ALTER TABLE models ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "models", "hidden_reason", "ALTER TABLE models ADD COLUMN hidden_reason TEXT")?;
+    ensure_column(&conn, "models", "missed_syncs", "ALTER TABLE models ADD COLUMN missed_syncs INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "models", "last_seen", "ALTER TABLE models ADD COLUMN last_seen INTEGER")?;
+    ensure_column(&conn, "models", "display_name", "ALTER TABLE models ADD COLUMN display_name TEXT")?;
+    ensure_column(&conn, "models", "price_source", "ALTER TABLE models ADD COLUMN price_source TEXT NOT NULL DEFAULT 'manual'")?;
+    ensure_column(&conn, "models", "tools", "ALTER TABLE models ADD COLUMN tools TEXT NOT NULL DEFAULT 'unknown'")?;
     ensure_column(&conn, "conversations", "model", "ALTER TABLE conversations ADD COLUMN model TEXT")?;
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
@@ -995,8 +1076,8 @@ impl Db {
     // ---- providers and models
 
     pub fn upsert_provider(&self, p: &ProviderConfig) -> Result<()> {
-        if !["anthropic", "openai", "scripted"].contains(&p.kind.as_str()) {
-            bail!("kind must be anthropic, openai or scripted");
+        if !["anthropic", "openai", "scripted", "harness"].contains(&p.kind.as_str()) {
+            bail!("kind must be anthropic, openai, scripted or harness");
         }
         if let Some(value) = p.options.get("via_device") {
             let Some(host) = value.as_str().map(str::trim).filter(|host| !host.is_empty()) else {
@@ -1062,9 +1143,9 @@ impl Db {
     }
 
     pub fn upsert_model(&self, m: &ModelEntry) -> Result<()> {
-        if self.provider(&m.provider_id)?.is_none() {
+        let Some(provider) = self.provider(&m.provider_id)? else {
             bail!("no provider {}; add it first", m.provider_id);
-        }
+        };
         core_registry::cost::check_price("input_price", m.input_price)?;
         core_registry::cost::check_price("output_price", m.output_price)?;
         if let Some(p) = m.cache_read_price {
@@ -1073,10 +1154,79 @@ impl Db {
         if let Some(p) = m.cache_write_price {
             core_registry::cost::check_price("cache_write_price", p)?;
         }
-        self.c().execute(
-            "INSERT OR REPLACE INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
-               cache_write_price, context_window, use_cases, free, roles, local, modalities)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        let kind = if provider.kind == "harness" {
+            "harness"
+        } else {
+            match m.kind.trim() {
+                "" | "api" => "api",
+                "harness" => "harness",
+                other => bail!("kind must be api or harness; got {other:?}"),
+            }
+        };
+        let source = match m.source.trim() {
+            "" | "manual" => "manual",
+            "auto" => "auto",
+            other => bail!("source must be manual or auto; got {other:?}"),
+        };
+        let hidden_reason = if !m.hidden {
+            None
+        } else {
+            match m.hidden_reason.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some("gone") => Some("gone"),
+                Some("user") => Some("user"),
+                Some(other) => bail!("hidden_reason must be gone or user; got {other:?}"),
+            }
+        };
+        let tools = match m.tools.trim() {
+            "" | "unknown" => "unknown",
+            "yes" => "yes",
+            "no" => "no",
+            other => bail!("tools must be yes, no or unknown; got {other:?}"),
+        };
+        let price_source = match m.price_source.trim() {
+            "" => "manual".to_string(),
+            other => other.to_ascii_lowercase(),
+        };
+        let display_name = m.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let c = self.c();
+        let explicit_device_id = m.device_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let device_id = explicit_device_id.or_else(|| {
+            if provider.kind != "harness" {
+                return None;
+            }
+            let via = provider.via_device()?;
+            let map = device_ref_map(&c);
+            Some(resolve_device_ref(&map, via))
+        });
+        c.execute(
+            "INSERT INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
+               cache_write_price, context_window, use_cases, free, roles, local, modalities,
+               kind, device_id, source, hidden, hidden_reason, last_seen, display_name, price_source, tools)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+             ON CONFLICT (id) DO UPDATE SET
+               provider_id = excluded.provider_id,
+               model = excluded.model,
+               input_price = excluded.input_price,
+               output_price = excluded.output_price,
+               cache_read_price = excluded.cache_read_price,
+               cache_write_price = excluded.cache_write_price,
+               context_window = excluded.context_window,
+               use_cases = excluded.use_cases,
+               free = excluded.free,
+               roles = excluded.roles,
+               local = excluded.local,
+               modalities = excluded.modalities,
+               kind = excluded.kind,
+               device_id = excluded.device_id,
+               source = excluded.source,
+               hidden = excluded.hidden,
+               hidden_reason = excluded.hidden_reason,
+               missed_syncs = CASE WHEN excluded.hidden = 0 THEN 0 ELSE models.missed_syncs END,
+               last_seen = excluded.last_seen,
+               display_name = excluded.display_name,
+               price_source = excluded.price_source,
+               tools = excluded.tools",
             params![
                 m.id,
                 m.provider_id,
@@ -1090,9 +1240,41 @@ impl Db {
                 m.free,
                 m.roles.join(","),
                 m.local,
-                m.modalities.join(",")
+                m.modalities.join(","),
+                kind,
+                device_id,
+                source,
+                m.hidden,
+                hidden_reason,
+                m.last_seen.map(|v| v as i64),
+                display_name,
+                price_source,
+                tools,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn set_model_hidden(&self, id: &str, hidden: bool, reason: Option<&str>) -> Result<()> {
+        let reason = if !hidden {
+            None
+        } else {
+            match reason.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some("gone") => Some("gone"),
+                Some("user") => Some("user"),
+                Some(other) => bail!("hidden_reason must be gone or user; got {other:?}"),
+            }
+        };
+        let n = self.c().execute(
+            "UPDATE models SET hidden = ?1, hidden_reason = ?2,
+               missed_syncs = CASE WHEN ?1 = 0 THEN 0 ELSE missed_syncs END
+             WHERE id = ?3",
+            params![hidden, reason, id],
+        )?;
+        if n == 0 {
+            bail!("no such model");
+        }
         Ok(())
     }
 
@@ -1103,10 +1285,17 @@ impl Db {
         Ok(())
     }
 
+    /// Every model row, including hidden rows (so history, usage and outcome stats still resolve them).
     pub fn models(&self) -> Vec<ModelEntry> {
         let c = self.c();
-        let mut st = c.prepare(&format!("SELECT {MODEL_COLS} FROM models ORDER BY id")).unwrap();
-        st.query_map([], model_row).unwrap().filter_map(Result::ok).collect()
+        let device_map = device_ref_map(&c);
+        let mut st = c.prepare(&format!("{MODEL_SELECT} ORDER BY m.id")).unwrap();
+        st.query_map([], |r| model_row(r, &device_map)).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Visible models only (excluding hidden rows).
+    pub fn visible_models(&self) -> Vec<ModelEntry> {
+        self.models().into_iter().filter(|m| !m.hidden).collect()
     }
 
     /// The model to use for a role. Standard chat prefers a free model.
@@ -1155,13 +1344,21 @@ impl Db {
     }
 
     /// Registry id this conversation uses instead of the role default, resolved to a model.
-    /// `Ok(None)` means it uses the role default. An error means the stored id is no longer registered.
+    /// `Ok(None)` means it uses the role default. An error means the stored id is no longer
+    /// registered or is hidden.
     pub fn conversation_model(&self, conversation_id: &str) -> Result<Option<ModelEntry>> {
         let Some(info) = self.conversation(conversation_id) else { bail!("no such conversation") };
         let Some(key) = info.model else { return Ok(None) };
-        self.find_model(&key).map(Some).with_context(|| {
-            format!("conversation {conversation_id} is set to model {key}, which is not in the registry")
-        })
+        let Some(model) = self.find_model(&key) else {
+            bail!("conversation {conversation_id} is set to model {key}, which is not in the registry");
+        };
+        if model.hidden {
+            if model.hidden_reason.as_deref() == Some("gone") {
+                bail!("conversation {conversation_id} is set to model {key}, which the provider no longer lists");
+            }
+            bail!("conversation {conversation_id} is set to model {key}, which is hidden");
+        }
+        Ok(Some(model))
     }
 
     /// Set or clear the conversation's model. `model` is a registry id (or the provider's model
@@ -1174,6 +1371,9 @@ impl Db {
             None => None,
             Some(key) => {
                 let Some(found) = self.find_model(key) else { bail!("no model {key:?} in the registry") };
+                if found.hidden {
+                    bail!("model {} is hidden and cannot be selected", found.id);
+                }
                 Some(found.id)
             }
         };
@@ -1620,6 +1820,7 @@ mod tests {
             roles: roles.iter().map(|s| s.to_string()).collect(),
             local: false,
             modalities: vec![],
+            ..Default::default()
         };
         db.upsert_model(&m("big", false, &["orchestrator"])).unwrap();
         db.upsert_model(&m("free", true, &[])).unwrap();
@@ -1675,6 +1876,7 @@ mod tests {
                 roles: vec![],
                 local: false,
                 modalities: vec![],
+                ..Default::default()
             })
             .unwrap();
         }
@@ -1831,6 +2033,7 @@ mod tests {
             roles: vec![],
             local: false,
             modalities: vec!["text".into()],
+            ..Default::default()
         })
         .unwrap();
         let id = db.create_conversation("project", "notes").unwrap();
@@ -1896,6 +2099,7 @@ mod tests {
             roles: vec![],
             local: false,
             modalities: vec![],
+            ..Default::default()
         };
         db.upsert_model(&base).unwrap();
         for bad in [-0.01, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -2084,5 +2288,185 @@ mod tests {
         assert!(orphan.revoked, "unused synthetic hub row should be revoked on adoption");
         drop(db3);
         std::fs::remove_dir_all(dir3).ok();
+    }
+
+    #[test]
+    fn old_models_table_migrates_with_m1_columns_and_defaults() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("grouper.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE providers (
+               id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}');
+             CREATE TABLE models (
+               id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL,
+               input_price REAL NOT NULL DEFAULT 0, output_price REAL NOT NULL DEFAULT 0,
+               context_window INTEGER NOT NULL DEFAULT 0, use_cases TEXT NOT NULL DEFAULT '',
+               free INTEGER NOT NULL DEFAULT 0, roles TEXT NOT NULL DEFAULT '');
+             INSERT INTO providers (id, kind) VALUES ('p1', 'openai');
+             INSERT INTO models (id, provider_id, model, input_price, output_price, roles)
+               VALUES ('legacy-gpt', 'p1', 'gpt-4o', 2.5, 10.0, 'orchestrator');",
+        )
+        .unwrap();
+        drop(conn);
+
+        // First open migrates; second open is idempotent.
+        drop(Db::open(&dir).unwrap());
+        let db = Db::open(&dir).unwrap();
+        for column in [
+            "cache_read_price",
+            "cache_write_price",
+            "modalities",
+            "local",
+            "kind",
+            "device_id",
+            "source",
+            "hidden",
+            "hidden_reason",
+            "missed_syncs",
+            "last_seen",
+            "display_name",
+            "price_source",
+            "tools",
+        ] {
+            assert!(
+                db.c()
+                    .prepare("SELECT 1 FROM pragma_table_info('models') WHERE name = ?1")
+                    .unwrap()
+                    .exists([column])
+                    .unwrap(),
+                "missing column {column}"
+            );
+        }
+
+        let models = db.models();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.id, "legacy-gpt");
+        assert_eq!(m.kind, "api");
+        assert_eq!(m.device_id, None);
+        assert_eq!(m.source, "manual");
+        assert!(!m.hidden);
+        assert_eq!(m.hidden_reason, None);
+        assert_eq!(m.last_seen, None);
+        assert_eq!(m.display_name, None);
+        assert_eq!(m.price_source, "manual");
+        assert_eq!(m.tools, "unknown");
+        assert_eq!(db.default_model("orchestrator").unwrap().id, "legacy-gpt");
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hidden_models_are_skipped_by_defaults_and_routing_but_resolve_for_history_and_usage() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "p".into(),
+            kind: "openai".into(),
+            base_url: None,
+            api_key: Some("k".into()),
+            options: Value::Null,
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "old-default".into(),
+            provider_id: "p".into(),
+            model: "old-default-model".into(),
+            input_price: 10.0,
+            output_price: 20.0,
+            free: false,
+            roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
+            source: "auto".into(),
+            last_seen: Some(1000),
+            display_name: Some("Old Default".into()),
+            price_source: "table".into(),
+            tools: "yes".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "live-backup".into(),
+            provider_id: "p".into(),
+            model: "live-backup-model".into(),
+            input_price: 1.0,
+            output_price: 2.0,
+            roles: vec![],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let conv = db.create_conversation("standard", "pinned chat").unwrap();
+        db.set_conversation_model(&conv, Some("old-default")).unwrap();
+        let thread = db.create_thread(&conv, "Past work", "hub", "old-default", None, "brief").unwrap();
+
+        // Hide the old default because the provider dropped it.
+        db.set_model_hidden("old-default", true, Some("gone")).unwrap();
+
+        // Defaults, visible listing, and routing skip the hidden row.
+        assert_eq!(db.default_model("orchestrator").unwrap().id, "live-backup");
+        assert_eq!(db.default_model("standard").unwrap().id, "live-backup");
+        assert_eq!(db.default_model("thread").unwrap().id, "live-backup");
+        assert_eq!(db.route_model(None, Some("code"), &[]).unwrap().model.id, "live-backup");
+        assert!(db.route_model(Some("old-default"), None, &[]).is_err());
+        assert_eq!(db.visible_models().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["live-backup"]);
+
+        // History, usage, and outcome resolution still find the hidden row.
+        let resolved = db.find_model("old-default").unwrap();
+        assert!(resolved.hidden);
+        assert_eq!(resolved.hidden_reason.as_deref(), Some("gone"));
+        assert_eq!(db.models().len(), 2);
+        let cost = db.record_usage(Some(&conv), Some(&thread.id), "p", "old-default-model", 100_000, 50_000, 0, 0);
+        assert!((cost - 2.0).abs() < 1e-9, "usage still prices hidden row: {cost}");
+        assert!(db.finish_thread(&thread.id, "done", "finished"));
+        assert!(db.record_outcome(&thread.id));
+        assert_eq!(db.conversation(&conv).unwrap().model.as_deref(), Some("old-default"));
+        let conv_err = db.conversation_model(&conv).unwrap_err().to_string();
+        assert!(conv_err.contains("no longer lists"), "{conv_err}");
+        assert!(db.set_conversation_model(&conv, Some("old-default")).is_err());
+
+        // Unhiding restores it.
+        db.set_model_hidden("old-default", false, None).unwrap();
+        assert_eq!(db.default_model("orchestrator").unwrap().id, "old-default");
+        assert_eq!(db.conversation_model(&conv).unwrap().unwrap().id, "old-default");
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn harness_models_compute_kind_and_device_id_from_provider() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: format!("claude-code@{}", pc.id),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: serde_json::json!({"harness": "claude-code", "via_device": "Gaming PC", "signed_in": true}),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "cc-opus".into(),
+            provider_id: format!("claude-code@{}", pc.id),
+            model: "opus".into(),
+            source: "auto".into(),
+            price_source: "none".into(),
+            display_name: Some("Claude Code Opus".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let saved = db.find_model("cc-opus").unwrap();
+        assert_eq!(saved.kind, "harness");
+        assert_eq!(saved.device_id.as_deref(), Some(pc.id.as_str()));
+        assert_eq!(saved.source, "auto");
+        assert_eq!(saved.price_source, "none");
+        assert_eq!(saved.display_name.as_deref(), Some("Claude Code Opus"));
+        assert!(!db.model_is_local(&saved));
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

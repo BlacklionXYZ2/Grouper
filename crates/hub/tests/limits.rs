@@ -50,6 +50,7 @@ fn setup(tag: &str, script: Value, limits: Limits) -> (PathBuf, Arc<Hub>) {
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     })
     .unwrap();
     db.set_limits(&limits).unwrap();

@@ -115,6 +115,7 @@ async fn scoped_folders_and_thread_files() {
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     })
     .unwrap();
     let (device, token) = db.add_device("Laptop", "windows", false).unwrap();

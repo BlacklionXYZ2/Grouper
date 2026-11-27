@@ -65,6 +65,7 @@ fn setup(tag: &str) -> (PathBuf, Arc<Hub>, String, String) {
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     })
     .unwrap();
     db.upsert_tools(

@@ -1290,6 +1290,7 @@ async fn run_authed_cmd(api: Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()
                 roles: roles.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
                 local,
                 modalities: vec![],
+                ..Default::default()
             };
             api.put(&format!("/v1/models/{id}"), &entry).await?;
             println!("saved model {id}");

@@ -348,6 +348,7 @@ mod tests {
             roles: vec!["thread".into()],
             local: false,
             modalities: vec!["text".into()],
+            ..Default::default()
         })
         .unwrap();
         let hub = Hub::new(db, dir.clone());
@@ -440,6 +441,7 @@ mod tests {
             roles: vec![],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         // Budget allows 2 calls ($0.04) before hitting $0.03.

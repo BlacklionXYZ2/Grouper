@@ -885,6 +885,7 @@ mod tests {
             roles: vec!["thread".into()],
             local: true,
             modalities: vec!["text".into()],
+            ..Default::default()
         })
         .unwrap();
         let conversation = db.create_conversation("project", "relay").unwrap();

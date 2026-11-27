@@ -1024,6 +1024,7 @@ mod tests {
             roles: vec![],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let conv = db.create_conversation("project", "free").unwrap();
@@ -1197,6 +1198,7 @@ mod tests {
             roles: vec![],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let conversation = db.create_conversation("project", "test").unwrap();
@@ -1404,6 +1406,7 @@ mod tests {
             roles: vec![],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         db.upsert_model(&core_protocol::ModelEntry {
@@ -1420,6 +1423,7 @@ mod tests {
             roles: vec![],
             local: true,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let conv = db.create_conversation("project", "match").unwrap();

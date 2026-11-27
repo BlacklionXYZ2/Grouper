@@ -51,6 +51,7 @@ fn model(id: &str, provider_id: &str, roles: &[&str]) -> ModelEntry {
         roles: roles.iter().map(|role| (*role).to_string()).collect(),
         local: false,
         modalities: vec!["text".into()],
+        ..Default::default()
     }
 }
 

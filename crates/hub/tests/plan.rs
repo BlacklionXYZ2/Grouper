@@ -40,6 +40,7 @@ fn setup(tag: &str) -> (PathBuf, Arc<Hub>) {
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     })
     .unwrap();
     // Even if a registry lists update_plan and someone sets it to Manual, it never asks.

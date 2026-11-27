@@ -541,6 +541,7 @@ mod tests {
             roles: roles.iter().map(|s| s.to_string()).collect(),
             local: false,
             modalities: vec![],
+            ..Default::default()
         }
     }
 
