@@ -17,6 +17,10 @@ struct GrouperIOSApp: App {
             // that launched the app is kept while it signs in.
             .onAppear { takeApprovalRoute() }
             .onReceive(NotificationCenter.default.publisher(for: .grouperApprovalRoute)) { _ in takeApprovalRoute() }
+            // The saved copy of the Usage page holds spend figures: signing out removes it.
+            .onChange(of: model.signedIn) { _, signedIn in
+                if !signedIn { UsageCacheStorage.clear() }
+            }
         }
     }
 
@@ -36,6 +40,8 @@ struct GrouperIOSApp: App {
                let text = components.queryItems?.first(where: { $0.name == "text" })?.value, !text.isEmpty {
                 Task { _ = await model.send(text) }
             }
+        case "usage":
+            NotificationCenter.default.post(name: .grouperOpenTab, object: PhoneTab.usage)
         case "stop":
             if let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
                let thread = components.queryItems?.first(where: { $0.name == "thread" })?.value {
@@ -50,6 +56,7 @@ struct GrouperIOSApp: App {
 /// the chat's toolbar).
 enum PhoneTab {
     static let chat = 0
+    static let usage = 1
     static let devices = 2
     static let more = 3
 }
@@ -65,13 +72,17 @@ struct PhoneRootView: View {
     }
 
     var body: some View {
-        // Chat, Devices and More (docs/gui-concept-plan.md V10): the native tab bar
-        // (Liquid Glass), with the selected tab in the brand teal.
+        // Chat, Usage, Devices and More (docs/usage-tab-spec.md 2, which replaced the three tabs of
+        // docs/gui-concept-plan.md V10): the native tab bar (Liquid Glass), with the selected tab in
+        // the brand teal. Usage has no badge in this round.
         TabView(selection: $selection) {
             Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: PhoneTab.chat) {
                 NavigationStack { ChatView() }
             }
             .badge(needsYouCount)
+            Tab("Usage", systemImage: "chart.pie", value: PhoneTab.usage) {
+                UsageView()
+            }
             Tab("Devices", systemImage: "desktopcomputer.and.macbook", value: PhoneTab.devices) {
                 DevicesView()
             }

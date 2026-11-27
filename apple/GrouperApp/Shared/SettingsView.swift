@@ -342,7 +342,6 @@ struct MoreView: View {
                     .listRowBackground(Theme.surface)
                 Section("Later milestones") {
                     Label("Models", systemImage: "cpu")
-                    Label("Usage", systemImage: "chart.bar")
                     Label("Memory", systemImage: "brain")
                     Label("Skills", systemImage: "sparkles")
                 }

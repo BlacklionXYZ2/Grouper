@@ -28,6 +28,10 @@ struct GrouperMacApp: App {
                 // A tapped approval notification opens its chat's approval dock.
                 .onAppear { takeApprovalRoute() }
                 .onReceive(NotificationCenter.default.publisher(for: .grouperApprovalRoute)) { _ in takeApprovalRoute() }
+                // The saved copy of the Usage page holds spend figures: signing out removes it.
+                .onChange(of: model.signedIn) { _, signedIn in
+                    if !signedIn { UsageCacheStorage.clear() }
+                }
         }
         .defaultSize(width: 1180, height: 760)
         .commands { PaletteCommands() }
@@ -56,12 +60,12 @@ struct GrouperMacApp: App {
 private enum MacSection: Hashable {
     case chat(String)
     case newChat
-    case devices, models, settings
+    case devices, models, usage, settings
 
     var isChat: Bool {
         switch self {
         case .chat, .newChat: return true
-        case .devices, .models, .settings: return false
+        case .devices, .models, .usage, .settings: return false
         }
     }
 }
@@ -73,15 +77,15 @@ struct MacRootView: View {
     @State private var paletteQuery = ""
     @State private var highlightedModel: String?
 
-    /// Destinations the Mac has. Needs you, Usage, Memory and Skills are not built here yet.
-    private static let palettePages: [PalettePage] = [.devices, .models, .settings]
+    /// Destinations the Mac has. Needs you, Memory and Skills are not built here yet.
+    private static let palettePages: [PalettePage] = [.devices, .models, .usage, .settings]
     /// No appearance setting exists yet, so no Switch theme action.
     private static let paletteActions: [PaletteAction] = [.newChat, .newProjectChat, .newStandardChat]
 
     var body: some View {
         NavigationSplitView {
             // The web sidebar's order: New chat, Chats, Needs you, then the pages the Mac
-            // has (Devices, Models, Settings), and the system status at the foot.
+            // has (Devices, Models, Usage, Settings), and the system status at the foot.
             List(selection: $section) {
                 Section {
                     ForEach(sidebarChats) { conversation in chatRow(conversation) }
@@ -107,6 +111,7 @@ struct MacRootView: View {
                 Section {
                     Label("Devices", systemImage: "desktopcomputer").tag(MacSection.devices)
                     Label("Models", systemImage: "cpu").tag(MacSection.models)
+                    Label("Usage", systemImage: "chart.pie").tag(MacSection.usage)
                     Label("Settings", systemImage: "gear").tag(MacSection.settings)
                 }
             }
@@ -124,6 +129,7 @@ struct MacRootView: View {
             case .chat, .newChat: NavigationStack { ChatView() }
             case .devices: DevicesView()
             case .models: NavigationStack { ModelsListView(highlighted: highlightedModel) }
+            case .usage: UsageView()
             case .settings: NavigationStack { SettingsView() }
             }
         }
@@ -315,8 +321,9 @@ struct MacRootView: View {
             case .models:
                 highlightedModel = nil
                 section = .models
+            case .usage: section = .usage
             case .settings: section = .settings
-            case .needsYou, .usage, .memory, .skills: return false
+            case .needsYou, .memory, .skills: return false
             }
         }
         return true
