@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod node;
 mod oauth;
 mod settings;
@@ -54,6 +55,14 @@ impl DesktopState {
 
     fn settings_snapshot(&self) -> DesktopSettings {
         self.settings.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn host_mode(&self) -> Option<HostMode> {
+        self.settings_snapshot().mode
+    }
+
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     fn set_hub(&self, next: Option<Arc<HubHandle>>) -> Option<Arc<HubHandle>> {
@@ -217,6 +226,8 @@ async fn apply_choice(
     updated.save(&state.data_dir)?;
     *state.settings.lock().unwrap_or_else(|e| e.into_inner()) = updated;
 
+    autostart::apply_default(app);
+
     open_target_in_main_window(app, WebviewUrl::External(target_url.parse()?))?;
     Ok(())
 }
@@ -364,8 +375,9 @@ fn build_main_window(app: &AppHandle, target: WebviewUrl) -> tauri::Result<()> {
 fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     let open_item = MenuItem::with_id(app, TRAY_OPEN_ID, "Open", true, None::<&str>)?;
     let setup_item = MenuItem::with_id(app, TRAY_SETUP_ID, "Where Grouper runs…", true, None::<&str>)?;
+    let login_item = autostart::menu_item(app)?;
     let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open_item, &setup_item, &quit_item])?;
+    let menu = Menu::with_items(app, &[&open_item, &setup_item, &login_item, &quit_item])?;
     let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
 
     TrayIconBuilder::with_id("grouper-tray")
@@ -380,6 +392,7 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
             TRAY_SETUP_ID => {
                 let _ = open_target_in_main_window(app, WebviewUrl::App("index.html".into()));
             }
+            autostart::TRAY_ID => autostart::toggle(app),
             TRAY_QUIT_ID => {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
@@ -422,6 +435,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = show_main_window(app);
         }))
+        .plugin(autostart::plugin())
         .invoke_handler(tauri::generate_handler![setup, choose])
         .setup(|app| {
             let data_dir = app_data_dir()?;
@@ -475,6 +489,7 @@ fn main() {
             }
             app.manage(desktop_state);
 
+            autostart::apply_default(app.handle());
             install_tray(app.handle())?;
             build_main_window(app.handle(), target)?;
             Ok(())
