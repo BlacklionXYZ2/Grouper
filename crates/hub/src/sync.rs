@@ -575,6 +575,7 @@ fn add_role(db: &Db, model_id: &str, role: &str) -> Result<()> {
 /// 1. `tools == "yes"` with a built-in rank (lowest `rank` number wins).
 /// 2. `tools == "yes"` without a built-in rank (largest `context_window`, then id).
 /// 3. `tools == "unknown"` (lowest `rank` if any, then largest `context_window`, then id).
+///
 /// Models with `tools == "no"` are never chosen.
 fn pick_orchestrator_default(candidates: &[(ModelEntry, Option<u32>)]) -> Option<String> {
     candidates
