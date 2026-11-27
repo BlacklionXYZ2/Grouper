@@ -610,6 +610,7 @@ mod tests {
             roles: vec!["thread".into()],
             local: false,
             modalities: vec![],
+            ..Default::default()
         }
     }
 

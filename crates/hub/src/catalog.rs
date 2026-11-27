@@ -356,6 +356,7 @@ pub fn import_from_catalog(
         roles,
         local,
         modalities: card.modalities.clone(),
+        ..Default::default()
     };
     db.upsert_model(&entry)?;
     let proposal_id = draft_proposal(db, &id, &card.use_cases_draft);
@@ -761,6 +762,7 @@ mod tests {
             roles: vec!["orchestrator".into()],
             local: true,
             modalities: vec!["file".into()],
+            ..Default::default()
         })
         .unwrap();
         let model = db.find_model("sonnet").unwrap();
@@ -890,6 +892,7 @@ mod tests {
             roles: vec![],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let updated = apply_price_refresh(&db, "openrouter", &parsed, &db.models());

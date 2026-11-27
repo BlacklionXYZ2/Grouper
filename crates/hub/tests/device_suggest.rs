@@ -63,6 +63,7 @@ fn model() -> ModelEntry {
         roles: vec!["orchestrator".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     }
 }
 

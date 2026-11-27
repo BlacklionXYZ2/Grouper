@@ -67,6 +67,7 @@ async fn usage_probe_tool_is_unlisted_and_snapshots_persist_when_device_goes_off
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     })
     .unwrap();
 

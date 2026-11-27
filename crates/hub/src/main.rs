@@ -228,6 +228,7 @@ async fn main() -> Result<()> {
                 roles: roles.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
                 local,
                 modalities: vec![],
+                ..Default::default()
             })?;
             println!("Saved model {id}.");
         }

@@ -850,9 +850,18 @@ async fn put_provider(
     Json(json!({"id": p.id, "saved": true})).into_response()
 }
 
-async fn list_models(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+#[derive(Deserialize, Default)]
+struct ModelsFilter {
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    include_hidden: bool,
+}
+
+async fn list_models(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q): Query<ModelsFilter>) -> Response {
     authed!(hub, headers);
-    Json(hub.db.models()).into_response()
+    let models = if q.all || q.include_hidden { hub.db.models() } else { hub.db.visible_models() };
+    Json(models).into_response()
 }
 
 async fn put_model(
@@ -864,7 +873,7 @@ async fn put_model(
     admin!(hub, headers);
     m.id = id;
     match hub.db.upsert_model(&m) {
-        Ok(()) => Json(m).into_response(),
+        Ok(()) => Json(hub.db.find_model(&m.id).unwrap_or(m)).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, e),
     }
 }
@@ -1604,6 +1613,7 @@ mod tests {
             roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let hub = Hub::new(db, dir.clone());
@@ -1710,6 +1720,7 @@ mod tests {
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
             local: false,
             modalities: vec![],
+            ..Default::default()
         };
         db.upsert_model(&entry("big", "big-model", &["orchestrator", "standard", "thread"])).unwrap();
         db.upsert_model(&entry("picked", "picked-model", &[])).unwrap();
@@ -2512,6 +2523,7 @@ mod tests {
             roles: vec!["thread".into()],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let conv = db.create_conversation("project", "rating test").unwrap();
@@ -2735,6 +2747,187 @@ mod tests {
             hub.db.events(&conv, 0, None).iter().all(|e| !matches!(e.body, EventBody::ApprovalResolved { .. })),
             "dropped approval event must be live-only"
         );
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_round_trips_kind_device_id_and_hidden_filtering() {
+        let dir = std::env::temp_dir().join(format!("grouper-models-kind-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (_, admin_token) = db.add_device("Admin", "macos", true).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let base = format!("http://{addr}");
+        let http = reqwest::Client::new();
+
+        // Register an API provider and a harness provider via HTTP.
+        let r = http
+            .put(format!("{base}/v1/providers/openai"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"id": "openai", "kind": "openai", "base_url": "https://api.openai.com/v1", "api_key": "k"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let harness_provider_id = format!("claude-code@{}", pc.id);
+        let r = http
+            .put(format!("{base}/v1/providers/{harness_provider_id}"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "id": harness_provider_id,
+                "kind": "harness",
+                "options": {"harness": "claude-code", "via_device": "Gaming PC", "signed_in": true}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // PUT an API model omitting new fields: defaults to kind="api", no device_id, existing fields preserved.
+        let api_saved: Value = http
+            .put(format!("{base}/v1/models/gpt-mini"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "id": "gpt-mini",
+                "provider_id": "openai",
+                "model": "gpt-4o-mini",
+                "input_price": 0.15,
+                "output_price": 0.60,
+                "context_window": 128000,
+                "use_cases": "quick answers",
+                "free": false,
+                "roles": ["standard"],
+                "local": false,
+                "modalities": ["text"]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(api_saved["kind"], "api");
+        assert!(api_saved.get("device_id").is_none());
+        assert_eq!(api_saved["source"], "manual");
+        assert_eq!(api_saved["price_source"], "manual");
+        assert_eq!(api_saved["tools"], "unknown");
+        assert_eq!(api_saved["hidden"], false);
+
+        // PUT a harness model under the harness provider: kind="harness" and device_id resolved to pc.id.
+        let harness_saved: ModelEntry = http
+            .put(format!("{base}/v1/models/cc-opus"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "id": "cc-opus",
+                "provider_id": harness_provider_id,
+                "model": "opus",
+                "source": "auto",
+                "display_name": "Claude Code · opus",
+                "price_source": "none",
+                "tools": "yes"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(harness_saved.kind, "harness");
+        assert_eq!(harness_saved.device_id.as_deref(), Some(pc.id.as_str()));
+        assert_eq!(harness_saved.source, "auto");
+        assert_eq!(harness_saved.display_name.as_deref(), Some("Claude Code · opus"));
+        assert_eq!(harness_saved.price_source, "none");
+        assert_eq!(harness_saved.tools, "yes");
+
+        // GET /v1/models returns both with kind, device_id, and every legacy JSON field intact.
+        let raw_list: Vec<Value> = http
+            .get(format!("{base}/v1/models"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(raw_list.len(), 2);
+        let api_row = raw_list.iter().find(|v| v["id"] == "gpt-mini").unwrap();
+        for key in [
+            "id",
+            "provider_id",
+            "model",
+            "input_price",
+            "output_price",
+            "cache_read_price",
+            "cache_write_price",
+            "context_window",
+            "use_cases",
+            "free",
+            "roles",
+            "local",
+            "modalities",
+            "kind",
+            "source",
+            "hidden",
+            "price_source",
+            "tools",
+        ] {
+            assert!(api_row.get(key).is_some(), "missing expected key {key:?} on {api_row}");
+        }
+        assert_eq!(api_row["kind"], "api");
+
+        let list: Vec<ModelEntry> = serde_json::from_value(Value::Array(raw_list)).unwrap();
+        let harness_row = list.iter().find(|m| m.id == "cc-opus").unwrap();
+        assert_eq!(harness_row.kind, "harness");
+        assert_eq!(harness_row.device_id.as_deref(), Some(pc.id.as_str()));
+
+        // Hiding a model omits it from GET /v1/models, while ?include_hidden=true returns it.
+        let hidden_resp = http
+            .put(format!("{base}/v1/models/cc-opus"))
+            .bearer_auth(&admin_token)
+            .json(&ModelEntry {
+                hidden: true,
+                hidden_reason: Some("user".into()),
+                ..harness_row.clone()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hidden_resp.status(), StatusCode::OK);
+
+        let visible: Vec<ModelEntry> = http
+            .get(format!("{base}/v1/models"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(visible.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["gpt-mini"]);
+
+        let all: Vec<ModelEntry> = http
+            .get(format!("{base}/v1/models?include_hidden=true"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        let hidden_row = all.iter().find(|m| m.id == "cc-opus").unwrap();
+        assert!(hidden_row.hidden);
+        assert_eq!(hidden_row.hidden_reason.as_deref(), Some("user"));
+        assert_eq!(hidden_row.kind, "harness");
+        assert_eq!(hidden_row.device_id.as_deref(), Some(pc.id.as_str()));
 
         drop(hub);
         std::fs::remove_dir_all(dir).ok();

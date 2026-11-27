@@ -883,6 +883,7 @@ mod tests {
             roles: roles.iter().map(|r| r.to_string()).collect(),
             local: false,
             modalities: vec![],
+            ..Default::default()
         };
         db.upsert_model(&model("big", 10.0, &["orchestrator", "thread"])).unwrap();
         db.upsert_model(&model("cheap", 0.5, &[])).unwrap();
@@ -976,6 +977,7 @@ mod tests {
             roles: vec!["orchestrator".into(), "thread".into()],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let hub = crate::server::Hub::new(db, dir.clone());

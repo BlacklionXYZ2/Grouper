@@ -661,6 +661,22 @@ pub struct ToolInfo {
     pub input_schema: Value,
 }
 
+fn default_model_kind() -> String {
+    "api".into()
+}
+
+fn default_model_source() -> String {
+    "manual".into()
+}
+
+fn default_price_source() -> String {
+    "manual".into()
+}
+
+fn default_model_tools() -> String {
+    "unknown".into()
+}
+
 /// A row of the model registry.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModelEntry {
@@ -698,6 +714,70 @@ pub struct ModelEntry {
     /// Empty until a catalog import sets them.
     #[serde(default)]
     pub modalities: Vec<String>,
+    /// Model kind: `"api"` (default) or `"harness"`.
+    #[serde(default = "default_model_kind")]
+    pub kind: String,
+    /// Hosting device id for harness models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// How this row was registered: `"manual"` (default) or `"auto"`.
+    #[serde(default = "default_model_source")]
+    pub source: String,
+    /// Hidden models are skipped by role defaults, routing and pickers, while staying
+    /// in the table so past threads, usage and outcome stats still resolve them.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Why this row is hidden: `"gone"` (dropped from provider listings) or `"user"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_reason: Option<String>,
+    /// Unix seconds when a provider sync last saw this model, if ever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
+    /// Human-readable display name from the provider, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Where prices came from (`"manual"`, `"catalog"`, `"table"`, `"api"`, `"none"`, …).
+    #[serde(default = "default_price_source")]
+    pub price_source: String,
+    /// Tool-calling support: `"yes"`, `"no"`, or `"unknown"`.
+    #[serde(default = "default_model_tools")]
+    pub tools: String,
+}
+
+impl Default for ModelEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            provider_id: String::new(),
+            model: String::new(),
+            input_price: 0.0,
+            output_price: 0.0,
+            cache_read_price: None,
+            cache_write_price: None,
+            context_window: 0,
+            use_cases: String::new(),
+            free: false,
+            roles: Vec::new(),
+            local: false,
+            modalities: Vec::new(),
+            kind: default_model_kind(),
+            device_id: None,
+            source: default_model_source(),
+            hidden: false,
+            hidden_reason: None,
+            last_seen: None,
+            display_name: None,
+            price_source: default_price_source(),
+            tools: default_model_tools(),
+        }
+    }
+}
+
+impl ModelEntry {
+    /// Whether this row represents a device-hosted CLI harness rather than an API model.
+    pub fn is_harness(&self) -> bool {
+        self.kind == "harness"
+    }
 }
 
 /// `POST /v1/models/import`. Pull one model from the provider's catalog.

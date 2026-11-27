@@ -177,6 +177,7 @@ async fn syncs_streams_reconnects_and_reads_offline() {
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     })
     .unwrap();
     let (_, admin) = db.add_device("Phone", "ios", true).unwrap();
