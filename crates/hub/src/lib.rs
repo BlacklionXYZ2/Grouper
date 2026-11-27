@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod db;
 mod device_provider;
 pub mod devices;
+pub mod discover;
 pub mod files;
 pub mod google_auth;
 pub mod host;
