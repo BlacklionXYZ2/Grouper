@@ -460,24 +460,46 @@ impl Hub {
         let text = req.text.trim().to_string();
         anyhow::ensure!(!text.is_empty(), "message is empty");
         let requested = req.model.as_deref().map(str::trim).filter(|model| !model.is_empty()).map(str::to_string);
-        if let Some(model) = &requested {
-            anyhow::ensure!(self.db.find_model(model).is_some(), "no model {model:?} in the registry");
-        }
-        let id = match &req.conversation_id {
+        let requested_model = match &requested {
+            Some(model) => {
+                let Some(found) = self.db.find_model(model) else {
+                    anyhow::bail!("no model {model:?} in the registry");
+                };
+                if found.hidden {
+                    anyhow::bail!("model {} is hidden and cannot be selected", found.id);
+                }
+                Some(found)
+            }
+            None => None,
+        };
+        let target_mode = match &req.conversation_id {
             Some(id) => {
-                anyhow::ensure!(self.db.conversation(id).is_some(), "no such conversation");
+                let Some(conv) = self.db.conversation(id) else {
+                    anyhow::bail!("no such conversation");
+                };
                 if requested.is_some() && !self.db.history(id).is_empty() {
                     anyhow::bail!(
                         "model can be set on the first message; use POST /v1/conversations/{id}/model to change it"
                     );
                 }
-                id.clone()
+                conv.mode
             }
             None => {
                 let mode = req.mode.as_deref().unwrap_or("project");
                 anyhow::ensure!(mode == "project" || mode == "standard", "mode must be project or standard");
+                mode.to_string()
+            }
+        };
+        if target_mode == "project"
+            && let Some(found) = &requested_model
+        {
+            crate::db::check_orchestrator_eligible(found)?;
+        }
+        let id = match &req.conversation_id {
+            Some(id) => id.clone(),
+            None => {
                 let title: String = text.chars().take(60).collect();
-                self.db.create_conversation(mode, &title)?
+                self.db.create_conversation(&target_mode, &title)?
             }
         };
         if let Some(model) = &requested {
@@ -637,6 +659,20 @@ pub fn router(hub: Arc<Hub>) -> Router {
 
 pub(crate) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, Json(json!({ "error": msg.to_string() }))).into_response()
+}
+
+pub(crate) fn model_rule_err(status: StatusCode, error: anyhow::Error) -> Response {
+    if error.downcast_ref::<crate::db::HarnessCannotOrchestrate>().is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": error.to_string(),
+                "code": crate::db::HARNESS_CANNOT_ORCHESTRATE_CODE,
+            })),
+        )
+            .into_response();
+    }
+    err(status, error)
 }
 
 /// Any valid token: a device or the user's client. Enough to connect and to read.
@@ -894,7 +930,7 @@ async fn put_model(
     m.id = id;
     match hub.db.upsert_model(&m) {
         Ok(()) => Json(hub.db.find_model(&m.id).unwrap_or(m)).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e),
+        Err(e) => model_rule_err(StatusCode::BAD_REQUEST, e),
     }
 }
 
@@ -966,7 +1002,7 @@ async fn chat(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(req): Json<C
     admin!(hub, headers);
     match hub.chat(req).await {
         Ok(conversation_id) => Json(ChatResponse { conversation_id }).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e),
+        Err(e) => model_rule_err(StatusCode::BAD_REQUEST, e),
     }
 }
 
@@ -998,7 +1034,7 @@ async fn set_conversation_model(
             } else {
                 StatusCode::BAD_REQUEST
             };
-            err(status, error)
+            model_rule_err(status, error)
         }
     }
 }
@@ -2955,6 +2991,238 @@ mod tests {
         assert_eq!(hidden_row.hidden_reason.as_deref(), Some("user"));
         assert_eq!(hidden_row.kind, "harness");
         assert_eq!(hidden_row.device_id.as_deref(), Some(pc.id.as_str()));
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn direct_api_calls_enforce_harness_orchestration_rules() {
+        let dir = std::env::temp_dir().join(format!("grouper-h2-api-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (_, admin_token) = db.add_device("Admin", "macos", true).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let base = format!("http://{addr}");
+        let http = reqwest::Client::new();
+
+        // Register an API provider and two harness providers (one non-orchestrating, one orchestrating).
+        assert_eq!(
+            http.put(format!("{base}/v1/providers/openai"))
+                .bearer_auth(&admin_token)
+                .json(&json!({"id": "openai", "kind": "openai", "base_url": "https://api.openai.com/v1"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let codex_pid = format!("codex@{}", pc.id);
+        assert_eq!(
+            http.put(format!("{base}/v1/providers/{codex_pid}"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": codex_pid,
+                    "kind": "harness",
+                    "options": {"harness": "codex", "via_device": pc.id, "signed_in": true}
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let claude_pid = format!("claude-code@{}", pc.id);
+        assert_eq!(
+            http.put(format!("{base}/v1/providers/{claude_pid}"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": claude_pid,
+                    "kind": "harness",
+                    "options": {"harness": "claude-code", "via_device": pc.id, "signed_in": true}
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Register an API orchestrator model.
+        assert_eq!(
+            http.put(format!("{base}/v1/models/api-orch"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": "api-orch",
+                    "provider_id": "openai",
+                    "model": "gpt-4o",
+                    "roles": ["orchestrator"]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Direct API bypass: PUT /v1/models/{id} with roles: ["orchestrator"] on a harness without can_orchestrate -> 400.
+        let r = http
+            .put(format!("{base}/v1/models/codex-o3"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "id": "codex-o3",
+                "provider_id": codex_pid,
+                "model": "o3",
+                "can_orchestrate": false,
+                "roles": ["orchestrator"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["code"], "harness_cannot_orchestrate");
+        assert_eq!(
+            body["error"],
+            "codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+
+        // Same harness MAY be saved with standard + thread roles.
+        assert_eq!(
+            http.put(format!("{base}/v1/models/codex-o3"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": "codex-o3",
+                    "provider_id": codex_pid,
+                    "model": "o3",
+                    "can_orchestrate": false,
+                    "roles": ["standard", "thread"]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Harness WITH can_orchestrate = true MAY hold the orchestrator role.
+        assert_eq!(
+            http.put(format!("{base}/v1/models/cc-opus"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": "cc-opus",
+                    "provider_id": claude_pid,
+                    "model": "opus",
+                    "can_orchestrate": true,
+                    "roles": ["orchestrator", "standard", "thread"]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Create a project chat and a standard chat.
+        let project_conv = hub.db.create_conversation("project", "Project").unwrap();
+        let standard_conv = hub.db.create_conversation("standard", "Standard").unwrap();
+
+        // Direct API bypass: POST /v1/conversations/{id}/model on a project chat with non-orchestrating harness -> 400.
+        let r = http
+            .post(format!("{base}/v1/conversations/{project_conv}/model"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"model": "codex-o3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["code"], "harness_cannot_orchestrate");
+        assert_eq!(
+            body["error"],
+            "codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+        assert!(hub.db.conversation(&project_conv).unwrap().model.is_none());
+
+        // Project chat accepts can_orchestrate = true harness via HTTP.
+        let r = http
+            .post(format!("{base}/v1/conversations/{project_conv}/model"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"model": "cc-opus"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(hub.db.conversation(&project_conv).unwrap().model.as_deref(), Some("cc-opus"));
+
+        // Standard chat accepts non-orchestrating harness via HTTP.
+        let r = http
+            .post(format!("{base}/v1/conversations/{standard_conv}/model"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"model": "codex-o3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(hub.db.conversation(&standard_conv).unwrap().model.as_deref(), Some("codex-o3"));
+
+        // Direct API bypass: POST /v1/chat starting a new project chat with non-orchestrating harness -> 400
+        // and does NOT create an orphan conversation row.
+        let before_convs = hub.db.conversations().len();
+        let r = http
+            .post(format!("{base}/v1/chat"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"text": "plan a task", "mode": "project", "model": "codex-o3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["code"], "harness_cannot_orchestrate");
+        assert_eq!(
+            body["error"],
+            "codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+        assert_eq!(hub.db.conversations().len(), before_convs, "rejected /v1/chat must not leave an orphan conversation");
+
+        // Starting a new standard chat with a non-orchestrating harness via POST /v1/chat succeeds.
+        let r = http
+            .post(format!("{base}/v1/chat"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"text": "quick question", "mode": "standard", "model": "codex-o3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let chat_resp: ChatResponse = r.json().await.unwrap();
+        assert_eq!(hub.db.conversation(&chat_resp.conversation_id).unwrap().model.as_deref(), Some("codex-o3"));
+
+        // Hub::free_alternates delegates and never returns a harness row.
+        hub.db
+            .upsert_model(&ModelEntry {
+                id: "free-a".into(),
+                provider_id: "openai".into(),
+                model: "free-a".into(),
+                free: true,
+                ..Default::default()
+            })
+            .unwrap();
+        hub.db
+            .upsert_model(&ModelEntry {
+                id: "free-harness".into(),
+                provider_id: "openai".into(),
+                model: "free-harness".into(),
+                kind: "harness".into(),
+                free: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(hub.free_alternates("openai", "free-a").is_empty());
 
         drop(hub);
         std::fs::remove_dir_all(dir).ok();

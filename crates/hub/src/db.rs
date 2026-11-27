@@ -104,6 +104,52 @@ impl std::fmt::Display for DeviceCapReached {
 
 impl std::error::Error for DeviceCapReached {}
 
+/// Machine-readable error code returned when a harness without `can_orchestrate`
+/// is assigned to orchestrate a project chat or hold the `orchestrator` role.
+pub const HARNESS_CANNOT_ORCHESTRATE_CODE: &str = "harness_cannot_orchestrate";
+
+/// A harness without `can_orchestrate` was chosen as a project-chat orchestrator
+/// or given the `orchestrator` default role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessCannotOrchestrate(pub String);
+
+impl std::fmt::Display for HarnessCannotOrchestrate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for HarnessCannotOrchestrate {}
+
+/// Whether `model` may orchestrate a project chat or hold the `orchestrator` default role:
+/// any API model, or a harness with `can_orchestrate = true`.
+pub fn can_orchestrate_project(model: &ModelEntry) -> bool {
+    core_registry::registry::can_orchestrate_project(model)
+}
+
+/// Refuse a harness without `can_orchestrate` when orchestrating a project chat.
+pub fn check_orchestrator_eligible(model: &ModelEntry) -> Result<()> {
+    if can_orchestrate_project(model) {
+        Ok(())
+    } else {
+        Err(HarnessCannotOrchestrate(model.id.clone()).into())
+    }
+}
+
+/// Refuse assigning the `orchestrator` role to a harness without `can_orchestrate`.
+/// Harnesses without `can_orchestrate` may still hold `standard` and `thread`.
+pub fn check_model_roles(model_id: &str, kind: &str, can_orchestrate: bool, roles: &[String]) -> Result<()> {
+    let has_orchestrator = roles.iter().any(|r| r.trim().eq_ignore_ascii_case("orchestrator"));
+    if has_orchestrator && kind == "harness" && !can_orchestrate {
+        return Err(HarnessCannotOrchestrate(model_id.to_string()).into());
+    }
+    Ok(())
+}
+
 /// What [`Db::issue_device`] did.
 #[derive(Debug)]
 pub struct IssuedDevice {
@@ -1166,6 +1212,7 @@ impl Db {
                 other => bail!("kind must be api or harness; got {other:?}"),
             }
         };
+        check_model_roles(&m.id, kind, m.can_orchestrate, &m.roles)?;
         let source = match m.source.trim() {
             "" | "manual" => "manual",
             "auto" => "auto",
@@ -1323,6 +1370,32 @@ impl Db {
         core_registry::find_model_in(&self.models(), key)
     }
 
+    /// When `model` is a free API model, the other visible free API models on the same
+    /// provider (same key), to swap in when it is rate limited. Never returns a harness row
+    /// as a fallback for an API model, and never treats a harness as a free API model.
+    pub fn free_alternates(&self, provider_id: &str, model: &str) -> Vec<String> {
+        let models = self.models();
+        if !models
+            .iter()
+            .any(|m| m.provider_id == provider_id && m.model == model && m.free && !m.is_harness())
+        {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for m in models {
+            if m.provider_id == provider_id
+                && m.free
+                && !m.is_harness()
+                && !m.hidden
+                && m.model != model
+                && !out.contains(&m.model)
+            {
+                out.push(m.model);
+            }
+        }
+        out
+    }
+
     // ---- conversations and history
 
     pub fn create_conversation(&self, mode: &str, title: &str) -> Result<String> {
@@ -1368,16 +1441,20 @@ impl Db {
 
     /// Set or clear the conversation's model. `model` is a registry id (or the provider's model
     /// name); null uses the role default again. The stored value is the registry id.
+    /// Project conversations only accept API models or harnesses with `can_orchestrate = true`.
     pub fn set_conversation_model(&self, id: &str, model: Option<&str>) -> Result<ConversationInfo> {
-        if self.conversation(id).is_none() {
+        let Some(conv) = self.conversation(id) else {
             bail!("no such conversation");
-        }
+        };
         let stored = match model.map(str::trim).filter(|s| !s.is_empty()) {
             None => None,
             Some(key) => {
                 let Some(found) = self.find_model(key) else { bail!("no model {key:?} in the registry") };
                 if found.hidden {
                     bail!("model {} is hidden and cannot be selected", found.id);
+                }
+                if conv.mode == "project" {
+                    check_orchestrator_eligible(&found)?;
                 }
                 Some(found.id)
             }
@@ -2471,6 +2548,180 @@ mod tests {
         assert_eq!(saved.price_source, "none");
         assert_eq!(saved.display_name.as_deref(), Some("Claude Code Opus"));
         assert!(!db.model_is_local(&saved));
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn harness_role_and_conversation_rules() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+
+        db.upsert_provider(&ProviderConfig {
+            id: "openai".into(),
+            kind: "openai".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            api_key: None,
+            options: serde_json::Value::Null,
+        })
+        .unwrap();
+        let codex_pid = format!("codex@{}", pc.id);
+        db.upsert_provider(&ProviderConfig {
+            id: codex_pid.clone(),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: serde_json::json!({"harness": "codex", "via_device": pc.id, "signed_in": true}),
+        })
+        .unwrap();
+        let claude_pid = format!("claude-code@{}", pc.id);
+        db.upsert_provider(&ProviderConfig {
+            id: claude_pid.clone(),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: serde_json::json!({"harness": "claude-code", "via_device": pc.id, "signed_in": true}),
+        })
+        .unwrap();
+
+        // API model can hold orchestrator.
+        db.upsert_model(&ModelEntry {
+            id: "z-gpt-4o".into(),
+            provider_id: "openai".into(),
+            model: "gpt-4o".into(),
+            roles: vec!["orchestrator".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Harness WITHOUT can_orchestrate: refused for orchestrator role with exact message.
+        let err = db
+            .upsert_model(&ModelEntry {
+                id: "a-codex-o3".into(),
+                provider_id: codex_pid.clone(),
+                model: "o3".into(),
+                kind: "harness".into(),
+                device_id: Some(pc.id.clone()),
+                can_orchestrate: false,
+                roles: vec!["orchestrator".into()],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.downcast_ref::<HarnessCannotOrchestrate>().is_some());
+        assert_eq!(
+            err.to_string(),
+            "a-codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+
+        // Same harness MAY hold standard and thread roles.
+        db.upsert_model(&ModelEntry {
+            id: "a-codex-o3".into(),
+            provider_id: codex_pid.clone(),
+            model: "o3".into(),
+            kind: "harness".into(),
+            device_id: Some(pc.id.clone()),
+            can_orchestrate: false,
+            roles: vec!["standard".into(), "thread".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Harness WITH can_orchestrate = true MAY hold orchestrator, standard, thread.
+        db.upsert_model(&ModelEntry {
+            id: "b-cc-opus".into(),
+            provider_id: claude_pid,
+            model: "opus".into(),
+            kind: "harness".into(),
+            device_id: Some(pc.id.clone()),
+            can_orchestrate: true,
+            roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Conversation model override rules.
+        let project_id = db.create_conversation("project", "Project chat").unwrap();
+        let standard_id = db.create_conversation("standard", "Standard chat").unwrap();
+
+        // Project chat refuses non-orchestrating harness.
+        let err = db.set_conversation_model(&project_id, Some("a-codex-o3")).unwrap_err();
+        assert!(err.downcast_ref::<HarnessCannotOrchestrate>().is_some());
+        assert_eq!(
+            err.to_string(),
+            "a-codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+        assert!(db.conversation(&project_id).unwrap().model.is_none());
+
+        // Project chat accepts can_orchestrate = true harness and API model.
+        assert_eq!(
+            db.set_conversation_model(&project_id, Some("b-cc-opus")).unwrap().model.as_deref(),
+            Some("b-cc-opus")
+        );
+        assert_eq!(
+            db.set_conversation_model(&project_id, Some("z-gpt-4o")).unwrap().model.as_deref(),
+            Some("z-gpt-4o")
+        );
+
+        // Standard chat accepts ANY harness (both without and with can_orchestrate).
+        assert_eq!(
+            db.set_conversation_model(&standard_id, Some("a-codex-o3")).unwrap().model.as_deref(),
+            Some("a-codex-o3")
+        );
+        assert_eq!(
+            db.set_conversation_model(&standard_id, Some("b-cc-opus")).unwrap().model.as_deref(),
+            Some("b-cc-opus")
+        );
+
+        // Even if a legacy row in SQLite has roles='orchestrator' on a non-orchestrating harness,
+        // default_model("orchestrator") still skips it.
+        db.c()
+            .execute("UPDATE models SET roles = 'orchestrator,standard,thread' WHERE id = 'a-codex-o3'", [])
+            .unwrap();
+        assert_eq!(db.default_model("orchestrator").unwrap().id, "b-cc-opus");
+        assert_eq!(db.default_model("standard").unwrap().id, "a-codex-o3");
+        assert_eq!(db.default_model("thread").unwrap().id, "a-codex-o3");
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn free_alternates_never_offers_harnesses_or_hidden_models() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "openrouter".into(),
+            kind: "openai".into(),
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            api_key: None,
+            options: serde_json::Value::Null,
+        })
+        .unwrap();
+
+        let make = |id: &str, model: &str, kind: &str, can_orch: bool, free: bool, hidden: bool| ModelEntry {
+            id: id.into(),
+            provider_id: "openrouter".into(),
+            model: model.into(),
+            kind: kind.into(),
+            can_orchestrate: can_orch,
+            free,
+            hidden,
+            hidden_reason: hidden.then(|| "gone".into()),
+            ..Default::default()
+        };
+        db.upsert_model(&make("api-free-1", "m/free-1:free", "api", false, true, false)).unwrap();
+        db.upsert_model(&make("api-free-2", "m/free-2:free", "api", false, true, false)).unwrap();
+        db.upsert_model(&make("api-hidden", "m/hidden:free", "api", false, true, true)).unwrap();
+        db.upsert_model(&make("harness-no-orch", "codex-free", "harness", false, true, false)).unwrap();
+        db.upsert_model(&make("harness-orch", "claude-free", "harness", true, true, false)).unwrap();
+
+        // API free model gets only visible API free alternates, never harnesses (with or without can_orchestrate).
+        assert_eq!(db.free_alternates("openrouter", "m/free-1:free"), vec!["m/free-2:free".to_string()]);
+        // A harness row never gets free API alternates either.
+        assert!(db.free_alternates("openrouter", "codex-free").is_empty());
+        assert!(db.free_alternates("openrouter", "claude-free").is_empty());
 
         drop(db);
         std::fs::remove_dir_all(dir).ok();

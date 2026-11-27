@@ -84,7 +84,7 @@ pub const PROPOSAL_LOW: f64 = 0.3;
 pub const MAX_USE_CASES_CHARS: usize = 500;
 
 /// Rule values for `require` / `forbid`, and for `prefer`.
-const PROPERTIES: &[&str] = &["local", "remote", "free", "paid"];
+const PROPERTIES: &[&str] = &["local", "remote", "free", "paid", "harness", "api"];
 const PREFERENCES: &[&str] = &["cheapest", "local", "free"];
 
 pub fn norm(s: &str) -> String {
@@ -145,8 +145,15 @@ pub fn local_map(
         .collect()
 }
 
+/// Whether a model may orchestrate a project chat (or hold the `orchestrator` role default):
+/// any API model, or a harness that explicitly supports MCP orchestration (`can_orchestrate`).
+pub fn can_orchestrate_project(model: &ModelEntry) -> bool {
+    !model.is_harness() || model.can_orchestrate
+}
+
 /// The role default excluding hidden models and providers that cannot currently serve an
 /// automatically selected model (for example, an offline device host). Standard chat prefers a free model.
+/// For the `orchestrator` role, harnesses without `can_orchestrate` are dropped before every fallback step.
 pub fn default_model_from(
     models: &[ModelEntry],
     role: &str,
@@ -154,7 +161,11 @@ pub fn default_model_from(
 ) -> Option<ModelEntry> {
     let available: Vec<&ModelEntry> = models
         .iter()
-        .filter(|model| !model.hidden && !unavailable_providers.contains(&model.provider_id))
+        .filter(|model| {
+            !model.hidden
+                && !unavailable_providers.contains(&model.provider_id)
+                && (role != "orchestrator" || can_orchestrate_project(model))
+        })
         .collect();
     let by_role = |r: &str| available.iter().find(|m| m.roles.iter().any(|x| x == r)).copied().cloned();
     match role {
@@ -163,7 +174,13 @@ pub fn default_model_from(
         _ => None,
     }
     .or_else(|| by_role(role))
-    .or_else(|| by_role("orchestrator"))
+    .or_else(|| {
+        available
+            .iter()
+            .find(|m| can_orchestrate_project(m) && m.roles.iter().any(|x| x == "orchestrator"))
+            .copied()
+            .cloned()
+    })
     .or_else(|| available.first().copied().cloned())
 }
 
@@ -189,6 +206,8 @@ fn has_property(m: &ModelEntry, local: bool, property: &str) -> bool {
         "remote" => !local,
         "free" => m.free,
         "paid" => !m.free,
+        "harness" => m.is_harness(),
+        "api" => !m.is_harness(),
         _ => false,
     }
 }
@@ -1291,5 +1310,88 @@ mod tests {
             ..Default::default()
         };
         assert!(!model_is_local(&harness, Some("http://localhost:1234"), true));
+    }
+
+    #[test]
+    fn default_model_and_routing_enforce_harness_orchestration_rules() {
+        let non_orch_harness = ModelEntry {
+            id: "a-codex-o3".into(),
+            provider_id: "codex@pc".into(),
+            model: "o3".into(),
+            kind: "harness".into(),
+            device_id: Some("pc".into()),
+            can_orchestrate: false,
+            roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
+            ..Default::default()
+        };
+        let orch_harness = ModelEntry {
+            id: "b-cc-opus".into(),
+            provider_id: "claude-code@pc".into(),
+            model: "opus".into(),
+            kind: "harness".into(),
+            device_id: Some("pc".into()),
+            can_orchestrate: true,
+            roles: vec!["orchestrator".into()],
+            ..Default::default()
+        };
+        let api_model = ModelEntry {
+            id: "z-gpt-4o".into(),
+            provider_id: "openai".into(),
+            model: "gpt-4o".into(),
+            kind: "api".into(),
+            roles: vec![],
+            ..Default::default()
+        };
+        let none_unavail = HashSet::new();
+
+        // Only a non-orchestrating harness: never auto-picked for orchestrator (even if it carries the role
+        // or would be the final "first available" fallback), but allowed for standard and thread.
+        let only_non_orch = vec![non_orch_harness.clone()];
+        assert!(default_model_from(&only_non_orch, "orchestrator", &none_unavail).is_none());
+        assert_eq!(default_model_from(&only_non_orch, "standard", &none_unavail).unwrap().id, "a-codex-o3");
+        assert_eq!(default_model_from(&only_non_orch, "thread", &none_unavail).unwrap().id, "a-codex-o3");
+
+        // Even with no roles at all, only a non-orchestrating harness is never auto-picked for orchestrator.
+        let unroled_non_orch = vec![ModelEntry { roles: vec![], ..non_orch_harness.clone() }];
+        assert!(default_model_from(&unroled_non_orch, "orchestrator", &none_unavail).is_none());
+        assert_eq!(default_model_from(&unroled_non_orch, "standard", &none_unavail).unwrap().id, "a-codex-o3");
+        assert_eq!(default_model_from(&unroled_non_orch, "thread", &none_unavail).unwrap().id, "a-codex-o3");
+
+        // Non-orchestrating harness listed before an API model: orchestrator skips it and picks the API model.
+        let non_orch_and_api = vec![non_orch_harness.clone(), api_model.clone()];
+        assert_eq!(default_model_from(&non_orch_and_api, "orchestrator", &none_unavail).unwrap().id, "z-gpt-4o");
+        assert_eq!(default_model_from(&non_orch_and_api, "standard", &none_unavail).unwrap().id, "a-codex-o3");
+        assert_eq!(default_model_from(&non_orch_and_api, "thread", &none_unavail).unwrap().id, "a-codex-o3");
+
+        // A harness with can_orchestrate = true IS allowed as the orchestrator default.
+        let all = vec![non_orch_harness.clone(), orch_harness.clone(), api_model.clone()];
+        assert_eq!(default_model_from(&all, "orchestrator", &none_unavail).unwrap().id, "b-cc-opus");
+
+        // Any harness (with or without can_orchestrate) may be picked for threads in route_model_from.
+        let local = HashMap::new();
+        let stats = HashMap::new();
+        let routed_non_orch =
+            route_model_from(&all, &local, &[], &stats, Some("a-codex-o3"), Some("code"), &[], false, &none_unavail)
+                .unwrap();
+        assert_eq!(routed_non_orch.model.id, "a-codex-o3");
+        let routed_orch =
+            route_model_from(&all, &local, &[], &stats, Some("b-cc-opus"), Some("code"), &[], false, &none_unavail)
+                .unwrap();
+        assert_eq!(routed_orch.model.id, "b-cc-opus");
+
+        // Priority rules understand `api` and `harness` properties.
+        let api_only = validate_rule(&RuleSpec { require: Some("api".into()), ..Default::default() }).unwrap();
+        let forbid_harness = validate_rule(&RuleSpec { forbid: Some("harness".into()), ..Default::default() }).unwrap();
+        let rules = vec![
+            PriorityRule { id: 1, text: "API only".into(), rule: api_only, enabled: true, created: 1 },
+            PriorityRule { id: 2, text: "No harnesses".into(), rule: forbid_harness, enabled: true, created: 2 },
+        ];
+        let routed_api =
+            route_model_from(&all, &local, &rules, &stats, None, Some("code"), &[], false, &none_unavail).unwrap();
+        assert_eq!(routed_api.model.id, "z-gpt-4o");
+        assert!(
+            route_model_from(&all, &local, &rules, &stats, Some("a-codex-o3"), None, &[], false, &none_unavail)
+                .is_err()
+        );
     }
 }
