@@ -172,10 +172,15 @@
 }
 
 .us-title {
+  /* Instrument-style eyebrow (design system 3.1): mono micro, uppercase. */
   margin: 0;
-  font-size: var(--type-body-size);
+  font-family: var(--mono);
+  font-size: var(--type-micro-size);
+  line-height: var(--type-micro-lh);
   font-weight: 600;
-  letter-spacing: var(--type-body-track);
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-3);
 }
 
 .us-sub {

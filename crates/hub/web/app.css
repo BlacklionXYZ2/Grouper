@@ -471,6 +471,37 @@
   --fam-mistral: var(--hue-rose-text);
   --fam-radium: var(--hue-indigo-text);
   --fam-deepseek: var(--hue-cyan-text);
+  /* The same map for the other steps: step-1 background, step-2 border, step-3 solid. */
+  --fam-gemini-bg: var(--hue-teal-bg);
+  --fam-gemini-border: var(--hue-teal-border);
+  --fam-gemini-solid: var(--hue-teal-solid);
+  --fam-qwen-bg: var(--hue-purple-bg);
+  --fam-qwen-border: var(--hue-purple-border);
+  --fam-qwen-solid: var(--hue-purple-solid);
+  --fam-llama-bg: var(--hue-orange-bg);
+  --fam-llama-border: var(--hue-orange-border);
+  --fam-llama-solid: var(--hue-orange-solid);
+  --fam-claude-bg: var(--hue-pink-bg);
+  --fam-claude-border: var(--hue-pink-border);
+  --fam-claude-solid: var(--hue-pink-solid);
+  --fam-gpt-bg: var(--hue-blue-bg);
+  --fam-gpt-border: var(--hue-blue-border);
+  --fam-gpt-solid: var(--hue-blue-solid);
+  --fam-nemotron-bg: var(--hue-green-bg);
+  --fam-nemotron-border: var(--hue-green-border);
+  --fam-nemotron-solid: var(--hue-green-solid);
+  --fam-ernie-bg: var(--hue-amber-bg);
+  --fam-ernie-border: var(--hue-amber-border);
+  --fam-ernie-solid: var(--hue-amber-solid);
+  --fam-mistral-bg: var(--hue-rose-bg);
+  --fam-mistral-border: var(--hue-rose-border);
+  --fam-mistral-solid: var(--hue-rose-solid);
+  --fam-radium-bg: var(--hue-indigo-bg);
+  --fam-radium-border: var(--hue-indigo-border);
+  --fam-radium-solid: var(--hue-indigo-solid);
+  --fam-deepseek-bg: var(--hue-cyan-bg);
+  --fam-deepseek-border: var(--hue-cyan-border);
+  --fam-deepseek-solid: var(--hue-cyan-solid);
 }
 
 :root[data-theme="dark"] {
@@ -727,6 +758,31 @@
   letter-spacing: 0.7px;
   text-transform: uppercase;
   color: var(--text-4);
+}
+
+/* Keycap (design system 3.8): one key per cap, so "Ctrl" and "K" are two caps. */
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  font-family: var(--mono);
+  font-size: var(--type-micro-size);
+  line-height: 1;
+  font-weight: 500;
+  color: var(--text-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-chip);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.08), 0 1px 0 rgb(2 6 14 / 0.5);
+}
+
+.kbd-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
 }
 
 /* ---- base */
@@ -2485,7 +2541,7 @@ button.strip:hover {
 
 .status.fam-tint {
   color: var(--fam);
-  background: color-mix(in srgb, var(--fam) var(--fam-pill), var(--surface));
+  background: var(--fam-bg, color-mix(in srgb, var(--fam) var(--fam-pill), var(--surface)));
 }
 
 .status .icon {
@@ -2830,8 +2886,13 @@ button.strip:hover {
 }
 
 .tool-row .tool-body .label {
+  /* Same as .label-mono: the TOOL INPUT / TOOL OUTPUT eyebrow. */
+  font-family: var(--mono);
   font-size: var(--type-micro-size);
+  line-height: var(--type-micro-lh);
   font-weight: 600;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
   color: var(--text-4);
 }
 
@@ -5162,26 +5223,26 @@ code.nowrap {
 
 /* ---- model families: the mark, the row stripe, the fixed model chip */
 
-.fam-claude { --fam: var(--fam-claude); }
-.fam-gpt { --fam: var(--fam-gpt); }
-.fam-gemini { --fam: var(--fam-gemini); }
-.fam-llama { --fam: var(--fam-llama); }
-.fam-qwen { --fam: var(--fam-qwen); }
-.fam-deepseek { --fam: var(--fam-deepseek); }
-.fam-mistral { --fam: var(--fam-mistral); }
-.fam-nemotron { --fam: var(--fam-nemotron); }
-.fam-ernie { --fam: var(--fam-ernie); }
-.fam-grok { --fam: var(--fam-grok); }
-.fam-radium { --fam: var(--fam-radium); }
-.fam-scripted { --fam: var(--fam-scripted); }
-.fam-unknown { --fam: var(--fam-unknown); }
+.fam-claude { --fam: var(--fam-claude); --fam-bg: var(--fam-claude-bg); --fam-edge: var(--fam-claude-border); --fam-solid: var(--fam-claude-solid); }
+.fam-gpt { --fam: var(--fam-gpt); --fam-bg: var(--fam-gpt-bg); --fam-edge: var(--fam-gpt-border); --fam-solid: var(--fam-gpt-solid); }
+.fam-gemini { --fam: var(--fam-gemini); --fam-bg: var(--fam-gemini-bg); --fam-edge: var(--fam-gemini-border); --fam-solid: var(--fam-gemini-solid); }
+.fam-llama { --fam: var(--fam-llama); --fam-bg: var(--fam-llama-bg); --fam-edge: var(--fam-llama-border); --fam-solid: var(--fam-llama-solid); }
+.fam-qwen { --fam: var(--fam-qwen); --fam-bg: var(--fam-qwen-bg); --fam-edge: var(--fam-qwen-border); --fam-solid: var(--fam-qwen-solid); }
+.fam-deepseek { --fam: var(--fam-deepseek); --fam-bg: var(--fam-deepseek-bg); --fam-edge: var(--fam-deepseek-border); --fam-solid: var(--fam-deepseek-solid); }
+.fam-mistral { --fam: var(--fam-mistral); --fam-bg: var(--fam-mistral-bg); --fam-edge: var(--fam-mistral-border); --fam-solid: var(--fam-mistral-solid); }
+.fam-nemotron { --fam: var(--fam-nemotron); --fam-bg: var(--fam-nemotron-bg); --fam-edge: var(--fam-nemotron-border); --fam-solid: var(--fam-nemotron-solid); }
+.fam-ernie { --fam: var(--fam-ernie); --fam-bg: var(--fam-ernie-bg); --fam-edge: var(--fam-ernie-border); --fam-solid: var(--fam-ernie-solid); }
+.fam-grok { --fam: var(--fam-grok); --fam-bg: var(--surface-2); --fam-edge: var(--line-3); --fam-solid: var(--fam-grok); }
+.fam-radium { --fam: var(--fam-radium); --fam-bg: var(--fam-radium-bg); --fam-edge: var(--fam-radium-border); --fam-solid: var(--fam-radium-solid); }
+.fam-scripted { --fam: var(--fam-scripted); --fam-bg: var(--surface-2); --fam-edge: var(--line-3); --fam-solid: var(--fam-scripted); }
+.fam-unknown { --fam: var(--fam-unknown); --fam-bg: var(--surface-2); --fam-edge: var(--line-3); --fam-solid: var(--fam-unknown); }
 /* Unmatched model ids hash onto these. They follow the contrast tokens of the
    family they point at; the mark stays the generic icon, not that family's glyph. */
-.fam-vivid-claude { --fam: var(--fam-claude); }
-.fam-vivid-nemotron { --fam: var(--fam-nemotron); }
-.fam-vivid-ernie { --fam: var(--fam-ernie); }
-.fam-vivid-radium { --fam: var(--fam-radium); }
-.fam-default { --fam: var(--text-2); }
+.fam-vivid-claude { --fam: var(--fam-claude); --fam-bg: var(--fam-claude-bg); --fam-edge: var(--fam-claude-border); --fam-solid: var(--fam-claude-solid); }
+.fam-vivid-nemotron { --fam: var(--fam-nemotron); --fam-bg: var(--fam-nemotron-bg); --fam-edge: var(--fam-nemotron-border); --fam-solid: var(--fam-nemotron-solid); }
+.fam-vivid-ernie { --fam: var(--fam-ernie); --fam-bg: var(--fam-ernie-bg); --fam-edge: var(--fam-ernie-border); --fam-solid: var(--fam-ernie-solid); }
+.fam-vivid-radium { --fam: var(--fam-radium); --fam-bg: var(--fam-radium-bg); --fam-edge: var(--fam-radium-border); --fam-solid: var(--fam-radium-solid); }
+.fam-default { --fam: var(--text-2); --fam-bg: var(--surface-2); --fam-edge: var(--line-3); --fam-solid: var(--text-2); }
 
 /* A small box in the family colour with the family's glyph (the non-colour cue).
    Its own opaque surface keeps the glyph's contrast whatever the row behind it. */
@@ -5192,9 +5253,9 @@ code.nowrap {
   min-width: 22px;
   height: 18px;
   padding: 0 3px;
-  border: 1.5px solid var(--fam, var(--text-3));
+  border: 1.5px solid var(--fam-edge, var(--fam, var(--text-3)));
   border-radius: var(--r-chip);
-  background: var(--surface);
+  background: var(--fam-bg, var(--surface));
   color: var(--fam, var(--text-3));
   font: 600 var(--type-micro-size)/1 var(--mono); /* was 10px; nothing under 11.5px */
   vertical-align: -4px;
@@ -5734,9 +5795,12 @@ dialog.sheet-dialog.model-picker {
 
 .mp-provider-id {
   font-family: var(--mono);
-  font-size: var(--type-caption-size);
+  font-size: var(--type-micro-size);
+  line-height: var(--type-micro-lh);
   font-weight: 600;
-  color: var(--text);
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-2);
 }
 
 .mp-option {
@@ -6560,7 +6624,7 @@ dialog.command-palette::backdrop {
 .palette-frame {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
   min-height: 0;
   max-height: min(70dvh, 640px);
 }
@@ -6606,6 +6670,25 @@ dialog.command-palette::backdrop {
   box-shadow: inset 0 -2px 0 var(--focus);
 }
 
+.palette-foot {
+  grid-column: 1 / -1;
+  grid-row: 3;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--line-1);
+  font-size: var(--type-micro-size);
+  line-height: var(--type-micro-lh);
+  color: var(--text-3);
+}
+
+.palette-foot-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .palette-scroll {
   grid-column: 1 / -1;
   grid-row: 2;
@@ -6633,6 +6716,7 @@ dialog.command-palette::backdrop {
 
 .palette-group {
   margin: 10px 10px 4px;
+  font-family: var(--mono);
   font-size: var(--type-micro-size);
   font-weight: 600;
   letter-spacing: 0.7px;
@@ -6762,7 +6846,7 @@ dialog.command-palette::backdrop {
   width: 10px;
   height: 10px;
   border-radius: var(--r-full);
-  background: var(--fam, var(--fam-unknown));
+  background: var(--fam-solid, var(--fam, var(--fam-unknown)));
 }
 
 /* Plan count: one chip. Purple while the plan is open, mint at n/n.

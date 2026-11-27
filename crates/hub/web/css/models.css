@@ -55,6 +55,7 @@
 .mp-option .fam-mark.fam-default,
 .mp-option .fam-mark.fam-unknown {
   --fam: var(--accent);
+  --fam-edge: var(--accent);
 }
 
 /* Section labels: sentence case, no tracking. */
