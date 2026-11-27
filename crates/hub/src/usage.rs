@@ -481,8 +481,9 @@ pub async fn refresh(hub: &Hub) -> RefreshResult {
 pub async fn collector_loop(hub: Arc<Hub>) {
     // Official API balances are collected every hour; opted-in device subscription probes
     // run every 10 minutes (plus on connect and after matching device threads). OpenRouter
-    // model prices refresh on the first pass and then once a day.
+    // model prices and API provider model listings refresh on the first pass and then once a day.
     let mut hours_until_prices = 0u32;
+    let mut hours_until_sync = 0u32;
     let mut official_tick = tokio::time::interval(COLLECT_INTERVAL);
     official_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut probe_tick = tokio::time::interval(PROBE_INTERVAL);
@@ -508,6 +509,15 @@ pub async fn collector_loop(hub: Arc<Hub>) {
                 }
                 if hours_until_prices > 0 {
                     hours_until_prices = hours_until_prices.saturating_sub(1);
+                }
+                if hours_until_sync == 0 {
+                    let synced = crate::sync::sync_all_providers(&hub).await;
+                    let failed = synced.iter().filter(|r| r.error.is_some()).count();
+                    tracing::debug!(providers = synced.len(), failed, "daily provider model sync complete");
+                    hours_until_sync = 24;
+                }
+                if hours_until_sync > 0 {
+                    hours_until_sync = hours_until_sync.saturating_sub(1);
                 }
             }
             _ = probe_tick.tick() => {

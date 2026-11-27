@@ -22,6 +22,7 @@ pub mod server;
 pub mod session;
 pub mod skills;
 pub mod stepdown;
+pub mod sync;
 pub mod threads;
 pub mod tunnel;
 pub mod usage;
