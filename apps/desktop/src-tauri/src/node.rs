@@ -4,17 +4,19 @@
 //! device rows — an admin client for the UI and a non-admin node row (`install_kind = "node"`)
 //! here — so a thread shell never holds an admin credential.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use core_client::core_protocol::{Capability, DeviceInfo, default_input_schema};
-use core_client::{Events, Status, ToolHandler};
+use core_client::{Events, HubMoveCommitInfo, HubMoveOfferInfo, Status, ToolHandler};
 use hub::db::{Install, NODE_INSTALL};
 use hub::host::HubHandle;
+use hub::migrate::{MoveCommit, MoveOffer, TargetMoveOptions, execute_target_move};
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::settings::{DesktopSettings, machine_device_name};
@@ -25,6 +27,44 @@ const NO_SHELL_ENV: &str = "GROUPER_DESKTOP_NO_SHELL";
 const USAGE_PROBES_ENV: &str = "GROUPER_USAGE_PROBES";
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
+pub type OnPromotedCallback = Arc<dyn Fn(HubHandle) + Send + Sync + 'static>;
+
+/// Target-side parameters used when this desktop install is in client mode (`AnotherComputer`)
+/// and its node receives a hub move offer + commit from the current hub.
+#[derive(Clone)]
+pub struct MoveTargetContext {
+    pub remote_hub_url: String,
+    pub device_token: String,
+    pub hub_data_dir: PathBuf,
+    pub local_hub_bind: SocketAddr,
+    pub confirm_address: String,
+    pub confirm_timeout: Duration,
+    pub poll_interval: Duration,
+    pub on_promoted: OnPromotedCallback,
+}
+
+impl MoveTargetContext {
+    pub fn new(
+        remote_hub_url: String,
+        device_token: String,
+        hub_data_dir: PathBuf,
+        local_hub_bind: SocketAddr,
+        confirm_address: String,
+        on_promoted: OnPromotedCallback,
+    ) -> Self {
+        Self {
+            remote_hub_url,
+            device_token,
+            hub_data_dir,
+            local_hub_bind,
+            confirm_address,
+            confirm_timeout: Duration::from_secs(120),
+            poll_interval: Duration::from_secs(1),
+            on_promoted,
+        }
+    }
+}
+
 pub struct NodeHandle {
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
@@ -32,7 +72,16 @@ pub struct NodeHandle {
 
 impl NodeHandle {
     pub fn start(hub_url: &str, token: String, app_data_dir: &Path) -> Self {
-        Self::start_with_options(hub_url, token, app_data_dir, None, None)
+        Self::start_with_options(hub_url, token, app_data_dir, None, None, None)
+    }
+
+    pub fn start_client(
+        hub_url: &str,
+        token: String,
+        app_data_dir: &Path,
+        move_target: MoveTargetContext,
+    ) -> Self {
+        Self::start_with_options(hub_url, token, app_data_dir, None, None, Some(move_target))
     }
 
     fn start_with_options(
@@ -41,6 +90,7 @@ impl NodeHandle {
         app_data_dir: &Path,
         mcp_config: Option<PathBuf>,
         folders_config: Option<&Path>,
+        move_target: Option<MoveTargetContext>,
     ) -> Self {
         let workspace = std::env::var_os(WORKSPACE_ENV)
             .filter(|v| !v.is_empty())
@@ -79,9 +129,10 @@ impl NodeHandle {
             usage_probes,
         };
 
+        let events = Arc::new(DesktopNodeEvents::new(move_target));
         let (shutdown, rx) = watch::channel(false);
         let task = tokio::spawn(async move {
-            core_client::run(config, Arc::new(DesktopTools), Arc::new(DesktopNodeEvents), rx).await;
+            core_client::run(config, Arc::new(DesktopTools), events, rx).await;
         });
         Self { shutdown, task }
     }
@@ -120,15 +171,48 @@ impl ToolHandler for DesktopTools {
     }
 }
 
-struct DesktopNodeEvents;
+struct ActiveTargetMove {
+    move_id: String,
+    commit_tx: Option<oneshot::Sender<std::result::Result<MoveCommit, String>>>,
+}
+
+struct DesktopNodeEvents {
+    move_target: Option<MoveTargetContext>,
+    active_move: Arc<Mutex<Option<ActiveTargetMove>>>,
+}
+
+impl DesktopNodeEvents {
+    fn new(move_target: Option<MoveTargetContext>) -> Self {
+        Self {
+            move_target,
+            active_move: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn cancel_uncommitted_move(&self, reason: &str) {
+        let tx = {
+            let mut guard = self.active_move.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_mut().and_then(|m| m.commit_tx.take())
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(Err(reason.to_string()));
+        }
+    }
+}
 
 impl Events for DesktopNodeEvents {
     fn status(&self, status: Status) {
         match status {
             Status::Connecting => tracing::debug!("desktop node connecting to hub"),
             Status::Connected { device_id } => tracing::info!(device = %device_id, "desktop node online"),
-            Status::Disconnected { reason } => tracing::info!("desktop node disconnected: {reason}"),
-            Status::Unauthorized => tracing::warn!("desktop node token rejected by hub"),
+            Status::Disconnected { reason } => {
+                tracing::info!("desktop node disconnected: {reason}");
+                self.cancel_uncommitted_move(&format!("disconnected from hub before switch: {reason}"));
+            }
+            Status::Unauthorized => {
+                tracing::warn!("desktop node token rejected by hub");
+                self.cancel_uncommitted_move("node token rejected by hub");
+            }
         }
     }
 
@@ -136,6 +220,114 @@ impl Events for DesktopNodeEvents {
 
     fn thread(&self, thread_id: &str, title: &str, state: &str) {
         tracing::info!(thread = %thread_id, title = %title, state = %state, "desktop node thread");
+    }
+
+    fn hub_move_offer(&self, offer: HubMoveOfferInfo) {
+        let Some(ctx) = self.move_target.clone() else {
+            tracing::debug!(move_id = %offer.move_id, "ignoring hub move offer because this computer is already the hub");
+            return;
+        };
+
+        let (commit_tx, commit_rx) = oneshot::channel();
+        {
+            let mut guard = self.active_move.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_some() {
+                tracing::warn!(move_id = %offer.move_id, "ignoring hub move offer while another target move is active");
+                return;
+            }
+            *guard = Some(ActiveTargetMove {
+                move_id: offer.move_id.clone(),
+                commit_tx: Some(commit_tx),
+            });
+        }
+
+        let active_slot = Arc::clone(&self.active_move);
+        let move_id = offer.move_id.clone();
+        tokio::spawn(async move {
+            struct ClearSlot {
+                slot: Arc<Mutex<Option<ActiveTargetMove>>>,
+                move_id: String,
+            }
+            impl Drop for ClearSlot {
+                fn drop(&mut self) {
+                    let mut guard = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.as_ref().is_some_and(|m| m.move_id == self.move_id) {
+                        *guard = None;
+                    }
+                }
+            }
+            let _clear = ClearSlot {
+                slot: active_slot,
+                move_id: move_id.clone(),
+            };
+
+            let mut opts = TargetMoveOptions::new(ctx.hub_data_dir.clone(), vec![ctx.local_hub_bind]);
+            opts.confirm_address = Some(ctx.confirm_address.clone());
+            opts.confirm_timeout = ctx.confirm_timeout;
+            opts.poll_interval = ctx.poll_interval;
+
+            let move_offer = MoveOffer {
+                move_id: offer.move_id,
+                ticket: offer.ticket,
+                target_device_id: offer.target_device_id,
+                current_epoch: offer.current_epoch,
+                snapshot_bytes: offer.snapshot_bytes,
+                snapshot_sha256: offer.snapshot_sha256,
+            };
+
+            match execute_target_move(
+                &ctx.remote_hub_url,
+                &ctx.device_token,
+                move_offer,
+                opts,
+                commit_rx,
+            )
+            .await
+            {
+                Ok(new_hub_handle) => {
+                    tracing::info!(
+                        move_id = %move_id,
+                        data_dir = %ctx.hub_data_dir.display(),
+                        "hub move confirmed on this computer; switching desktop app to hub mode"
+                    );
+                    (ctx.on_promoted)(new_hub_handle);
+                }
+                Err(err) => {
+                    tracing::warn!(move_id = %move_id, "target hub move did not complete: {err:#}");
+                }
+            }
+        });
+    }
+
+    fn hub_move_commit(&self, commit: HubMoveCommitInfo) {
+        let tx = {
+            let mut guard = self.active_move.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .as_mut()
+                .filter(|m| m.move_id == commit.move_id)
+                .and_then(|m| m.commit_tx.take())
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(Ok(MoveCommit {
+                move_id: commit.move_id,
+                ticket: commit.ticket,
+                target_device_id: commit.target_device_id,
+                new_epoch: commit.new_epoch,
+            }));
+        }
+    }
+
+    fn hub_move_abort(&self, move_id: &str, reason: &str) {
+        let tx = {
+            let mut guard = self.active_move.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .as_mut()
+                .filter(|m| m.move_id == move_id)
+                .and_then(|m| m.commit_tx.take())
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(Err(reason.to_string()));
+        }
     }
 }
 
@@ -308,6 +500,7 @@ mod tests {
             &app_dir,
             Some(app_dir.join("mcp.json")),
             Some(&app_dir.join("folders.json")),
+            None,
         );
 
         // Wait until the hub sees this PC's node online with its MCP tools listed.
@@ -331,6 +524,67 @@ mod tests {
         assert_eq!(info["client"], "grouper-desktop");
 
         node.stop().await;
+        hub_handle.stop().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn hub_mode_node_ignores_offers_and_client_node_routes_abort_and_disconnect() {
+        let root = std::env::temp_dir().join(format!("grouper-desktop-move-ev-{}", hub::db::random_hex(4)));
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+
+        // 1. Hub-mode node (`move_target: None`) ignores move offers completely.
+        let hub_events = DesktopNodeEvents::new(None);
+        hub_events.hub_move_offer(HubMoveOfferInfo {
+            move_id: "m_ignored".into(),
+            ticket: "tok".into(),
+            target_device_id: "dev1".into(),
+            current_epoch: 1,
+            snapshot_bytes: 100,
+            snapshot_sha256: "00".repeat(32),
+        });
+        assert!(hub_events.active_move.lock().unwrap().is_none());
+
+        // 2. Client-mode node tracks active move and clears slot when move fails / aborts.
+        let hub_handle = hub::host::start(&root.join("src-hub"), &[loopback]).await.unwrap();
+        let live_url = format!("http://{}", hub_handle.binds()[0]);
+        let (_dev, dev_token) = hub_handle.hub().unwrap().db.add_device("PC", "windows", false).unwrap();
+        let promoted = Arc::new(Mutex::new(false));
+        let promoted_flag = promoted.clone();
+        let mut ctx = MoveTargetContext::new(
+            live_url,
+            dev_token,
+            root.join("hub"),
+            loopback,
+            "https://grouper.clockmillbarn.uk".into(),
+            Arc::new(move |_| {
+                *promoted_flag.lock().unwrap() = true;
+            }),
+        );
+        ctx.confirm_timeout = Duration::from_millis(100);
+        ctx.poll_interval = Duration::from_millis(20);
+
+        let client_events = DesktopNodeEvents::new(Some(ctx));
+        client_events.hub_move_offer(HubMoveOfferInfo {
+            move_id: "m_fail".into(),
+            ticket: "t_unknown_ticket".into(),
+            target_device_id: "dev1".into(),
+            current_epoch: 1,
+            snapshot_bytes: 100,
+            snapshot_sha256: "00".repeat(32),
+        });
+        client_events.hub_move_abort("m_fail", "cancelled");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client_events.active_move.lock().unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("failed/aborted target move clears active_move slot");
+        assert!(!*promoted.lock().unwrap());
+        assert!(!root.join("hub").join("grouper.db").exists());
+
         hub_handle.stop().await;
         let _ = std::fs::remove_dir_all(&root);
     }

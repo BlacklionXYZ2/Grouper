@@ -13,7 +13,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use hub::host::HubHandle;
-use node::NodeHandle;
+use node::{MoveTargetContext, NodeHandle};
 use serde::Serialize;
 use settings::{DEFAULT_REMOTE_HUB_URL, DesktopSettings, HostMode, LOCAL_HUB_URL, machine_device_name};
 use tauri::image::Image;
@@ -260,7 +260,16 @@ async fn apply_choice(
                 state.arm_session_handoff(&target_url, saved_tok);
             }
             match node::resolve_remote_node_token(&target_url, &mut updated).await {
-                Ok(Some(node_token)) => Some(NodeHandle::start(&target_url, node_token, state.data_dir())),
+                Ok(Some(node_token)) => {
+                    let confirm_addr = updated.resolved_remote_hub_url();
+                    Some(start_client_node(
+                        state,
+                        Some(app.clone()),
+                        &target_url,
+                        node_token,
+                        confirm_addr,
+                    ))
+                }
                 Ok(None) => None,
                 Err(err) => {
                     tracing::warn!("could not start remote desktop node yet: {err:#}");
@@ -397,7 +406,16 @@ async fn step_down_hub_to_client(
     let remote_url = updated.persist_client_mode(state.data_dir(), Some(public_address))?;
 
     let next_node = match node::resolve_remote_node_token(&remote_url, &mut updated).await {
-        Ok(Some(node_token)) => Some(NodeHandle::start(&remote_url, node_token, state.data_dir())),
+        Ok(Some(node_token)) => {
+            let confirm_addr = updated.resolved_remote_hub_url();
+            Some(start_client_node(
+                state,
+                app.cloned(),
+                &remote_url,
+                node_token,
+                confirm_addr,
+            ))
+        }
         Ok(None) => None,
         Err(err) => {
             tracing::warn!("could not start remote desktop node after step-down: {err:#}");
@@ -426,6 +444,91 @@ async fn step_down_hub_to_client(
         }
     }
     Ok(Some(remote_url))
+}
+
+fn start_client_node(
+    state: &DesktopState,
+    app: Option<AppHandle>,
+    remote_url: &str,
+    node_token: String,
+    confirm_address: String,
+) -> NodeHandle {
+    let ctx = build_move_target_context(state, app, remote_url, &node_token, confirm_address);
+    NodeHandle::start_client(remote_url, node_token, state.data_dir(), ctx)
+}
+
+fn build_move_target_context(
+    state: &DesktopState,
+    app: Option<AppHandle>,
+    remote_url: &str,
+    node_token: &str,
+    confirm_address: String,
+) -> MoveTargetContext {
+    let state_for_promote = state.clone();
+    MoveTargetContext::new(
+        remote_url.to_string(),
+        node_token.to_string(),
+        target_hub_install_dir(state.data_dir()),
+        state.local_hub_bind(),
+        confirm_address,
+        Arc::new(move |new_hub: HubHandle| {
+            let state = state_for_promote.clone();
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = promote_target_to_hub(&state, app.as_ref(), Arc::new(new_hub)).await {
+                    tracing::error!("failed switching desktop app to hub mode after move: {err:#}");
+                }
+            });
+        }),
+    )
+}
+
+/// Switch this desktop install from client mode (`AnotherComputer`) to hub mode (`ThisComputer`)
+/// once `execute_target_move` has installed `%LOCALAPPDATA%\Grouper\hub`, started the embedded hub,
+/// and confirmed serving.
+async fn promote_target_to_hub(
+    state: &DesktopState,
+    app: Option<&AppHandle>,
+    new_hub: Arc<HubHandle>,
+) -> Result<String> {
+    let bound = new_hub.binds().first().copied();
+    let local_url = match bound {
+        Some(addr) if addr.port() == LOCAL_HUB_PORT => LOCAL_HUB_URL.to_string(),
+        Some(addr) => format!("http://{addr}"),
+        None => LOCAL_HUB_URL.to_string(),
+    };
+
+    if let Some(prev_hub) = state.set_hub(Some(Arc::clone(&new_hub))) {
+        prev_hub.stop().await;
+    }
+
+    let mut updated = state.settings_snapshot();
+    updated.persist_hub_mode(state.data_dir(), &local_url)?;
+    let node_tok = node::ensure_local_node_token(&new_hub, &local_url, &mut updated)?;
+    updated.save(state.data_dir())?;
+    if let Ok(Some(saved_tok)) = updated.admin_token_for(&local_url) {
+        state.arm_session_handoff(&local_url, saved_tok);
+    }
+    *state.inner.settings.lock().unwrap_or_else(|e| e.into_inner()) = updated;
+
+    let next_node = Some(NodeHandle::start(&local_url, node_tok, state.data_dir()));
+    if let Some(prev_node) = state.replace_node(next_node) {
+        prev_node.stop().await;
+    }
+
+    spawn_stepdown_watcher(state.clone(), app.cloned(), new_hub);
+
+    if let Some(app) = app {
+        autostart::apply_default(app);
+        if let Ok(url) = local_url.parse() {
+            let _ = open_target_in_main_window(app, WebviewUrl::External(url));
+        }
+    }
+    Ok(local_url)
+}
+
+fn target_hub_install_dir(app_data: &Path) -> PathBuf {
+    app_data.join("hub")
 }
 
 fn show_stepdown_toast(app: &AppHandle) {
@@ -715,7 +818,7 @@ fn main() {
             let _ = prune_expired_pre_move_dirs(&data_dir, hub::db::now());
             let mut settings = DesktopSettings::load(&data_dir)?;
 
-            let (initial_hub, initial_node) = match settings.mode {
+            let (initial_hub, initial_local_node, initial_remote_node) = match settings.mode {
                 Some(HostMode::ThisComputer) => {
                     let hub_dir = hub_data_dir(&data_dir);
                     let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_HUB_PORT));
@@ -733,17 +836,17 @@ fn main() {
                     let node_tok = node::ensure_local_node_token(&handle, LOCAL_HUB_URL, &mut settings)?;
                     settings.save(&data_dir)?;
                     let node_handle = NodeHandle::start(LOCAL_HUB_URL, node_tok, &data_dir);
-                    (Some(Arc::new(handle)), Some(node_handle))
+                    (Some(Arc::new(handle)), Some(node_handle), None)
                 }
                 Some(HostMode::AnotherComputer) => {
                     let remote_url = settings.resolved_remote_hub_url();
-                    let node_handle = match tauri::async_runtime::block_on(node::resolve_remote_node_token(
+                    let remote_tok = match tauri::async_runtime::block_on(node::resolve_remote_node_token(
                         &remote_url,
                         &mut settings,
                     )) {
                         Ok(Some(tok)) => {
                             let _ = settings.save(&data_dir);
-                            Some(NodeHandle::start(&remote_url, tok, &data_dir))
+                            Some((remote_url, tok))
                         }
                         Ok(None) => None,
                         Err(err) => {
@@ -751,14 +854,26 @@ fn main() {
                             None
                         }
                     };
-                    (None, node_handle)
+                    (None, None, remote_tok)
                 }
-                None => (None, None),
+                None => (None, None, None),
             };
 
             let target = initial_webview_url(&settings);
             let initial_hub_for_watch = initial_hub.clone();
-            let desktop_state = DesktopState::new(data_dir.clone(), settings.clone(), initial_hub, initial_node);
+            let desktop_state =
+                DesktopState::new(data_dir.clone(), settings.clone(), initial_hub, initial_local_node);
+            if let Some((remote_url, tok)) = initial_remote_node {
+                let confirm_addr = settings.resolved_remote_hub_url();
+                let node_handle = start_client_node(
+                    &desktop_state,
+                    Some(app.handle().clone()),
+                    &remote_url,
+                    tok,
+                    confirm_addr,
+                );
+                let _ = desktop_state.replace_node(Some(node_handle));
+            }
             if let Some(hub_url) = settings.active_hub_url()
                 && let Ok(Some(saved_tok)) = settings.admin_token_for(&hub_url)
             {
@@ -895,6 +1010,117 @@ mod tests {
             n.stop().await;
         }
         peer_handle.stop().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn promote_target_to_hub_switches_client_to_hub_mode_persists_and_connects_local_node() {
+        let root = std::env::temp_dir().join(format!("grouper-desktop-promote-{}", hub::db::random_hex(4)));
+        let app_dir = root.join("app");
+        let old_hub_dir = root.join("old-hub");
+        let target_hub_dir = target_hub_install_dir(&app_dir);
+        std::fs::create_dir_all(&app_dir).unwrap();
+
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let mut settings = DesktopSettings::load(&app_dir).unwrap();
+
+        // Old remote hub with this PC's admin and node device rows already registered.
+        let old_handle = hub::host::start(&old_hub_dir, &[loopback]).await.unwrap();
+        let old_hub = old_handle.hub().unwrap();
+        let old_url = format!("http://{}", old_handle.binds()[0]);
+        let admin_issued = old_hub
+            .db
+            .issue_device(
+                "Oscar PC",
+                "windows",
+                true,
+                Some(hub::db::Install { id: &settings.install_id, kind: "windows" }),
+                None,
+            )
+            .unwrap();
+        let node_issued = old_hub
+            .db
+            .issue_device(
+                "Oscar PC",
+                "windows",
+                false,
+                Some(hub::db::Install { id: &settings.install_id, kind: hub::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+
+        settings.set_choice(HostMode::AnotherComputer, Some(&old_url)).unwrap();
+        settings.set_admin_token(&old_url, &admin_issued.token).unwrap();
+        settings.set_node_token(&old_url, &node_issued.token).unwrap();
+        settings.save(&app_dir).unwrap();
+
+        let state = DesktopState::new_with_bind(app_dir.clone(), loopback, settings.clone(), None, None);
+        let confirm_addr = settings.resolved_remote_hub_url();
+        let ctx = build_move_target_context(&state, None, &old_url, &node_issued.token, confirm_addr.clone());
+        assert_eq!(ctx.confirm_address, confirm_addr);
+        assert_eq!(ctx.hub_data_dir, app_dir.join("hub"));
+        let remote_node = NodeHandle::start_client(&old_url, node_issued.token.clone(), &app_dir, ctx);
+        let _ = state.replace_node(Some(remote_node));
+
+        // Simulate `execute_target_move` completing installation into `<app_dir>/hub` and starting the new hub.
+        let snap = root.join("move.tar.gz");
+        hub::backup::backup(&old_hub_dir, &snap, true).unwrap();
+        // Copy old hub's master key via backup restore into target_hub_dir:
+        let new_handle = Arc::new(
+            hub::host::start_with_install(&target_hub_dir, &[loopback], Some(&settings.install_id))
+                .await
+                .unwrap(),
+        );
+        let new_hub = new_handle.hub().unwrap();
+        let new_admin = new_hub
+            .db
+            .issue_device(
+                "Oscar PC",
+                "windows",
+                true,
+                Some(hub::db::Install { id: &settings.install_id, kind: "windows" }),
+                None,
+            )
+            .unwrap();
+        {
+            let mut s = state.settings_snapshot();
+            s.set_admin_token(&old_url, &new_admin.token).unwrap();
+            s.save(&app_dir).unwrap();
+            *state.inner.settings.lock().unwrap() = s;
+        }
+
+        let local_url = promote_target_to_hub(&state, None, new_handle.clone()).await.unwrap();
+        assert_eq!(state.host_mode(), Some(HostMode::ThisComputer));
+        assert!(state.hub_handle().is_some());
+
+        // Verify desktop.json persisted ThisComputer mode and carried tokens to local_url.
+        let reloaded = DesktopSettings::load(&app_dir).unwrap();
+        assert_eq!(reloaded.mode, Some(HostMode::ThisComputer));
+        assert_eq!(reloaded.active_hub_url().as_deref(), Some(LOCAL_HUB_URL));
+        assert_eq!(
+            state.take_session_handoff_for(&local_url.parse().unwrap()).as_deref(),
+            Some(new_admin.token.as_str())
+        );
+
+        // Verify local node switched from old remote hub to the new embedded hub.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if new_hub.devices().await.iter().any(|d| d.online) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .expect("local node connected to newly promoted embedded hub");
+
+        if let Some(n) = state.take_node() {
+            n.stop().await;
+        }
+        if let Some(h) = state.take_hub() {
+            h.stop().await;
+        }
+        old_handle.stop().await;
         let _ = std::fs::remove_dir_all(&root);
     }
 }

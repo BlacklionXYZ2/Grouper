@@ -154,7 +154,6 @@ impl DesktopSettings {
 
     /// Persist a switch to hub mode (`ThisComputer`) after receiving a hub move, re-pointing
     /// any saved admin and node tokens to `local_hub_url` (their device rows moved with `grouper.db`).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn persist_hub_mode(&mut self, data_dir: &Path, local_hub_url: &str) -> Result<()> {
         self.mode = Some(HostMode::ThisComputer);
         let key = normalize_url_key(local_hub_url);
