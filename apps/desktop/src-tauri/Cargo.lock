@@ -1603,14 +1603,23 @@ name = "grouper-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "core-client",
  "dirs 6.0.0",
+ "getrandom 0.4.3",
+ "hex",
  "hub",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.2",
  "tauri",
  "tauri-build",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,35 +1,198 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod oauth;
+mod settings;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use hub::host::HubHandle;
+use serde::Serialize;
+use settings::{DEFAULT_REMOTE_HUB_URL, DesktopSettings, HostMode, LOCAL_HUB_URL, machine_device_name};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::webview::PageLoadEvent;
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const LOCAL_HUB_PORT: u16 = 47600;
-const LOCAL_HUB_URL: &str = "http://127.0.0.1:47600";
 const DATA_DIR_ENV: &str = "GROUPER_DESKTOP_DATA_DIR";
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_OPEN_ID: &str = "open";
+const TRAY_SETUP_ID: &str = "setup";
 const TRAY_QUIT_ID: &str = "quit";
 
 struct DesktopState {
+    data_dir: PathBuf,
+    settings: Mutex<DesktopSettings>,
     hub: Mutex<Option<Arc<HubHandle>>>,
+    /// One-time `(origin, admin_token)` traded into a session cookie via `POST /v1/session` once
+    /// the WebView finishes loading that exact origin.
+    pending_session: Mutex<Option<(String, String)>>,
 }
 
 impl DesktopState {
-    fn new(hub: Option<Arc<HubHandle>>) -> Self {
-        Self { hub: Mutex::new(hub) }
+    fn new(data_dir: PathBuf, settings: DesktopSettings, hub: Option<Arc<HubHandle>>) -> Self {
+        Self {
+            data_dir,
+            settings: Mutex::new(settings),
+            hub: Mutex::new(hub),
+            pending_session: Mutex::new(None),
+        }
+    }
+
+    fn settings_snapshot(&self) -> DesktopSettings {
+        self.settings.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_hub(&self, next: Option<Arc<HubHandle>>) -> Option<Arc<HubHandle>> {
+        let mut guard = self.hub.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *guard, next)
     }
 
     fn take_hub(&self) -> Option<Arc<HubHandle>> {
         self.hub.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
+
+    fn arm_session_handoff(&self, hub_url: &str, token: String) {
+        if let Ok(parsed) = url::Url::parse(hub_url) {
+            let origin = parsed.origin().ascii_serialization();
+            if origin != "null" {
+                *self.pending_session.lock().unwrap_or_else(|e| e.into_inner()) = Some((origin, token));
+            }
+        }
+    }
+
+    fn take_session_handoff_for(&self, page_url: &url::Url) -> Option<String> {
+        let page_origin = page_url.origin().ascii_serialization();
+        let mut guard = self.pending_session.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|(origin, _)| *origin == page_origin) {
+            return guard.take().map(|(_, tok)| tok);
+        }
+        None
+    }
+}
+
+#[derive(Serialize)]
+struct SetupStateView {
+    mode: Option<HostMode>,
+    remote_hub_url: String,
+    default_remote_hub_url: &'static str,
+    local_hub_url: &'static str,
+    google_desktop_configured: bool,
+}
+
+#[tauri::command]
+fn setup(state: State<'_, DesktopState>) -> SetupStateView {
+    let s = state.settings_snapshot();
+    SetupStateView {
+        mode: s.mode,
+        remote_hub_url: s.resolved_remote_hub_url(),
+        default_remote_hub_url: DEFAULT_REMOTE_HUB_URL,
+        local_hub_url: LOCAL_HUB_URL,
+        google_desktop_configured: oauth::resolve_oauth_config(&s).is_some(),
+    }
+}
+
+#[tauri::command]
+async fn choose(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    mode: HostMode,
+    remote_hub_url: Option<String>,
+    sign_in_with_google: bool,
+) -> std::result::Result<(), String> {
+    apply_choice(&app, &state, mode, remote_hub_url.as_deref(), sign_in_with_google)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+async fn apply_choice(
+    app: &AppHandle,
+    state: &DesktopState,
+    mode: HostMode,
+    remote_hub_url: Option<&str>,
+    sign_in_with_google: bool,
+) -> Result<()> {
+    let mut updated = state.settings_snapshot();
+    updated.set_choice(mode, remote_hub_url)?;
+    let target_url = updated.active_hub_url().expect("mode was just set");
+
+    // Stop any running local hub first if switching to another computer OR if we need port 47600
+    // temporarily for the Desktop OAuth loopback redirect (`http://localhost:47600/oauth/google/return`).
+    if (mode == HostMode::AnotherComputer || sign_in_with_google)
+        && let Some(prev) = state.take_hub()
+    {
+        prev.stop().await;
+    }
+
+    match mode {
+        HostMode::ThisComputer => {
+            if sign_in_with_google {
+                let oauth_cfg = oauth::resolve_oauth_config(&updated).context(
+                    "GROUPER_GOOGLE_DESKTOP_CLIENT_ID is not set yet (see TODO in src/oauth.rs)",
+                )?;
+                let nonce = hub::db::random_hex(16);
+                let id_token = oauth::obtain_google_id_token(&oauth_cfg, &nonce).await?;
+                let hub = ensure_embedded_hub(state).await?;
+                let device_name = machine_device_name();
+                let (_owner, issued) = hub
+                    .claim_local_client(&id_token, "windows", Some(&device_name), Some(&updated.install_id))
+                    .await
+                    .context("claiming local hub with Google account")?;
+                updated.set_admin_token(&target_url, &issued.token)?;
+                state.arm_session_handoff(&target_url, issued.token);
+            } else {
+                let _ = ensure_embedded_hub(state).await?;
+                if let Ok(Some(saved_tok)) = updated.admin_token_for(&target_url) {
+                    state.arm_session_handoff(&target_url, saved_tok);
+                }
+            }
+        }
+        HostMode::AnotherComputer => {
+            if sign_in_with_google {
+                let oauth_cfg = oauth::resolve_oauth_config(&updated).context(
+                    "GROUPER_GOOGLE_DESKTOP_CLIENT_ID is not set yet (see TODO in src/oauth.rs)",
+                )?;
+                let device_name = machine_device_name();
+                let token =
+                    oauth::sign_in_remote_hub(&target_url, &oauth_cfg, &device_name, &updated.install_id).await?;
+                updated.set_admin_token(&target_url, &token)?;
+                state.arm_session_handoff(&target_url, token);
+            } else if let Ok(Some(saved_tok)) = updated.admin_token_for(&target_url) {
+                state.arm_session_handoff(&target_url, saved_tok);
+            }
+        }
+    }
+
+    updated.save(&state.data_dir)?;
+    *state.settings.lock().unwrap_or_else(|e| e.into_inner()) = updated;
+
+    open_target_in_main_window(app, WebviewUrl::External(target_url.parse()?))?;
+    Ok(())
+}
+
+async fn ensure_embedded_hub(state: &DesktopState) -> Result<Arc<HubHandle>> {
+    if let Some(existing) = state.hub.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(existing);
+    }
+    let hub_dir = hub_data_dir(&state.data_dir);
+    let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_HUB_PORT));
+    let handle = hub::host::start(&hub_dir, &[bind])
+        .await
+        .with_context(|| format!("starting embedded hub on {bind}"))?;
+    tracing::info!(
+        client_version = core_client::CLIENT_VERSION,
+        data_dir = %hub_dir.display(),
+        "embedded local hub started"
+    );
+    let arc = Arc::new(handle);
+    if let Some(prev) = state.set_hub(Some(arc.clone())) {
+        prev.stop().await;
+    }
+    Ok(arc)
 }
 
 fn app_data_dir() -> Result<PathBuf> {
@@ -48,18 +211,81 @@ fn hub_data_dir(app_data: &Path) -> PathBuf {
     }
 }
 
-fn show_or_create_main_window(app: &AppHandle, target_url: &str) -> tauri::Result<()> {
+fn initial_webview_url(settings: &DesktopSettings) -> WebviewUrl {
+    match settings.active_hub_url().and_then(|u| u.parse::<url::Url>().ok()) {
+        Some(url) => WebviewUrl::External(url),
+        None => WebviewUrl::App("index.html".into()),
+    }
+}
+
+fn open_target_in_main_window(app: &AppHandle, target: WebviewUrl) -> tauri::Result<()> {
+    // Recreate when switching between local Tauri setup (`WebviewUrl::App`) and external hub URLs
+    // so Tauri's `local: true` capability boundary applies cleanly only to `index.html`.
+    if let Some(existing) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        match &target {
+            WebviewUrl::External(url) => {
+                let current_is_app = existing
+                    .url()
+                    .ok()
+                    .is_some_and(|u| u.scheme() == "tauri" || u.host_str() == Some("tauri.localhost"));
+                if !current_is_app {
+                    let _ = existing.navigate(url.clone());
+                    let _ = existing.unminimize();
+                    existing.show()?;
+                    let _ = existing.set_focus();
+                    return Ok(());
+                }
+            }
+            WebviewUrl::App(_) => {}
+            _ => {}
+        }
+        let _ = existing.destroy();
+    }
+    build_main_window(app, target)
+}
+
+fn show_main_window(app: &AppHandle) -> tauri::Result<()> {
     if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = win.unminimize();
         win.show()?;
         let _ = win.set_focus();
         return Ok(());
     }
-    let parsed: url::Url = target_url.parse().expect("valid hub URL");
-    let win = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::External(parsed))
+    let target = app
+        .try_state::<DesktopState>()
+        .map(|s| initial_webview_url(&s.settings_snapshot()))
+        .unwrap_or_else(|| WebviewUrl::App("index.html".into()));
+    build_main_window(app, target)
+}
+
+fn build_main_window(app: &AppHandle, target: WebviewUrl) -> tauri::Result<()> {
+    let app_for_load = app.clone();
+    let win = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, target)
         .title("Grouper")
         .inner_size(1180.0, 800.0)
         .min_inner_size(420.0, 520.0)
+        .on_page_load(move |webview, payload| {
+            if payload.event() != PageLoadEvent::Finished {
+                return;
+            }
+            let Some(state) = app_for_load.try_state::<DesktopState>() else {
+                return;
+            };
+            let Some(token) = state.take_session_handoff_for(payload.url()) else {
+                return;
+            };
+            if let Ok(token_json) = serde_json::to_string(&token) {
+                let js = format!(
+                    "(async()=>{{try{{const s=await fetch('/v1/session',{{credentials:'same-origin'}});\
+                     if(s.ok){{const j=await s.json();if(j&&j.signed_in)return;}}\
+                     const r=await fetch('/v1/session',{{method:'POST',credentials:'same-origin',\
+                     headers:{{'Content-Type':'application/json','X-Grouper':'1'}},\
+                     body:JSON.stringify({{token:{token_json}}})}});\
+                     if(r.ok)location.reload();}}catch(_){{}}}})();"
+                );
+                let _ = webview.eval(&js);
+            }
+        })
         .build()?;
     let win_for_close = win.clone();
     win.on_window_event(move |event| {
@@ -73,8 +299,9 @@ fn show_or_create_main_window(app: &AppHandle, target_url: &str) -> tauri::Resul
 
 fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     let open_item = MenuItem::with_id(app, TRAY_OPEN_ID, "Open", true, None::<&str>)?;
+    let setup_item = MenuItem::with_id(app, TRAY_SETUP_ID, "Where Grouper runs…", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+    let menu = Menu::with_items(app, &[&open_item, &setup_item, &quit_item])?;
     let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
 
     TrayIconBuilder::with_id("grouper-tray")
@@ -84,7 +311,10 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             TRAY_OPEN_ID => {
-                let _ = show_or_create_main_window(app, LOCAL_HUB_URL);
+                let _ = show_main_window(app);
+            }
+            TRAY_SETUP_ID => {
+                let _ = open_target_in_main_window(app, WebviewUrl::App("index.html".into()));
             }
             TRAY_QUIT_ID => {
                 let handle = app.clone();
@@ -106,7 +336,7 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                let _ = show_or_create_main_window(tray.app_handle(), LOCAL_HUB_URL);
+                let _ = show_main_window(tray.app_handle());
             }
         })
         .build(app)?;
@@ -121,24 +351,39 @@ fn main() {
         .init();
 
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![setup, choose])
         .setup(|app| {
             let data_dir = app_data_dir()?;
             std::fs::create_dir_all(&data_dir)
                 .with_context(|| format!("creating {}", data_dir.display()))?;
-            let hub_dir = hub_data_dir(&data_dir);
-            let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_HUB_PORT));
+            let settings = DesktopSettings::load(&data_dir)?;
 
-            let handle = tauri::async_runtime::block_on(hub::host::start(&hub_dir, &[bind]))
-                .with_context(|| format!("starting embedded hub on {bind}"))?;
-            tracing::info!(
-                client_version = core_client::CLIENT_VERSION,
-                data_dir = %hub_dir.display(),
-                "embedded local hub started"
-            );
+            let initial_hub = if settings.mode == Some(HostMode::ThisComputer) {
+                let hub_dir = hub_data_dir(&data_dir);
+                let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_HUB_PORT));
+                let handle = tauri::async_runtime::block_on(hub::host::start(&hub_dir, &[bind]))
+                    .with_context(|| format!("starting embedded hub on {bind}"))?;
+                tracing::info!(
+                    client_version = core_client::CLIENT_VERSION,
+                    data_dir = %hub_dir.display(),
+                    "embedded local hub started"
+                );
+                Some(Arc::new(handle))
+            } else {
+                None
+            };
 
-            app.manage(DesktopState::new(Some(Arc::new(handle))));
+            let target = initial_webview_url(&settings);
+            let desktop_state = DesktopState::new(data_dir, settings.clone(), initial_hub);
+            if let Some(hub_url) = settings.active_hub_url()
+                && let Ok(Some(saved_tok)) = settings.admin_token_for(&hub_url)
+            {
+                desktop_state.arm_session_handoff(&hub_url, saved_tok);
+            }
+            app.manage(desktop_state);
+
             install_tray(app.handle())?;
-            show_or_create_main_window(app.handle(), LOCAL_HUB_URL)?;
+            build_main_window(app.handle(), target)?;
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -1,7 +1,7 @@
 {
   "identifier": "default",
-  "description": "Default permissions for the Grouper desktop window",
+  "description": "Default permissions for the local Grouper setup screen",
   "local": true,
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "allow-setup", "allow-choose"]
 }
