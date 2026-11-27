@@ -151,6 +151,48 @@ Headless and MCP support (all verify): Claude Code has both, plus tool restricti
 
 **Verdict: later, as an experiment; Claude Code only; behind a flag; not the default.** The rule in section 3 ships now. Most of the benefit arrives without it: an inexpensive API model orchestrates (little token use) while harness threads do the heavy work on the subscription. The experiment becomes worth running once package H5 exists and three things are measured on a real device: built-in tools fully off, wake latency, and behaviour when the device sleeps.
 
+### Owner decision (27 November 2026): build the harness orchestrator
+
+> "I was interested in using mcp to allow an external harness to act as an orchestrator. The main
+> thing is making sure that it uses a continuous conversation rather than making a new one each
+> call. I think we can do it."
+
+So the verdict above is overruled: a harness **can** orchestrate a project chat, through MCP, when
+it meets the rules below. Answers to the objections:
+
+- **Availability.** Under local-first the hub runs on the owner's own computer, so the harness
+  orchestrator runs on **the hub's device**, not a random one. It is up exactly when the hub is.
+  A harness on another device may orchestrate only if the owner picks that explicitly; the chat
+  shows "orchestrator offline" while it sleeps.
+- **One continuous conversation per chat (the owner's main requirement).** Each project chat
+  stores its harness session id (Claude Code `session_id`, Codex session/thread id, Antigravity
+  `--conversation`, Hermes chat id; verify each). Every user message and every thread wake-up is
+  a new turn in that same session (`claude -p --resume <id>` with `stream-json`, or a long-lived
+  process using `--input-format stream-json` where supported), never a fresh conversation. If the
+  session is lost (deleted or expired), the hub starts a new one seeded with a compact summary of
+  the chat and says so in the chat.
+- **Tools.** The orchestrator harness gets **only** Grouper's MCP tools (`mcp__grouper__*`:
+  start/message/stop thread, list devices/threads, memory). Its built-in shell, edit and web tools
+  are switched off (Claude Code `--allowedTools`/`--disallowedTools`; verify exact flags). A harness
+  that cannot be confined (Hermes, Grok, OpenCode today) cannot orchestrate. Codex orchestrates
+  only if its built-in tools can be disabled; otherwise not.
+- **MCP endpoint.** The hub serves the orchestrator tools at an authenticated MCP endpoint bound to
+  loopback (the harness runs on the hub's device), with a per-chat token minted for that harness
+  session. Every tool call goes through the hub, so approvals, budgets and the transcript of tool
+  calls stay Grouper's.
+- **Transcript.** The hub records the visible text and every MCP tool call of each turn as chat
+  events (the harness's own session file holds the model's private history). Switching a chat from
+  a harness orchestrator to an API orchestrator starts fresh from that recorded transcript.
+- **Cost.** Billed to the subscription; turns appear on the Usage subscription track at API cost 0.
+- **Capability flag.** Harness rows carry `can_orchestrate` (true only for harnesses that pass the
+  tool-confinement and resume checks). Rule 1 in section 3 becomes: the orchestrator of a project
+  chat must be an API model **or** a harness with `can_orchestrate`. Others stay standard-chat and
+  thread only. The picker shows confinable harnesses in the orchestrator picker with an
+  "Orchestrates via MCP" note.
+
+First target: Claude Code on the hub's device. Package H5 becomes a normal package after H1 and H4
+(H4 builds the resumable session that H5 reuses).
+
 ## 5. Build packages
 
 "Device" means it needs a real device with the CLI signed in.
@@ -167,7 +209,7 @@ Headless and MCP support (all verify): Claude Code has both, plus tool restricti
 | H4 | Harness in standard chat | `core-protocol` frames, `orchestrator.rs`, `hub/src/harness.rs` | Two-turn chat that resumes its session; device-offline message. **Device** |
 | U1 | Pickers and Models page | `model-picker.js`, `models.js`, `ModelPickerSheet.swift` | Fixtures with harness rows; disabled state in project chats; hub still refuses when the UI is bypassed |
 | U2 | Subscription-billed usage rows | `usage.rs`, `web/views/usage.js` | Harness turn adds no API cost and refreshes the plan window. **Device** |
-| H5 | Experiment: hub MCP server and Claude Code orchestrator, flagged | new `hub/src/mcp_server.rs` | Only after the owner says go. **Device** |
+| H5 | Harness orchestrator via MCP (owner: build it): loopback MCP endpoint with per-chat token, one resumed harness session per chat, built-in tools off, `can_orchestrate` | new `hub/src/mcp_server.rs`, `hub/src/harness.rs`, `orchestrator.rs` | Claude Code orchestrates a project chat over several turns in one session. **Device** |
 
 Order: M1 → M2 → M3, then H2 (the rule, cheap and safe), H1, H3, H4, with U1 after H1.
 
