@@ -454,12 +454,16 @@ fn start_thread(
 
 const MAX_HARNESS_TASKS: usize = 16;
 
+#[allow(clippy::too_many_arguments)]
 fn start_harness_turn(
     conversation_id: String,
     agent: String,
     model: String,
     session_id: Option<String>,
     message: String,
+    mcp: Option<core_protocol::HarnessMcp>,
+    allowed_tools: Vec<String>,
+    system_prompt: Option<String>,
     config: &Config,
     threads: &Arc<Threads>,
 ) {
@@ -484,6 +488,11 @@ fn start_harness_turn(
     let weak = Arc::downgrade(threads);
     let conv_key = conversation_id.clone();
     let join = tokio::spawn(async move {
+        let attach = mcp.as_ref().map(|mcp| harness::ClaudeOrchestrator {
+            mcp,
+            allowed_tools: &allowed_tools,
+            system_prompt: system_prompt.as_deref(),
+        });
         let result = harness::turn(
             &agent,
             &model,
@@ -491,6 +500,7 @@ fn start_harness_turn(
             &message,
             &workdir,
             harness::HarnessLevel::Confined,
+            attach.as_ref(),
         )
         .await;
         if let Some(t) = weak.upgrade() {
@@ -701,8 +711,28 @@ async fn connect_once(
                     Ok(HubMessage::HubMoveAbort { move_id, reason }) => {
                         events.hub_move_abort(&move_id, &reason);
                     }
-                    Ok(HubMessage::HarnessTurn { conversation_id, agent, model, session_id, message }) => {
-                        start_harness_turn(conversation_id, agent, model, session_id, message, config, &threads);
+                    Ok(HubMessage::HarnessTurn {
+                        conversation_id,
+                        agent,
+                        model,
+                        session_id,
+                        message,
+                        mcp,
+                        allowed_tools,
+                        system_prompt,
+                    }) => {
+                        start_harness_turn(
+                            conversation_id,
+                            agent,
+                            model,
+                            session_id,
+                            message,
+                            mcp,
+                            allowed_tools,
+                            system_prompt,
+                            config,
+                            &threads,
+                        );
                     }
                     Ok(HubMessage::Pong) => {}
                     Ok(HubMessage::Error { message }) => {
