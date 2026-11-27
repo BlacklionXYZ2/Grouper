@@ -5,27 +5,43 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Where should Grouper run?</title>
   <style>
+    /* Grouper design system (docs/design-system/design-system.md): navy base, teal action,
+       four text tiers, hairlines, system fonts. This page is bundled with the app and
+       shown before any hub exists, so the tokens are copied here, not linked. */
     :root {
       color-scheme: light dark;
-      --bg: #f8f8f7;
-      --card: #ffffff;
-      --fg: #18181b;
-      --muted: #52525b;
-      --border: #d4d4d8;
-      --accent: #4f46e5;
-      --accent-fg: #ffffff;
-      --err: #b91c1c;
+      --bg: #F4F6F9;
+      --surface: #FFFFFF;
+      --surface-2: #EEF2F6;
+      --text: #0F1722;
+      --text-2: #39434F;
+      --text-3: #4C5663;
+      --line-2: rgb(15 23 34 / 0.14);
+      --border-control: #78828F;
+      --accent: #0B7372;
+      --accent-fill: #12C4BF;
+      --accent-fill-edge: #0B8A86;
+      --accent-ink: #06262A;
+      --focus: #1A73E8;
+      --danger: #B42318;
+      --shadow-sm: 0 0 0 1px rgb(15 23 34 / 0.04), 0 2px 8px rgb(15 23 34 / 0.04);
+      --ease-out: cubic-bezier(0.165, 0.84, 0.44, 1);
     }
     @media (prefers-color-scheme: dark) {
       :root {
-        --bg: #121215;
-        --card: #1b1b20;
-        --fg: #f4f4f5;
-        --muted: #a1a1aa;
-        --border: #303038;
-        --accent: #6366f1;
-        --accent-fg: #ffffff;
-        --err: #f87171;
+        --bg: #10141D;
+        --surface: #171C25;
+        --surface-2: #1D222C;
+        --text: #F3F6F9;
+        --text-2: #C5CFDC;
+        --text-3: #A4ADBB;
+        --line-2: rgb(214 226 245 / 0.08);
+        --border-control: #656F7E;
+        --accent: #22D3CE;
+        --accent-fill-edge: #12C4BF;
+        --focus: #7CB4FF;
+        --danger: #F87171;
+        --shadow-sm: none;
       }
     }
     * { box-sizing: border-box; }
@@ -36,120 +52,144 @@
       place-items: center;
       padding: 24px;
       background: var(--bg);
-      color: var(--fg);
-      font: 15px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif;
+      color: var(--text);
+      font: 400 15px/22px system-ui, "Segoe UI Variable", "Segoe UI", -apple-system, sans-serif;
+      letter-spacing: -0.1px;
     }
     main {
       width: 100%;
       max-width: 460px;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 28px;
+      background: var(--surface);
+      border: 1px solid var(--line-2);
+      border-radius: 16px;
+      box-shadow: var(--shadow-sm);
+      padding: 24px;
     }
     h1 {
-      margin: 0 0 6px;
-      font-size: 21px;
+      margin: 0 0 4px;
+      font-size: 20px;
+      line-height: 26px;
       font-weight: 600;
-      letter-spacing: -0.01em;
+      letter-spacing: -0.25px;
     }
     p.lead {
       margin: 0 0 20px;
-      color: var(--muted);
-      font-size: 14px;
+      color: var(--text-3);
+      font-size: 13.5px;
+      line-height: 18px;
     }
     .option {
       display: flex;
       gap: 12px;
       align-items: flex-start;
-      padding: 14px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      margin-bottom: 10px;
+      padding: 12px 16px;
+      border: 1px solid var(--line-2);
+      border-radius: 12px;
+      margin-bottom: 8px;
       cursor: pointer;
+      transition: border-color 120ms var(--ease-out), background-color 120ms var(--ease-out);
     }
+    .option:hover { background: var(--surface-2); }
     .option:has(input:checked) {
       border-color: var(--accent);
       outline: 1px solid var(--accent);
     }
     .option input[type="radio"] {
       margin-top: 3px;
-      accent-color: var(--accent);
+      accent-color: var(--accent-fill-edge);
     }
     .option-title {
+      font-size: 13.5px;
+      line-height: 18px;
       font-weight: 600;
       display: block;
       margin-bottom: 2px;
     }
     .option-desc {
-      color: var(--muted);
-      font-size: 13px;
+      color: var(--text-3);
+      font-size: 12.5px;
+      line-height: 16px;
       display: block;
     }
     .remote-box {
-      margin: 6px 0 14px;
-      padding: 12px 14px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
+      margin: 4px 0 12px;
+      padding: 12px 16px;
+      border: 1px solid var(--line-2);
+      border-radius: 12px;
     }
     .remote-box[hidden] { display: none; }
     .remote-box label {
       display: block;
-      font-size: 13px;
+      font-size: 12.5px;
+      line-height: 16px;
       font-weight: 600;
-      margin-bottom: 6px;
+      color: var(--text-2);
+      margin-bottom: 4px;
     }
     .remote-box input {
       width: 100%;
-      padding: 8px 10px;
-      border-radius: 7px;
-      border: 1px solid var(--border);
-      background: var(--bg);
-      color: var(--fg);
+      height: 36px;
+      padding: 0 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border-control);
+      background: var(--surface);
+      color: var(--text);
       font: inherit;
-      font-size: 14px;
+      font-size: 13.5px;
     }
+    :focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
     .hint {
-      margin: 6px 0 0;
-      color: var(--muted);
-      font-size: 12px;
+      margin: 4px 0 0;
+      color: var(--text-3);
+      font-size: 12.5px;
+      line-height: 16px;
     }
     .actions {
       display: flex;
-      gap: 10px;
+      gap: 8px;
       flex-wrap: wrap;
-      margin-top: 18px;
+      margin-top: 20px;
     }
     button {
-      padding: 9px 16px;
+      height: 36px;
+      padding: 0 14px;
       border-radius: 8px;
       border: 1px solid transparent;
       font: inherit;
+      font-size: 13.5px;
       font-weight: 600;
       cursor: pointer;
+      transition: background-color 60ms var(--ease-out), opacity 60ms var(--ease-out);
     }
     button.primary {
-      background: var(--accent);
-      color: var(--accent-fg);
+      background: var(--accent-fill);
+      border-color: var(--accent-fill-edge);
+      color: var(--accent-ink);
     }
     button.secondary {
       background: transparent;
-      color: var(--fg);
-      border-color: var(--border);
+      color: var(--text);
+      border-color: var(--border-control);
     }
+    button.secondary:hover { background: var(--surface-2); }
     button:disabled {
-      opacity: 0.6;
+      opacity: 0.5;
       cursor: default;
     }
     #error {
       margin-top: 12px;
-      color: var(--err);
-      font-size: 13px;
+      color: var(--danger);
+      font-size: 12.5px;
+      line-height: 16px;
     }
     #oauth-note {
-      margin-top: 14px;
-      color: var(--muted);
-      font-size: 12px;
+      margin-top: 16px;
+      color: var(--text-3);
+      font-size: 12.5px;
+      line-height: 16px;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { transition: none !important; }
     }
   </style>
 </head>
