@@ -152,6 +152,44 @@ impl DesktopSettings {
         Ok(())
     }
 
+    /// Persist a switch to hub mode (`ThisComputer`) after receiving a hub move, re-pointing
+    /// any saved admin and node tokens to `local_hub_url` (their device rows moved with `grouper.db`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn persist_hub_mode(&mut self, data_dir: &Path, local_hub_url: &str) -> Result<()> {
+        self.mode = Some(HostMode::ThisComputer);
+        let key = normalize_url_key(local_hub_url);
+        if self.admin_token.is_some() {
+            self.admin_hub_url = Some(key.clone());
+        }
+        if self.node_token.is_some() {
+            self.node_hub_url = Some(key);
+        }
+        self.save(data_dir)
+    }
+
+    /// Persist a switch to client mode (`AnotherComputer`) after the embedded hub steps down,
+    /// pointing at `public_address` and carrying saved admin and node tokens to that address.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn persist_client_mode(&mut self, data_dir: &Path, public_address: Option<&str>) -> Result<String> {
+        if let Some(addr) = public_address.map(str::trim).filter(|s| !s.is_empty()) {
+            if self.set_choice(HostMode::AnotherComputer, Some(addr)).is_err() {
+                self.set_choice(HostMode::AnotherComputer, None)?;
+            }
+        } else {
+            self.set_choice(HostMode::AnotherComputer, None)?;
+        }
+        let remote_url = self.resolved_remote_hub_url();
+        let key = normalize_url_key(&remote_url);
+        if self.admin_token.is_some() {
+            self.admin_hub_url = Some(key.clone());
+        }
+        if self.node_token.is_some() {
+            self.node_hub_url = Some(key);
+        }
+        self.save(data_dir)?;
+        Ok(remote_url)
+    }
+
     /// Store the Desktop OAuth client secret sealed with DPAPI. An empty secret clears it.
     pub fn set_google_desktop_client_secret(&mut self, secret: &str) -> Result<()> {
         let trimmed = secret.trim();
@@ -510,6 +548,50 @@ mod tests {
             assert!(!raw.contains(secret));
             assert!(!raw.contains("google_desktop_client_secret"));
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mode_switches_persist_and_carry_tokens_between_hub_and_client_modes() {
+        let dir = temp_dir("mode-switch");
+        let mut s = DesktopSettings::load(&dir).unwrap();
+        let install_id = s.install_id.clone();
+
+        // Start in client mode with a custom remote hub URL and saved admin + node tokens.
+        s.set_choice(HostMode::AnotherComputer, Some("https://hub.example.org/")).unwrap();
+        s.set_admin_token("https://hub.example.org", "adm1.secret").unwrap();
+        s.set_node_token("https://hub.example.org", "nod1.secret").unwrap();
+        s.save(&dir).unwrap();
+
+        // Promote to hub mode: persists ThisComputer, preserves custom remote URL, carries tokens to local hub.
+        s.persist_hub_mode(&dir, LOCAL_HUB_URL).unwrap();
+        let as_hub = DesktopSettings::load(&dir).unwrap();
+        assert_eq!(as_hub.mode, Some(HostMode::ThisComputer));
+        assert_eq!(as_hub.active_hub_url().as_deref(), Some(LOCAL_HUB_URL));
+        assert_eq!(as_hub.resolved_remote_hub_url(), "https://hub.example.org");
+        assert_eq!(as_hub.install_id, install_id);
+        assert_eq!(as_hub.admin_token_for(LOCAL_HUB_URL).unwrap().as_deref(), Some("adm1.secret"));
+        assert_eq!(as_hub.node_token_for(LOCAL_HUB_URL).unwrap().as_deref(), Some("nod1.secret"));
+
+        // Step down to client mode at default public address: persists AnotherComputer and carries tokens.
+        let mut stepping_down = as_hub;
+        let remote_url = stepping_down
+            .persist_client_mode(&dir, Some(DEFAULT_REMOTE_HUB_URL))
+            .unwrap();
+        assert_eq!(remote_url, DEFAULT_REMOTE_HUB_URL);
+        let as_client = DesktopSettings::load(&dir).unwrap();
+        assert_eq!(as_client.mode, Some(HostMode::AnotherComputer));
+        assert_eq!(as_client.remote_hub_url, None);
+        assert_eq!(as_client.active_hub_url().as_deref(), Some(DEFAULT_REMOTE_HUB_URL));
+        assert_eq!(
+            as_client.admin_token_for(DEFAULT_REMOTE_HUB_URL).unwrap().as_deref(),
+            Some("adm1.secret")
+        );
+        assert_eq!(
+            as_client.node_token_for(DEFAULT_REMOTE_HUB_URL).unwrap().as_deref(),
+            Some("nod1.secret")
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
