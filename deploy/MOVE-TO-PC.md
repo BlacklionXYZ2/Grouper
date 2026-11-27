@@ -140,8 +140,8 @@ Checked on this branch, not fixed here:
   `GROUPER_GOOGLE_DESKTOP_CLIENT_ID` and `GROUPER_GOOGLE_CLIENT_IDS`.
   `GROUPER_GOOGLE_CLIENT_IDS` replaces the default list, so it has to list
   every client the hub should trust, including the new Desktop id.
-- The client secret must not be a plain field in `desktop.json`. The app
-  reads `GROUPER_GOOGLE_DESKTOP_CLIENT_SECRET`.
+- (Done in package A: the client secret is stored DPAPI-protected, or read from
+  `GROUPER_GOOGLE_DESKTOP_CLIENT_SECRET`; never a plain field in `desktop.json`.)
 - The Windows app has not had a first real run (window, tray, sign-in,
   session hand-off, real `cloudflared`).
 - The same day, the app still needs a single instance and autostart, or the
