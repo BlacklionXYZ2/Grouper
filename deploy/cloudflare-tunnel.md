@@ -1,5 +1,10 @@
 # Cloudflare Tunnel for the Grouper hub
 
+**Server mode.** This guide installs `cloudflared` as a service in the VM and points
+the public hostname at `localhost:8080`. The PC does not use that service. Once the
+hub runs on the PC, follow [MOVE-TO-PC.md](MOVE-TO-PC.md): the hostname becomes
+`http://127.0.0.1:47600`, and the hub starts and stops `cloudflared` itself.
+
 Goal: `https://grouper.clockmillbarn.uk` reaches the Grouper hub, which runs in the
 Hyper-V VM `grouper-hub` on Oscar's Windows PC. Everything here can be done by a person or
 an agent with access to Cloudflare and (for step 3) a terminal on that PC.
