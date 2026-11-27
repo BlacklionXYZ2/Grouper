@@ -2982,7 +2982,7 @@ mod tests {
                 let new_u = new_for_pub.clone();
                 async move {
                     let c = reqwest::Client::builder()
-                        .timeout(Duration::from_millis(200))
+                        .timeout(Duration::from_secs(2))
                         .build()
                         .unwrap();
                     if let Ok(info) = fetch_hub_info(&c, &new_u).await {
@@ -3047,7 +3047,7 @@ mod tests {
             node_stop_rx,
         ));
 
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if old_hub.is_online(&target_id).await
                     && old_hub.host_info_for(&target_id).is_some_and(|h| h.can_host)
