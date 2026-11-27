@@ -12,7 +12,9 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
+use core_agent::ToolOutput;
 use core_protocol::tunnel::{result_from_text, tool_to_mcp};
+use core_protocol::{AgentEvent, EventBody};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
     ServerConfig,
@@ -69,11 +71,29 @@ impl ServerHandler for OrchestratorServer {
     ) -> Result<CallToolResponse, ErrorData> {
         let conversation_id = chat_of(&context)?;
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let tools = crate::orchestrator::harness_orchestrator_tools(&self.hub, &conversation_id);
-        let Some(tool) = tools.iter().find(|tool| tool.def().name == request.name) else {
-            return Ok(result_from_text(false, format!("unknown tool {}", request.name)).into());
+        let call_id = match &context.id {
+            rmcp::model::NumberOrString::Number(n) => n.to_string(),
+            rmcp::model::NumberOrString::String(s) => s.to_string(),
         };
-        let out = tool.call(args).await;
+        let name = request.name.clone();
+        // The harness keeps its own session. Grouper's transcript is these events.
+        self.hub.emit(
+            &conversation_id,
+            None,
+            EventBody::ThreadActivity { event: AgentEvent::ToolCall { call_id: call_id.clone(), name: name.clone(), input: args.clone() } },
+        );
+        let tools = crate::orchestrator::harness_orchestrator_tools(&self.hub, &conversation_id);
+        let out = match tools.iter().find(|tool| tool.def().name == name) {
+            Some(tool) => tool.call(args).await,
+            None => ToolOutput::err(format!("unknown tool {name}")),
+        };
+        self.hub.emit(
+            &conversation_id,
+            None,
+            EventBody::ThreadActivity {
+                event: AgentEvent::ToolResult { call_id, name, ok: !out.is_error, output: out.content.clone() },
+            },
+        );
         Ok(result_from_text(!out.is_error, out.content).into())
     }
 }
@@ -402,6 +422,26 @@ mod tests {
         }
     }
 
+    /// The latest conversation-level tool call and its result were stored.
+    fn assert_recorded(hub: &Hub, chat: &str, name: &str, ok: bool) {
+        use core_protocol::{AgentEvent, EventBody};
+        let events = hub.db.events(chat, 0, None);
+        let result = events.iter().rev().find(|event| {
+            event.thread_id.is_none()
+                && matches!(&event.body, EventBody::ThreadActivity { event: AgentEvent::ToolResult { name: recorded, .. } } if recorded == name)
+        });
+        let Some(result) = result else { panic!("no stored tool result for {name}") };
+        let EventBody::ThreadActivity { event: AgentEvent::ToolResult { call_id, ok: stored_ok, output, .. } } = &result.body else {
+            unreachable!()
+        };
+        assert_eq!(*stored_ok, ok, "{name}: {output}");
+        let found_call = events.iter().any(|event| {
+            event.thread_id.is_none()
+                && matches!(&event.body, EventBody::ThreadActivity { event: AgentEvent::ToolCall { call_id: id, name: recorded, .. } } if id == call_id && recorded == name)
+        });
+        assert!(found_call, "no stored tool call for {name}");
+    }
+
     fn scripted_thread_model(hub: &Hub) {
         use core_protocol::{ModelEntry, ProviderConfig};
         hub.db
@@ -448,21 +488,27 @@ mod tests {
         assert!(!err, "{devices}");
         let devices: serde_json::Value = serde_json::from_str(&devices).unwrap();
         assert!(devices.as_array().unwrap().iter().any(|row| row["id"] == "hub"), "{devices}");
+        assert_recorded(&run.hub, &chat, "list_devices", true);
 
         let (err, saved) = session.tool("remember", serde_json::json!({"content": "The barn clock is slow", "tags": ["clock"]})).await;
         assert!(!err, "{saved}");
+        assert_recorded(&run.hub, &chat, "remember", true);
         let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
         let id = saved["id"].as_i64().unwrap();
         let (err, found) = session.tool("recall", serde_json::json!({"query": "barn clock"})).await;
         assert!(!err && found.contains("The barn clock is slow"), "{found}");
+        assert_recorded(&run.hub, &chat, "recall", true);
         let (err, updated) = session.tool("update_memory", serde_json::json!({"id": id, "content": "The barn clock is five minutes slow"})).await;
         assert!(!err, "{updated}");
+        assert_recorded(&run.hub, &chat, "update_memory", true);
         let (err, forgotten) = session.tool("forget", serde_json::json!({"id": id})).await;
         assert!(!err && forgotten.contains(&format!("forgot #{id}")), "{forgotten}");
+        assert_recorded(&run.hub, &chat, "forget", true);
         assert!(run.hub.db.memory(id).is_none());
 
         let (err, started) = session.tool("start_thread", serde_json::json!({"title": "Notes", "goal": "Write the notes."})).await;
         assert!(!err, "{started}");
+        assert_recorded(&run.hub, &chat, "start_thread", true);
         let started: serde_json::Value = serde_json::from_str(&started).unwrap();
         let thread_id = started["thread_id"].as_str().unwrap().to_string();
         assert_eq!(started["device"], "hub");
@@ -470,19 +516,24 @@ mod tests {
 
         let (err, threads) = session.tool("list_threads", serde_json::json!({})).await;
         assert!(!err && threads.contains(&thread_id), "{threads}");
+        assert_recorded(&run.hub, &chat, "list_threads", true);
 
         let (err, sent) = session.tool("message_thread", serde_json::json!({"thread_id": thread_id, "text": "Keep it short."})).await;
         assert!(!err && sent == "sent", "{sent}");
+        assert_recorded(&run.hub, &chat, "message_thread", true);
 
         let (err, stopped) = session.tool("stop_thread", serde_json::json!({"thread_id": thread_id})).await;
         assert!(!err && stopped == "stopped", "{stopped}");
+        assert_recorded(&run.hub, &chat, "stop_thread", true);
         assert_eq!(run.hub.db.thread(&thread_id).unwrap().status, "stopped");
 
         let mut other_session = run.open_session(&other, &other_token).await;
         let (err, other_threads) = other_session.tool("list_threads", serde_json::json!({})).await;
         assert!(!err && !other_threads.contains(&thread_id), "{other_threads}");
+        assert_recorded(&run.hub, &other, "list_threads", true);
         let (err, refused) = other_session.tool("message_thread", serde_json::json!({"thread_id": thread_id, "text": "no"})).await;
         assert!(err && refused.contains("no such thread"), "{refused}");
+        assert_recorded(&run.hub, &other, "message_thread", false);
 
         drop(run.hub);
         std::fs::remove_dir_all(run.dir).ok();
