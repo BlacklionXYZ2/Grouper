@@ -49,13 +49,23 @@ public struct DeviceInfo: Codable, Equatable, Identifiable, Sendable {
     /// Which providers it reads (`claude`, `codex`, `grok`, `antigravity`). Empty with
     /// `usageProbes` on means every provider the device supports.
     public let usageProbeProviders: [String]
+    /// The hub lists one entry per machine: `id` is the credential threads run on, and these are
+    /// the machine's other credential ids (an app's sign-in next to its node). Empty from an older hub.
+    public let aliases: [String]
+    /// Whether any of the machine's credentials is an admin token. False from an older hub.
+    public let admin: Bool
+    /// Whether threads can run on the machine (it has a node credential). Nil from an older hub,
+    /// which doesn't say.
+    public let runsThreads: Bool?
 
     public init(id: String, name: String, platform: String, online: Bool, capabilities: [ToolSummary] = [],
                 lastSeen: UInt64? = nil, folders: [FolderInfo] = [], usageProbes: Bool? = nil,
-                usageProbeProviders: [String] = []) {
+                usageProbeProviders: [String] = [], aliases: [String] = [], admin: Bool = false,
+                runsThreads: Bool? = nil) {
         self.id = id; self.name = name; self.platform = platform; self.online = online
         self.capabilities = capabilities; self.lastSeen = lastSeen; self.folders = folders
         self.usageProbes = usageProbes; self.usageProbeProviders = usageProbeProviders
+        self.aliases = aliases; self.admin = admin; self.runsThreads = runsThreads
     }
 
     public init(from decoder: Decoder) throws {
@@ -69,6 +79,9 @@ public struct DeviceInfo: Codable, Equatable, Identifiable, Sendable {
         folders = try c.decodeIfPresent([FolderInfo].self, forKey: .folders) ?? []
         usageProbes = try c.decodeIfPresent(Bool.self, forKey: .usageProbes)
         usageProbeProviders = try c.decodeIfPresent([String].self, forKey: .usageProbeProviders) ?? []
+        aliases = try c.decodeIfPresent([String].self, forKey: .aliases) ?? []
+        admin = try c.decodeIfPresent(Bool.self, forKey: .admin) ?? false
+        runsThreads = try c.decodeIfPresent(Bool.self, forKey: .runsThreads)
     }
 }
 

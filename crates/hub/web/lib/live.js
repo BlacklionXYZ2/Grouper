@@ -307,10 +307,19 @@ function applyDerived(e, { replay = false } = {}) {
 function applyDevicePresence(e) {
   const id = e.device_id;
   if (!id) return;
-  const idx = store.devices.findIndex((d) => d.id === id);
+  // The hub lists a machine once, under its node's id, with its other credentials as aliases:
+  // the changed id may be an alias, and a machine's lead credential can change.
+  const idx = store.devices.findIndex((d) => d.id === id || d.aliases?.includes(id));
   if (e.device) {
-    if (idx >= 0) store.devices[idx] = e.device;
-    else store.devices.push(e.device);
+    const ids = new Set([e.device.id, ...(e.device.aliases || [])]);
+    const first = store.devices.findIndex((d) => ids.has(d.id));
+    const rest = store.devices.filter((d, i) => i !== first && !ids.has(d.id));
+    if (first >= 0) {
+      rest.splice(first, 0, e.device);
+      store.devices = rest;
+    } else {
+      store.devices = [...rest, e.device];
+    }
     store.devicesAt = Date.now();
     emit('devices');
   } else if (idx >= 0) {

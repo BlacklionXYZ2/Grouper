@@ -19,14 +19,17 @@ enum GoogleSignIn {
         return GoogleOAuth(clientID: id)
     }()
 
-    /// "Grouper on <this device>", the name of the device row the hub makes for this app install.
+    /// This device's own name (the phone's, or the Mac's, as the Mac's node registers under it), for
+    /// the device row the hub makes for this app install. The hub lists one device per machine,
+    /// so the app's sign-in and the Mac's node show as that one device. iOS 16 and later report
+    /// just "iPhone" unless the app holds Apple's user-assigned-device-name entitlement.
     @MainActor static var deviceName: String {
         #if os(iOS)
         let name = UIDevice.current.name
         #else
         let name = MacNodeController.computerName() ?? "Mac"
         #endif
-        return DeviceRegistration.name("Grouper on \(name)", fallback: "Grouper app")
+        return DeviceRegistration.name(name, fallback: "Grouper app")
     }
 
     /// Runs Google's sign-in page for `nonce` (from the hub) and returns the Google ID token.

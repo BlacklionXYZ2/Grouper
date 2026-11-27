@@ -463,7 +463,9 @@ final class AppModel: ObservableObject {
     /// Settings > Account: this app install's own device on the hub (the one its admin token
     /// belongs to), from the devices list, else as the last Google sign-in named it.
     var thisAppDevice: AppDeviceSummary? {
-        if let id = DeviceRegistration.deviceId(ofToken: adminToken), let device = devices.first(where: { $0.id == id }) {
+        // The hub lists one device per machine: this app's sign-in may be an alias of the Mac's node entry.
+        if let id = DeviceRegistration.deviceId(ofToken: adminToken),
+           let device = devices.first(where: { $0.id == id || $0.aliases.contains(id) }) {
             return AppDeviceSummary(name: device.name, platform: device.platform)
         }
         guard let name = UserDefaults.standard.string(forKey: Self.appDeviceNameKey) else { return nil }
@@ -619,11 +621,12 @@ final class AppModel: ObservableObject {
     /// Registers this Mac as a plain device and saves its token, then revokes `old` (best
     /// effort). On failure the manual token field opens with a plain explanation.
     ///
-    /// The registration carries this install's node id (`InstallID.node`), so a hub that
-    /// supports install ids hands back the same node device with a fresh token (revoking the
+    /// The registration carries this install's id (the same one the app signs in with), so a hub
+    /// that supports install ids hands back the same node device with a fresh token (revoking the
     /// old one) instead of adding a second device for this Mac; `old` is then that same device
-    /// and is not revoked. The node id differs from the app's own sign-in id, so the node can
-    /// never be handed the app's admin device.
+    /// and is not revoked. The hub keeps the node and the app's sign-in as separate credentials
+    /// (one plain, one admin) and lists them as this one Mac; the node can never be handed the
+    /// app's admin device.
     @discardableResult
     private func registerThisMac(api: HubClient, hubURL: String, revoking old: String?) async -> Bool {
         // Launch can race the node's own 401 report; only one registration runs.
@@ -634,7 +637,7 @@ final class AppModel: ObservableObject {
         let registered: RegisteredDevice
         do {
             registered = try await api.registerDevice(name: name, platform: "macos",
-                                                      installId: AppInstall.id.map(InstallID.node))
+                                                      installId: AppInstall.id)
         } catch {
             if DeviceRegistration.hubLacksRegistration(error) {
                 deviceMessage = "This hub can't register devices yet; paste a device token instead."

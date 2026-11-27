@@ -1244,7 +1244,7 @@ mod tests {
         // The Mac: the node credential leads, the app's sign-in is an alias, admin if either is.
         let mac = entry(&list, "Oscar's Macbook Air");
         assert_eq!(mac.id, node.device.id);
-        assert_eq!(mac.aliases, [admin.device.id.clone()]);
+        assert_eq!(mac.aliases, vec![admin.device.id.clone()]);
         assert!(mac.admin && mac.runs_threads);
         // The phone only signs in: one entry, named for the phone, no threads.
         let iphone = entry(&list, "iPhone");
@@ -1274,7 +1274,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(over_http.len(), 4);
-            assert_eq!(entry(&over_http, "Oscar's Macbook Air").aliases, [admin.device.id.clone()]);
+            assert_eq!(entry(&over_http, "Oscar's Macbook Air").aliases, vec![admin.device.id.clone()]);
         }
         srv.abort();
         std::fs::remove_dir_all(dir).ok();
@@ -1297,7 +1297,7 @@ mod tests {
         assert_eq!(list.len(), 3);
         let mac = entry(&list, "Oscar's Macbook Air");
         assert_eq!(mac.id, node.id);
-        assert_eq!(mac.aliases, [admin.id.clone()]);
+        assert_eq!(mac.aliases, vec![admin.id.clone()]);
         assert!(mac.admin);
 
         // The plain credential is still plain; the admin one is still admin; both tokens still work.

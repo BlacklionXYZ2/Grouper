@@ -4,7 +4,7 @@
 
 import { h, icon, setChildren, setText, setAttr, syncList } from '../lib/dom.js';
 import { enc } from '../lib/api.js';
-import { store, on, deviceName, needsYouCount } from '../lib/store.js';
+import { store, on, deviceName, findDevice, needsYouCount } from '../lib/store.js';
 import { threadStatus } from '../lib/format.js';
 
 const RECENTS_KEY = 'grouper.paletteRecents';
@@ -527,7 +527,7 @@ function stillThere(item) {
   if (item.kind === 'chat') return store.conversations.some((c) => c.id === item.id);
   if (item.kind === 'thread') return store.threads.has(item.id);
   if (item.kind === 'model') return store.models.some((m) => m.id === item.id);
-  if (item.kind === 'device') return store.devices.some((d) => d.id === item.id);
+  if (item.kind === 'device') return Boolean(findDevice(item.id));
   return true;
 }
 

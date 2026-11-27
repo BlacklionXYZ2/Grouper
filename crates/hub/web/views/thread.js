@@ -33,7 +33,7 @@
 import { h, icon, setChildren, throttle, setText, setAttr } from '../lib/dom.js';
 import { get, post, qs, enc, describe } from '../lib/api.js';
 import { renderMarkdown } from '../lib/md.js';
-import { store, on, liveOf, deviceName, deviceOnline, approvalsFor, isAdmin } from '../lib/store.js';
+import { store, on, liveOf, deviceName, deviceOnline, findDevice, approvalsFor, isAdmin } from '../lib/store.js';
 import { statusPill, skeleton, confirmAction, toast, autoGrow, errorBanner, announce, sentenceSpeaker, onTick, isNarrow, syncInert } from '../lib/ui.js';
 import { ago, dateTime, time, num, pretty, isActive, elapsed, isoDuration, threadElapsed } from '../lib/format.js';
 import { familyOfId, familyMark, familyInfo, setFamilyClass } from '../lib/family.js';
@@ -670,7 +670,7 @@ export function renderThread(container, { threadId, conversationId, onClose, onW
       waitingSlot.replaceChildren();
       return;
     }
-    const device = store.devices.find((d) => d.id === th.device_id);
+    const device = findDevice(th.device_id);
     const parts = [];
     if (th.status === 'waiting_device') {
       parts.push(

@@ -31,6 +31,17 @@ final class DecodingTests: XCTestCase {
         let device = try JSONDecoder.grouper.decode(DeviceInfo.self, from: Data(deviceRaw.utf8))
         XCTAssertEqual(device.folders, [])
         XCTAssertEqual(device.capabilities.first?.name, "mac_info")
+        // An older hub says nothing about machines: one credential, not known to run threads.
+        XCTAssertEqual(device.aliases, [])
+        XCTAssertFalse(device.admin)
+        XCTAssertNil(device.runsThreads)
+
+        // The hub lists a machine once: the node's id leads, the app's sign-in is an alias.
+        let machineRaw = #"{"id":"node1","name":"MacBook","platform":"macos","online":true,"capabilities":[],"last_seen":null,"aliases":["app1"],"admin":true,"runs_threads":true}"#
+        let machine = try JSONDecoder.grouper.decode(DeviceInfo.self, from: Data(machineRaw.utf8))
+        XCTAssertEqual(machine.aliases, ["app1"])
+        XCTAssertTrue(machine.admin)
+        XCTAssertEqual(machine.runsThreads, true)
 
         let modelRaw = #"{"id":"opus","provider_id":"anthropic","model":"claude-opus","roles":["orchestrator"],"free":false}"#
         let model = try JSONDecoder.grouper.decode(ModelEntry.self, from: Data(modelRaw.utf8))
