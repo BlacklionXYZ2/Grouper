@@ -24,7 +24,7 @@ struct LoginChoice {
 }
 
 /// Held so a toggle can update the check mark on the tray item already in the menu.
-pub(crate) struct LoginMenuItem(CheckMenuItem);
+pub(crate) struct LoginMenuItem(CheckMenuItem<tauri::Wry>);
 
 pub fn plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri_plugin_autostart::Builder::new().build()
@@ -58,7 +58,7 @@ pub fn is_enabled(app: &AppHandle) -> bool {
 }
 
 /// Tray item. Call once, after [`apply_default`], so the check matches the Run key.
-pub fn menu_item(app: &AppHandle) -> tauri::Result<CheckMenuItem> {
+pub fn menu_item(app: &AppHandle) -> tauri::Result<CheckMenuItem<tauri::Wry>> {
     let item = CheckMenuItem::with_id(app, TRAY_ID, LABEL, true, is_enabled(app), None::<&str>)?;
     app.manage(LoginMenuItem(item.clone()));
     Ok(item)

@@ -61,6 +61,7 @@ impl ApprovalNotice {
     }
 
     /// `#/chat/<id>?approval=<approval id>`
+    #[cfg(test)]
     pub(crate) fn hash(&self) -> String {
         approval_hash(&self.conversation_id, &self.approval_id)
     }
@@ -128,6 +129,7 @@ fn current_hub(app: &AppHandle) -> Option<Arc<Hub>> {
     app.try_state::<crate::DesktopState>()?.hub_handle()?.hub()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn notice_for(
     hub: &Hub,
     tool: &str,
@@ -214,7 +216,7 @@ fn open_chat(app: &AppHandle, conversation_id: &str, approval_id: &str) {
         });
         if on_local_hub {
             if let Ok(hash_json) = serde_json::to_string(&hash) {
-                let _ = win.eval(&format!("location.hash = {hash_json};"));
+                let _ = win.eval(format!("location.hash = {hash_json};"));
             }
             let _ = win.unminimize();
             let _ = win.show();
