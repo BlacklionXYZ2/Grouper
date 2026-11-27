@@ -131,6 +131,7 @@ impl DesktopSettings {
     }
 
     /// Companion `install_id` for the non-admin node row (distinct from the admin UI row).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn node_install_id(&self) -> String {
         let base: String = self.install_id.chars().take(48).collect();
         format!("{base}-node")

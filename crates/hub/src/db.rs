@@ -1746,7 +1746,8 @@ mod tests {
         drop(db);
 
         let key_path = dir.join("master.key");
-        std::fs::remove_file(&key_path).unwrap();
+        // The key may live DPAPI-protected (Windows) or in the Keychain (macOS), not as a file.
+        crate::secrets::remove_master_key(&dir).unwrap();
 
         let error = Db::open(&dir).err().unwrap();
         let message = format!("{error:#}");
@@ -1771,7 +1772,8 @@ mod tests {
 
         // A sealed VAPID key alone is enough to refuse making a fresh master key.
         let key_path = dir.join("master.key");
-        std::fs::remove_file(&key_path).unwrap();
+        // The key may live DPAPI-protected (Windows) or in the Keychain (macOS), not as a file.
+        crate::secrets::remove_master_key(&dir).unwrap();
         let message = format!("{:#}", Db::open(&dir).err().unwrap());
         assert!(message.contains("master key missing"), "{message}");
         assert!(!key_path.exists());
