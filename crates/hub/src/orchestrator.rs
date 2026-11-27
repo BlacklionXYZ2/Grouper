@@ -381,6 +381,21 @@ fn orchestrator_tools(hub: &Arc<Hub>, conversation_id: &str) -> Vec<Arc<dyn Tool
     tools
 }
 
+/// The tools a harness may call at `/mcp/orchestrator`. Same implementations as the API
+/// orchestrator: start, message and stop a thread, list devices and threads, and memory.
+pub(crate) fn harness_orchestrator_tools(hub: &Arc<Hub>, conversation_id: &str) -> Vec<Arc<dyn Tool>> {
+    let ctx = || Ctx { hub: hub.clone(), conversation_id: conversation_id.to_string() };
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(StartThread(ctx())),
+        Arc::new(MessageThread(ctx())),
+        Arc::new(StopThread(ctx())),
+        Arc::new(ListThreads(ctx())),
+        Arc::new(ListDevices(ctx())),
+    ];
+    tools.extend(crate::memory::memory_tools(hub, conversation_id));
+    tools
+}
+
 struct Ctx {
     hub: Arc<Hub>,
     conversation_id: String,

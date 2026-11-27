@@ -12,10 +12,16 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use core_protocol::tunnel::{result_from_text, tool_to_mcp};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+    ServerConfig,
+};
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::ServerHandler;
+use rmcp::{ErrorData, ServerHandler};
+use serde_json::Value;
 
 use crate::server::{Hub, err};
 
@@ -27,14 +33,48 @@ pub(crate) type OrchestratorHttp = StreamableHttpService<OrchestratorServer, Loc
 struct OrchestratorChat(String);
 
 pub(crate) struct OrchestratorServer {
-    #[allow(dead_code)] // read once tools dispatch on this chat
     hub: Arc<Hub>,
+}
+
+fn chat_of(context: &RequestContext<RoleServer>) -> Result<String, ErrorData> {
+    let parts = context.extensions.get::<axum::http::request::Parts>().ok_or_else(|| {
+        ErrorData::internal_error("orchestrator request is missing its HTTP parts", None)
+    })?;
+    parts
+        .extensions
+        .get::<OrchestratorChat>()
+        .map(|chat| chat.0.clone())
+        .ok_or_else(|| ErrorData::internal_error("orchestrator request is missing its chat", None))
 }
 
 impl ServerHandler for OrchestratorServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("grouper-hub", env!("CARGO_PKG_VERSION")))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let tools = crate::orchestrator::harness_orchestrator_tools(&self.hub, "");
+        Ok(ListToolsResult::with_all_items(tools.iter().map(|tool| tool_to_mcp(&tool.def())).collect()))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let conversation_id = chat_of(&context)?;
+        let args = Value::Object(request.arguments.unwrap_or_default());
+        let tools = crate::orchestrator::harness_orchestrator_tools(&self.hub, &conversation_id);
+        let Some(tool) = tools.iter().find(|tool| tool.def().name == request.name) else {
+            return Ok(result_from_text(false, format!("unknown tool {}", request.name)).into());
+        };
+        let out = tool.call(args).await;
+        Ok(result_from_text(!out.is_error, out.content).into())
     }
 }
 
@@ -84,8 +124,9 @@ async fn orchestrator_mcp(State(hub): State<Arc<Hub>>, mut req: Request) -> Resp
     }
     req.extensions_mut().insert(OrchestratorChat(conversation_id));
     let mut service = http_service(&hub);
-    let Ok(response) = tower_service::Service::call(&mut service, req).await else {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "orchestrator MCP failed");
+    let response = match tower_service::Service::call(&mut service, req).await {
+        Ok(response) => response,
+        Err(infallible) => match infallible {},
     };
     response.into_response()
 }
@@ -250,6 +291,198 @@ mod tests {
         assert!(run.hub.db.revoke_orchestrator_token(&token_a));
         let revoked = post(endpoint(&run.base, &chat_a), Some(token_a)).await;
         assert_eq!(revoked.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        drop(run.hub);
+        std::fs::remove_dir_all(run.dir).ok();
+    }
+
+    fn rpc_body(id: i64, method: &str, params: serde_json::Value) -> String {
+        let mut msg = serde_json::json!({"jsonrpc": "2.0", "method": method});
+        if id >= 0 {
+            msg["id"] = serde_json::json!(id);
+        }
+        if !params.is_null() {
+            msg["params"] = params;
+        }
+        msg.to_string()
+    }
+
+    fn json_messages(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+                payload.starts_with('{').then(|| serde_json::from_str(payload).ok()).flatten()
+            })
+            .collect()
+    }
+
+    fn tool_text(message: &serde_json::Value) -> (bool, String) {
+        let result = &message["result"];
+        let error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (error, text)
+    }
+
+    struct Session {
+        url: String,
+        token: String,
+        session: String,
+        next_id: i64,
+    }
+
+    impl Running {
+        async fn open_session(&self, conversation_id: &str, token: &str) -> Session {
+            let res = self
+                .http
+                .post(endpoint(&self.base, conversation_id))
+                .header("accept", ACCEPT)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(init_body())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::OK);
+            let session = res.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let status = res.status();
+            let _ = res.text().await;
+            let session = session.unwrap_or_else(|| panic!("initialize status {status} opened no session"));
+            let url = endpoint(&self.base, conversation_id);
+            let opened = Session { url, token: token.to_string(), session, next_id: 2 };
+            opened.notify("notifications/initialized").await;
+            opened
+        }
+    }
+
+    impl Session {
+        async fn post(&self, body: String) -> reqwest::Response {
+            // A fresh client: the session SSE response ends, and a pooled connection
+            // still reading it would stall the next call.
+            let http = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap();
+            http.post(&self.url)
+                .header("accept", ACCEPT)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", self.token))
+                .header("mcp-session-id", &self.session)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+
+        async fn notify(&self, method: &str) {
+            let res = self.post(rpc_body(-1, method, serde_json::Value::Null)).await;
+            assert_eq!(res.status(), reqwest::StatusCode::ACCEPTED, "{method}");
+        }
+
+        async fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            let id = self.next_id;
+            self.next_id += 1;
+            let res = self.post(rpc_body(id, method, params)).await;
+            let status = res.status();
+            let body = res.text().await.unwrap();
+            assert_eq!(status, reqwest::StatusCode::OK, "{method}: {body}");
+            json_messages(&body)
+                .into_iter()
+                .find(|msg| msg.get("id").and_then(|v| v.as_i64()) == Some(id))
+                .unwrap_or_else(|| panic!("{method} returned no result: {body}"))
+        }
+
+        async fn tool(&mut self, name: &str, arguments: serde_json::Value) -> (bool, String) {
+            let msg = self.call("tools/call", serde_json::json!({"name": name, "arguments": arguments})).await;
+            assert!(msg.get("error").is_none(), "{name}: {msg}");
+            tool_text(&msg)
+        }
+    }
+
+    fn scripted_thread_model(hub: &Hub) {
+        use core_protocol::{ModelEntry, ProviderConfig};
+        hub.db
+            .upsert_provider(&ProviderConfig {
+                id: "p".into(),
+                kind: "scripted".into(),
+                base_url: None,
+                api_key: None,
+                options: serde_json::json!({
+                    "inline": {"delay_ms": 30000, "default": [{"type": "text", "text": "OK"}]}
+                }),
+            })
+            .unwrap();
+        hub.db
+            .upsert_model(&ModelEntry {
+                id: "m".into(),
+                provider_id: "p".into(),
+                model: "m-1".into(),
+                roles: vec!["thread".into()],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn orchestrator_mcp_tools_call_the_same_hub_functions() {
+        let run = serve().await;
+        scripted_thread_model(&run.hub);
+        let chat = run.hub.db.create_conversation("project", "Tools").unwrap();
+        let other = run.hub.db.create_conversation("project", "Other").unwrap();
+        let token = run.hub.db.mint_orchestrator_token(&chat).unwrap();
+        let other_token = run.hub.db.mint_orchestrator_token(&other).unwrap();
+        let mut session = run.open_session(&chat, &token).await;
+
+        let listed = session.call("tools/list", serde_json::Value::Null).await;
+        let mut names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["forget", "list_devices", "list_threads", "message_thread", "recall", "remember", "start_thread", "stop_thread", "update_memory"]
+        );
+
+        let (err, devices) = session.tool("list_devices", serde_json::json!({})).await;
+        assert!(!err, "{devices}");
+        let devices: serde_json::Value = serde_json::from_str(&devices).unwrap();
+        assert!(devices.as_array().unwrap().iter().any(|row| row["id"] == "hub"), "{devices}");
+
+        let (err, saved) = session.tool("remember", serde_json::json!({"content": "The barn clock is slow", "tags": ["clock"]})).await;
+        assert!(!err, "{saved}");
+        let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        let id = saved["id"].as_i64().unwrap();
+        let (err, found) = session.tool("recall", serde_json::json!({"query": "barn clock"})).await;
+        assert!(!err && found.contains("The barn clock is slow"), "{found}");
+        let (err, updated) = session.tool("update_memory", serde_json::json!({"id": id, "content": "The barn clock is five minutes slow"})).await;
+        assert!(!err, "{updated}");
+        let (err, forgotten) = session.tool("forget", serde_json::json!({"id": id})).await;
+        assert!(!err && forgotten.contains(&format!("forgot #{id}")), "{forgotten}");
+        assert!(run.hub.db.memory(id).is_none());
+
+        let (err, started) = session.tool("start_thread", serde_json::json!({"title": "Notes", "goal": "Write the notes."})).await;
+        assert!(!err, "{started}");
+        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let thread_id = started["thread_id"].as_str().unwrap().to_string();
+        assert_eq!(started["device"], "hub");
+        assert_eq!(run.hub.db.thread(&thread_id).unwrap().conversation_id, chat);
+
+        let (err, threads) = session.tool("list_threads", serde_json::json!({})).await;
+        assert!(!err && threads.contains(&thread_id), "{threads}");
+
+        let (err, sent) = session.tool("message_thread", serde_json::json!({"thread_id": thread_id, "text": "Keep it short."})).await;
+        assert!(!err && sent == "sent", "{sent}");
+
+        let (err, stopped) = session.tool("stop_thread", serde_json::json!({"thread_id": thread_id})).await;
+        assert!(!err && stopped == "stopped", "{stopped}");
+        assert_eq!(run.hub.db.thread(&thread_id).unwrap().status, "stopped");
+
+        let mut other_session = run.open_session(&other, &other_token).await;
+        let (err, other_threads) = other_session.tool("list_threads", serde_json::json!({})).await;
+        assert!(!err && !other_threads.contains(&thread_id), "{other_threads}");
+        let (err, refused) = other_session.tool("message_thread", serde_json::json!({"thread_id": thread_id, "text": "no"})).await;
+        assert!(err && refused.contains("no such thread"), "{refused}");
 
         drop(run.hub);
         std::fs::remove_dir_all(run.dir).ok();
