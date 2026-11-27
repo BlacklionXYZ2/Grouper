@@ -163,6 +163,8 @@ pub struct Hub {
     pub(crate) migrate: crate::migrate::MigrateState,
     /// Last-seen host capability metadata per device id ([`crate::devices`]).
     pub(crate) host_info: std::sync::Mutex<HashMap<String, core_protocol::NodeHostInfo>>,
+    /// Streamable HTTP session store for `/mcp/orchestrator`. One per hub, created on first use.
+    pub(crate) orchestrator_mcp: std::sync::OnceLock<crate::mcp_server::OrchestratorHttp>,
 }
 
 impl Hub {
@@ -195,6 +197,7 @@ impl Hub {
             stepdown: crate::stepdown::StepDownState::new(),
             migrate: crate::migrate::MigrateState::new(),
             host_info: std::sync::Mutex::new(HashMap::new()),
+            orchestrator_mcp: std::sync::OnceLock::new(),
         })
     }
 
