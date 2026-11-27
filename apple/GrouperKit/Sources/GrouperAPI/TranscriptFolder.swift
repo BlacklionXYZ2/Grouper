@@ -184,7 +184,7 @@ public struct TranscriptFolder: Sendable {
             case (.approvalRequested(let request), let id):
                 approvals[request.approvalId] = id
                 if let id { _ = ensureCard(event, threadId: id) }
-            case (.approvalResolved(let id, _), _): approvals.removeValue(forKey: id)
+            case (.approvalResolved(let id, _, _), _): approvals.removeValue(forKey: id)
             default: break
             }
         }
@@ -222,7 +222,7 @@ public struct TranscriptFolder: Sendable {
                     deviceId: request.deviceId, tool: request.tool, input: request.input, reason: request.reason,
                     seq: event.seq, ts: event.ts
                 )
-            case .approvalResolved(let id, _): open.removeValue(forKey: id)
+            case .approvalResolved(let id, _, _): open.removeValue(forKey: id)
             case .threadFinished:
                 if let id = event.threadId { open = open.filter { $0.value.threadId != id } }
             default: break
@@ -258,7 +258,7 @@ public struct TranscriptFolder: Sendable {
             case .threadCheckpoint(let value): rows.append(.checkpoint(seq: seq, ts: ts, value: value))
             case .threadHandedOver(let value): rows.append(.handedOver(seq: seq, ts: ts, value: value))
             case .approvalRequested(let request): approvals[request.approvalId] = rows.count; rows.append(.approval(seq: seq, ts: ts, request: request, approved: nil))
-            case .approvalResolved(let id, let approved):
+            case .approvalResolved(let id, let approved, _):
                 if let index = approvals[id], case .approval(let firstSeq, let firstTs, let request, _) = rows[index] {
                     rows[index] = .approval(seq: firstSeq, ts: firstTs, request: request, approved: approved)
                 }

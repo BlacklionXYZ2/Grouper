@@ -2,13 +2,13 @@
 //! RFC 8292 VAPID).
 //!
 //! The web client subscribes its service worker with the hub's VAPID public key and posts the
-//! `PushSubscription` here. Each new approval request is pushed to every subscription; when the
-//! approval is answered, times out, or is dropped with its thread or device, an
-//! `approval_cleared` push with the same `Topic` follows so a still-queued request is replaced
-//! and the service worker can close its notification. Payloads never carry tool input.
+//! `PushSubscription` here. Each new approval request is pushed to every active subscription;
+//! stale notifications are closed by the open page and by the service worker on the next push
+//! (no silent `approval_cleared` pushes, which violate `userVisibleOnly` and cause WebKit to
+//! revoke subscriptions). Payloads never carry tool input.
 //!
-//! Sending runs on one background task per hub, in order, so a clear never overtakes its
-//! request. Nothing here can block or fail the approval path.
+//! Delivery fans out to one task per subscription, fed in emit order, so a slow or hanging
+//! push endpoint only delays itself. Nothing here can block or fail the approval path.
 //!
 //! Endpoints (an admin token or the web client's admin session, as for answering approvals):
 //! - `GET /v1/push/vapid-key` → `{"public_key"}` (base64url, uncompressed P-256 point)
@@ -18,9 +18,11 @@
 //! - `POST /v1/push/test` (optional `{"id"}`) → per-subscription results
 //!
 //! The VAPID private key lives in `hub_meta`, sealed with the master key (see [`Db::vapid_private_key`]).
-//! The JWT `sub` is `GROUPER_PUBLIC_URL` when set, else the origin the subscription was made from.
+//! The JWT `sub` is `GROUPER_PUBLIC_URL` (`https://`, `mailto:`, or loopback `http://`) when set,
+//! else the origin the subscription was made from (`https://` or loopback `http://`).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -52,8 +54,9 @@ use crate::server::{HUB_DEVICE, Hub, err};
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS push_subscriptions (
   id TEXT PRIMARY KEY, endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL,
-  label TEXT, origin TEXT, expiration_time INTEGER, device_id TEXT, created INTEGER NOT NULL,
-  last_ok INTEGER, last_error TEXT);
+  label TEXT, origin TEXT, expiration_time INTEGER, device_id TEXT, session_id TEXT,
+  created INTEGER NOT NULL, last_ok INTEGER, last_error TEXT);
+CREATE INDEX IF NOT EXISTS push_subscriptions_device ON push_subscriptions (device_id);
 ";
 
 /// At most this many subscriptions; subscribing another browser past it is refused.
@@ -62,8 +65,8 @@ pub const MAX_SUBSCRIPTIONS: usize = 50;
 const RECORD_SIZE: u32 = 4096;
 /// A request push lives this long at the push service when no approval timeout is set.
 const DEFAULT_TTL: u64 = 86_400;
-/// A clear only matters while its request could still be queued; it replaces it by `Topic`.
-const CLEAR_TTL: u64 = 60;
+/// Idle per-subscription delivery tasks exit after this long without new pushes.
+const SUB_WORKER_IDLE: Duration = Duration::from_secs(60);
 /// VAPID JWTs are valid this long (RFC 8292 allows at most 24 hours).
 const JWT_LIFETIME: u64 = 12 * 3600;
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -71,7 +74,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_ENDPOINT_LEN: usize = 2048;
 const MAX_LABEL_CHARS: usize = 100;
 const MAX_TITLE_CHARS: usize = 100;
-/// Optional public origin of the hub (e.g. `https://grouper.example.org`), used as the JWT `sub`.
+/// Optional public contact for the hub (`https://…` or `mailto:…`), used as the JWT `sub`.
 const ENV_PUBLIC_URL: &str = "GROUPER_PUBLIC_URL";
 
 // ---------------------------------------------------------------- crypto
@@ -296,9 +299,20 @@ pub struct SubscriptionKeys {
     pub auth: String,
 }
 
+fn prune_invalid_push_subscriptions(c: &rusqlite::Connection) {
+    let current = now() as i64;
+    let _ = c.execute(
+        "DELETE FROM push_subscriptions
+         WHERE (session_id IS NOT NULL AND session_id NOT IN (SELECT id_hash FROM sessions WHERE expires > ?1))
+            OR (device_id IS NOT NULL AND device_id NOT IN (SELECT id FROM devices WHERE revoked = 0 AND admin != 0))",
+        [current],
+    );
+}
+
 impl Db {
     fn push_subscriptions(&self) -> Vec<Subscription> {
         let c = self.c();
+        prune_invalid_push_subscriptions(&c);
         let Ok(mut st) = c.prepare(&format!("SELECT {SUB_COLS} FROM push_subscriptions ORDER BY created, id")) else {
             return vec![];
         };
@@ -310,15 +324,17 @@ impl Db {
     }
 
     pub fn push_subscription_count(&self) -> usize {
-        self.c()
-            .query_row("SELECT COUNT(*) FROM push_subscriptions", [], |r| r.get::<_, i64>(0))
+        let c = self.c();
+        prune_invalid_push_subscriptions(&c);
+        c.query_row("SELECT COUNT(*) FROM push_subscriptions", [], |r| r.get::<_, i64>(0))
             .map(|n| n as usize)
             .unwrap_or(0)
     }
 
     fn push_subscription(&self, id: &str) -> Option<Subscription> {
-        self.c()
-            .query_row(&format!("SELECT {SUB_COLS} FROM push_subscriptions WHERE id = ?1"), [id], sub_row)
+        let c = self.c();
+        prune_invalid_push_subscriptions(&c);
+        c.query_row(&format!("SELECT {SUB_COLS} FROM push_subscriptions WHERE id = ?1"), [id], sub_row)
             .optional()
             .ok()
             .flatten()
@@ -332,9 +348,11 @@ impl Db {
         label: Option<&str>,
         origin: &RequestOrigin,
         device_id: &str,
+        session_id: Option<&str>,
     ) -> Result<SubscriptionInfo, String> {
         let (origin, from_header) = (origin.origin.as_deref(), origin.from_header);
         let c = self.c();
+        prune_invalid_push_subscriptions(&c);
         let existing: Option<String> = c
             .query_row("SELECT id FROM push_subscriptions WHERE endpoint = ?1", [&new.endpoint], |r| r.get(0))
             .optional()
@@ -342,11 +360,11 @@ impl Db {
         let expiration = new.expiration_time.filter(|t| t.is_finite() && *t > 0.0).map(|t| t as i64);
         let id = match existing {
             Some(id) => {
-                // The browser subscribed again (perhaps with new keys): keep the id, take the rest.
+                // The browser subscribed again (perhaps with new keys or a new session): keep the id, take the rest.
                 c.execute(
                     "UPDATE push_subscriptions SET p256dh = ?2, auth = ?3, label = COALESCE(?4, label), \
                      origin = CASE WHEN ?8 THEN COALESCE(?5, origin) ELSE COALESCE(origin, ?5) END, \
-                     expiration_time = ?6, device_id = ?7 WHERE id = ?1",
+                     expiration_time = ?6, device_id = ?7, session_id = ?9 WHERE id = ?1",
                     params![
                         id,
                         new.keys.p256dh.trim(),
@@ -355,7 +373,8 @@ impl Db {
                         origin,
                         expiration,
                         device_id,
-                        from_header
+                        from_header,
+                        session_id
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -370,7 +389,7 @@ impl Db {
                 let id = random_hex(8);
                 c.execute(
                     "INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, label, origin, expiration_time, \
-                     device_id, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     device_id, session_id, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         id,
                         new.endpoint,
@@ -380,6 +399,7 @@ impl Db {
                         origin,
                         expiration,
                         device_id,
+                        session_id,
                         now() as i64
                     ],
                 )
@@ -424,42 +444,53 @@ impl Db {
 
 // ---------------------------------------------------------------- sending
 
-enum Job {
-    Requested(Event),
-    Cleared { conversation_id: String, approval_id: String },
+struct SubJob {
+    vapid: Arc<Vapid>,
+    sub: Subscription,
+    message: Arc<Message>,
 }
 
-/// Per-hub push state: the ordered send queue and its settings.
+/// Per-hub push state: the ordered dispatcher queue and its settings.
 pub struct PushState {
     hub: Weak<Hub>,
-    queue: OnceLock<mpsc::UnboundedSender<Job>>,
+    queue: OnceLock<mpsc::UnboundedSender<Event>>,
     vapid: Mutex<Option<Arc<Vapid>>>,
     client: reqwest::Client,
     allow_local_http: AtomicBool,
+    sub_count: AtomicUsize,
+    warned_no_sub: AtomicBool,
 }
 
 impl PushState {
-    pub(crate) fn new(hub: Weak<Hub>) -> Self {
+    pub(crate) fn new(hub: Weak<Hub>, initial_subs: usize) -> Self {
         let client = reqwest::Client::builder()
             .timeout(SEND_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default();
-        Self { hub, queue: OnceLock::new(), vapid: Mutex::new(None), client, allow_local_http: AtomicBool::new(false) }
+        Self {
+            hub,
+            queue: OnceLock::new(),
+            vapid: Mutex::new(None),
+            client,
+            allow_local_http: AtomicBool::new(false),
+            sub_count: AtomicUsize::new(initial_subs),
+            warned_no_sub: AtomicBool::new(false),
+        }
     }
 
-    fn enqueue(&self, job: Job) {
+    fn enqueue(&self, event: Event) {
         let tx = self.queue.get_or_init(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
-                    handle.spawn(worker(self.hub.clone(), rx));
+                    handle.spawn(dispatcher(self.hub.clone(), rx));
                 }
                 Err(_) => tracing::warn!("web push needs a Tokio runtime; notifications are off"),
             }
             tx
         });
-        let _ = tx.send(job);
+        let _ = tx.send(event);
     }
 }
 
@@ -467,6 +498,10 @@ impl Hub {
     /// Tests only: accept `http://` push endpoints on loopback hosts. Production requires https.
     pub fn set_push_allow_local_http(&self, allow: bool) {
         self.push.allow_local_http.store(allow, Ordering::Relaxed);
+    }
+
+    pub(crate) fn sync_push_sub_count(&self) {
+        self.push.sub_count.store(self.db.push_subscription_count(), Ordering::Release);
     }
 
     /// The VAPID key, loaded (or made) once.
@@ -481,24 +516,14 @@ impl Hub {
         Ok(vapid)
     }
 
-    /// Called for every stored event; queues pushes for approval requests and answers.
+    /// Called inside `emit_order` for every stored event; queues pushes for approval requests
+    /// without DB I/O under the lock.
     pub(crate) fn push_on_event(&self, event: &Event) {
-        let job = match &event.body {
-            EventBody::ApprovalRequested { .. } => Job::Requested(event.clone()),
-            EventBody::ApprovalResolved { approval_id, .. } => {
-                Job::Cleared { conversation_id: event.conversation_id.clone(), approval_id: approval_id.clone() }
-            }
-            _ => return,
-        };
-        if self.db.push_subscription_count() > 0 {
-            self.push.enqueue(job);
+        if !matches!(event.body, EventBody::ApprovalRequested { .. }) {
+            return;
         }
-    }
-
-    /// An approval was dropped without an answer (its thread ended or its device went away).
-    pub(crate) fn push_approval_cleared(&self, conversation_id: &str, approval_id: &str) {
-        if self.db.push_subscription_count() > 0 {
-            self.push.enqueue(Job::Cleared { conversation_id: conversation_id.into(), approval_id: approval_id.into() });
+        if self.push.sub_count.load(Ordering::Acquire) > 0 {
+            self.push.enqueue(event.clone());
         }
     }
 }
@@ -522,11 +547,52 @@ pub struct Delivery {
     pub removed: bool,
 }
 
-async fn worker(hub: Weak<Hub>, mut rx: mpsc::UnboundedReceiver<Job>) {
-    while let Some(job) = rx.recv().await {
+/// Fans out each event to per-subscription worker tasks, preserving emit order per
+/// subscription without letting a slow endpoint block healthy ones.
+async fn dispatcher(hub: Weak<Hub>, mut rx: mpsc::UnboundedReceiver<Event>) {
+    let mut workers: HashMap<String, mpsc::UnboundedSender<SubJob>> = HashMap::new();
+    while let Some(event) = rx.recv().await {
         let Some(hub) = hub.upgrade() else { break };
-        let Some(message) = build_message(&hub, job) else { continue };
-        deliver_all(&hub, &message, None).await;
+        let Some(message) = build_message(&hub, event).map(Arc::new) else { continue };
+        let subs = hub.db.push_subscriptions();
+        hub.push.sub_count.store(subs.len(), Ordering::Release);
+        if subs.is_empty() {
+            continue;
+        }
+        let vapid = match hub.vapid() {
+            Ok(v) => v,
+            Err(error) => {
+                tracing::error!("web push: no VAPID key: {error:#}");
+                continue;
+            }
+        };
+        workers.retain(|_, tx| !tx.is_closed());
+        for sub in subs {
+            let id = sub.info.id.clone();
+            let job = SubJob { vapid: Arc::clone(&vapid), sub, message: Arc::clone(&message) };
+            let job = match workers.get(&id) {
+                Some(tx) => match tx.send(job) {
+                    Ok(()) => continue,
+                    Err(mpsc::error::SendError(job)) => {
+                        workers.remove(&id);
+                        job
+                    }
+                },
+                None => job,
+            };
+            let (tx, mut sub_rx) = mpsc::unbounded_channel::<SubJob>();
+            let _ = tx.send(job);
+            workers.insert(id, tx);
+            let sub_hub = Arc::downgrade(&hub);
+            tokio::spawn(async move {
+                while let Ok(Some(job)) = tokio::time::timeout(SUB_WORKER_IDLE, sub_rx.recv()).await {
+                    let Some(hub) = sub_hub.upgrade() else { break };
+                    if deliver(&hub, &job.vapid, &job.sub, &job.message).await.removed {
+                        break;
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -534,46 +600,35 @@ fn clip(text: &str) -> String {
     text.chars().take(MAX_TITLE_CHARS).collect()
 }
 
-fn build_message(hub: &Hub, job: Job) -> Option<Message> {
-    match job {
-        Job::Requested(event) => {
-            let EventBody::ApprovalRequested { approval_id, device_id, tool, .. } = &event.body else { return None };
-            let device = if device_id == HUB_DEVICE {
-                "Hub".to_string()
-            } else {
-                let name = hub.db.devices().into_iter().find(|d| &d.id == device_id).map(|d| d.name);
-                name.unwrap_or_else(|| device_id.clone())
-            };
-            let thread_title = event.thread_id.as_deref().and_then(|t| hub.db.thread(t)).map(|t| clip(&t.title));
-            let chat_title = hub.db.conversation(&event.conversation_id).map(|c| clip(&c.title));
-            // Deliberately no tool input or reason: the push service and the OS see this.
-            let payload = json!({
-                "type": "approval_requested",
-                "approval_id": approval_id,
-                "conversation_id": event.conversation_id,
-                "thread_id": event.thread_id,
-                "tool": clip(tool),
-                "device": clip(&device),
-                "thread_title": thread_title,
-                "chat_title": chat_title,
-                "ts": event.ts,
-            });
-            Some(Message {
-                kind: "approval_requested",
-                payload: serde_json::to_vec(&payload).ok()?,
-                topic: Some(topic(&event.conversation_id, approval_id)),
-                ttl: hub.db.limits().approval_timeout_secs.unwrap_or(DEFAULT_TTL),
-                urgency: "high",
-            })
-        }
-        Job::Cleared { conversation_id, approval_id } => Some(Message {
-            kind: "approval_cleared",
-            payload: serde_json::to_vec(&json!({"type": "approval_cleared", "approval_id": approval_id})).ok()?,
-            topic: Some(topic(&conversation_id, &approval_id)),
-            ttl: CLEAR_TTL,
-            urgency: "normal",
-        }),
-    }
+fn build_message(hub: &Hub, event: Event) -> Option<Message> {
+    let EventBody::ApprovalRequested { approval_id, device_id, tool, .. } = &event.body else { return None };
+    let device = if device_id == HUB_DEVICE {
+        "Hub".to_string()
+    } else {
+        let name = hub.db.devices().into_iter().find(|d| &d.id == device_id).map(|d| d.name);
+        name.unwrap_or_else(|| device_id.clone())
+    };
+    let thread_title = event.thread_id.as_deref().and_then(|t| hub.db.thread(t)).map(|t| clip(&t.title));
+    let chat_title = hub.db.conversation(&event.conversation_id).map(|c| clip(&c.title));
+    // Deliberately no tool input or reason: the push service and the OS see this.
+    let payload = json!({
+        "type": "approval_requested",
+        "approval_id": approval_id,
+        "conversation_id": event.conversation_id,
+        "thread_id": event.thread_id,
+        "tool": clip(tool),
+        "device": clip(&device),
+        "thread_title": thread_title,
+        "chat_title": chat_title,
+        "ts": event.ts,
+    });
+    Some(Message {
+        kind: "approval_requested",
+        payload: serde_json::to_vec(&payload).ok()?,
+        topic: Some(topic(&event.conversation_id, approval_id)),
+        ttl: hub.db.limits().approval_timeout_secs.unwrap_or(DEFAULT_TTL),
+        urgency: "high",
+    })
 }
 
 async fn deliver_all(hub: &Hub, message: &Message, only: Option<&str>) -> Vec<Delivery> {
@@ -623,6 +678,7 @@ async fn deliver(hub: &Hub, vapid: &Vapid, sub: &Subscription, message: &Message
         Ok(Attempt::Status(status)) if (200..300).contains(&status) => (Some(status), None, false),
         Ok(Attempt::Status(status @ (404 | 410))) => {
             hub.db.delete_push_subscription(&id);
+            hub.sync_push_sub_count();
             (Some(status), Some(format!("the push service says the subscription is gone ({status})")), true)
         }
         Ok(Attempt::Status(status)) => (Some(status), Some(format!("push service answered {status}")), false),
@@ -646,8 +702,14 @@ async fn deliver(hub: &Hub, vapid: &Vapid, sub: &Subscription, message: &Message
 /// `Err` for problems on our side (bad stored keys), which retrying won't fix.
 async fn send_once(hub: &Hub, vapid: &Vapid, sub: &Subscription, message: &Message) -> Result<Attempt> {
     let body = encrypt(&message.payload, &sub.p256dh, &sub.auth)?;
-    let public_url = std::env::var(ENV_PUBLIC_URL).ok().and_then(|u| contact_origin(&u));
+    let public_url = std::env::var(ENV_PUBLIC_URL).ok().and_then(|u| contact_from_env(&u));
     let sub_claim = public_url.or_else(|| sub.origin.as_deref().and_then(contact_origin));
+    if sub_claim.is_none() && !hub.push.warned_no_sub.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "web push: no VAPID contact (`sub`) available; set {ENV_PUBLIC_URL} to an https:// URL or mailto: \
+             address (Apple and Mozilla push services reject JWTs without sub)"
+        );
+    }
     let authorization = vapid.authorization(&sub.info.endpoint, sub_claim.as_deref(), now())?;
     let mut request = hub
         .push
@@ -679,10 +741,33 @@ fn without_url(error: &reqwest::Error) -> String {
     kind.to_string()
 }
 
-/// An `https://` origin suitable for the JWT `sub` claim.
+/// Contact from `GROUPER_PUBLIC_URL`: accepts `mailto:`, `https://`, or loopback `http://`.
+fn contact_from_env(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let url = reqwest::Url::parse(trimmed).ok()?;
+    if url.scheme() == "mailto" {
+        let addr = url.path();
+        let valid = url.query().is_none()
+            && url.fragment().is_none()
+            && !addr.chars().any(char::is_whitespace)
+            && addr
+                .split_once('@')
+                .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'));
+        return valid.then(|| format!("mailto:{addr}"));
+    }
+    contact_origin(trimmed)
+}
+
+/// Subscribe origin suitable for the JWT `sub` claim: `https://` or loopback `http://`.
 fn contact_origin(url: &str) -> Option<String> {
     let url = reqwest::Url::parse(url.trim()).ok()?;
-    (url.scheme() == "https" && url.host_str().is_some()).then(|| url.origin().ascii_serialization())
+    let host = url.host()?;
+    let ok = match url.scheme() {
+        "https" => true,
+        "http" => is_loopback(&host),
+        _ => false,
+    };
+    ok.then(|| url.origin().ascii_serialization())
 }
 
 // ---------------------------------------------------------------- validation
@@ -791,12 +876,14 @@ async fn subscribe(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): 
         .map(|l| l.trim().chars().take(MAX_LABEL_CHARS).collect::<String>())
         .filter(|l| !l.is_empty());
     let origin = request_origin(&headers);
+    let session_id = crate::session::current_session_hash(&hub, &headers);
     // Make sure the key exists before the browser relies on it.
     if let Err(error) = hub.vapid() {
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"));
     }
-    match hub.db.upsert_push_subscription(&body, label.as_deref(), &origin, &auth.device_id) {
+    match hub.db.upsert_push_subscription(&body, label.as_deref(), &origin, &auth.device_id, session_id.as_deref()) {
         Ok(info) => {
+            hub.sync_push_sub_count();
             tracing::info!(subscription = %info.id, device = %auth.device_id, "web push subscription saved");
             Json(info).into_response()
         }
@@ -810,6 +897,7 @@ async fn unsubscribe(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): 
         return r;
     }
     if hub.db.delete_push_subscription(&id) {
+        hub.sync_push_sub_count();
         Json(json!({"deleted": id})).into_response()
     } else {
         err(StatusCode::NOT_FOUND, "no push subscription with that id")
@@ -836,7 +924,10 @@ async fn unsubscribe_endpoint(
         );
     };
     match hub.db.delete_push_subscription_by_endpoint(&endpoint) {
-        Some(id) => Json(json!({"deleted": id})).into_response(),
+        Some(id) => {
+            hub.sync_push_sub_count();
+            Json(json!({"deleted": id})).into_response()
+        }
         None => err(StatusCode::NOT_FOUND, "no push subscription with that endpoint"),
     }
 }
@@ -967,6 +1058,26 @@ mod tests {
         assert!(t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
         assert_eq!(t, topic("c1", "a7"));
         assert_ne!(t, topic("c2", "a7"));
+    }
+
+    #[test]
+    fn contact_subject_accepts_mailto_https_and_loopback_http() {
+        assert_eq!(contact_from_env("mailto:ops@example.com").as_deref(), Some("mailto:ops@example.com"));
+        assert_eq!(contact_from_env("  https://grouper.example.org/app  ").as_deref(), Some("https://grouper.example.org"));
+        assert_eq!(contact_from_env("http://localhost:8080/x").as_deref(), Some("http://localhost:8080"));
+        assert_eq!(contact_from_env("http://127.0.0.1:8080").as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(contact_from_env("http://[::1]:8080").as_deref(), Some("http://[::1]:8080"));
+        assert_eq!(contact_from_env("http://example.com"), None);
+        assert_eq!(contact_from_env("mailto:not-an-email"), None);
+        assert_eq!(contact_from_env("mailto:user@localhost"), None);
+        assert_eq!(contact_from_env("mailto:ops@example.com?subject=hi"), None);
+
+        assert_eq!(contact_origin("https://grouper.example.org/x").as_deref(), Some("https://grouper.example.org"));
+        assert_eq!(contact_origin("http://localhost:8080").as_deref(), Some("http://localhost:8080"));
+        assert_eq!(contact_origin("http://127.0.0.1:9000").as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(contact_origin("http://[::1]:8080").as_deref(), Some("http://[::1]:8080"));
+        assert_eq!(contact_origin("http://example.com"), None);
+        assert_eq!(contact_origin("mailto:ops@example.com"), None);
     }
 
     #[test]

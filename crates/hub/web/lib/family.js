@@ -3,8 +3,12 @@
 // view's fixed model chip and the model picker.
 //
 // The family comes from the registry entry's provider model string (then its id),
-// matched on clear name prefixes only. Anything else is Unknown: never a guess.
-// The colour is a supplement. The model's name is always shown as text beside it.
+// matched on clear name prefixes only. Anything else stays Unknown (no guessed
+// name or glyph). Its colour is a hash of the model id onto four vivid tokens,
+// so two unknown models can still be told apart. The name beside the mark is
+// the fact; the colour is only a supplement.
+// Colours live in app.css (--fam-<key>); the common families sit on the concept
+// art's set: Gemini/Gemma teal, Qwen purple, Llama orange, Radium indigo.
 
 import { h, icon } from './dom.js';
 import { store } from './store.js';
@@ -57,14 +61,37 @@ function match(s) {
   return null;
 }
 
+// Pink, green, amber, indigo. CSS maps these onto the existing family tokens.
+const VIVID = ['vivid-claude', 'vivid-nemotron', 'vivid-ernie', 'vivid-radium'];
+
+function isVivid(key) {
+  return typeof key === 'string' && key.startsWith('vivid-');
+}
+
+/** Stable hue for an unmatched model id. FNV-1a, so the same id always lands. */
+function vividKey(id) {
+  let h = 2166136261;
+  const s = String(id);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return VIVID[(h >>> 0) % VIVID.length];
+}
+
 /**
  * The family key of a registry entry `{id, model}` (or of a bare model string).
  * The provider model string wins; the registry id is the fallback.
  */
 export function familyKey(entry) {
   if (!entry) return 'unknown';
-  if (typeof entry === 'string') return match(entry) || 'unknown';
-  return match(entry.model) || match(entry.id) || 'unknown';
+  if (typeof entry === 'string') return match(entry) || (nameOf(entry) ? vividKey(entry.trim()) : 'unknown');
+  const known = match(entry.model) || match(entry.id);
+  if (known) return known;
+  const id = String(entry.id || '').trim();
+  if (id) return vividKey(id);
+  const model = String(entry.model || '').trim();
+  return model ? vividKey(model) : 'unknown';
 }
 
 /** Family of a registry id as the hub reports it on a thread (`thread.model`). */
@@ -74,6 +101,9 @@ export function familyOfId(id) {
 }
 
 export function familyInfo(key) {
+  // A hashed hue is not a family: empty label and glyph, so callers keep
+  // saying "unknown" and drawing the generic mark.
+  if (isVivid(key)) return { key, label: '', maker: '', glyph: '' };
   return { key, ...(FAMILIES[key] || FAMILIES.unknown) };
 }
 
@@ -86,15 +116,27 @@ export function familyMark(key) {
   const f = familyInfo(key);
   return h(
     'span',
-    { class: ['fam-mark', `fam-${f.key}`], 'aria-hidden': 'true', title: f.key === 'unknown' ? 'Family unknown' : `${f.label} family` },
+    { class: ['fam-mark', `fam-${f.key}`], 'aria-hidden': 'true', title: FAMILIES[f.key] && f.key !== 'unknown' ? `${f.label} family` : 'Family unknown' },
     f.glyph || icon('models'),
   );
+}
+
+/**
+ * The family's colour dot (thread rows, the threads card). Decorative: the row
+ * names the model in text. Pair with `statusPill(status, { family: key })` so the
+ * dot and the Running pill share a hue.
+ */
+export function familyDot(key) {
+  const f = familyInfo(key);
+  const colour = FAMILIES[f.key] || isVivid(f.key) ? f.key : 'unknown';
+  return h('span', { class: ['fam-dot', `fam-${colour}`], 'aria-hidden': 'true' });
 }
 
 /** Words for screen readers, e.g. "Claude family" or "family unknown". */
 export function familyLabel(key) {
   const f = familyInfo(key);
-  return f.key === 'unknown' ? 'family unknown' : `${f.label} family`;
+  if (!FAMILIES[key] || key === 'unknown') return 'family unknown';
+  return `${f.label} family`;
 }
 
 /** Point an element's family class at `key` (keeps other classes). */

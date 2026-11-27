@@ -1,0 +1,31 @@
+/* The public privacy page (/privacy). Plain and readable in light and dark. */
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfa;
+  --fg: #1d1d1b;
+  --muted: #5f5f5a;
+  --link: #0b6e69;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161615; --fg: #ececea; --muted: #a8a8a2; --link: #5cc8c0; }
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 42rem; margin: 0 auto; padding: 2.5rem 1rem 4rem; }
+h1 { font-size: 1.75rem; line-height: 1.25; margin: 0 0 0.25rem; }
+h2 { font-size: 1.15rem; margin: 2rem 0 0.5rem; }
+.updated { color: var(--muted); margin-top: 0; }
+a { color: var(--link); }
+code { font-size: 0.95em; }
+li { margin: 0.35rem 0; }
+
+/* Same look as the app: cool light, navy dark. */
+:root { --bg: #f4f6f9; --fg: #0f1722; --muted: #46505e; --link: #0b7372; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #10141d; --fg: #f3f6f9; --muted: #a4adbb; --link: #22d3ce; }
+}
+h1 { letter-spacing: -0.02em; }

@@ -1,0 +1,7 @@
+{
+  "object": "list",
+  "data": [
+    { "id": "grok-3", "object": "model", "owned_by": "xai" },
+    { "id": "grok-2-image-1212", "object": "model", "owned_by": "xai" }
+  ]
+}

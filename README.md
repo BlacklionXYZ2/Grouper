@@ -7,9 +7,10 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 ## What works now
 
 - **Web app**: open the hub's address in a browser (`https://grouper.clockmillbarn.uk/`) and
-  sign in with an admin token: chat with live streaming and thread cards, approvals, the
+  sign in with Google: chat with live streaming and thread cards, approvals, the
   thread inspector, devices and permissions, models, usage and limits, memory and skills.
-  Served by the hub itself; a session cookie, never the token, stays in the browser.
+  Served by the hub itself; a session cookie, never a token, stays in the browser. See
+  [Signing in](#signing-in).
 - **Hub**: devices, tokens and live presence; SQLite storage; HTTP API and a live event stream.
 - **Harness**: project chat (an orchestrator that starts subagent **threads** on your
   devices or on the hub and is woken when they finish or ask something) and standard
@@ -37,7 +38,7 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 - **Accounting**: tokens and estimated cost per call, conversation, model and day
   (`grouper usage`), and OpenRouter/DeepSeek balances.
 - **Windows**: thread shells run PowerShell, with Windows-aware Auto risk rules; the device
-  token is stored with DPAPI (`grouper login`).
+  token from `grouper login` is stored with DPAPI.
 - **Swift ⇄ Rust**: the Mac demo app runs threads inside the Rust core and offers a
   Swift-implemented tool to them.
 
@@ -59,7 +60,7 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 | `apple/GrouperApp` | SwiftUI apps for iPhone and Mac (first draft, not yet built: see its README; needs Xcode 26) |
 | `apple/GrouperKit` | Swift package wrapping the Rust core, plus the `grouper-mac` demo node |
 | `examples/scripted-demo.json` | Script for the fake model, to try everything without API keys |
-| `Dockerfile`, `deploy/` | Hub container for the Linux VM on the PC (later a VPS) |
+| `Dockerfile`, `deploy/` | Server mode (parked): Docker hub for a Linux VM or a VPS. The PC move is [deploy/MOVE-TO-PC.md](deploy/MOVE-TO-PC.md) |
 
 ## Try it without API keys
 
@@ -78,6 +79,39 @@ managing keys and models, chatting and steering threads need an admin token
 (`--admin`, or `grouper-hub device admin <id>` later). Keep admin tokens off devices
 that run threads with a shell. Thread shells never see `GROUPER_*` variables.
 
+Admin clients can also make plain device tokens over HTTP: `POST /v1/devices` with
+`{"name": "...", "platform": "macos", "install_id": "..."}` returns `{"device": …, "token": "…"}`
+(the token is shown only then; at most 100 devices), and `DELETE /v1/devices/{id}` revokes one
+and closes its connection. With an `install_id` (16 to 64 characters of `[A-Za-z0-9_-]`) that a
+live plain device already has, that device gets a fresh token and its old one is revoked, instead
+of a new device being made. Admin tokens are only made on the hub's CLI. The Mac app uses this to
+register itself when you sign in, so you never paste a device token for it.
+
+## Signing in
+
+- **Web, iPhone, Mac:** sign in with Google. A new hub is claimed by the first Google sign-in
+  that brings its setup code (logged at start, or `grouper-hub setup-code`); after that only the
+  owner's Google account gets in. Apps send a random per-install `install_id`, so signing in
+  again from the same install reuses its device (same id, fresh token, old token revoked).
+- **CLI (computers that run threads):** `grouper login [--name <name>]` (the hub is
+  `https://grouper.clockmillbarn.uk` unless you pass `--hub <url>` or set `GROUPER_HUB`) prints a code
+  and a link (and tries to open it). Open it where you're signed in to Grouper, check the code
+  and the device name, and approve; the CLI gets its own non-admin device token and saves it with
+  the hub URL and its install id (see the CLI table). `grouper connect` and the other commands then
+  need no token. `grouper logout` forgets them; logging in again reuses the same device.
+- **Recovery and automation:** tokens still work. `GROUPER_TOKEN` (or `--token`) overrides the
+  saved sign-in for any CLI command. In a browser, open `<hub>/#/token-signin` for the token form
+  (nothing links to it); make a token on the hub with `grouper-hub device add <name> --admin`.
+  A hub with no Google sign-in configured shows the token form on its normal sign-in page.
+
+Device link API (what `grouper login` uses; [docs/accounts-design.md](docs/accounts-design.md)):
+`POST /v1/auth/link/start` `{name, platform, install_id?}` (no auth, rate-limited) →
+`{code, poll_secret, verify_url, expires_in: 600, interval: 3}`; the web page `#/link?code=…`
+reads `GET /v1/auth/link/{code}` and answers with `POST /v1/auth/link/{code}/approve` or `/deny`
+(admin); `POST /v1/auth/link/poll` `{poll_secret}` → `pending`, `denied`, `expired`, or once
+`approved` with the token. The link uses `GROUPER_PUBLIC_URL` when set, else the address the
+CLI used.
+
 In a second terminal, connect a device that runs threads:
 
 ```bash
@@ -92,6 +126,10 @@ target/debug/grouper chat "Write two haiku, one on my Mac and one in the cloud"
 ```
 
 The Mac thread's shell command waits for approval: run the `grouper approve …` it prints.
+
+`grouper chat "Show me a plan demo"` starts a hub thread that posts a four-step plan with
+`update_plan` and ticks it off about every 1.5 seconds (no device needed). Threads' plans are
+ordinary `update_plan` tool calls in their activity; clients show the latest one as a checklist.
 
 ## End-to-end test
 
@@ -120,9 +158,11 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 
 ## CLI
 
+`--hub` is optional on every command, including `grouper login` with no arguments. The hub address is `--hub`, then `GROUPER_HUB`, then the hub saved by `grouper login`, then `https://grouper.clockmillbarn.uk`.
+
 | Command | Does |
 |---|---|
-| `grouper login --hub <url>`, `grouper logout` | Store this device's token (DPAPI / Keychain), so `GROUPER_TOKEN` isn't needed |
+| `grouper login [--hub <url>] [--name <name>] [--no-browser]`, `grouper logout` | Sign this computer in by approving it in the browser. With no `--hub` and no `GROUPER_HUB`, login uses the saved hub, or `https://grouper.clockmillbarn.uk`. Saves the hub URL, its device token (DPAPI on Windows, Keychain on macOS, an owner-only file on Linux) and install id in `<config dir>/grouper/credentials.json` (`GROUPER_CREDENTIALS_FILE` overrides the path), so `GROUPER_TOKEN` isn't needed |
 | `grouper connect` | Be a device: stay online, run threads here (`--workspace`, `--no-shell`, `--mcp-config`, `--folder name=path[:rw]`) |
 | `grouper files <thread> [<path> -o out]` | List or download a thread's output files, from whichever device it ran on |
 | `grouper chat "…"` (`-c <id>`, `--standard`) | Talk to Grouper; prints replies and thread activity |
@@ -144,6 +184,7 @@ Anthropic: `keys set anthropic --kind anthropic`, then models such as `claude-op
 | `grouper limits`, `grouper limits set <key> <value\|off>` | Thread caps, budgets, approval and ask timeouts (all off by default) |
 | `grouper sync` | Refresh the local cache; `log`, `conversations` and `threads` read it when the hub is unreachable |
 | `grouper devices`, `grouper call <device> <tool>` | Presence and direct device tools |
+| `grouper hub init\|run\|status\|move\|take` | Set up and run a local hub + in-process node on Linux or any headless machine, inspect status/tunnel, or print the web UI link to move the hub |
 
 ## Swift demo node
 
@@ -152,10 +193,25 @@ scripts/build-apple.sh
 cd apple/GrouperKit && GROUPER_TOKEN=<token> swift run grouper-mac
 ```
 
-## Run the hub in the VM on the PC
+## Run the hub
 
-See [deploy/README.md](deploy/README.md): a Hyper-V VM made by script, the hub in
-Docker, and a Cloudflare Tunnel to `https://grouper.clockmillbarn.uk`.
+On this PC the hub is the Windows app. [deploy/MOVE-TO-PC.md](deploy/MOVE-TO-PC.md)
+moves the VM's data there.
+
+On Linux or any headless computer, use the CLI hub commands:
+
+```bash
+grouper hub init                 # creates ~/.local/share/grouper/hub (or --data <dir>)
+grouper hub run                  # binds 127.0.0.1:47600 + starts an in-process node; Ctrl+C stops cleanly
+grouper hub status               # shows hub running state, account id, hub_device_id, epoch and tunnel status
+grouper hub move <device>        # prints the web UI link (Devices → Change hub…) to confirm with Google sign-in
+grouper hub take                 # same, targeting this machine
+```
+
+An example systemd user unit is in [deploy/grouper-hub.service](deploy/grouper-hub.service).
+
+Server mode (parked) is [deploy/README.md](deploy/README.md): a Hyper-V VM made by
+script, the hub in Docker, and a Cloudflare Tunnel to `https://grouper.clockmillbarn.uk`.
 
 ## Scoped folders
 
@@ -184,6 +240,12 @@ tools) can't be confined to a folder, so on Auto each of their chat calls asks y
 - Approval notifications use Web Push. The hub's VAPID key is sealed with the same master
   key. Set `GROUPER_PUBLIC_URL` (e.g. `https://hub.example.com`) to name the hub to push
   services; otherwise it uses the origin each browser subscribed from.
+- Sign in with Google (hub side; [docs/accounts-design.md](docs/accounts-design.md)): a hub has one
+  owner. Trusted app client IDs come from `GROUPER_GOOGLE_CLIENT_IDS` (comma-separated), the
+  browser client from `GROUPER_GOOGLE_WEB_CLIENT_ID` and its shared return page from
+  `GROUPER_GOOGLE_RETURN_URL`; with none set, Google sign-in is off. An unclaimed hub logs a
+  one-hour setup code at start (`grouper-hub setup-code` prints another); `grouper-hub owner
+  show|reset` shows or unlinks the owner (tokens keep working).
 - Hub threads get file tools only, until they run in sandbox containers.
 - `apple/GrouperKit` links a static library so it builds with the Command Line Tools.
   With Xcode installed, switch to an XCFramework for iOS.

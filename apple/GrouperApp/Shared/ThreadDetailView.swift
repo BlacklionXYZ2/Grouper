@@ -1,11 +1,13 @@
 import SwiftUI
 import GrouperAPI
 
-/// One thread, read like a chat: the orchestrator's brief is the first message, the
-/// thread model's text is the assistant's (labelled with the model), tool calls are
-/// collapsible rows with the exact input and output, and step-ins and the
-/// orchestrator's answers are messages. The fixed header shows status, device,
-/// elapsed time and the model the orchestrator chose (no picker). The
+/// One thread, read like a chat (owner, 26 Nov: threads behave like a chat): the
+/// orchestrator's brief is the first message, the thread model's text is the
+/// assistant's (labelled with the model), tool calls are collapsible rows with the
+/// exact input and output, and step-ins and the orchestrator's answers are messages.
+/// The fixed header shows status with live elapsed time, device and the model the
+/// orchestrator chose (no picker), then the thread's live plan checklist when it
+/// keeps one (`update_plan`; those calls are not tool rows). The
 /// waiting/checkpoint card, the result and rating sit around the transcript; the
 /// step-in composer with Stop sits at the bottom, replaced by the approval dock
 /// while this thread has a pending request.
@@ -22,6 +24,8 @@ struct ThreadDetailView: View {
     @State private var sending = false
     @State private var showStopConfirmation = false
     @State private var openCalls: Set<String> = []
+    @State private var planExpanded = true
+    @FocusState private var composerFocused: Bool
 
     private var liveThread: ThreadInfo {
         model.threads.first { $0.id == thread.id } ?? thread
@@ -42,18 +46,20 @@ struct ThreadDetailView: View {
                     }
                     if transcript.messages.isEmpty && draft.isEmpty {
                         Text(liveThread.isActive ? "Working… output appears here as it streams." : "No output.")
-                            .font(.callout).foregroundStyle(.secondary)
+                            .font(.callout).foregroundStyle(Theme.text3)
                     }
                     if liveThread.isTerminal { result(transcript.finishedSummary) }
                     Color.clear.frame(height: 1).id("end")
                 }
                 .padding()
             }
+            .background(Theme.bg)
+            .dismissesKeyboardOnTap($composerFocused)
             .onChange(of: transcript.messages.count) { _, _ in
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end") }
             }
         }
-        .safeAreaInset(edge: .top, spacing: 0) { header(started: started(in: rows)) }
+        .safeAreaInset(edge: .top, spacing: 0) { header(started: started(in: rows), plan: ThreadPlan.latest(in: rows)) }
         .safeAreaInset(edge: .bottom, spacing: 0) { footer }
         .navigationTitle(liveThread.title.isEmpty ? "Thread" : liveThread.title)
         #if os(iOS)
@@ -75,29 +81,35 @@ struct ThreadDetailView: View {
 
     // MARK: - Header (fixed)
 
-    private func header(started: ThreadStarted?) -> some View {
+    private func header(started: ThreadStarted?, plan: ThreadPlan?) -> some View {
         let modelId = liveThread.model.isEmpty ? (started?.model ?? "") : liveThread.model
         let reason = liveThread.reason ?? started?.reason
+        let family = model.family(ofModel: modelId)
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                if approvals.isEmpty {
-                    StatusLabel(status: liveThread.status)
-                } else {
-                    Label("Needs approval", systemImage: "exclamationmark.shield.fill")
-                        .font(.caption.weight(.semibold)).foregroundStyle(.orange)
-                }
-                Label(deviceName, systemImage: "desktopcomputer").lineLimit(1)
+                StatusPill(status: liveThread.status, family: family, needsApproval: !approvals.isEmpty)
                 ElapsedText(thread: liveThread)
+                    .font(Theme.Typeface.meta).foregroundStyle(Theme.text3)
             }
-            .font(.caption).foregroundStyle(.secondary)
-            FixedModelChip(modelId: modelId, family: model.family(ofModel: modelId), providerId: model.modelEntry(modelId)?.providerId)
+            HStack(spacing: 8) {
+                Label(deviceName, systemImage: "desktopcomputer")
+                    .font(Theme.Typeface.chip).foregroundStyle(Theme.text2).lineLimit(1)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Theme.surface2, in: RoundedRectangle(cornerRadius: Theme.Radius.sm))
+                    .accessibilityLabel("Device: \(deviceName)")
+                FixedModelChip(modelId: modelId, family: family, providerId: model.modelEntry(modelId)?.providerId)
+            }
             if let reason, !reason.isEmpty {
-                Text(reason).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                Text(reason).font(Theme.Typeface.meta).foregroundStyle(Theme.text3).lineLimit(3)
+            }
+            if let plan {
+                PlanChecklist(plan: plan, expanded: $planExpanded)
             }
         }
         .padding(.horizontal).padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.bar)
+        .background(Theme.bgTint)
+        .overlay(alignment: .bottom) { Rectangle().fill(Theme.border).frame(height: 1) }
     }
 
     // MARK: - Attention: approvals, waiting, checkpoint, hand-over
@@ -119,43 +131,40 @@ struct ThreadDetailView: View {
         let handover = latest.handover
         if liveThread.status == "waiting_device" {
             VStack(alignment: .leading, spacing: 6) {
-                Label("\(deviceName) is offline", systemImage: "clock.fill").font(.headline).foregroundStyle(.orange)
+                Label("\(deviceName) is offline", systemImage: "clock.fill").font(.headline).foregroundStyle(Theme.warn)
                 if let device = model.devices.first(where: { $0.id == liveThread.deviceId }), let last = device.lastSeen {
                     HStack(spacing: 4) {
                         Text("Last seen")
                         RelativeAgeText(seconds: last)
                     }
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(Theme.text2)
                 } else {
-                    Text("Not seen yet.").font(.caption).foregroundStyle(.secondary)
+                    Text("Not seen yet.").font(.caption).foregroundStyle(Theme.text2)
                 }
-                if let waiting, !waiting.reason.isEmpty { Text(waiting.reason).font(.callout) }
+                if let waiting, !waiting.reason.isEmpty { Text(waiting.reason).font(.callout).foregroundStyle(Theme.text) }
                 if checkpoint == nil {
-                    Text("Meanwhile the hub works towards a checkpoint, then waits for the device.").font(.callout).foregroundStyle(.secondary)
+                    Text("Meanwhile the hub works towards a checkpoint, then waits for the device.").font(.callout).foregroundStyle(Theme.text2)
                 }
             }
-            .padding().frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.orange.opacity(0.09), in: .rect(cornerRadius: 14))
+            .grouperCard(fill: Theme.warnSoft, stroke: Theme.warnSoft)
         }
         // The checkpoint stays visible after the thread resumes, so the hand-over is clear.
         if let checkpoint {
             VStack(alignment: .leading, spacing: 6) {
-                Label("Checkpoint on the hub", systemImage: "flag.checkered").font(.headline).foregroundStyle(.teal)
-                Text(LocalizedStringKey(checkpoint.summary)).textSelection(.enabled)
+                Label("Checkpoint on the hub", systemImage: "flag.checkered").font(.headline).foregroundStyle(Theme.accent)
+                Text(LocalizedStringKey(checkpoint.summary)).textSelection(.enabled).foregroundStyle(Theme.text)
             }
-            .padding().frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 14))
+            .grouperCard()
         }
         if let handover {
             VStack(alignment: .leading, spacing: 4) {
-                Label("Handed over to \(model.deviceDisplayName(handover.deviceId))", systemImage: "arrow.triangle.2.circlepath").font(.headline)
-                Text(handover.files.isEmpty ? "No files to copy." : "Copied: \(handover.files.joined(separator: ", "))").font(.caption)
+                Label("Handed over to \(model.deviceDisplayName(handover.deviceId))", systemImage: "arrow.triangle.2.circlepath").font(.headline).foregroundStyle(Theme.text)
+                Text(handover.files.isEmpty ? "No files to copy." : "Copied: \(handover.files.joined(separator: ", "))").font(.caption).foregroundStyle(Theme.text2)
                 if !handover.skipped.isEmpty {
-                    Text("Left out: \(handover.skipped.joined(separator: "; "))").font(.caption).foregroundStyle(.secondary)
+                    Text("Left out: \(handover.skipped.joined(separator: "; "))").font(.caption).foregroundStyle(Theme.text3)
                 }
             }
-            .padding().frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 14))
+            .grouperCard()
         }
     }
 
@@ -169,17 +178,17 @@ struct ThreadDetailView: View {
             modelLabel(started: nil)
         case .text(_, let text):
             Text(LocalizedStringKey(text))
+                .foregroundStyle(Theme.text)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         case .tool(_, let call, let result):
             ToolCallRow(call: call, result: result, threadActive: liveThread.isActive, isExpanded: expanded(call.callId))
         case .ask(_, let question):
             VStack(alignment: .leading, spacing: 4) {
-                Label("Asked the orchestrator", systemImage: "bubble.left.and.text.bubble.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Text(question).textSelection(.enabled)
+                Label("Asked the orchestrator", systemImage: "bubble.left.and.text.bubble.right").font(.caption.weight(.semibold)).foregroundStyle(Theme.text2)
+                Text(question).textSelection(.enabled).foregroundStyle(Theme.text)
             }
-            .padding(12).frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 16))
+            .grouperCard()
             .accessibilityElement(children: .combine)
         case .notice(_, let text):
             note(text, systemImage: "info.circle")
@@ -199,11 +208,14 @@ struct ThreadDetailView: View {
         HStack {
             Spacer(minLength: 36)
             VStack(alignment: .leading, spacing: 4) {
-                Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Text(LocalizedStringKey(text)).textSelection(.enabled)
+                Text(label).font(.caption.weight(.semibold)).foregroundStyle(Theme.text2)
+                Text(LocalizedStringKey(text)).textSelection(.enabled).foregroundStyle(Theme.text)
             }
             .padding(12)
-            .background(sender == .owner ? Color.grouperSecondaryBackground : Color.teal.opacity(0.1), in: .rect(cornerRadius: 16))
+            .background(sender == .owner ? Theme.surface : Theme.accentSoft, in: RoundedRectangle(cornerRadius: Theme.Radius.card))
+            .overlay {
+                RoundedRectangle(cornerRadius: Theme.Radius.card).strokeBorder(sender == .owner ? Theme.border : Theme.accentSoft, lineWidth: 1)
+            }
         }
         .accessibilityElement(children: .combine)
     }
@@ -213,15 +225,18 @@ struct ThreadDetailView: View {
         let modelId = liveThread.model.isEmpty ? (started?.model ?? "") : liveThread.model
         return HStack(spacing: 6) {
             FamilyMark(family: model.family(ofModel: modelId))
-            Text(modelId.isEmpty ? "Thread model" : modelId).font(.caption.monospaced()).foregroundStyle(.secondary)
+            Text(modelId.isEmpty ? "Thread model" : modelId).font(Theme.Typeface.chip).foregroundStyle(Theme.text2)
         }
         .accessibilityElement(children: .combine)
     }
 
     private func draftView(_ draft: String) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(draft).textSelection(.enabled)
-            Label("Working", systemImage: "ellipsis").font(.caption).foregroundStyle(.teal)
+            Text(draft).textSelection(.enabled).foregroundStyle(Theme.text)
+            Label("Working…", systemImage: "ellipsis")
+                .font(Theme.Typeface.chip).foregroundStyle(Theme.brand)
+                .padding(.horizontal, 8).padding(.vertical, 2)
+                .background(Theme.brandSoft, in: RoundedRectangle(cornerRadius: Theme.Radius.sm))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
@@ -229,7 +244,7 @@ struct ThreadDetailView: View {
     }
 
     private func note(_ text: String, systemImage: String) -> some View {
-        Label(text, systemImage: systemImage).font(.callout).foregroundStyle(.secondary)
+        Label(text, systemImage: systemImage).font(.callout).foregroundStyle(Theme.text3)
     }
 
     private func expanded(_ callId: String) -> Binding<Bool> {
@@ -254,23 +269,23 @@ struct ThreadDetailView: View {
         let summary = liveThread.summary ?? finishedSummary
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("Result").font(.headline)
+                Text("Result").font(.headline).foregroundStyle(Theme.text)
                 Spacer()
-                StatusLabel(status: liveThread.status)
+                StatusPill(status: liveThread.status)
             }
             if let summary, !summary.isEmpty {
-                Text(LocalizedStringKey(summary)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                Text(LocalizedStringKey(summary)).textSelection(.enabled).foregroundStyle(Theme.text)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             rating
         }
-        .padding()
-        .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 14))
+        .grouperCard(padding: 16)
     }
 
     private var rating: some View {
         GlassEffectContainer(spacing: 8) {
             HStack {
-                Text("Rate this result").font(.subheadline.weight(.semibold)); Spacer()
+                Text("Rate this result").font(.subheadline.weight(.semibold)).foregroundStyle(Theme.text); Spacer()
                 Button { Task { await model.rateThread(liveThread.id, rating: "up") } } label: { Image(systemName: "hand.thumbsup") }.accessibilityLabel("Rate up")
                 Button { Task { await model.rateThread(liveThread.id, rating: "down") } } label: { Image(systemName: "hand.thumbsdown") }.accessibilityLabel("Rate down")
             }.buttonStyle(.glass)
@@ -291,28 +306,33 @@ struct ThreadDetailView: View {
                              otherInChat: otherApprovalsInChat, onShowChatQueue: onClose)
             } else if liveThread.isTerminal {
                 Text("This thread has finished. Ask about it in the chat.")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(Theme.text3)
                     .frame(maxWidth: .infinity)
                     .padding()
             } else {
                 GlassSurface {
                     VStack(alignment: .leading, spacing: 6) {
-                        TextField("Message this thread", text: $message, axis: .vertical)
-                            .lineLimit(1...4).textFieldStyle(.plain).padding(.horizontal, 8).grouperMinimumControlSize()
+                        TextField("Message this thread", text: $message,
+                                  prompt: Text("Message this thread").foregroundStyle(Theme.text3), axis: .vertical)
+                            .lineLimit(1...4).textFieldStyle(.plain).font(Theme.Typeface.body).foregroundStyle(Theme.text)
+                            .padding(.horizontal, 8).grouperMinimumControlSize()
+                            .focused($composerFocused)
                         HStack {
                             Button(role: .destructive) {
                                 if liveThread.status == "running" { showStopConfirmation = true } else { stop() }
                             } label: {
                                 if stopping { ProgressView() } else { Label("Stop", systemImage: "stop.circle") }
                             }
+                            .buttonStyle(.borderless)
+                            .foregroundStyle(Theme.danger)
                             .disabled(!model.online || stopping)
                             .grouperMinimumControlSize()
                             .accessibilityLabel("Stop thread")
                             Spacer()
                             Button { stepIn() } label: {
-                                if sending { ProgressView().frame(width: 22, height: 22) } else { Image(systemName: "arrow.up") }
+                                if sending { ProgressView().controlSize(.small) } else { Image(systemName: "arrow.up") }
                             }
-                            .buttonStyle(.glassProminent).grouperMinimumControlSize()
+                            .buttonStyle(SendButtonStyle())
                             .accessibilityLabel("Send to this thread")
                             .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.online || sending)
                         }
@@ -388,25 +408,24 @@ private struct ToolCallRow: View {
         DisclosureGroup(isExpanded: $isExpanded) {
             VStack(alignment: .leading, spacing: 8) {
                 if call.input != .null {
-                    Text("Input").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Text(call.input.prettyPrinted).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                    Text("Input").font(.caption.weight(.semibold)).foregroundStyle(Theme.text2)
+                    Text(call.input.prettyPrinted).font(Theme.Typeface.mono).foregroundStyle(Theme.text).textSelection(.enabled)
                 }
                 if let result {
-                    Text("Output").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Text(result.output.isEmpty ? "(empty)" : result.output).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                    Text("Output").font(.caption.weight(.semibold)).foregroundStyle(Theme.text2)
+                    Text(result.output.isEmpty ? "(empty)" : result.output).font(Theme.Typeface.mono).foregroundStyle(Theme.text).textSelection(.enabled)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 8)
         } label: {
             HStack {
-                Label(call.name, systemImage: "wrench.and.screwdriver").lineLimit(1)
+                Label(call.name, systemImage: "wrench.and.screwdriver").lineLimit(1).foregroundStyle(Theme.text)
                 Spacer()
-                Text(state).font(.caption.weight(.semibold)).foregroundStyle(stateColor)
+                Label(state, systemImage: stateIcon).font(.caption.weight(.semibold)).foregroundStyle(stateColor)
             }
         }
-        .padding(12)
-        .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 12))
+        .grouperCard()
     }
 
     private var state: String {
@@ -415,7 +434,108 @@ private struct ToolCallRow: View {
     }
 
     private var stateColor: Color {
-        if let result { return result.ok ? Color.secondary : Color.red }
-        return threadActive ? Color.teal : Color.secondary
+        if let result { return result.ok ? Theme.ok : Theme.danger }
+        return threadActive ? Theme.accent : Theme.text3
+    }
+
+    private var stateIcon: String {
+        if let result { return result.ok ? "checkmark" : "xmark" }
+        return threadActive ? "circle.dotted" : "minus"
+    }
+}
+
+/// The thread's live plan, pinned above its chat: "Plan · 2 of 5 done", then one
+/// row per step. Pending is an empty circle; the step in progress is highlighted in
+/// the brand purple with a spinner and its active form; done is a tick with quieter
+/// text. Collapsible; every row says its state in words for VoiceOver.
+struct PlanChecklist: View {
+    let plan: ThreadPlan
+    @Binding var expanded: Bool
+
+    /// Longer plans scroll inside the pinned header instead of pushing the chat away.
+    private static let scrollAfter = 6
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "checklist").foregroundStyle(Theme.brand)
+                    Text("Plan").font(Theme.Typeface.row.weight(.semibold)).foregroundStyle(Theme.text)
+                    Text("· \(plan.progressText)").font(Theme.Typeface.row).foregroundStyle(Theme.text2)
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.text3)
+                        .rotationEffect(.degrees(expanded ? 0 : -90))
+                }
+                .frame(minHeight: 32)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Plan, \(plan.progressText)")
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+            .accessibilityHint(expanded ? "Hides the steps" : "Shows the steps")
+            .accessibilityAddTraits(.isButton)
+
+            ProgressView(value: Double(plan.completedCount), total: Double(max(plan.items.count, 1)))
+                .tint(Theme.brandFill)
+                .accessibilityHidden(true)
+
+            if expanded {
+                if plan.items.count > Self.scrollAfter {
+                    ScrollView { rows }.frame(maxHeight: 220)
+                } else {
+                    rows
+                }
+            }
+        }
+        .grouperCard(padding: 10)
+        // Progress is visual; say it too when a step is ticked off.
+        .onChange(of: plan.completedCount) { old, new in
+            if new > old { AccessibilityNotification.Announcement("Plan: \(plan.progressText)").post() }
+        }
+    }
+
+    private var rows: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(plan.items.enumerated()), id: \.offset) { _, item in row(item) }
+        }
+    }
+
+    private func row(_ item: ThreadPlan.Item) -> some View {
+        let inProgress = item.status == .inProgress
+        return HStack(spacing: 10) {
+            Group {
+                switch item.status {
+                case .pending:
+                    Image(systemName: "circle").foregroundStyle(Theme.text3)
+                case .inProgress:
+                    ProgressView().controlSize(.small).tint(Theme.brand)
+                case .completed:
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.ok)
+                }
+            }
+            .frame(width: 18, height: 18)
+            Text(item.displayText)
+                .font(inProgress ? Theme.Typeface.row.weight(.semibold) : Theme.Typeface.row)
+                .foregroundStyle(item.status == .completed ? Theme.text3 : inProgress ? Theme.brand : Theme.text)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(inProgress ? Theme.brandSoft : Color.clear, in: RoundedRectangle(cornerRadius: Theme.Radius.sm))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(item.displayText), \(Self.spoken(item.status))")
+    }
+
+    private static func spoken(_ status: ThreadPlan.Status) -> String {
+        switch status {
+        case .pending: return "not started"
+        case .inProgress: return "in progress"
+        case .completed: return "done"
+        }
     }
 }

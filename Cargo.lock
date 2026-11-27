@@ -939,6 +939,9 @@ dependencies = [
  "core-sync",
  "dirs",
  "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "hub",
  "reqwest",
  "rpassword",
  "security-framework",
@@ -1062,14 +1065,17 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rusqlite",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1893,22 +1899,31 @@ version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "391f153431ab68664d946513ea0cb3edbca78eaf99c5a983036cacab6220d85b"
 dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
  "chrono",
  "futures",
+ "http",
+ "http-body",
+ "http-body-util",
  "indexmap",
  "libc",
  "pastey",
  "percent-encoding",
  "pin-project-lite",
  "process-wrap",
+ "rand 0.10.4",
  "schemars",
  "serde",
  "serde_json",
  "sha2",
+ "sse-stream",
  "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "tracing",
  "unicode-general-category",
  "unicode-normalization",
@@ -2374,6 +2389,19 @@ checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
 dependencies = [
  "cc",
  "rsqlite-vfs",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25ac7aff0abd1dbc474536e40416e1102c7dd9bfba0b9861c6d357f835dcfb4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]

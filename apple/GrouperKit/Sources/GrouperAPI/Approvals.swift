@@ -27,6 +27,7 @@ public enum ApprovalOutcome: Equatable, Sendable {
     case answeredHere(approved: Bool)
     case answeredElsewhere
     case threadEnded
+    case timedOut(threadStopped: Bool)
     case noLongerWaiting
 
     public var message: String {
@@ -34,6 +35,7 @@ public enum ApprovalOutcome: Equatable, Sendable {
         case .answeredHere(let approved): return approved ? "Approved." : "Denied."
         case .answeredElsewhere: return "Answered on another device."
         case .threadEnded: return "Thread ended; this request can’t run."
+        case .timedOut(let stopped): return stopped ? "Timed out: denied, and the thread was stopped." : "Timed out: denied."
         case .noLongerWaiting: return "This request is no longer waiting."
         }
     }
@@ -172,9 +174,16 @@ public struct ApprovalBook: Equatable, Sendable {
             pending[approval.id] = approval
             arrivals[approval.id] = clock
             return .added(approval)
-        case .approvalResolved(let id, let approved):
+        case .approvalResolved(let id, let approved, let reason):
             if outcomes[id] == nil {
-                record(id, answering.contains(id) ? .answeredHere(approved: approved) : .answeredElsewhere)
+                let outcome: ApprovalOutcome
+                switch reason {
+                case "timeout": outcome = .timedOut(threadStopped: false)
+                case "timeout_stop": outcome = .timedOut(threadStopped: true)
+                case "dropped": outcome = .noLongerWaiting
+                default: outcome = answering.contains(id) ? .answeredHere(approved: approved) : .answeredElsewhere
+                }
+                record(id, outcome)
             }
             return remove([id])
         case .threadFinished:

@@ -1,0 +1,102 @@
+# Windows desktop app (Tauri 2 shell embedding hub and core-client node).
+# Unsigned build on GitHub-hosted windows-latest. The NSIS setup exe is an artifact kept 14 days.
+# cargo fmt is intentionally not run: the tree is not rustfmt-clean.
+
+name: Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "apps/desktop/**"
+      - "crates/hub/**"
+      - "crates/core-client/**"
+      - "crates/core-agent/**"
+      - "crates/core-protocol/**"
+      - "crates/core-registry/**"
+      - "crates/core-memory/**"
+      - "crates/providers/**"
+      - "Cargo.toml"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "apps/desktop/**"
+      - "crates/hub/**"
+      - "crates/core-client/**"
+      - "crates/core-agent/**"
+      - "crates/core-protocol/**"
+      - "crates/core-registry/**"
+      - "crates/core-memory/**"
+      - "crates/providers/**"
+      - "Cargo.toml"
+      - ".github/workflows/desktop.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: windows-latest
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/desktop/src-tauri -> target"
+
+      - name: Build desktop app (release, unsigned)
+        working-directory: apps/desktop/src-tauri
+        run: cargo build --release --locked
+
+      - name: Test desktop app
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked
+
+      - name: Clippy
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The binary is reused until GitHub evicts the cache. A miss installs the current ^2.
+      - name: Cache Tauri CLI
+        id: cache-tauri-cli
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-tauri.exe
+          key: ${{ runner.os }}-tauri-cli-2-locked
+
+      - name: Install Tauri CLI
+        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build unsigned NSIS installer
+        working-directory: apps/desktop/src-tauri
+        run: cargo tauri build --bundles nsis -- --locked
+
+      - name: Upload unsigned Windows executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: Grouper-windows-x64
+          path: apps/desktop/src-tauri/target/release/grouper-desktop.exe
+          retention-days: 14
+
+      - name: Upload unsigned NSIS installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: Grouper-windows-x64-setup
+          path: apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 14
+          if-no-files-found: error

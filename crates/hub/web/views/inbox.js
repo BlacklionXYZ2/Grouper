@@ -1,7 +1,9 @@
 // Needs you (#/inbox): everything waiting on the owner, across every chat.
 //
-//   1. Pending approvals, newest first, grouped by chat. Tool, device, the plain
-//      reason, age, thread and chat; Review opens the approval sheet. Tool
+//   1. Pending approvals, oldest first (the dock's order on every client),
+//      grouped by chat. Tool, device, the plain reason, age, thread and chat.
+//      Review only navigates: it opens the request's chat with the approval dock
+//      on that request (#/chat/<id>?approval=<id>); a row never answers. Tool
 //      arguments are never shown here (they can hold secrets; spec 4.3).
 //   2. Threads waiting for a device, grouped by chat: device, last seen,
 //      checkpoint or not, age, and the thread's model with its family accent.
@@ -12,25 +14,22 @@
 // thread's own chat. Live updates go through syncList so focus and scroll stay
 // put. An approval answered elsewhere (or dropped because its thread ended) stays
 // a while as a settled row with no actions, then goes. New approvals are
-// announced once each. Offline, the cached rows stay and Review is disabled.
+// announced once each. Offline, the cached rows stay; Review still opens the
+// dock, which shows the request read-only until the hub reconnects.
 
 import { h, icon, setChildren, setText, setAttr, syncList } from '../lib/dom.js';
 import { enc } from '../lib/api.js';
-import { store, on, deviceName, waitingThreads } from '../lib/store.js';
+import { store, on, deviceName, waitingThreads, byRequestOrder } from '../lib/store.js';
+import { navigate } from '../lib/ui.js';
 import { bar, statusPill, skeletonBlocks, announce, isOffline } from '../lib/ui.js';
 import { ago } from '../lib/format.js';
 import { familyOfId, familyMark, familyLabel, setFamilyClass } from '../lib/family.js';
-import { openApproval } from './approvals.js';
+import { isManualReason, approvalHref } from './approvals.js';
 
 const ALL_ACTIVE = 'grouper.inbox.allActive';
 const LAST_CONV = 'grouper.lastConversation';
 const SETTLED_MS = 20000; // how long an answered request stays as a settled row
 let uid = 0;
-
-/** The hub's reason for a Manual tool ends like this (as in approvals.js). */
-function isManualReason(reason) {
-  return !reason || / is set to Manual$/.test(reason);
-}
 
 function readFlag(key) {
   try {
@@ -185,10 +184,12 @@ export function renderInbox(container) {
     const cid = a.conversation_id || thread?.conversation_id;
     const row = li.firstChild;
     setText(row.querySelector('.inbox-tool'), a.tool);
-    setText(row.querySelector('.inbox-on'), ` on ${device}`);
+    setText(row.querySelector('.inbox-on'), ` · via ${device}`);
     setText(row.querySelector('.inbox-reason'), a.reason || 'This tool is set to Manual, so every call waits for you.');
-    setText(row.querySelector('.inbox-kind'), isManualReason(a.reason) ? 'Manual tool' : 'A safety rule asked');
-    row.querySelector('.inbox-kind').classList.toggle('inbox-risk', !isManualReason(a.reason));
+    const risk = !isManualReason(a.reason);
+    row.classList.toggle('is-risk', risk);
+    setText(row.querySelector('.inbox-kind'), risk ? 'A safety rule asked' : 'Manual tool');
+    row.querySelector('.inbox-kind').classList.toggle('inbox-risk', risk);
     const threadLink = row.querySelector('.inbox-thread-link');
     setText(threadLink, thread?.title || 'Open thread');
     setAttr(threadLink, 'href', cid ? `#/chat/${enc(cid)}/thread/${enc(a.thread_id)}` : `#/threads/${enc(a.thread_id)}`);
@@ -199,8 +200,8 @@ export function renderInbox(container) {
     const settled = item.settled;
     row.classList.toggle('settled', Boolean(settled));
     if (settled) {
-      // Stays focusable (aria-disabled, not disabled) so focus that returns here
-      // from the closed approval sheet isn't dropped on the page.
+      // Stays focusable (aria-disabled, not disabled) so focus on it isn't
+      // dropped on the page when the request settles.
       btn.onclick = null;
       btn.disabled = false;
       setAttr(btn, 'aria-disabled', 'true');
@@ -217,11 +218,12 @@ export function renderInbox(container) {
       btn.className = 'btn btn-sm btn-primary inbox-primary inbox-review';
       setChildren(btn, 'Review');
     }
-    btn.onclick = () => openApproval(a.approval_id, { conversationId: cid || undefined });
+    // Review opens the dock in the request's chat; Back returns here.
+    btn.onclick = () => navigate(approvalHref(a));
     setAttr(btn, 'aria-disabled', null);
     setAttr(btn, 'aria-label', `Review ${a.tool} on ${device}${thread?.title ? `, thread ${thread.title}` : ''}`);
-    btn.disabled = isOffline();
-    setAttr(btn, 'title', btn.disabled ? 'Offline: you can answer once the hub reconnects' : null);
+    btn.disabled = false;
+    setAttr(btn, 'title', isOffline() ? 'Offline: the request opens read-only until the hub reconnects' : null);
   }
 
   function threadRow() {
@@ -269,10 +271,10 @@ export function renderInbox(container) {
     setText(cp, waiting ? (t.checkpoint ? 'Checkpoint saved' : 'No checkpoint') : '');
     setText(a.querySelector('.inbox-age'), `Started ${ago(t.created)}`);
     const pill = a.querySelector('.tp-pill');
-    const key = `${t.status}|${t.checkpoint ? 1 : 0}`;
+    const key = `${t.status}|${t.checkpoint ? 1 : 0}|${fam}`;
     if (pill.dataset.key !== key) {
       pill.dataset.key = key;
-      setChildren(pill, statusPill(t.status, { checkpoint: t.checkpoint }));
+      setChildren(pill, statusPill(t.status, { checkpoint: t.checkpoint, family: fam }));
     }
   }
 
@@ -286,7 +288,16 @@ export function renderInbox(container) {
   function trackApprovals() {
     for (const [id, a] of known) {
       if (store.approvals.has(id) || settled.has(id)) continue;
-      settled.set(id, { approval: a, text: store.answered.has(id) ? 'Answered' : 'No longer waiting', at: Date.now() });
+      const res = store.resolutions.get(id);
+      const text =
+        res?.reason === 'timeout' || res?.reason === 'timeout_stop'
+          ? 'Timed out'
+          : res?.reason === 'dropped'
+            ? 'No longer waiting'
+            : store.answered.has(id)
+              ? 'Answered'
+              : 'No longer waiting';
+      settled.set(id, { approval: a, text, at: Date.now() });
     }
     known.clear();
     for (const [id, a] of store.approvals) {
@@ -317,11 +328,11 @@ export function renderInbox(container) {
     const offline = isOffline();
     const loaded = store.threadsLoaded || store.threads.size > 0 || store.approvals.size > 0 || settled.size > 0 || offline;
 
-    // Approvals, newest first; settled ones keep their place until they go.
+    // Approvals, oldest first (ties by id); settled ones keep their place until they go.
     const approvalItems = [
       ...[...store.approvals.values()].map((a) => ({ key: `a:${a.approval_id}`, approval: a, settled: null })),
       ...[...settled.values()].map((s) => ({ key: `a:${s.approval.approval_id}`, approval: s.approval, settled: s.text })),
-    ].sort((x, y) => (y.approval.ts || 0) - (x.approval.ts || 0));
+    ].sort((x, y) => byRequestOrder(x.approval, y.approval));
     const approvalGroups = byChat(approvalItems, (it) => it.approval.conversation_id || store.threads.get(it.approval.thread_id)?.conversation_id);
 
     const newestFirst = (x, y) => (y.created || 0) - (x.created || 0);
@@ -349,7 +360,7 @@ export function renderInbox(container) {
     offlineNote.hidden = !offline;
     if (offline) {
       const since = offlineSince ? ` from ${ago(offlineSince / 1000)}` : '';
-      setText(offlineNote.querySelector('.grow'), `Offline · showing the last synced copy${since}. Review is paused until the hub reconnects.`);
+      setText(offlineNote.querySelector('.grow'), `Offline · showing the last synced copy${since}. Answering is paused until the hub reconnects.`);
     }
 
     skeleton.hidden = loaded;

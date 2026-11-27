@@ -1,0 +1,23 @@
+{
+  "models": [
+    {
+      "name": "models/gemini-2.5-pro",
+      "displayName": "Gemini 2.5 Pro",
+      "inputTokenLimit": 1048576,
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/text-embedding-004",
+      "displayName": "Text Embedding 004",
+      "inputTokenLimit": 2048,
+      "supportedGenerationMethods": ["embedContent"]
+    },
+    {
+      "name": "models/aqa",
+      "displayName": "Attributed Question Answering",
+      "inputTokenLimit": 7168,
+      "supportedGenerationMethods": ["generateAnswer"]
+    }
+  ],
+  "nextPageToken": "page-2-token"
+}

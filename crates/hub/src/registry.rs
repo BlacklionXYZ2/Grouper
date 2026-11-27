@@ -541,6 +541,7 @@ mod tests {
             roles: roles.iter().map(|s| s.to_string()).collect(),
             local: false,
             modalities: vec![],
+            ..Default::default()
         }
     }
 
@@ -881,7 +882,7 @@ mod tests {
         let t = &threads[0];
         assert_eq!((t.model.as_str(), t.status.as_str()), ("llama", "done"));
         let reason = t.reason.clone().unwrap();
-        assert!(reason.starts_with("No device needed.; model llama: rule #1 \"Sensitive data: local only\" (require local)"), "{reason}");
+        assert!(reason.starts_with("No device needed; model llama: rule #1 \"Sensitive data: local only\" (require local)"), "{reason}");
         let events = hub.db.events(&conv, 0, None);
         assert!(events.iter().any(|e| matches!(&e.body,
             core_protocol::EventBody::ThreadStarted { model, reason: Some(r), .. } if model == "llama" && *r == reason)));

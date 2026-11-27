@@ -3,14 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use core_agent::thread::ThreadControl;
 use core_protocol::{
@@ -41,6 +41,8 @@ pub const HUB_DEVICE: &str = "hub";
 pub(crate) enum CloseReason {
     Replaced,
     Overflow,
+    /// The device's token was revoked (`DELETE /v1/devices/{id}`).
+    Revoked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +111,8 @@ pub(crate) struct ApprovalRoute {
     pub(crate) timeout_secs: Option<u64>,
     /// Set for threads running on the hub itself (and for the hub's hand-over copy).
     pub(crate) local: Option<oneshot::Sender<ApprovalAnswer>>,
+    /// The approval id the remote device sent, when the hub assigned its own random id.
+    pub(crate) device_approval_id: Option<String>,
     /// Distinguishes this route from any later request that happens to use the same id.
     pub(crate) generation: u64,
     /// Cancelled whenever the request is answered or cleared.
@@ -123,6 +127,8 @@ pub struct Hub {
     pub(crate) handover_acks: Mutex<HashMap<String, HandoverAckRoute>>,
     /// Concurrent model calls currently relayed through hosting devices.
     pub(crate) model_calls: Mutex<HashMap<String, ModelRoute>>,
+    /// In-flight standard-chat harness turns waiting on a hosting device, keyed by conversation id.
+    pub(crate) harness_turns: Mutex<HashMap<String, crate::harness::PendingHarnessTurn>>,
     /// Requester call ids already used on each live connection; prevents reuse
     /// after a route finishes as well as simultaneous duplicates.
     pub(crate) model_request_ids: Mutex<HashMap<(String, u64), HashSet<String>>>,
@@ -145,12 +151,29 @@ pub struct Hub {
     emit_order: std::sync::Mutex<()>,
     pub(crate) next_id: AtomicU64,
     pub(crate) limits: crate::limits::LimitState,
+    /// Sign in with Google: trusted clients, nonces, `state`s and Google's signing keys.
+    pub(crate) google: crate::google_auth::GoogleAuth,
     /// Web Push notifications for approvals ([`crate::push`]).
     pub(crate) push: crate::push::PushState,
+    /// Device link rate limits ([`crate::link`]).
+    pub(crate) link: crate::link::LinkState,
+    /// Cloudflare tunnel supervisor state ([`crate::tunnel`]).
+    pub(crate) tunnel: crate::tunnel::TunnelState,
+    /// Step-down detection state ([`crate::stepdown`]).
+    pub(crate) stepdown: crate::stepdown::StepDownState,
+    /// Hub move state machine ([`crate::migrate`]).
+    pub(crate) migrate: crate::migrate::MigrateState,
+    /// Last-seen host capability metadata per device id ([`crate::devices`]).
+    pub(crate) host_info: std::sync::Mutex<HashMap<String, core_protocol::NodeHostInfo>>,
+    /// Streamable HTTP session store for `/mcp/orchestrator`. One per hub, created on first use.
+    pub(crate) orchestrator_mcp: std::sync::OnceLock<crate::mcp_server::OrchestratorHttp>,
+    /// Loopback port serving `/mcp/orchestrator`. Zero until a listener is bound.
+    pub(crate) loopback_port: AtomicU16,
 }
 
 impl Hub {
     pub fn new(db: Db, data_dir: PathBuf) -> Arc<Self> {
+        let initial_push_subs = db.push_subscription_count();
         Arc::new_cyclic(|hub| Self {
             db,
             data_dir,
@@ -158,6 +181,7 @@ impl Hub {
             approvals: Mutex::new(HashMap::new()),
             handover_acks: Mutex::new(HashMap::new()),
             model_calls: Mutex::new(HashMap::new()),
+            harness_turns: Mutex::new(HashMap::new()),
             model_request_ids: Mutex::new(HashMap::new()),
             relayed_usage: std::sync::Mutex::new(HashMap::new()),
             probe_runs: std::sync::Mutex::new(HashSet::new()),
@@ -171,8 +195,89 @@ impl Hub {
             emit_order: std::sync::Mutex::new(()),
             next_id: AtomicU64::new(1),
             limits: Default::default(),
-            push: crate::push::PushState::new(hub.clone()),
+            google: crate::google_auth::GoogleAuth::from_env(),
+            push: crate::push::PushState::new(hub.clone(), initial_push_subs),
+            link: Default::default(),
+            tunnel: crate::tunnel::TunnelState::new(),
+            stepdown: crate::stepdown::StepDownState::new(),
+            migrate: crate::migrate::MigrateState::new(),
+            host_info: std::sync::Mutex::new(HashMap::new()),
+            orchestrator_mcp: std::sync::OnceLock::new(),
+            loopback_port: AtomicU16::new(0),
         })
+    }
+
+    /// Record the loopback port that serves `/mcp/orchestrator` for harness orchestrators.
+    pub(crate) fn set_loopback_port(&self, port: u16) {
+        self.loopback_port.store(port, Ordering::Relaxed);
+    }
+
+    pub(crate) fn loopback_port(&self) -> u16 {
+        self.loopback_port.load(Ordering::Relaxed)
+    }
+
+    /// Delete a chat, revoke its orchestrator tokens, and stop its worker.
+    pub async fn delete_conversation(self: &Arc<Self>, id: &str) -> anyhow::Result<bool> {
+        let deleted = self.db.delete_conversation(id)?;
+        if deleted {
+            self.orchestrators.lock().await.remove(id);
+        }
+        Ok(deleted)
+    }
+
+    /// Cloudflare tunnel supervisor state and status.
+    pub fn tunnel(&self) -> &crate::tunnel::TunnelState {
+        &self.tunnel
+    }
+
+    /// Step-down state (whether a newer hub for this account replaced us).
+    pub fn stepdown(&self) -> &crate::stepdown::StepDownState {
+        &self.stepdown
+    }
+
+    /// Whether this hub has stepped down after detecting a higher-epoch peer hub.
+    pub fn is_stepped_down(&self) -> bool {
+        self.stepdown.is_stepped_down()
+    }
+
+    /// Hub move state machine and progress.
+    pub fn migrate(&self) -> &crate::migrate::MigrateState {
+        &self.migrate
+    }
+
+    /// Whether writes are currently paused for an active hub move.
+    pub fn is_move_paused(&self) -> bool {
+        self.migrate.is_paused()
+    }
+
+    /// [`Db::issue_device`], then the live side of a reused device: its old token's browser sessions
+    /// and node connection close as on revocation, and clients see the presence change.
+    pub(crate) async fn issue_device(
+        &self,
+        name: &str,
+        platform: &str,
+        admin: bool,
+        install: Option<crate::db::Install<'_>>,
+        max_live: Option<usize>,
+    ) -> anyhow::Result<crate::db::IssuedDevice> {
+        let issued = self.db.issue_device(name, platform, admin, install, max_live)?;
+        if issued.reused {
+            for session in &issued.ended_sessions {
+                self.invalidate_session(session);
+            }
+            self.sync_push_sub_count();
+            if let Some(live) = self.live.lock().await.get(&issued.device.id) {
+                live.close.trigger(CloseReason::Revoked);
+            }
+            tracing::info!(device = %issued.device.id, "same install signed in again: new token, the old one is revoked");
+        }
+        self.broadcast_presence(&issued.device.id).await;
+        Ok(issued)
+    }
+
+    /// A globally unique approval id that never collides across hub restarts.
+    pub(crate) fn new_approval_id() -> String {
+        format!("a_{}", crate::db::random_hex(12))
     }
 
     /// Override how long a hand-over waits for `WorkspaceFileResult` acknowledgements.
@@ -184,14 +289,16 @@ impl Hub {
         *self.handover_ack_timeout.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[cfg(test)]
+    pub(crate) fn subscribe_events_for_test(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
     /// Store an event and send it to everyone watching.
     pub fn emit(&self, conversation_id: &str, thread_id: Option<&str>, body: EventBody) -> Event {
-        let e = {
-            let _order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
-            let e = self.db.add_event(conversation_id, thread_id, body);
-            let _ = self.events.send(e.clone());
-            e
-        };
+        let _order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
+        let e = self.db.add_event(conversation_id, thread_id, body);
+        let _ = self.events.send(e.clone());
         self.push_on_event(&e);
         e
     }
@@ -381,27 +488,50 @@ impl Hub {
 
     /// A user's message: create the conversation if needed and wake its agent.
     pub async fn chat(self: &Arc<Self>, req: ChatRequest) -> anyhow::Result<String> {
+        anyhow::ensure!(!self.is_move_paused(), "Your hub is moving");
         let text = req.text.trim().to_string();
         anyhow::ensure!(!text.is_empty(), "message is empty");
         let requested = req.model.as_deref().map(str::trim).filter(|model| !model.is_empty()).map(str::to_string);
-        if let Some(model) = &requested {
-            anyhow::ensure!(self.db.find_model(model).is_some(), "no model {model:?} in the registry");
-        }
-        let id = match &req.conversation_id {
+        let requested_model = match &requested {
+            Some(model) => {
+                let Some(found) = self.db.find_model(model) else {
+                    anyhow::bail!("no model {model:?} in the registry");
+                };
+                if found.hidden {
+                    anyhow::bail!("model {} is hidden and cannot be selected", found.id);
+                }
+                Some(found)
+            }
+            None => None,
+        };
+        let target_mode = match &req.conversation_id {
             Some(id) => {
-                anyhow::ensure!(self.db.conversation(id).is_some(), "no such conversation");
+                let Some(conv) = self.db.conversation(id) else {
+                    anyhow::bail!("no such conversation");
+                };
                 if requested.is_some() && !self.db.history(id).is_empty() {
                     anyhow::bail!(
                         "model can be set on the first message; use POST /v1/conversations/{id}/model to change it"
                     );
                 }
-                id.clone()
+                conv.mode
             }
             None => {
                 let mode = req.mode.as_deref().unwrap_or("project");
                 anyhow::ensure!(mode == "project" || mode == "standard", "mode must be project or standard");
+                mode.to_string()
+            }
+        };
+        if target_mode == "project"
+            && let Some(found) = &requested_model
+        {
+            crate::db::check_orchestrator_eligible(found)?;
+        }
+        let id = match &req.conversation_id {
+            Some(id) => id.clone(),
+            None => {
                 let title: String = text.chars().take(60).collect();
-                self.db.create_conversation(mode, &title)?
+                self.db.create_conversation(&target_mode, &title)?
             }
         };
         if let Some(model) = &requested {
@@ -481,9 +611,10 @@ impl Hub {
                 let _ = tx.send(if approved { ApprovalAnswer::Allow } else { ApprovalAnswer::Deny });
             }
             None => {
+                let device_id_to_send = route.device_approval_id.as_deref().unwrap_or(approval_id);
                 self.send_to(
                     &route.device_id,
-                    HubMessage::ApprovalResult { approval_id: approval_id.into(), approved, timeout_secs: None },
+                    HubMessage::ApprovalResult { approval_id: device_id_to_send.into(), approved, timeout_secs: None },
                 )
                 .await;
             }
@@ -491,7 +622,7 @@ impl Hub {
         self.emit(
             &route.conversation_id,
             Some(&route.thread_id),
-            EventBody::ApprovalResolved { approval_id: approval_id.into(), approved },
+            EventBody::ApprovalResolved { approval_id: approval_id.into(), approved, reason: None },
         );
     }
 }
@@ -511,12 +642,15 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/hub", get(hub_info))
         .route(core_protocol::CONNECT_PATH, any(connect))
         .route("/v1/events", any(events_ws))
-        .route("/v1/devices", get(list_devices))
+        .route("/v1/devices", get(list_devices).post(register_device))
+        .route("/v1/devices/{id}", delete(revoke_device))
         .route("/v1/devices/{id}/call", post(call_device))
         .route("/v1/devices/{id}/tools/{tool}", put(set_permission))
         .route("/v1/tools", get(list_tools))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}", put(put_provider))
+        .route("/v1/providers/{id}/sync", post(sync_provider_models))
+        .route("/v1/providers/{id}/sync-models", post(sync_provider_models))
         .route("/v1/models", get(list_models))
         .route("/v1/models/{id}", put(put_model).delete(delete_model))
         .route("/v1/usage", get(list_usage))
@@ -525,6 +659,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/usage/free-requests", get(free_requests_today))
         .route("/v1/chat", post(chat))
         .route("/v1/conversations", get(list_conversations))
+        .route("/v1/conversations/{id}", delete(delete_conversation_route))
         .route("/v1/conversations/{id}/model", post(set_conversation_model))
         .route("/v1/conversations/{id}/events", get(conversation_events))
         .route("/v1/threads", get(list_threads))
@@ -542,15 +677,36 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::limits::routes())
         .merge(crate::files::routes())
         .merge(crate::session::routes())
+        .merge(crate::mcp_server::routes())
+        .merge(crate::google_auth::routes())
+        .merge(crate::link::routes())
         .merge(crate::push::routes())
+        .merge(crate::tunnel::routes())
+        .merge(crate::devices::routes())
+        .merge(crate::migrate::routes())
         .merge(crate::web::routes())
-        .with_state(hub)
+        .with_state(hub.clone())
+        .layer(axum::middleware::from_fn_with_state(hub, crate::migrate::pause_guard))
         .layer(axum::middleware::from_fn(crate::session::guard))
         .layer(axum::middleware::from_fn(crate::session::response_security))
 }
 
 pub(crate) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, Json(json!({ "error": msg.to_string() }))).into_response()
+}
+
+pub(crate) fn model_rule_err(status: StatusCode, error: anyhow::Error) -> Response {
+    if error.downcast_ref::<crate::db::HarnessCannotOrchestrate>().is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": error.to_string(),
+                "code": crate::db::HARNESS_CANNOT_ORCHESTRATE_CODE,
+            })),
+        )
+            .into_response();
+    }
+    err(status, error)
 }
 
 /// Any valid token: a device or the user's client. Enough to connect and to read.
@@ -579,6 +735,104 @@ macro_rules! admin {
 async fn list_devices(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     authed!(hub, headers);
     Json(hub.devices().await).into_response()
+}
+
+/// Most devices `POST /v1/devices` lets one hub keep registered (revoked devices don't count).
+pub const MAX_DEVICES: usize = 100;
+const REVOKED_MESSAGE: &str = "this device's token was revoked on the hub";
+
+#[derive(Deserialize)]
+struct NewDevice {
+    name: String,
+    #[serde(default)]
+    platform: Option<String>,
+    #[serde(default)]
+    install_id: Option<String>,
+}
+
+/// A device name as clients send it: 1 to 64 characters, no control characters.
+pub(crate) fn check_device_name(name: &str) -> Result<&str, &'static str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err("name must be 1 to 64 characters, without control characters");
+    }
+    Ok(name)
+}
+
+/// A platform as clients send it: one short word (`unknown` when left out).
+pub(crate) fn check_platform(platform: Option<&str>) -> Result<&str, &'static str> {
+    let platform = platform.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("unknown");
+    if platform.len() > 32 || !platform.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("platform must be one short word, such as macos, windows, linux or ios");
+    }
+    Ok(platform)
+}
+
+/// An optional `install_id` as clients send it (absent or null is none; anything else must be valid).
+pub(crate) fn check_install_id(install_id: Option<&str>) -> Result<Option<&str>, &'static str> {
+    match install_id {
+        None => Ok(None),
+        Some(id) if crate::db::valid_install_id(id) => Ok(Some(id)),
+        Some(_) => Err("install_id must be 16 to 64 characters of letters, digits, - and _"),
+    }
+}
+
+/// How a failed [`Hub::issue_device`] is answered.
+pub(crate) fn issue_error(e: anyhow::Error) -> Response {
+    if e.downcast_ref::<crate::db::DeviceCapReached>().is_some() {
+        return err(StatusCode::CONFLICT, e);
+    }
+    err(StatusCode::BAD_REQUEST, e)
+}
+
+/// `POST /v1/devices` (admin): register a plain device and return its token, which is shown only
+/// here. The Mac app calls it so the owner never pastes a device token. Admin tokens are made only
+/// on the hub's CLI. The body is read after the admin check, so a device token always gets 403.
+/// With an `install_id` that a live plain device already has, that device gets a fresh token (the
+/// old one is revoked) instead of a new device being made.
+async fn register_device(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let caller = admin!(hub, headers).device_id;
+    let Ok(req) = serde_json::from_slice::<NewDevice>(&body) else {
+        return err(StatusCode::BAD_REQUEST, r#"body must be {"name": "...", "platform": "macos"}"#);
+    };
+    let (name, platform, install_id) =
+        match (check_device_name(&req.name), check_platform(req.platform.as_deref()), check_install_id(req.install_id.as_deref())) {
+            (Ok(n), Ok(p), Ok(i)) => (n, p, i),
+            (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => return err(StatusCode::BAD_REQUEST, why),
+        };
+    let install = install_id.map(|id| crate::db::Install { id, kind: crate::db::NODE_INSTALL });
+    let device = match hub.issue_device(name, platform, false, install, Some(MAX_DEVICES)).await {
+        Ok(issued) => issued,
+        Err(e) => return issue_error(e),
+    };
+    let (token, reused, device) = (device.token, device.reused, device.device);
+    tracing::info!(%caller, device = %device.id, name = %device.name, platform = %device.platform, reused, "device registered");
+    let info = hub.devices().await.into_iter().find(|d| d.id == device.id);
+    Json(json!({ "device": info, "token": token })).into_response()
+}
+
+/// `DELETE /v1/devices/{id}` (admin): revoke a device's token. Its web sessions stop working at
+/// once and its live connection, if any, is closed. The caller can't revoke its own token here.
+async fn revoke_device(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let caller = admin!(hub, headers).device_id;
+    if !hub.db.devices().iter().any(|d| d.id == id && !d.revoked) {
+        return err(StatusCode::NOT_FOUND, "no such device");
+    }
+    if id == caller {
+        return err(
+            StatusCode::CONFLICT,
+            "that is the token making this request; revoke it from another admin client or the hub's CLI",
+        );
+    }
+    if let Err(e) = hub.db.revoke_device(&id) {
+        return err(StatusCode::NOT_FOUND, e);
+    }
+    tracing::info!(%caller, device = %id, "device revoked");
+    if let Some(live) = hub.live.lock().await.get(&id) {
+        live.close.trigger(CloseReason::Revoked);
+    }
+    hub.broadcast_presence(&id).await;
+    Json(json!({ "revoked": id })).into_response()
 }
 
 async fn call_device(
@@ -665,12 +919,39 @@ async fn put_provider(
         return err(StatusCode::BAD_REQUEST, e);
     }
     hub.broadcast_providers().await;
+    if let Ok(Some(saved)) = hub.db.provider(&p.id)
+        && crate::sync::is_syncable(&saved)
+    {
+        crate::sync::spawn_provider_sync(hub.clone(), p.id.clone());
+    }
     Json(json!({"id": p.id, "saved": true})).into_response()
 }
 
-async fn list_models(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+async fn sync_provider_models(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    admin!(hub, headers);
+    match crate::sync::sync_provider(&hub, &id).await {
+        Ok(result) => Json(result).into_response(),
+        Err(crate::sync::SyncError::NotFound(msg)) => err(StatusCode::NOT_FOUND, msg),
+        Err(crate::sync::SyncError::NotSyncable(msg)) => err(StatusCode::BAD_REQUEST, msg),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ModelsFilter {
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    include_hidden: bool,
+}
+
+async fn list_models(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q): Query<ModelsFilter>) -> Response {
     authed!(hub, headers);
-    Json(hub.db.models()).into_response()
+    let models = if q.all || q.include_hidden { hub.db.models() } else { hub.db.visible_models() };
+    Json(models).into_response()
 }
 
 async fn put_model(
@@ -682,8 +963,8 @@ async fn put_model(
     admin!(hub, headers);
     m.id = id;
     match hub.db.upsert_model(&m) {
-        Ok(()) => Json(m).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e),
+        Ok(()) => Json(hub.db.find_model(&m.id).unwrap_or(m)).into_response(),
+        Err(e) => model_rule_err(StatusCode::BAD_REQUEST, e),
     }
 }
 
@@ -755,13 +1036,22 @@ async fn chat(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(req): Json<C
     admin!(hub, headers);
     match hub.chat(req).await {
         Ok(conversation_id) => Json(ChatResponse { conversation_id }).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e),
+        Err(e) => model_rule_err(StatusCode::BAD_REQUEST, e),
     }
 }
 
 async fn list_conversations(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     authed!(hub, headers);
     Json(hub.db.conversations()).into_response()
+}
+
+async fn delete_conversation_route(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    admin!(hub, headers);
+    match hub.delete_conversation(&id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, "no such conversation"),
+        Err(error) => err(StatusCode::BAD_REQUEST, error),
+    }
 }
 
 #[derive(Deserialize)]
@@ -787,7 +1077,7 @@ async fn set_conversation_model(
             } else {
                 StatusCode::BAD_REQUEST
             };
-            err(status, error)
+            model_rule_err(status, error)
         }
     }
 }
@@ -1040,9 +1330,9 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
         .map_err(|_| "no hello")?
         .ok_or("closed before hello")?
         .map_err(|e| e.to_string())?;
-    match first {
+    let hello_host = match first {
         Message::Text(t) => match serde_json::from_str::<NodeMessage>(&t) {
-            Ok(NodeMessage::Hello { protocol_version, client_version }) => {
+            Ok(NodeMessage::Hello { protocol_version, client_version, host }) => {
                 if protocol_version != PROTOCOL_VERSION {
                     let msg = HubMessage::Error {
                         message: format!("protocol {protocol_version} unsupported, hub speaks {PROTOCOL_VERSION}"),
@@ -1051,10 +1341,14 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                     return Err("protocol mismatch".into());
                 }
                 tracing::info!(device = %device_id, %client_version, "connected");
+                host
             }
             _ => return Err("first frame was not hello".into()),
         },
         _ => return Err("first frame was not text".into()),
+    };
+    if let Some(ref info) = hello_host {
+        hub.record_host_info(&device_id, info.clone());
     }
 
     let providers = hub.db.providers().map_err(|error| error.to_string())?;
@@ -1146,6 +1440,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                 break Err(match r {
                     CloseReason::Replaced => "replaced by a newer connection".to_string(),
                     CloseReason::Overflow => "connection queue full".to_string(),
+                    CloseReason::Revoked => REVOKED_MESSAGE.to_string(),
                 });
             }
             next = tokio::time::timeout(Duration::from_secs(IDLE_TIMEOUT_SECS), stream.next()) => match next {
@@ -1193,7 +1488,8 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                 msg @ (NodeMessage::ThreadEvent { .. }
                 | NodeMessage::ThreadFinished { .. }
                 | NodeMessage::ApprovalRequest { .. }
-                | NodeMessage::AskOrchestrator { .. }),
+                | NodeMessage::AskOrchestrator { .. }
+                | NodeMessage::ThreadHarnessSession { .. }),
             ) => {
                 handle_thread_frame(&hub, &device_id, conn_id, msg).await;
             }
@@ -1201,6 +1497,24 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                 if hub.is_live_conn(&device_id, conn_id).await {
                     hub.workspace_file_result(&device_id, conn_id, &thread_id, path, ok, error).await;
                 }
+            }
+            Ok(NodeMessage::HubMoveStatus { move_id, stage, progress_pct, error, target_url }) => {
+                if hub.is_live_conn(&device_id, conn_id).await {
+                    hub.handle_move_status(&device_id, &move_id, &stage, progress_pct, error, target_url).await;
+                }
+            }
+            Ok(NodeMessage::HarnessReport { harnesses }) => {
+                if hub.is_live_conn(&device_id, conn_id).await
+                    && let Err(e) = crate::harness::apply_report(&hub.db, &device_id, &harnesses)
+                {
+                    tracing::warn!(device = %device_id, "applying harness report failed: {e:#}");
+                }
+            }
+            Ok(NodeMessage::HarnessFinished { conversation_id, text, session_id, usage }) => {
+                hub.harness_finished(&device_id, conn_id, &conversation_id, text, session_id, usage).await;
+            }
+            Ok(NodeMessage::HarnessFailed { conversation_id, error }) => {
+                hub.harness_failed(&device_id, conn_id, &conversation_id, error).await;
             }
             Ok(NodeMessage::Hello { .. }) => {
                 if let Err(mpsc::error::TrySendError::Full(_)) =
@@ -1222,6 +1536,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     };
 
     hub.model_connection_gone(&device_id, conn_id).await;
+    hub.harness_connection_gone(&device_id, conn_id).await;
 
     let call_device_gone = {
         let mut live = hub.live.lock().await;
@@ -1238,6 +1553,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     let final_error = match close_reason {
         Some(CloseReason::Replaced) => Some(HubMessage::Error { message: "replaced by a newer connection".into() }),
         Some(CloseReason::Overflow) => Some(HubMessage::Error { message: "connection queue full".into() }),
+        Some(CloseReason::Revoked) => Some(HubMessage::Error { message: REVOKED_MESSAGE.into() }),
         None => None,
     };
     let _ = writer_close_tx.send(final_error);
@@ -1273,7 +1589,7 @@ async fn handle_thread_frame(hub: &Arc<Hub>, device_id: &str, conn_id: u64, msg:
         NodeMessage::ApprovalRequest { approval_id, thread_id, tool, input, reason }
             if hub.owns_thread(device_id, &thread_id) =>
         {
-            if !hub.request_approval(device_id, &thread_id, &approval_id, &tool, input, &reason, None).await {
+            if !hub.request_device_approval(device_id, &thread_id, &approval_id, &tool, input, &reason).await {
                 hub.send_to(
                     device_id,
                     HubMessage::ApprovalResult { approval_id, approved: false, timeout_secs: None },
@@ -1283,6 +1599,9 @@ async fn handle_thread_frame(hub: &Arc<Hub>, device_id: &str, conn_id: u64, msg:
         }
         NodeMessage::AskOrchestrator { thread_id, question } if hub.owns_thread(device_id, &thread_id) => {
             hub.thread_ask(&thread_id, &question).await;
+        }
+        NodeMessage::ThreadHarnessSession { thread_id, session_id } if hub.owns_thread(device_id, &thread_id) => {
+            hub.note_thread_harness_session(&thread_id, &session_id);
         }
         _ => {}
     }
@@ -1343,11 +1662,29 @@ async fn delete_memory(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id)
 }
 
 /// `GET /v1/hub`: public identity (no token needed; nothing private).
+/// `key_sha256` is omitted while no hub identity key exists (arrives with LAN TLS).
+/// The account as `GET /v1/hub` shows it: an opaque id, the first 16 bytes of
+/// SHA-256("grouper-account:" + provider + ":" + sub) in hex. `/v1/hub` needs no sign-in, so it
+/// never carries the owner's email; two hubs of one account still get the same id (step-down).
+pub(crate) fn account_id(provider: &str, sub: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("grouper-account:{provider}:{sub}").as_bytes());
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 async fn hub_info(State(hub): State<Arc<Hub>>) -> Response {
+    let (hub_device_id, epoch) = match hub.db.ensure_hub_device() {
+        Ok(state) => state,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
     Json(core_protocol::HubInfo {
         hub_id: hub.db.hub_id(),
         hub_version: HUB_VERSION.into(),
         protocol_version: PROTOCOL_VERSION,
+        account: hub.db.owner().map(|owner| account_id(&owner.provider, &owner.sub)),
+        hub_device_id,
+        epoch,
+        key_sha256: hub.db.identity_key_sha256(),
     })
     .into_response()
 }
@@ -1393,6 +1730,7 @@ mod tests {
             roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let hub = Hub::new(db, dir.clone());
@@ -1499,6 +1837,7 @@ mod tests {
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
             local: false,
             modalities: vec![],
+            ..Default::default()
         };
         db.upsert_model(&entry("big", "big-model", &["orchestrator", "standard", "thread"])).unwrap();
         db.upsert_model(&entry("picked", "picked-model", &[])).unwrap();
@@ -1666,7 +2005,7 @@ mod tests {
             let mut req = format!("ws://{addr}{}", core_protocol::CONNECT_PATH).into_client_request().unwrap();
             req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
             let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-            let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into() };
+            let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into(), host: None };
             ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
             ws
         };
@@ -2041,7 +2380,7 @@ mod tests {
             .events(&c1, 0, None)
             .into_iter()
             .filter_map(|e| match e.body {
-                EventBody::ApprovalResolved { approval_id, approved: false } => Some(approval_id),
+                EventBody::ApprovalResolved { approval_id, approved: false, .. } => Some(approval_id),
                 _ => None,
             })
             .collect();
@@ -2190,7 +2529,7 @@ mod tests {
         let mut dev_req = format!("ws://{addr}{}", core_protocol::CONNECT_PATH).into_client_request().unwrap();
         dev_req.headers_mut().insert("authorization", format!("Bearer {worker_token}").parse().unwrap());
         let (mut dev_ws, _) = tokio_tungstenite::connect_async(dev_req).await.unwrap();
-        let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into() };
+        let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "test".into(), host: None };
         dev_ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
 
         let online_ev: Event = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2301,6 +2640,7 @@ mod tests {
             roles: vec!["thread".into()],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let conv = db.create_conversation("project", "rating test").unwrap();
@@ -2408,6 +2748,535 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.rating, None);
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn device_approval_gets_random_hub_id_and_replies_with_device_id() {
+        let dir = std::env::temp_dir().join(format!("grouper-dev-approval-id-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (worker, _) = db.add_device("Laptop", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let (tx, mut dev_rx) = mpsc::channel(8);
+        let (close, _close_rx) = CloseHandle::new();
+        let (_closed_tx, closed_rx) = watch::channel(false);
+        hub.live.lock().await.insert(
+            worker.id.clone(),
+            Live { conn_id: 7, tx, tools: Vec::new(), mcp: None, usage_probes: false, close, closed: closed_rx },
+        );
+        let conv = hub.db.create_conversation("project", "dev-approval").unwrap();
+        let thread = hub.db.create_thread(&conv, "T", &worker.id, "m", None, "b").unwrap();
+        let device_id = format!("{}-a1", thread.id);
+
+        handle_thread_frame(
+            &hub,
+            &worker.id,
+            7,
+            NodeMessage::ApprovalRequest {
+                approval_id: device_id.clone(),
+                thread_id: thread.id.clone(),
+                tool: "run_shell".into(),
+                input: json!({"command": "echo hi"}),
+                reason: "manual".into(),
+            },
+        )
+        .await;
+
+        let pending = hub.pending_approvals(Some(&conv)).await;
+        assert_eq!(pending.len(), 1);
+        let hub_id = pending[0].approval_id.clone();
+        assert_ne!(hub_id, device_id);
+        assert!(hub_id.starts_with("a_") && hub_id.len() == 26, "{hub_id}");
+
+        // Duplicate device_approval_id while pending is rejected with an immediate denial.
+        handle_thread_frame(
+            &hub,
+            &worker.id,
+            7,
+            NodeMessage::ApprovalRequest {
+                approval_id: device_id.clone(),
+                thread_id: thread.id.clone(),
+                tool: "run_shell".into(),
+                input: json!({"command": "echo hi"}),
+                reason: "manual".into(),
+            },
+        )
+        .await;
+        match dev_rx.try_recv() {
+            Ok(HubMessage::ApprovalResult { approval_id, approved: false, timeout_secs: None }) => {
+                assert_eq!(approval_id, device_id);
+            }
+            other => panic!("expected duplicate rejection, got {other:?}"),
+        }
+        assert_eq!(hub.pending_approvals(Some(&conv)).await.len(), 1);
+
+        // Resolving by hub_id sends the device's original approval_id back to the device.
+        assert!(hub.resolve_approval(&hub_id, true).await);
+        match dev_rx.try_recv() {
+            Ok(HubMessage::ApprovalResult { approval_id, approved: true, timeout_secs: None }) => {
+                assert_eq!(approval_id, device_id);
+            }
+            other => panic!("expected approval reply with device id, got {other:?}"),
+        }
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn device_disconnect_emits_live_only_dropped_approval_event() {
+        let dir = std::env::temp_dir().join(format!("grouper-drop-event-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (worker, _) = db.add_device("Laptop", "windows", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        let conv = hub.db.create_conversation("project", "drop").unwrap();
+        let thread = hub.db.create_thread(&conv, "T", &worker.id, "m", None, "b").unwrap();
+        let (tx, _rx) = oneshot::channel();
+        let approval_id = Hub::new_approval_id();
+        assert!(
+            hub.request_approval(&worker.id, &thread.id, &approval_id, "run_shell", json!({}), "manual", Some(tx)).await
+        );
+
+        let mut ev_rx = hub.events.subscribe();
+        hub.device_gone(&worker.id).await;
+
+        let ev = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let e = ev_rx.recv().await.unwrap();
+                if matches!(
+                    &e.body,
+                    EventBody::ApprovalResolved { approval_id: id, approved: false, reason }
+                        if id == &approval_id && reason.as_deref() == Some("dropped")
+                ) {
+                    break e;
+                }
+            }
+        })
+        .await
+        .expect("live dropped event on device disconnect");
+        assert_eq!(ev.seq, 0);
+        assert_eq!(ev.conversation_id, conv);
+        assert_eq!(ev.thread_id.as_deref(), Some(thread.id.as_str()));
+        // Live-only: not stored in SQLite events.
+        assert!(
+            hub.db.events(&conv, 0, None).iter().all(|e| !matches!(e.body, EventBody::ApprovalResolved { .. })),
+            "dropped approval event must be live-only"
+        );
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_round_trips_kind_device_id_and_hidden_filtering() {
+        let dir = std::env::temp_dir().join(format!("grouper-models-kind-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (_, admin_token) = db.add_device("Admin", "macos", true).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let base = format!("http://{addr}");
+        let http = reqwest::Client::new();
+
+        // Register an API provider and a harness provider via HTTP.
+        let r = http
+            .put(format!("{base}/v1/providers/openai"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"id": "openai", "kind": "openai", "base_url": "https://api.openai.com/v1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let harness_provider_id = format!("claude-code@{}", pc.id);
+        let r = http
+            .put(format!("{base}/v1/providers/{harness_provider_id}"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "id": harness_provider_id,
+                "kind": "harness",
+                "options": {"harness": "claude-code", "via_device": "Gaming PC", "signed_in": true}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // PUT an API model omitting new fields: defaults to kind="api", no device_id, existing fields preserved.
+        let api_saved: Value = http
+            .put(format!("{base}/v1/models/gpt-mini"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "id": "gpt-mini",
+                "provider_id": "openai",
+                "model": "gpt-4o-mini",
+                "input_price": 0.15,
+                "output_price": 0.60,
+                "context_window": 128000,
+                "use_cases": "quick answers",
+                "free": false,
+                "roles": ["standard"],
+                "local": false,
+                "modalities": ["text"]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(api_saved["kind"], "api");
+        assert!(api_saved.get("device_id").is_none());
+        assert_eq!(api_saved["source"], "manual");
+        assert_eq!(api_saved["price_source"], "manual");
+        assert_eq!(api_saved["tools"], "unknown");
+        assert_eq!(api_saved["hidden"], false);
+
+        // PUT a harness model under the harness provider: kind="harness" and device_id resolved to pc.id.
+        let harness_saved: ModelEntry = http
+            .put(format!("{base}/v1/models/cc-opus"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "id": "cc-opus",
+                "provider_id": harness_provider_id,
+                "model": "opus",
+                "source": "auto",
+                "display_name": "Claude Code · opus",
+                "price_source": "none",
+                "tools": "yes"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(harness_saved.kind, "harness");
+        assert_eq!(harness_saved.device_id.as_deref(), Some(pc.id.as_str()));
+        assert_eq!(harness_saved.source, "auto");
+        assert_eq!(harness_saved.display_name.as_deref(), Some("Claude Code · opus"));
+        assert_eq!(harness_saved.price_source, "none");
+        assert_eq!(harness_saved.tools, "yes");
+
+        // GET /v1/models returns both with kind, device_id, and every legacy JSON field intact.
+        let raw_list: Vec<Value> = http
+            .get(format!("{base}/v1/models"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(raw_list.len(), 2);
+        let api_row = raw_list.iter().find(|v| v["id"] == "gpt-mini").unwrap();
+        for key in [
+            "id",
+            "provider_id",
+            "model",
+            "input_price",
+            "output_price",
+            "cache_read_price",
+            "cache_write_price",
+            "context_window",
+            "use_cases",
+            "free",
+            "roles",
+            "local",
+            "modalities",
+            "kind",
+            "source",
+            "hidden",
+            "price_source",
+            "tools",
+        ] {
+            assert!(api_row.get(key).is_some(), "missing expected key {key:?} on {api_row}");
+        }
+        assert_eq!(api_row["kind"], "api");
+
+        let list: Vec<ModelEntry> = serde_json::from_value(Value::Array(raw_list)).unwrap();
+        let harness_row = list.iter().find(|m| m.id == "cc-opus").unwrap();
+        assert_eq!(harness_row.kind, "harness");
+        assert_eq!(harness_row.device_id.as_deref(), Some(pc.id.as_str()));
+
+        // Hiding a model omits it from GET /v1/models, while ?include_hidden=true returns it.
+        let hidden_resp = http
+            .put(format!("{base}/v1/models/cc-opus"))
+            .bearer_auth(&admin_token)
+            .json(&ModelEntry {
+                hidden: true,
+                hidden_reason: Some("user".into()),
+                ..harness_row.clone()
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hidden_resp.status(), StatusCode::OK);
+
+        let visible: Vec<ModelEntry> = http
+            .get(format!("{base}/v1/models"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(visible.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["gpt-mini"]);
+
+        let all: Vec<ModelEntry> = http
+            .get(format!("{base}/v1/models?include_hidden=true"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        let hidden_row = all.iter().find(|m| m.id == "cc-opus").unwrap();
+        assert!(hidden_row.hidden);
+        assert_eq!(hidden_row.hidden_reason.as_deref(), Some("user"));
+        assert_eq!(hidden_row.kind, "harness");
+        assert_eq!(hidden_row.device_id.as_deref(), Some(pc.id.as_str()));
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn direct_api_calls_enforce_harness_orchestration_rules() {
+        let dir = std::env::temp_dir().join(format!("grouper-h2-api-{}", crate::db::random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (_, admin_token) = db.add_device("Admin", "macos", true).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let base = format!("http://{addr}");
+        let http = reqwest::Client::new();
+
+        // Register an API provider and two harness providers (one non-orchestrating, one orchestrating).
+        assert_eq!(
+            http.put(format!("{base}/v1/providers/openai"))
+                .bearer_auth(&admin_token)
+                .json(&json!({"id": "openai", "kind": "openai", "base_url": "https://api.openai.com/v1"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let codex_pid = format!("codex@{}", pc.id);
+        assert_eq!(
+            http.put(format!("{base}/v1/providers/{codex_pid}"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": codex_pid,
+                    "kind": "harness",
+                    "options": {"harness": "codex", "via_device": pc.id, "signed_in": true}
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let claude_pid = format!("claude-code@{}", pc.id);
+        assert_eq!(
+            http.put(format!("{base}/v1/providers/{claude_pid}"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": claude_pid,
+                    "kind": "harness",
+                    "options": {"harness": "claude-code", "via_device": pc.id, "signed_in": true}
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Register an API orchestrator model.
+        assert_eq!(
+            http.put(format!("{base}/v1/models/api-orch"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": "api-orch",
+                    "provider_id": "openai",
+                    "model": "gpt-4o",
+                    "roles": ["orchestrator"]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Direct API bypass: PUT /v1/models/{id} with roles: ["orchestrator"] on a harness without can_orchestrate -> 400.
+        let r = http
+            .put(format!("{base}/v1/models/codex-o3"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "id": "codex-o3",
+                "provider_id": codex_pid,
+                "model": "o3",
+                "can_orchestrate": false,
+                "roles": ["orchestrator"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["code"], "harness_cannot_orchestrate");
+        assert_eq!(
+            body["error"],
+            "codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+
+        // Same harness MAY be saved with standard + thread roles.
+        assert_eq!(
+            http.put(format!("{base}/v1/models/codex-o3"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": "codex-o3",
+                    "provider_id": codex_pid,
+                    "model": "o3",
+                    "can_orchestrate": false,
+                    "roles": ["standard", "thread"]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Harness WITH can_orchestrate = true MAY hold the orchestrator role.
+        assert_eq!(
+            http.put(format!("{base}/v1/models/cc-opus"))
+                .bearer_auth(&admin_token)
+                .json(&json!({
+                    "id": "cc-opus",
+                    "provider_id": claude_pid,
+                    "model": "opus",
+                    "can_orchestrate": true,
+                    "roles": ["orchestrator", "standard", "thread"]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Create a project chat and a standard chat.
+        let project_conv = hub.db.create_conversation("project", "Project").unwrap();
+        let standard_conv = hub.db.create_conversation("standard", "Standard").unwrap();
+
+        // Direct API bypass: POST /v1/conversations/{id}/model on a project chat with non-orchestrating harness -> 400.
+        let r = http
+            .post(format!("{base}/v1/conversations/{project_conv}/model"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"model": "codex-o3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["code"], "harness_cannot_orchestrate");
+        assert_eq!(
+            body["error"],
+            "codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+        assert!(hub.db.conversation(&project_conv).unwrap().model.is_none());
+
+        // Project chat accepts can_orchestrate = true harness via HTTP.
+        let r = http
+            .post(format!("{base}/v1/conversations/{project_conv}/model"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"model": "cc-opus"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(hub.db.conversation(&project_conv).unwrap().model.as_deref(), Some("cc-opus"));
+
+        // Standard chat accepts non-orchestrating harness via HTTP.
+        let r = http
+            .post(format!("{base}/v1/conversations/{standard_conv}/model"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"model": "codex-o3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(hub.db.conversation(&standard_conv).unwrap().model.as_deref(), Some("codex-o3"));
+
+        // Direct API bypass: POST /v1/chat starting a new project chat with non-orchestrating harness -> 400
+        // and does NOT create an orphan conversation row.
+        let before_convs = hub.db.conversations().len();
+        let r = http
+            .post(format!("{base}/v1/chat"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"text": "plan a task", "mode": "project", "model": "codex-o3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["code"], "harness_cannot_orchestrate");
+        assert_eq!(
+            body["error"],
+            "codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+        assert_eq!(hub.db.conversations().len(), before_convs, "rejected /v1/chat must not leave an orphan conversation");
+
+        // Starting a new standard chat with a non-orchestrating harness via POST /v1/chat succeeds.
+        let r = http
+            .post(format!("{base}/v1/chat"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"text": "quick question", "mode": "standard", "model": "codex-o3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let chat_resp: ChatResponse = r.json().await.unwrap();
+        assert_eq!(hub.db.conversation(&chat_resp.conversation_id).unwrap().model.as_deref(), Some("codex-o3"));
+
+        // Hub::free_alternates delegates and never returns a harness row.
+        hub.db
+            .upsert_model(&ModelEntry {
+                id: "free-a".into(),
+                provider_id: "openai".into(),
+                model: "free-a".into(),
+                free: true,
+                ..Default::default()
+            })
+            .unwrap();
+        hub.db
+            .upsert_model(&ModelEntry {
+                id: "free-harness".into(),
+                provider_id: "openai".into(),
+                model: "free-harness".into(),
+                kind: "harness".into(),
+                free: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(hub.free_alternates("openai", "free-a").is_empty());
 
         drop(hub);
         std::fs::remove_dir_all(dir).ok();

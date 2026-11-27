@@ -8,6 +8,8 @@
 //!   request came over HTTPS, as `X-Forwarded-Proto: https` says behind Cloudflare). The
 //!   hub keeps only a SHA-256 of the id, in `sessions`, with the token's device, and the
 //!   session expires after 30 days. The token itself is never stored by the browser.
+//!   A session opened by `POST /v1/auth/google/return` also stores that Google account's
+//!   `sub`; `created` is when the sign-in happened. Token sessions leave `google_sub` empty.
 //! - `GET /v1/session` says who the caller is; `DELETE /v1/session` logs out.
 //! - [`crate::server::Hub::auth`] accepts the cookie wherever a Bearer token is
 //!   accepted. A Bearer header, when present, is used alone, as before. The session
@@ -17,10 +19,11 @@
 //!   CORS preflight the hub never grants) and an `Origin`/`Referer` from this host;
 //!   a cookie-authenticated WebSocket upgrade needs an `Origin` that is this host.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Once};
 
-use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -50,7 +53,7 @@ static PLAIN_HTTP_WARNING: Once = Once::new();
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
   id_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL, created INTEGER NOT NULL,
-  last_used INTEGER NOT NULL, expires INTEGER NOT NULL);
+  last_used INTEGER NOT NULL, expires INTEGER NOT NULL, google_sub TEXT);
 CREATE INDEX IF NOT EXISTS sessions_device ON sessions (device_id);
 ";
 
@@ -63,20 +66,64 @@ fn well_formed(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A live browser session. `google_sub` is set only when `POST /v1/auth/google/return` opened it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveSession {
+    pub google_sub: Option<String>,
+    pub created: u64,
+}
+
 impl Db {
-    /// Start a session for `device_id`. Returns the raw id (for the cookie only) and
-    /// when it expires. Expired sessions are cleared on the way.
-    pub fn create_session(&self, device_id: &str) -> anyhow::Result<(String, u64)> {
+    fn insert_session(&self, device_id: &str, google_sub: Option<&str>) -> anyhow::Result<(String, u64)> {
         let id = random_hex(32);
         let created = now();
         let expires = created + SESSION_TTL_SECS;
         let c = self.c();
         c.execute("DELETE FROM sessions WHERE expires <= ?1", [created as i64])?;
         c.execute(
-            "INSERT INTO sessions (id_hash, device_id, created, last_used, expires) VALUES (?1, ?2, ?3, ?3, ?4)",
-            params![hash(&id), device_id, created as i64, expires as i64],
+            "INSERT INTO sessions (id_hash, device_id, created, last_used, expires, google_sub)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
+            params![hash(&id), device_id, created as i64, expires as i64, google_sub],
         )?;
         Ok((id, expires))
+    }
+
+    /// Start a session for `device_id`. Returns the raw id (for the cookie only) and
+    /// when it expires. Expired sessions are cleared on the way. This is not a Google sign-in.
+    pub fn create_session(&self, device_id: &str) -> anyhow::Result<(String, u64)> {
+        self.insert_session(device_id, None)
+    }
+
+    /// Start the session `POST /v1/auth/google/return` just verified. `google_sub` is that
+    /// account's `sub`. `created` is the sign-in time a hub move checks against.
+    pub fn create_google_session(&self, device_id: &str, google_sub: &str) -> anyhow::Result<(String, u64)> {
+        self.insert_session(device_id, Some(google_sub))
+    }
+
+    /// A live, unexpired session whose device is not revoked.
+    pub(crate) fn live_session(&self, id: &str) -> Option<LiveSession> {
+        if !well_formed(id) {
+            return None;
+        }
+        let key = hash(id);
+        let (google_sub, created, expires): (Option<String>, i64, i64) = self
+            .c()
+            .query_row(
+                "SELECT s.google_sub, s.created, s.expires FROM sessions s
+                 JOIN devices d ON d.id = s.device_id WHERE s.id_hash = ?1 AND d.revoked = 0",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        if expires <= now() as i64 {
+            return None;
+        }
+        Some(LiveSession {
+            google_sub: google_sub.filter(|s| !s.is_empty()),
+            created: created as u64,
+        })
     }
 
     /// Who a session belongs to, if it exists, hasn't expired and its device's token
@@ -108,9 +155,15 @@ impl Db {
         Some(Auth { device_id, admin: admin != 0 })
     }
 
-    /// End a session. Returns whether it existed.
+    /// End a session. Returns whether it existed. Also removes any push subscriptions owned by it.
     pub fn delete_session(&self, id: &str) -> bool {
-        well_formed(id) && self.c().execute("DELETE FROM sessions WHERE id_hash = ?1", [hash(id)]).unwrap_or(0) > 0
+        if !well_formed(id) {
+            return false;
+        }
+        let key = hash(id);
+        let c = self.c();
+        let _ = c.execute("DELETE FROM push_subscriptions WHERE session_id = ?1", [&key]);
+        c.execute("DELETE FROM sessions WHERE id_hash = ?1", [&key]).unwrap_or(0) > 0
     }
 
     /// Active, non-expired browser sessions for non-revoked devices, most recently used first.
@@ -146,13 +199,15 @@ impl Db {
     }
 
     /// Revoke a session by its stored hash (`SessionInfo::id`). Returns whether it existed.
+    /// Also removes any push subscriptions owned by it.
     pub fn delete_session_by_hash(&self, id_hash: &str) -> bool {
-        well_formed(id_hash)
-            && self
-                .c()
-                .execute("DELETE FROM sessions WHERE id_hash = ?1", [id_hash.to_ascii_lowercase()])
-                .unwrap_or(0)
-                > 0
+        if !well_formed(id_hash) {
+            return false;
+        }
+        let key = id_hash.to_ascii_lowercase();
+        let c = self.c();
+        let _ = c.execute("DELETE FROM push_subscriptions WHERE session_id = ?1", [&key]);
+        c.execute("DELETE FROM sessions WHERE id_hash = ?1", [&key]).unwrap_or(0) > 0
     }
 }
 
@@ -172,7 +227,7 @@ pub(crate) fn cookie_sessions(headers: &HeaderMap) -> Vec<&str> {
 }
 
 /// Whether the request reached the hub over HTTPS (directly or via a proxy that says so).
-fn is_https(headers: &HeaderMap) -> bool {
+pub(crate) fn is_https(headers: &HeaderMap) -> bool {
     headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -199,7 +254,7 @@ fn authority(url: &str) -> Option<&str> {
 
 /// Whether `url` (an `Origin` or `Referer`) names this hub's `Host`. In particular,
 /// do not trust `X-Forwarded-Host`: Cloudflare passes client-supplied values through.
-fn same_host(headers: &HeaderMap, url: &str) -> bool {
+pub(crate) fn same_host(headers: &HeaderMap, url: &str) -> bool {
     let Some(origin) = authority(url) else { return false };
     headers.get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(|host| host.trim().eq_ignore_ascii_case(origin))
 }
@@ -215,6 +270,12 @@ fn header_has_token(headers: &HeaderMap, name: header::HeaderName, token: &str) 
 
 /// `None` when the request may go on; otherwise why not.
 fn csrf_refusal(method: &Method, path: &str, headers: &HeaderMap) -> Option<&'static str> {
+    // Google's sign-in result arrives as a cross-site form POST by design: at the shared return page, which only
+    // forwards it, and then at the hub, which accepts it only with a one-time `state` and nonce it issued itself
+    // (see `crate::google_auth`). Those two paths, and only those, skip the cookie CSRF rules.
+    if crate::google_auth::CROSS_SITE_PATHS.contains(&path) {
+        return None;
+    }
     let bearer = headers.contains_key(header::AUTHORIZATION);
     let cookie = !cookie_sessions(headers).is_empty();
     let session_route = path == "/v1/session";
@@ -283,31 +344,111 @@ fn who(hub: &Hub, auth: &Auth) -> serde_json::Value {
     json!({"signed_in": true, "device_id": auth.device_id, "name": name, "admin": auth.admin})
 }
 
-/// `POST /v1/session`: trade a token for a session cookie.
-async fn login(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Json<LoginBody>) -> Response {
-    let Some(auth) = hub.db.authenticate(&body.token) else {
-        return err(StatusCode::UNAUTHORIZED, "that token isn't valid on this hub");
+/// The CSRF rules of `POST /v1/session`, for other endpoints that sign a browser in.
+pub(crate) fn login_csrf_refusal(headers: &HeaderMap) -> Option<&'static str> {
+    csrf_refusal(&Method::POST, "/v1/session", headers)
+}
+
+fn issue_session(
+    hub: &Hub,
+    headers: &HeaderMap,
+    auth: &Auth,
+    google_sub: Option<&str>,
+) -> anyhow::Result<(Vec<HeaderValue>, u64)> {
+    let (id, expires) = match google_sub {
+        Some(sub) => hub.db.create_google_session(&auth.device_id, sub)?,
+        None => hub.db.create_session(&auth.device_id)?,
     };
-    let (id, expires) = match hub.db.create_session(&auth.device_id) {
-        Ok(s) => s,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
-    tracing::info!(device = %auth.device_id, admin = auth.admin, "web session started");
-    let mut body = who(&hub, &auth);
-    body["expires"] = json!(expires);
-    let mut response = Json(body).into_response();
-    let secure = is_https(&headers);
+    tracing::info!(device = %auth.device_id, admin = auth.admin, google = google_sub.is_some(), "web session started");
+    let secure = is_https(headers);
     if !secure {
         PLAIN_HTTP_WARNING.call_once(|| {
             tracing::warn!("web sessions over plain HTTP can be sniffed; use HTTPS outside a trusted LAN")
         });
     }
-    response.headers_mut().insert(header::SET_COOKIE, set_cookie(&id, SESSION_TTL_SECS, secure));
+    let mut cookies = vec![set_cookie(&id, SESSION_TTL_SECS, secure)];
     if secure {
         // Remove the old LAN-cookie name as the browser migrates to the __Host- cookie.
-        response.headers_mut().append(header::SET_COOKIE, clear_legacy_cookie());
+        cookies.push(clear_legacy_cookie());
+    }
+    Ok((cookies, expires))
+}
+
+/// Start a browser session for `auth`: the `Set-Cookie` values to send and when it expires.
+pub(crate) fn start_session(hub: &Hub, headers: &HeaderMap, auth: &Auth) -> anyhow::Result<(Vec<HeaderValue>, u64)> {
+    issue_session(hub, headers, auth, None)
+}
+
+/// Start the session created by `POST /v1/auth/google/return`, recording `google_sub`.
+pub(crate) fn start_google_session(
+    hub: &Hub,
+    headers: &HeaderMap,
+    auth: &Auth,
+    google_sub: &str,
+) -> anyhow::Result<(Vec<HeaderValue>, u64)> {
+    issue_session(hub, headers, auth, Some(google_sub))
+}
+
+/// The first live session cookie on this request. A bearer token is not consulted.
+pub(crate) fn first_live_cookie_session(hub: &Hub, headers: &HeaderMap) -> Option<LiveSession> {
+    cookie_sessions(headers).into_iter().find_map(|id| hub.db.live_session(id))
+}
+
+/// Start a session and answer the way `POST /v1/session` does: who signed in, plus the cookie.
+pub(crate) fn session_response(hub: &Hub, headers: &HeaderMap, auth: &Auth) -> Response {
+    let (cookies, expires) = match start_session(hub, headers, auth) {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let mut body = who(hub, auth);
+    body["expires"] = json!(expires);
+    let mut response = Json(body).into_response();
+    for cookie in cookies {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     response
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
+/// Whether the request came directly from loopback (not from another machine or a reverse proxy / tunnel).
+pub(crate) fn is_loopback_request(headers: &HeaderMap, ext: &Extensions) -> bool {
+    let Some(peer) = ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()) else {
+        return false;
+    };
+    if !is_loopback_ip(peer) || headers.contains_key("cf-ray") {
+        return false;
+    }
+    for name in ["cf-connecting-ip", "x-forwarded-for"] {
+        for val in headers.get_all(name) {
+            let Ok(s) = val.to_str() else { return false };
+            if !s.split(',').all(|part| part.trim().parse::<IpAddr>().is_ok_and(is_loopback_ip)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `POST /v1/session`: trade a token for a session cookie.
+async fn login(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    ext: Extensions,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    if hub.is_local_mode() && !is_loopback_request(&headers, &ext) {
+        return err(StatusCode::FORBIDDEN, "token sign-in is only accepted from loopback in local mode");
+    }
+    let Some(auth) = hub.db.authenticate(&body.token) else {
+        return err(StatusCode::UNAUTHORIZED, "that token isn't valid on this hub");
+    };
+    session_response(&hub, &headers, &auth)
 }
 
 /// `GET /v1/session`: who this cookie (or Bearer token) belongs to. Answers 200 with
@@ -321,7 +462,7 @@ async fn whoami(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
 }
 
 /// The hash of the session cookie authenticating this request, if any (Bearer requests have none).
-fn current_session_hash(hub: &Hub, headers: &HeaderMap) -> Option<String> {
+pub(crate) fn current_session_hash(hub: &Hub, headers: &HeaderMap) -> Option<String> {
     if headers.contains_key(header::AUTHORIZATION) {
         return None;
     }
@@ -340,6 +481,9 @@ async fn logout(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
             hub.invalidate_session(&hash(id));
             ended = true;
         }
+    }
+    if ended {
+        hub.sync_push_sub_count();
     }
     let mut response = Json(json!({"signed_out": ended})).into_response();
     let secure = is_https(&headers);
@@ -369,6 +513,7 @@ async fn revoke_session(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id
     if !hub.db.delete_session_by_hash(&target) {
         return err(StatusCode::NOT_FOUND, "no such session");
     }
+    hub.sync_push_sub_count();
     hub.invalidate_session(&target);
     let mut response = Json(json!({"revoked": target, "current": is_current})).into_response();
     if is_current {
@@ -449,6 +594,31 @@ mod tests {
         set_cookie.split(';').next().unwrap().to_string()
     }
 
+    #[test]
+    fn opening_an_old_database_adds_google_sub_to_sessions() {
+        let dir = std::env::temp_dir().join(format!("grouper-session-migrate-{}", random_hex(4)));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(dir.join("grouper.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   id_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL, created INTEGER NOT NULL,
+                   last_used INTEGER NOT NULL, expires INTEGER NOT NULL);
+                 INSERT INTO sessions (id_hash, device_id, created, last_used, expires)
+                 VALUES ('aa', 'dev', 10, 10, 20);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&dir).unwrap();
+        let sub: Option<String> = db
+            .c()
+            .query_row("SELECT google_sub FROM sessions WHERE id_hash = 'aa'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sub, None);
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn session_create_use_and_logout() {
         let f = fixture().await;
@@ -474,6 +644,8 @@ mod tests {
         let stored: String = f.hub.db.c().query_row("SELECT id_hash FROM sessions", [], |r| r.get(0)).unwrap();
         assert_eq!(stored, hash(raw));
         assert_ne!(stored, raw);
+        let google_sub: Option<String> = f.hub.db.c().query_row("SELECT google_sub FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(google_sub, None, "trading a token for a cookie is not a Google sign-in");
 
         // The cookie works on reads and, with the CSRF header and a same-site Origin, on admin writes.
         let r = f.http.get(format!("{}/v1/session", f.base)).header("cookie", &cookie).send().await.unwrap();
@@ -916,5 +1088,74 @@ mod tests {
             f.http.get(format!("{}/v1/devices", f.base)).header("cookie", &cookie1).send().await.unwrap().status(),
             S::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn local_mode_accepts_token_sign_in_only_from_loopback() {
+        let dir = std::env::temp_dir().join(format!("grouper-session-local-{}", random_hex(4)));
+        let db = Db::open(&dir).unwrap();
+        let (_, admin_token) = db.add_device("Desktop", "windows", true).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        hub.set_local_mode(true);
+
+        // Serve one router with real ConnectInfo on 127.0.0.1, and one simulating a LAN peer (192.168.1.44).
+        let lo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lo_base = format!("http://{}", lo_listener.local_addr().unwrap());
+        let lo_app = router(hub.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(lo_listener, lo_app).await });
+
+        let lan_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lan_base = format!("http://{}", lan_listener.local_addr().unwrap());
+        let lan_app = router(hub.clone()).layer(axum::middleware::from_fn(|mut req: Request, next: Next| async move {
+            req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 44], 51234))));
+            next.run(req).await
+        }));
+        tokio::spawn(async move { axum::serve(lan_listener, lan_app).await });
+
+        let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+
+        // Non-loopback peer is refused even with a valid admin token.
+        let r = http
+            .post(format!("{lan_base}/v1/session"))
+            .header("x-grouper", "1")
+            .header("origin", &lan_base)
+            .json(&json!({"token": admin_token}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::FORBIDDEN);
+        assert!(r.headers().get("set-cookie").is_none());
+
+        // Tunnel / reverse-proxy headers carrying a remote client IP over loopback are also refused.
+        for (hdr, val) in [("cf-connecting-ip", "203.0.113.9"), ("x-forwarded-for", "203.0.113.9"), ("cf-ray", "abc")] {
+            let r = http
+                .post(format!("{lo_base}/v1/session"))
+                .header("x-grouper", "1")
+                .header("origin", &lo_base)
+                .header(hdr, val)
+                .json(&json!({"token": admin_token}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), S::FORBIDDEN, "{hdr}");
+            assert!(r.headers().get("set-cookie").is_none(), "{hdr}");
+        }
+        let count: i64 = hub.db.c().query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "no session was created for non-loopback requests");
+
+        // Direct loopback token sign-in succeeds.
+        let r = http
+            .post(format!("{lo_base}/v1/session"))
+            .header("x-grouper", "1")
+            .header("origin", &lo_base)
+            .json(&json!({"token": admin_token}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), S::OK);
+        assert!(r.headers().get("set-cookie").is_some());
+
+        drop(hub);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

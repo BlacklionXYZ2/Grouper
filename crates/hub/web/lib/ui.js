@@ -5,6 +5,7 @@ import { h, icon } from './dom.js';
 import { threadStatus } from './format.js';
 import { describe } from './api.js';
 import { store, on } from './store.js';
+import { openPalette, paletteShortcut } from '../views/palette.js';
 
 export function navigate(hash) {
   if (location.hash === hash) window.dispatchEvent(new HashChangeEvent('hashchange'));
@@ -122,12 +123,23 @@ export function confirmAction({ title, body, confirmLabel = 'Confirm', danger = 
   }).then(Boolean);
 }
 
+/**
+ * A thread's status as a rounded-rect pill: word plus icon, never colour alone.
+ * `opts.family` (a family key from lib/family.js) tints a Running pill with that
+ * family's colour, as the threads card draws it; every other state keeps its
+ * fixed status colour, so an orange family never reads as a warning.
+ */
 export function statusPill(status, opts) {
   const s = threadStatus(status, opts);
+  const running = status === 'running' && !opts?.approval;
+  const tint = running && opts?.family ? `fam-${opts.family}` : null;
+  // Done is mint (good state). Stopped and unknown stay muted. An approval
+  // wins over a finished status, so that pill stays a warning.
+  const tone = status === 'done' && !opts?.approval ? 'ok' : s.tone;
   return h(
     'span',
-    { class: ['status', s.tone] },
-    status === 'running' && !opts?.approval ? h('span', { class: 'live-dot', 'aria-hidden': 'true' }) : icon(s.icon),
+    { class: ['status', tint ? 'fam-tint' : tone, tint] },
+    running ? h('span', { class: 'live-dot', 'aria-hidden': 'true' }) : icon(s.icon),
     s.word,
   );
 }
@@ -293,7 +305,31 @@ export function closeDrawer({ restoreFocus = false } = {}) {
   if (wasOpen) drawerOpener = null;
 }
 
-/** The bar at the top of a view (glass). */
+/**
+ * Search: opens the command palette (Ctrl/Cmd+K does the same). Desktop only;
+ * the palette isn't offered on phones. `.palette-launch` lets the palette keep
+ * its aria-expanded in step and return focus here when it closes.
+ */
+function searchButton() {
+  const shortcut = paletteShortcut();
+  return h(
+    'button',
+    {
+      type: 'button',
+      class: 'icon-btn palette-launch only-desktop',
+      'aria-label': 'Search chats, threads, models, devices, pages, actions',
+      title: `Search (${shortcut.label})`,
+      'aria-haspopup': 'dialog',
+      'aria-controls': 'command-palette',
+      'aria-expanded': document.getElementById('command-palette')?.open ? 'true' : 'false',
+      'aria-keyshortcuts': shortcut.keys,
+      onclick: () => openPalette(),
+    },
+    icon('search'),
+  );
+}
+
+/** The bar at the top of a view (glass): menu or back, titles, search, actions. */
 export function bar({ title, caption, actions = [], back = null, menu = true }) {
   return h(
     'header',
@@ -315,7 +351,7 @@ export function bar({ title, caption, actions = [], back = null, menu = true }) 
           )
         : null,
     h('div', { class: 'bar-titles' }, h('h1', null, title), caption ? h('div', { class: 'caption' }, caption) : null),
-    h('div', { class: 'bar-actions' }, actions),
+    h('div', { class: 'bar-actions' }, searchButton(), actions),
   );
 }
 

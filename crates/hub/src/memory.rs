@@ -284,6 +284,7 @@ mod tests {
             roles: vec!["orchestrator".into(), "standard".into()],
             local: false,
             modalities: vec![],
+            ..Default::default()
         })
         .unwrap();
         let cat = db.add_memory("Oscar's cat is called Miso.", &[], None).unwrap();

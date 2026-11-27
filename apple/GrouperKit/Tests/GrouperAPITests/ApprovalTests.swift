@@ -70,6 +70,23 @@ final class ApprovalTests: XCTestCase {
         XCTAssertTrue(book.pending.isEmpty)
     }
 
+    func testResolutionReasonSaysTimedOutOrNoLongerWaiting() throws {
+        var book = ApprovalBook()
+        for (i, id) in ["a_1", "a_2", "a_3"].enumerated() { _ = book.apply(try requested(id, seq: Int64(i + 1), ts: 100)) }
+        let base = #""conversation_id":"c1","thread_id":"t1","ts":200,"kind":"approval_resolved","approved":false"#
+        _ = book.apply(try event(#"{"seq":4,\#(base),"approval_id":"a_1","reason":"timeout"}"#))
+        _ = book.apply(try event(#"{"seq":5,\#(base),"approval_id":"a_2","reason":"timeout_stop"}"#))
+        _ = book.apply(try event(#"{"seq":6,\#(base),"approval_id":"a_3","reason":"dropped"}"#))
+        XCTAssertEqual(book.outcome(of: "a_1"), .timedOut(threadStopped: false))
+        XCTAssertEqual(book.outcome(of: "a_2"), .timedOut(threadStopped: true))
+        XCTAssertEqual(book.outcome(of: "a_3"), .noLongerWaiting)
+        XCTAssertTrue(book.pending.isEmpty)
+        // Older hubs send no reason: the event still decodes.
+        let old = try event(#"{"seq":7,\#(base),"approval_id":"a_4"}"#)
+        guard case .approvalResolved(_, _, let reason) = old.body else { return XCTFail("\(old.body)") }
+        XCTAssertNil(reason)
+    }
+
     func testOwnAnswerIsNotMistakenForAnotherDevice() throws {
         var book = ApprovalBook()
         _ = book.apply(try requested("a1", seq: 1, ts: 100))

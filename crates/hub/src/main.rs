@@ -1,12 +1,10 @@
-mod backup;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use core_protocol::{ModelEntry, ProviderConfig};
-use hub::{db::Db, server};
+use hub::{backup, db::Db, host};
 
 /// Grouper hub: the always-on server every device connects to.
 #[derive(Parser)]
@@ -25,10 +23,18 @@ enum Cmd {
     Serve {
         #[arg(long, env = "GROUPER_BIND", default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
+        /// Run in local mode (HTTP setup-code claim off, token sign-in loopback-only).
+        #[arg(long)]
+        local: bool,
     },
     /// Manage registered devices.
     #[command(subcommand)]
     Device(DeviceCmd),
+    /// Print a fresh one-time code for claiming this hub with Google (valid 1 hour).
+    SetupCode,
+    /// The Google account that owns this hub.
+    #[command(subcommand)]
+    Owner(OwnerCmd),
     /// Add or update a model provider (keys can also be set from any device: `grouper keys set`).
     Provider {
         id: String,
@@ -110,6 +116,14 @@ enum DeviceCmd {
     Revoke { id: String },
 }
 
+#[derive(Subcommand)]
+enum OwnerCmd {
+    /// Show the linked Google account.
+    Show,
+    /// Unlink the owner (if the Google account is lost). Device tokens and sessions keep working.
+    Reset,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -122,33 +136,19 @@ async fn main() -> Result<()> {
     match &cli.cmd {
         Cmd::Backup { output, include_workspaces } => return backup::backup(&cli.data, output, *include_workspaces),
         Cmd::Restore { backup, force } => return backup::restore(&cli.data, backup, *force),
+        Cmd::Serve { bind, local } => {
+            let handle = host::start_with_options(&cli.data, &[*bind], host::Options { local: *local }).await?;
+            let _ = tokio::signal::ctrl_c().await;
+            handle.stop().await;
+            return Ok(());
+        }
         _ => {}
     }
-    let _serve_lock = if matches!(&cli.cmd, Cmd::Serve { .. }) {
-        Some(backup::lock_data_dir(&cli.data)?)
-    } else {
-        None
-    };
     let db = Db::open(&cli.data)?;
 
     match cli.cmd {
-        Cmd::Backup { .. } | Cmd::Restore { .. } => unreachable!("handled before opening the database"),
-        Cmd::Serve { bind } => {
-            let hub = server::Hub::new(db, cli.data.clone());
-            // Threads waiting for a device keep waiting; a hub part that was running stops at once.
-            hub.recover_waiting_threads();
-            // Threads that were running when the hub stopped can't be resumed.
-            for t in hub.db.threads(None).into_iter().filter(|t| t.status == "running") {
-                hub.db.finish_thread(&t.id, "failed", "The hub restarted while this thread was running.");
-            }
-            tokio::spawn(hub::usage::collector_loop(hub.clone()));
-            let listener = tokio::net::TcpListener::bind(bind).await?;
-            tracing::info!("grouper-hub listening on {bind}, data in {}", cli.data.display());
-            axum::serve(listener, server::router(hub))
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
+        Cmd::Backup { .. } | Cmd::Restore { .. } | Cmd::Serve { .. } => {
+            unreachable!("handled before opening the database")
         }
         Cmd::Device(DeviceCmd::Add { name, platform, admin }) => {
             let (d, token) = db.add_device(&name, &platform, admin)?;
@@ -175,6 +175,25 @@ async fn main() -> Result<()> {
             db.revoke_device(&id)?;
             println!("Revoked {id}. Restart the hub to drop any live connection, and rotate any API keys it held.");
         }
+        Cmd::SetupCode => {
+            if let Some(o) = db.owner() {
+                anyhow::bail!("this hub is already claimed by {}; `grouper-hub owner reset` unlinks it first", o.email);
+            }
+            let (code, _) = db.new_setup_code()?;
+            println!("Setup code (valid 1 hour, once): {code}");
+            println!("Claim the hub: open <hub address>{}", hub::google_auth::claim_path(&code));
+        }
+        Cmd::Owner(OwnerCmd::Show) => match db.owner() {
+            Some(o) => println!("{} {} ({} account {}), since {}", o.email, o.name, o.provider, o.sub, o.claimed_at),
+            None => println!("No owner: this hub hasn't been claimed or linked."),
+        },
+        Cmd::Owner(OwnerCmd::Reset) => match db.reset_owner()? {
+            Some(o) => println!(
+                "Unlinked {}. Device tokens and sessions keep working; `grouper-hub setup-code` lets a Google account claim the hub again.",
+                o.email
+            ),
+            None => println!("No owner to unlink."),
+        },
         Cmd::Provider { id, kind, base_url, key, options } => {
             let options = match options {
                 Some(o) => serde_json::from_str(&o)?,
@@ -209,6 +228,7 @@ async fn main() -> Result<()> {
                 roles: roles.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
                 local,
                 modalities: vec![],
+                ..Default::default()
             })?;
             println!("Saved model {id}.");
         }

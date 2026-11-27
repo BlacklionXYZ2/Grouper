@@ -87,6 +87,8 @@ public struct ProviderInfo: Codable, Equatable, Identifiable, Sendable {
     public let hasKey: Bool
     /// Device id or name that hosts the provider (`options.via_device`), if any.
     public let viaDevice: String?
+    /// Kind-specific non-secret options (e.g. harness `display_name`, `signed_in`, `sign_in`).
+    public let options: JSONValue?
 }
 
 public struct ProviderConfig: Codable, Equatable, Identifiable, Sendable {
@@ -115,6 +117,12 @@ public struct ModelEntry: Codable, Equatable, Identifiable, Sendable {
     public let roles: [String]
     public let local: Bool
     public let modalities: [String]
+    public let kind: String
+    public let deviceId: String?
+    public let canOrchestrate: Bool
+    public let displayName: String?
+
+    public var isHarness: Bool { kind == "harness" }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -131,6 +139,10 @@ public struct ModelEntry: Codable, Equatable, Identifiable, Sendable {
         roles = try c.decodeIfPresent([String].self, forKey: .roles) ?? []
         local = try c.decodeIfPresent(Bool.self, forKey: .local) ?? false
         modalities = try c.decodeIfPresent([String].self, forKey: .modalities) ?? []
+        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "api"
+        deviceId = try c.decodeIfPresent(String.self, forKey: .deviceId)
+        canOrchestrate = try c.decodeIfPresent(Bool.self, forKey: .canOrchestrate) ?? false
+        displayName = try c.decodeIfPresent(String.self, forKey: .displayName)
     }
 }
 

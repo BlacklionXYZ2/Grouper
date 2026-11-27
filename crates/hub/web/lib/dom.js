@@ -50,11 +50,15 @@ export function setChildren(el, ...children) {
   return append(el, children);
 }
 
-/** A small inline icon from the sprite of paths below. */
+/**
+ * A small inline icon from the sprite of paths below. Names ending in "-fill" are
+ * solid shapes (the sidebar and tab bar nav set); the rest are 1.8px strokes.
+ */
 export function icon(name, label) {
   const svg = document.createElementNS(SVG_NS, 'svg');
+  const filled = String(name).endsWith('-fill') && name in ICONS;
   svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('class', 'icon');
+  svg.setAttribute('class', filled ? 'icon icon-fill' : 'icon');
   if (label) {
     svg.setAttribute('role', 'img');
     svg.setAttribute('aria-label', label);
@@ -64,6 +68,7 @@ export function icon(name, label) {
   for (const d of ICONS[name] || ICONS.dot) {
     const path = document.createElementNS(SVG_NS, 'path');
     path.setAttribute('d', d);
+    if (filled) path.setAttribute('fill-rule', 'evenodd');
     svg.append(path);
   }
   return svg;
@@ -108,6 +113,24 @@ const ICONS = {
   play: ['M7 5l12 7-12 7z'],
   clock: ['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z', 'M12 7v5l3 2'],
   inbox: ['M4 13l2.5-8h11l2.5 8', 'M4 13v6h16v-6', 'M4 13h5l1.5 2.5h3L15 13h5'],
+  // Composer, thread panel and threads card (26 Nov concept plan).
+  paperclip: ['M20 11.5l-8.1 8.1a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8'],
+  image: ['M4 5h16v14H4z', 'M4 16l4.5-4.5 4 4 3-3L20 17', 'M15.5 9.5h.01'],
+  code: ['M8.5 7.5L4 12l4.5 4.5', 'M15.5 7.5L20 12l-4.5 4.5', 'M13.5 5l-3 14'],
+  popout: ['M14 4h6v6', 'M20 4l-9 9', 'M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5'],
+  'thread-tree': ['M12 7.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4z', 'M12 7.5V11', 'M6 15v-2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2', 'M12 11v4', 'M6 20a2 2 0 1 0 0-4 2 2 0 0 0 0 4z', 'M12 20a2 2 0 1 0 0-4 2 2 0 0 0 0 4z', 'M18 20a2 2 0 1 0 0-4 2 2 0 0 0 0 4z'],
+  bolt: ['M13 3L5 14h6l-1 7 8-11h-6z'],
+  'new-chat': ['M12 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6', 'M18.5 3.5a2.1 2.1 0 0 1 3 3L13 15l-4 1 1-4z'],
+  // Filled nav set (sidebar rows, tab bar). Even-odd fill, so inner paths cut holes.
+  'chat-fill': ['M5 4h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H10l-5 4v-4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z'],
+  'devices-fill': ['M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM4.5 6.5v8h15v-8z', 'M11 17h2v2.5h3V21H8v-1.5h3z'],
+  'models-fill': ['M12 2.8l7.8 4.4L12 11.6 4.2 7.2z', 'M3.4 8.6l7.8 4.4v8.4l-7.8-4.4z', 'M20.6 8.6v8.4l-7.8 4.4V13z'],
+  'usage-fill': ['M3.5 12.5a1 1 0 0 1 1-1h2.5a1 1 0 0 1 1 1V20H3.5z', 'M10 4.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h-4z', 'M16.5 9a1 1 0 0 1 1-1H20a1 1 0 0 1 1 1v11h-4.5z'],
+  'memory-fill': ['M7 3h10a2 2 0 0 1 2 2v16l-7-4.5L5 21V5a2 2 0 0 1 2-2z'],
+  'skills-fill': ['M15.2 3.6a2 2 0 0 1 2.8 0l2.4 2.4a2 2 0 0 1 0 2.8L9 20.2 3.5 21l.8-5.5z', 'M5 2l.7 1.8L7.5 4.5l-1.8.7L5 7l-.7-1.8L2.5 4.5l1.8-.7z'],
+  'settings-fill': ['M19.4 10.4l2.5.4v2.4l-2.5.4-1 2.5 1.5 2-1.8 1.8-2-1.5-2.5 1-.4 2.5h-2.4l-.4-2.5-2.5-1-2 1.5-1.8-1.8 1.5-2-1-2.5-2.5-.4v-2.4l2.5-.4 1-2.5-1.5-2 1.8-1.8 2 1.5 2.5-1 .4-2.5h2.4l.4 2.5 2.5 1 2-1.5 1.8 1.8-1.5 2zM12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4z'],
+  'more-fill': ['M5 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z', 'M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z', 'M19 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z'],
+  'inbox-fill': ['M6.2 4h11.6a1 1 0 0 1 .95.7L21 12v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6l2.25-7.3A1 1 0 0 1 6.2 4zM5.6 12h3.9l1.5 2.5h2l1.5-2.5h3.9l-1.8-5.5H7.4z'],
 };
 
 /** Visually hidden text for screen readers. */

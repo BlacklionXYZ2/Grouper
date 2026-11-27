@@ -3,9 +3,9 @@ import GrouperAPI
 
 /// The chat's model picker: a covering panel (a full-height sheet on iPhone, a
 /// large sheet on Mac), because there are many models. "Default model" comes
-/// first; then the models with this chat's role, then "Other models", each grouped
-/// under its provider (id, kind, key set / no key from `GET /v1/providers`). A model
-/// reached through two providers is two entries, one under each.
+/// first; then API sections (the models with this chat's role, then "Other models",
+/// each grouped under its provider), then "Harnesses (subscriptions)" grouped by
+/// device. A model reached through two providers is two entries, one under each.
 struct ModelPickerSheet: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -21,20 +21,20 @@ struct ModelPickerSheet: View {
 
     var body: some View {
         NavigationStack {
-            let sections = Self.sections(models: model.models, providers: model.providers, role: role,
-                                          words: Self.words(query), familyOf: { ModelFamily.of($0) })
+            let sections = Self.sections(models: model.models, providers: model.providers, devices: model.devices,
+                                          role: role, words: Self.words(query), familyOf: { ModelFamily.of($0) })
             List {
                 #if os(macOS)
                 Section { searchField }
                 #endif
                 Section {
-                    Text(currentLine).font(.caption).foregroundStyle(.secondary)
+                    Text(currentLine).font(.caption).foregroundStyle(Theme.text2)
                     defaultRow
                 }
                 if model.providersFailed && model.providers.isEmpty {
                     Section {
                         Label("Provider details (kind, key) could not be loaded. Models are still grouped by provider id.", systemImage: "exclamationmark.triangle")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(Theme.text2)
                     }
                 }
                 ForEach(sections) { section in
@@ -49,7 +49,7 @@ struct ModelPickerSheet: View {
                 if sections.isEmpty && !query.trimmingCharacters(in: .whitespaces).isEmpty {
                     Section {
                         Text("No models match “\(query.trimmingCharacters(in: .whitespaces))”. Default model is still available.")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Theme.text2)
                     }
                 }
             }
@@ -79,7 +79,7 @@ struct ModelPickerSheet: View {
     // VERIFY ON MAC: `.searchable` inside a sheet's NavigationStack may not show a field on macOS, so the Mac uses a plain focused field.
     private var searchField: some View {
         HStack {
-            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            Image(systemName: "magnifyingglass").foregroundStyle(Theme.text2)
             TextField("Search by name, provider, family or role", text: $query)
                 .textFieldStyle(.plain)
                 .focused($searchFocused)
@@ -102,10 +102,10 @@ struct ModelPickerSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Default model").font(.body.weight(.semibold)).foregroundStyle(.primary)
                     Text(roleDefault.map { "The \(role) default, now \($0.id)" } ?? "The hub's \(role) default")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(Theme.text2)
                 }
                 Spacer(minLength: 8)
-                if current == nil { Image(systemName: "checkmark").foregroundStyle(.tint).accessibilityHidden(true) }
+                if current == nil { Image(systemName: "checkmark").foregroundStyle(Theme.accent).accessibilityHidden(true) }
             }
             .contentShape(Rectangle())
         }
@@ -119,16 +119,32 @@ struct ModelPickerSheet: View {
             if group.isFirst {
                 Text(section.title).font(.headline).foregroundStyle(.primary)
             }
-            HStack(spacing: 6) {
-                Text(group.providerId.isEmpty ? "Unknown provider" : group.providerId).font(.subheadline.weight(.semibold))
-                if let provider = group.provider {
-                    TagBadge(text: provider.kind)
-                    TagBadge(text: provider.hasKey ? "Key set" : "No key", tint: provider.hasKey ? .teal : .secondary)
-                    if let via = provider.viaDevice, !via.isEmpty {
-                        TagBadge(text: "via \(model.deviceDisplayName(via))")
+            if group.isHarnessGroup {
+                let devName = group.deviceId.map { model.deviceDisplayName($0) } ?? "Unknown device"
+                let devOnline = group.deviceId.flatMap { id in model.devices.first(where: { $0.id == id })?.online }
+                HStack(spacing: 6) {
+                    Text(devName).font(.subheadline.weight(.semibold))
+                    TagBadge(text: "Harness", tint: Theme.accent, fill: Theme.accentSoft)
+                    if let devOnline {
+                        TagBadge(
+                            text: devOnline ? "Online" : "Offline",
+                            tint: devOnline ? Theme.ok : Theme.text2,
+                            fill: devOnline ? Theme.okSoft : Theme.surface2
+                        )
                     }
-                } else if model.providersLoaded {
-                    TagBadge(text: "Unknown provider", tint: .orange)
+                }
+            } else {
+                HStack(spacing: 6) {
+                    Text(group.providerId.isEmpty ? "Unknown provider" : group.providerId).font(.subheadline.weight(.semibold))
+                    if let provider = group.provider {
+                        TagBadge(text: provider.kind)
+                        TagBadge(text: provider.hasKey ? "Key set" : "No key", tint: provider.hasKey ? Theme.ok : Theme.text2, fill: provider.hasKey ? Theme.okSoft : Theme.surface2)
+                        if let via = provider.viaDevice, !via.isEmpty {
+                            TagBadge(text: "via \(model.deviceDisplayName(via))")
+                        }
+                    } else if model.providersLoaded {
+                        TagBadge(text: "Unknown provider", tint: Theme.warn, fill: Theme.warnSoft)
+                    }
                 }
             }
         }
@@ -137,27 +153,36 @@ struct ModelPickerSheet: View {
         .accessibilityAddTraits(.isHeader)
     }
 
-    private func modelRow(_ entry: ModelEntry) -> some View {
+    @ViewBuilder private func modelRow(_ entry: ModelEntry) -> some View {
         let family = ModelFamily.of(entry)
         let selected = entry.id == current
-        return Button { pick(entry.id) } label: {
+        let provider = model.providers.first { $0.id == entry.providerId }
+        if Self.isHarnessModel(entry, provider: provider) {
+            harnessRow(entry, provider: provider, family: family, selected: selected)
+        } else {
+            apiModelRow(entry, family: family, selected: selected)
+        }
+    }
+
+    private func apiModelRow(_ entry: ModelEntry, family: ModelFamily, selected: Bool) -> some View {
+        Button { pick(entry.id) } label: {
             HStack(alignment: .top, spacing: 10) {
                 FamilyMark(family: family).padding(.top, 2)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(entry.id).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
                         priceBadge(entry)
-                        if entry.local { TagBadge(text: "Local") }
+                        if entry.local { TagBadge(text: "Local", tint: Theme.ok, fill: Theme.okSoft) }
                     }
-                    Text(entry.model).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
-                    Text(Self.meta(entry, family: family)).font(.caption).foregroundStyle(.secondary)
+                    Text(entry.model).font(.caption.monospaced()).foregroundStyle(Theme.text2).lineLimit(1)
+                    Text(Self.meta(entry, family: family)).font(.caption).foregroundStyle(Theme.text2)
                 }
                 Spacer(minLength: 8)
-                if selected { Image(systemName: "checkmark").foregroundStyle(.tint).accessibilityHidden(true) }
+                if selected { Image(systemName: "checkmark").foregroundStyle(Theme.accent).accessibilityHidden(true) }
             }
             .padding(.leading, 6)
             .background(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2).fill(family.color).frame(width: 3)
+                RoundedRectangle(cornerRadius: 2).fill(family.color).frame(width: 4)
             }
             .contentShape(Rectangle())
         }
@@ -166,9 +191,46 @@ struct ModelPickerSheet: View {
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
+    private func harnessRow(_ entry: ModelEntry, provider: ProviderInfo?, family: ModelFamily, selected: Bool) -> some View {
+        let cliName = Self.harnessCliName(entry, provider: provider)
+        let devId = Self.harnessDeviceId(entry, provider: provider)
+        let devName = devId.isEmpty ? "unknown device" : model.deviceDisplayName(devId)
+        let devOnline = devId.isEmpty ? nil : model.devices.first(where: { $0.id == devId })?.online
+        let isDisabled = role == "orchestrator" && !entry.canOrchestrate
+        let place = devOnline.map { "\(cliName) on \(devName) · \($0 ? "online" : "offline")" } ?? "\(cliName) on \(devName)"
+        return Button { pick(entry.id) } label: {
+            HStack(alignment: .top, spacing: 10) {
+                FamilyMark(family: family).padding(.top, 2)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text("\(cliName) · \(entry.model)")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(isDisabled ? Theme.text3 : .primary)
+                            .lineLimit(1)
+                        TagBadge(text: "Harness", tint: Theme.accent, fill: Theme.accentSoft)
+                    }
+                    Text(place).font(.caption).foregroundStyle(Theme.text2).lineLimit(1)
+                    Text(Self.harnessMeta(entry, role: role)).font(.caption).foregroundStyle(Theme.text2)
+                }
+                Spacer(minLength: 8)
+                if selected { Image(systemName: "checkmark").foregroundStyle(Theme.accent).accessibilityHidden(true) }
+            }
+            .padding(.leading, 6)
+            .background(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 2).fill(family.color).frame(width: 4)
+            }
+            .opacity(isDisabled ? 0.58 : 1)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
     @ViewBuilder private func priceBadge(_ entry: ModelEntry) -> some View {
         if entry.free {
-            TagBadge(text: "Free", tint: .teal)
+            TagBadge(text: "Free", tint: Theme.ok, fill: Theme.okSoft)
         } else if entry.inputPrice > 0 || entry.outputPrice > 0 {
             TagBadge(text: "Paid")
         } else {
@@ -187,6 +249,8 @@ struct ModelPickerSheet: View {
         let id: String
         let providerId: String
         let provider: ProviderInfo?
+        let deviceId: String?
+        let isHarnessGroup: Bool
         let models: [ModelEntry]
         let isFirst: Bool
     }
@@ -195,6 +259,61 @@ struct ModelPickerSheet: View {
         let id: String
         let title: String
         let groups: [PickerGroup]
+    }
+
+    private static let harnessNames: [String: String] = [
+        "claude-code": "Claude Code",
+        "codex": "Codex",
+        "antigravity": "Antigravity",
+        "grok": "Grok",
+        "hermes": "Hermes",
+        "pi": "pi",
+        "opencode": "OpenCode",
+        "cursor": "Cursor",
+    ]
+
+    static func isHarnessModel(_ entry: ModelEntry, provider: ProviderInfo?) -> Bool {
+        entry.isHarness || provider?.kind == "harness"
+    }
+
+    static func harnessDeviceId(_ entry: ModelEntry, provider: ProviderInfo?) -> String {
+        if let deviceId = entry.deviceId, !deviceId.isEmpty { return deviceId }
+        if let via = provider?.viaDevice, !via.isEmpty { return via }
+        if let at = entry.providerId.firstIndex(of: "@") {
+            return String(entry.providerId[entry.providerId.index(after: at)...])
+        }
+        return ""
+    }
+
+    static func harnessCliName(_ entry: ModelEntry, provider: ProviderInfo?) -> String {
+        if case .object(let opts)? = provider?.options {
+            if case .string(let displayName) = opts["display_name"] {
+                let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+            if case .string(let slug) = opts["harness"] {
+                let trimmed = slug.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return harnessNames[trimmed] ?? trimmed }
+            }
+        }
+        if let at = entry.providerId.firstIndex(of: "@") {
+            let slug = String(entry.providerId[..<at])
+            if !slug.isEmpty { return harnessNames[slug] ?? slug }
+        }
+        return "Harness"
+    }
+
+    static func harnessMeta(_ entry: ModelEntry, role: String) -> String {
+        var parts: [String] = ["Subscription"]
+        if role == "orchestrator" {
+            parts.append(entry.canOrchestrate ? "Orchestrates via MCP" : "Standard chats and threads only")
+        } else if entry.roles.contains(role) {
+            parts.append("\(role) default")
+        }
+        if entry.contextWindow > 0 {
+            parts.append("\(entry.contextWindow.formatted(.number.notation(.compactName))) context")
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// Family, roles, price per 1M tokens and context, for the row's secondary line.
@@ -219,29 +338,74 @@ struct ModelPickerSheet: View {
         query.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
     }
 
-    static func sections(models: [ModelEntry], providers: [ProviderInfo], role: String, words: [String],
-                         familyOf: (ModelEntry) -> ModelFamily) -> [PickerSection] {
+    static func sections(models: [ModelEntry], providers: [ProviderInfo], devices: [DeviceInfo] = [], role: String,
+                         words: [String], familyOf: (ModelEntry) -> ModelFamily) -> [PickerSection] {
         let byId = Dictionary(providers.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let devicesById = Dictionary(devices.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let shown = models.filter { entry in
             guard !words.isEmpty else { return true }
+            let provider = byId[entry.providerId]
+            let isHarness = isHarnessModel(entry, provider: provider)
             let family = familyOf(entry)
             let familyWords: String = family == .unknown ? "" : "\(family.label) \(family.maker)"
-            let kind: String = byId[entry.providerId]?.kind ?? ""
+            let kind: String = provider?.kind ?? ""
+            let devId = isHarness ? harnessDeviceId(entry, provider: provider) : (provider?.viaDevice ?? "")
+            let dev = devId.isEmpty ? nil : devicesById[devId]
+            let devName = dev?.name ?? devId
             let parts: [String] = [
-                entry.id, entry.model, entry.providerId, kind, entry.roles.joined(separator: " "), familyWords,
-                entry.free ? "free" : "paid", entry.local ? "local" : "",
+                entry.id,
+                entry.model,
+                entry.displayName ?? "",
+                entry.providerId,
+                kind,
+                isHarness ? "\(harnessCliName(entry, provider: provider)) harness subscription" : "",
+                (isHarness && entry.canOrchestrate) ? "orchestrates mcp" : "",
+                dev.map { $0.online ? "online" : "offline" } ?? "",
+                devName,
+                entry.roles.joined(separator: " "),
+                familyWords,
+                isHarness ? "" : (entry.free ? "free" : "paid"),
+                (!isHarness && entry.local) ? "local" : "",
             ]
             let hay = parts.joined(separator: " ").lowercased()
             return words.allSatisfy { hay.contains($0) }
         }
-        let primary = shown.filter { $0.roles.contains(role) }
-        let other = shown.filter { !$0.roles.contains(role) }
+        let apiShown = shown.filter { !isHarnessModel($0, provider: byId[$0.providerId]) }
+        let harnessShown = shown.filter { isHarnessModel($0, provider: byId[$0.providerId]) }
+
+        let primary = apiShown.filter { $0.roles.contains(role) }
+        let other = apiShown.filter { !$0.roles.contains(role) }
         var result: [PickerSection] = []
         if !primary.isEmpty {
             result.append(section(id: "primary", title: role == "standard" ? "Standard models" : "Orchestrator models", models: primary, byId: byId))
         }
         if !other.isEmpty {
             result.append(section(id: "other", title: primary.isEmpty ? "All models" : "Other models", models: other, byId: byId))
+        }
+        if !harnessShown.isEmpty {
+            let grouped = Dictionary(grouping: harnessShown) { harnessDeviceId($0, provider: byId[$0.providerId]) }
+            let sortedDeviceIds = grouped.keys.sorted { lhs, rhs in
+                let lName = lhs.isEmpty ? "Unknown device" : (devicesById[lhs]?.name ?? lhs)
+                let rName = rhs.isEmpty ? "Unknown device" : (devicesById[rhs]?.name ?? rhs)
+                return (lName, lhs) < (rName, rhs)
+            }
+            let groups = sortedDeviceIds.enumerated().map { index, devId in
+                let sortedModels = (grouped[devId] ?? []).sorted { a, b in
+                    let ca = harnessCliName(a, provider: byId[a.providerId])
+                    let cb = harnessCliName(b, provider: byId[b.providerId])
+                    return (ca, a.model, a.id) < (cb, b.model, b.id)
+                }
+                return PickerGroup(
+                    id: "harnesses:\(devId)",
+                    providerId: devId,
+                    provider: nil,
+                    deviceId: devId.isEmpty ? nil : devId,
+                    isHarnessGroup: true,
+                    models: sortedModels,
+                    isFirst: index == 0
+                )
+            }
+            result.append(PickerSection(id: "harnesses", title: "Harnesses (subscriptions)", groups: groups))
         }
         return result
     }
@@ -253,6 +417,8 @@ struct ModelPickerSheet: View {
                 id: "\(id):\(providerId)",
                 providerId: providerId,
                 provider: byId[providerId],
+                deviceId: nil,
+                isHarnessGroup: false,
                 models: (grouped[providerId] ?? []).sorted { $0.id < $1.id },
                 isFirst: index == 0
             )

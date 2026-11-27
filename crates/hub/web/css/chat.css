@@ -1,0 +1,1027 @@
+/* Owned by W2 (chat: messages, threads card, composer; views/chat.js).
+   Tokens and shared base classes live in app.css. Rules here are scoped to the
+   chat view so views/thread.js inside .inspector keeps its own styles intact. */
+
+/* ---- chat bar and header title menu */
+
+.chat-view .bar h1 {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.chat-title-static {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.chat-title-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 32px;
+  padding: 2px 8px 2px 4px;
+  margin-left: -4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-title-btn:hover {
+  background: var(--surface-3);
+}
+
+.chat-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-title-btn > .icon {
+  width: 15px;
+  height: 15px;
+  color: var(--text-3);
+  flex: none;
+}
+
+.chat-view .threads-btn {
+  min-height: 36px;
+  padding: 4px 8px;
+  gap: 5px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-view .threads-btn:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.chat-view .threads-btn[aria-expanded="true"] {
+  background: var(--surface-select);
+  color: var(--text);
+}
+
+.chat-view .threads-btn > .icon {
+  width: 18px;
+  height: 18px;
+}
+
+/* Anchor the menu popover to the bar so opening from the title aligns left
+   while opening from the ⋯ button aligns right. */
+.chat-view .menu-wrap {
+  position: static;
+}
+
+.chat-view .menu-pop {
+  top: calc(100% + 4px);
+  right: 12px;
+  left: auto;
+}
+
+.chat-view .menu-pop.from-title {
+  left: 16px;
+  right: auto;
+}
+
+.chat-view .menu-item .grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-view .menu-item-meta {
+  font-size: 12px;
+  color: var(--text-3);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- running-threads strip (override capsule radius from app.css) */
+
+.chat-view .strip {
+  margin: 10px auto 0;
+  width: min(720px, calc(100% - 40px));
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.chat-view button.strip:hover {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.chat-view .strip > .icon:last-child {
+  margin-left: auto;
+  width: 15px;
+  height: 15px;
+  color: var(--text-3);
+}
+
+/* ---- transcript (720px inner width; aligns with composer and dock) */
+
+.chat-transcript {
+  max-width: 760px;
+  padding: 20px 20px 24px;
+  gap: 16px;
+}
+
+/* ---- messages: avatars, bubbles, thinking chip, timestamps */
+
+.chat-transcript .msg-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  max-width: 100%;
+}
+
+.msg-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  margin-top: 1px;
+}
+
+/* Owner initial disc: --user-avatar with --accent-ink in dark mode (4.66:1; white
+   is 3.42:1) and white in light mode (4.60:1; --accent-ink is 3.46:1). */
+.msg-avatar-user {
+  background: var(--user-avatar);
+  color: #ffffff;
+  font-size: 13.5px;
+  font-weight: 650;
+  line-height: 1;
+  user-select: none;
+}
+
+:root[data-theme="dark"] .msg-avatar-user {
+  color: var(--accent-ink);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .msg-avatar-user {
+    color: var(--accent-ink);
+  }
+}
+
+/* Assistant avatar: the 7-fish glyph, readable at 28px. Welcome keeps logo.svg. */
+.msg-avatar-assistant {
+  background: url("/app/logo-glyph.svg") center / contain no-repeat;
+}
+
+/* User message: left-aligned beside the avatar, surface bubble, time at row right. */
+.chat-transcript .msg-user {
+  align-self: stretch;
+  max-width: 100%;
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  white-space: normal;
+}
+
+.msg-user-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.msg-bubble {
+  max-width: min(84%, 560px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 11px 15px;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.msg-time {
+  margin-left: auto;
+  flex: none;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  padding-bottom: 2px;
+}
+
+/* Assistant message: fish avatar, "Grouper" label, optional Thinking chip, plain canvas text. */
+.chat-transcript .msg-assistant {
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.chat-transcript .msg-assistant.msg-cont {
+  padding-left: 44px;
+}
+
+.msg-content {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.msg-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.msg-author {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.msg-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--purple-soft);
+  border: 1px solid color-mix(in srgb, var(--purple-fill) 36%, var(--border));
+  color: var(--purple);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.3;
+}
+
+.thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.thinking-dots > span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--purple-fill);
+  animation: thinking-dot 1.2s ease-in-out infinite;
+}
+
+.thinking-dots > span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.thinking-dots > span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes thinking-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.35;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+.msg-assistant-body {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  min-width: 0;
+}
+
+.msg-assistant-body > .msg-body,
+.msg-content > .msg-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-transcript .msg-error {
+  margin-left: 44px;
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+}
+
+/* ---- grouped threads card (V5, V6; extends W1's .thread-group in app.css) */
+
+.chat-transcript .thread-group {
+  margin-left: 44px;
+}
+
+.chat-transcript .thread-group-head {
+  padding: 6px 8px 6px;
+}
+
+.chat-transcript .thread-group-head > .icon {
+  box-sizing: content-box;
+  width: 14px;
+  height: 14px;
+  padding: 5px;
+  border-radius: var(--radius-xs);
+  background: var(--purple-soft);
+  color: var(--purple);
+}
+
+.thread-group-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-transcript .thread-line {
+  transition: background 0.15s var(--ease);
+}
+
+.chat-transcript .thread-line > .fam-dot {
+  box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--fam, var(--fam-unknown)) 24%, transparent);
+}
+
+.chat-transcript .thread-line[aria-current="true"] {
+  background: var(--surface-select);
+  box-shadow: inset 3px 0 0 var(--fam, var(--accent));
+}
+
+.chat-transcript .thread-line-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.thread-line-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-plan {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--radius-xs);
+  background: var(--purple-soft);
+  color: var(--purple);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-transcript .thread-line > .model-tag {
+  max-width: 180px;
+  border: 1px solid color-mix(in srgb, var(--fam, var(--fam-unknown)) 32%, var(--border));
+}
+
+.thread-plan.is-done {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.thread-line-pill {
+  display: inline-flex;
+  align-items: center;
+}
+
+.chat-transcript button.thread-group-foot {
+  width: 100%;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+
+.chat-transcript button.thread-group-foot:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.chat-transcript button.thread-group-foot .spacer {
+  flex: 1;
+}
+
+.chat-transcript button.thread-group-foot > .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--text-3);
+}
+
+/* Override W1's legacy .chip capsule/grid rules if anything still references .chip in chat. */
+.chat-view .chip {
+  border-radius: var(--radius);
+}
+
+/* ---- new-chat empty state with Project / Standard cards (Q12) */
+
+.chat-transcript .welcome {
+  margin: auto;
+  width: 100%;
+  max-width: 580px;
+  text-align: center;
+  padding: 36px 12px 20px;
+}
+
+.chat-transcript .welcome .boot-mark {
+  width: 64px;
+  height: 64px;
+  border-radius: 16px;
+  background:
+    url("/app/logo.svg") center / contain no-repeat,
+    radial-gradient(circle at 35% 40%, rgb(88 236 226 / 0.22), transparent 62%),
+    radial-gradient(circle at 70% 65%, rgb(167 139 250 / 0.22), transparent 62%);
+  box-shadow: 0 0 36px 10px rgb(127 176 255 / 0.12);
+  margin: 0 auto 14px;
+}
+
+.chat-transcript .welcome h2 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--text);
+}
+
+@supports (background-clip: text) or (-webkit-background-clip: text) {
+  .chat-transcript .welcome h2 {
+    background-image: var(--brand-gradient-text);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+}
+
+.chat-transcript .welcome-sub {
+  margin: 0 auto 20px;
+  color: var(--text-2);
+  font-size: 14px;
+  max-width: 44ch;
+}
+
+.mode-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  text-align: left;
+}
+
+.mode-card {
+  position: relative;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: background 0.15s var(--ease), border-color 0.15s var(--ease);
+}
+
+.mode-card input {
+  position: absolute;
+  opacity: 0;
+  inset: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.mode-card:hover {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+}
+
+.mode-card:has(input:checked) {
+  background: var(--surface-select);
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.mode-card:has(input:focus-visible) {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.mode-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mode-card-icon {
+  display: inline-grid;
+  color: var(--text-2);
+  flex: none;
+}
+
+.mode-card:has(input[value="project"]) .mode-card-icon {
+  color: var(--purple);
+}
+
+.mode-card:has(input[value="standard"]) .mode-card-icon {
+  color: #1f5fcc;
+}
+
+:root[data-theme="dark"] .mode-card:has(input[value="standard"]) .mode-card-icon {
+  color: #7fb0ff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .mode-card:has(input[value="standard"]) .mode-card-icon {
+    color: #7fb0ff;
+  }
+}
+
+.mode-card-title {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+  flex: 1;
+}
+
+.mode-card-check {
+  display: inline-grid;
+  color: var(--accent);
+  opacity: 0;
+  flex: none;
+}
+
+.mode-card-check > .icon {
+  width: 16px;
+  height: 16px;
+  stroke-width: 2.3;
+}
+
+.mode-card:has(input:checked) .mode-card-check {
+  opacity: 1;
+}
+
+.mode-card-desc {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+
+/* ---- composer card (V8) */
+
+.chat-view .composer-wrap {
+  max-width: 760px;
+  padding: 0 20px;
+  bottom: 12px;
+}
+
+.chat-composer {
+  border-radius: var(--radius);
+  padding: 10px 12px 10px 14px;
+  display: grid;
+  gap: 6px;
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.chat-composer:focus-within {
+  /* Neutral 3:1 edge, 2px thick, as the visible focus indicator (no blue wash). */
+  border-color: var(--border-control);
+  box-shadow: 0 0 0 1px var(--border-control), var(--shadow-sm);
+}
+
+.composer-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.composer-top > .spacer {
+  flex: 1;
+  min-width: 0;
+}
+
+.composer-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.composer-tools:empty {
+  display: none;
+}
+
+/* Override capsule radius on .model-btn from app.css: rounded rectangle chip. */
+.chat-composer .model-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: min(280px, 100%);
+  min-height: 30px;
+  padding: 3px 10px 3px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-select);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.chat-composer .model-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.chat-composer .model-btn > .icon {
+  color: var(--text-3);
+}
+
+/* Round 32px teal send button (V2, V8, Checkpoint 4). */
+.chat-composer .send-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  flex: none;
+}
+
+.chat-composer .send-btn-disc {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--accent-fill);
+  border: 1px solid var(--accent-fill-edge);
+  color: var(--accent-ink);
+  transition: background 0.15s var(--ease), transform 0.1s var(--ease);
+}
+
+.chat-composer .send-btn:hover:not(:disabled) .send-btn-disc {
+  background: var(--accent-hover);
+}
+
+.chat-composer .send-btn:active:not(:disabled) .send-btn-disc {
+  transform: scale(0.95);
+}
+
+.chat-composer .send-btn:disabled {
+  background: transparent;
+  cursor: not-allowed;
+}
+
+.chat-composer .send-btn:disabled .send-btn-disc {
+  background: var(--surface-3);
+  border-color: var(--border);
+  color: var(--text-3);
+}
+
+.chat-composer .send-btn .icon {
+  width: 17px;
+  height: 17px;
+  stroke-width: 2.2;
+}
+
+.chat-composer textarea {
+  width: 100%;
+  height: auto;
+  min-height: 26px;
+  max-height: 168px;
+  padding: 2px 2px 2px 0;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text);
+  field-sizing: content;
+}
+
+/* Override capsule radius on .new-messages from app.css. */
+.chat-view .new-messages {
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-float);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.chat-view .new-messages:hover {
+  background: var(--surface-2);
+}
+
+/* ---- narrow / phone layout (<= 760px) */
+
+.chat-menu-new {
+  display: none;
+}
+
+@media (max-width: 760px) {
+  .chat-menu-new {
+    display: flex;
+  }
+
+  .chat-view .strip {
+    width: calc(100% - 28px);
+  }
+
+  .chat-transcript {
+    padding: 16px 14px 18px;
+    gap: 14px;
+  }
+
+  .chat-transcript .msg-row {
+    gap: 8px;
+  }
+
+  .msg-avatar {
+    width: 28px;
+    height: 28px;
+    font-size: 12.5px;
+  }
+
+  .chat-transcript .msg-assistant.msg-cont {
+    padding-left: 36px;
+  }
+
+  .msg-user-body {
+    gap: 8px;
+  }
+
+  .msg-bubble {
+    max-width: calc(100% - 42px);
+    padding: 10px 13px;
+    font-size: 15.5px;
+  }
+
+  .chat-transcript .msg-assistant {
+    font-size: 15.5px;
+  }
+
+  .chat-transcript .msg-error,
+  .chat-transcript .thread-group {
+    margin-left: 0;
+  }
+
+  .chat-view .composer-wrap {
+    padding: 0 12px;
+    bottom: 8px;
+  }
+
+  /* Single-line composer card on phone (Checkpoint 7); model chip appears on focus. */
+  .chat-composer {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 6px;
+    row-gap: 0;
+    padding: 4px 4px 4px 14px;
+  }
+
+  .chat-composer .composer-top {
+    display: contents;
+  }
+
+  .chat-composer .composer-top > .spacer,
+  .chat-composer .composer-tools {
+    display: none;
+  }
+
+  .chat-composer .model-btn {
+    display: none;
+    grid-column: 1 / -1;
+    grid-row: 1;
+    justify-self: start;
+    max-width: 100%;
+    min-height: 36px;
+    margin: 4px 0 4px -4px;
+  }
+
+  .chat-composer:focus-within .model-btn:not([hidden]) {
+    display: inline-flex;
+  }
+
+  .chat-composer textarea {
+    grid-column: 1;
+    grid-row: 2;
+    padding: 9px 0;
+    font-size: 16px;
+    line-height: 1.4;
+    min-height: 24px;
+  }
+
+  .chat-composer .send-btn {
+    grid-column: 2;
+    grid-row: 2;
+    align-self: end;
+    width: 44px;
+    height: 44px;
+  }
+
+  .chat-composer .send-btn-disc {
+    width: 34px;
+    height: 34px;
+  }
+
+  .chat-composer .composer-error {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    padding: 0 4px 6px 0;
+  }
+
+  .chat-view .threads-btn {
+    min-height: 44px;
+    padding: 4px 10px;
+  }
+
+  .chat-title-btn {
+    min-height: 40px;
+  }
+
+  .chat-transcript button.thread-group-foot {
+    min-height: 44px;
+  }
+}
+
+/* Keep the thread row on one line at 390px (Checkpoint 7) while showing the model (V6);
+   only stack the model tag onto row 2 below 360px so 320px stays clean. */
+@media (min-width: 361px) and (max-width: 560px) {
+  .chat-transcript .thread-line {
+    grid-template-columns: 10px minmax(0, 1fr) minmax(0, max-content) max-content 16px;
+    column-gap: 8px;
+    row-gap: 0;
+  }
+
+  .chat-transcript .thread-line > .model-tag {
+    grid-column: auto;
+    grid-row: auto;
+    justify-self: auto;
+    max-width: 96px;
+    font-size: 11.5px;
+    padding: 1px 6px;
+    min-height: 22px;
+  }
+}
+
+@media (max-width: 520px) {
+  .mode-cards {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- accessibility preferences */
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking-dots > span {
+    animation: none;
+    opacity: 0.7;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .chat-composer {
+    background: var(--surface);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .msg-bubble,
+  .msg-state,
+  .mode-card,
+  .chat-view .strip,
+  .chat-view .new-messages,
+  .chat-composer,
+  .chat-composer .model-btn {
+    border: 1.5px solid var(--border-strong);
+  }
+
+  .chat-composer {
+    background: var(--surface);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  .mode-card:has(input:checked) {
+    border: 2px solid var(--accent);
+  }
+
+  .mode-card:has(input:focus-visible),
+  .chat-title-btn:focus-visible,
+  .chat-transcript .thread-line:focus-visible,
+  .chat-transcript button.thread-group-foot:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 2px;
+  }
+
+  .chat-composer:focus-within {
+    border-color: var(--focus);
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+
+  .msg-avatar-user {
+    border: 1.5px solid var(--border-strong);
+  }
+}
+
+@media (forced-colors: active) {
+  .chat-transcript .welcome h2 {
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: CanvasText;
+  }
+
+  .msg-avatar-user {
+    forced-color-adjust: none;
+    background: Highlight;
+    color: HighlightText;
+    border: 1px solid CanvasText;
+  }
+
+  .msg-bubble,
+  .msg-state,
+  .mode-card,
+  .chat-composer,
+  .chat-view .strip,
+  .chat-view .new-messages {
+    background: Canvas;
+    color: CanvasText;
+    border: 1px solid CanvasText;
+  }
+
+  .mode-card:has(input:checked) {
+    forced-color-adjust: none;
+    background: Highlight;
+    color: HighlightText;
+    border-color: Highlight;
+  }
+
+  .mode-card:has(input:checked) .mode-card-title,
+  .mode-card:has(input:checked) .mode-card-desc,
+  .mode-card:has(input:checked) .mode-card-icon,
+  .mode-card:has(input:checked) .mode-card-check {
+    color: HighlightText;
+  }
+
+  .chat-composer .model-btn {
+    background: ButtonFace;
+    color: ButtonText;
+    border: 1px solid ButtonText;
+  }
+
+  .chat-composer .send-btn-disc {
+    forced-color-adjust: none;
+    background: ButtonFace;
+    color: ButtonText;
+    border: 1px solid ButtonText;
+  }
+
+  .chat-composer .send-btn:disabled .send-btn-disc {
+    color: GrayText;
+    border-color: GrayText;
+  }
+
+  .chat-transcript button.thread-group-foot {
+    color: ButtonText;
+    border-top-color: CanvasText;
+  }
+
+  .chat-title-btn {
+    color: ButtonText;
+  }
+}

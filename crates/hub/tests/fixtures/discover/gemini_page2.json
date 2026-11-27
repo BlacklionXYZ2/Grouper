@@ -1,0 +1,16 @@
+{
+  "models": [
+    {
+      "name": "models/gemini-2.5-flash-001",
+      "displayName": "Gemini 2.5 Flash",
+      "inputTokenLimit": 1048576,
+      "supportedGenerationMethods": ["generateContent", "countTokens"]
+    },
+    {
+      "name": "models/imagen-3.0-generate-002",
+      "displayName": "Imagen 3",
+      "inputTokenLimit": 480,
+      "supportedGenerationMethods": ["predict"]
+    }
+  ]
+}

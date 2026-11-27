@@ -8,6 +8,8 @@ import { store, isAdmin, deviceName } from '../lib/store.js';
 import { loadModels } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { num, usd, pct, duration, ago, plural } from '../lib/format.js';
+import { familyKey, familyMark } from '../lib/family.js';
+import { isLocalModel, isHarnessModel, harnessDeviceId, harnessCliName, harnessSignInInfo, modelBadge, price } from './model-picker.js';
 
 const CONSTRAINTS = ['local', 'remote', 'free', 'paid'];
 const PREFERS = ['cheapest', 'local', 'free'];
@@ -96,43 +98,90 @@ export function renderModels(container, { id: targetId = null } = {}) {
   }
 
   function groupModels(models) {
-    const buckets = new Map();
+    const apiModels = [];
+    const harnessModels = [];
     for (const m of models) {
+      const p = providersById.get(m.provider_id);
+      if (isHarnessModel(m, p)) harnessModels.push(m);
+      else apiModels.push(m);
+    }
+
+    const buckets = new Map();
+    for (const m of apiModels) {
       const id = m.provider_id || '';
       if (!buckets.has(id)) buckets.set(id, []);
       buckets.get(id).push(m);
     }
     for (const list of buckets.values()) list.sort((a, b) => a.id.localeCompare(b.id));
 
+    let apiGroups;
     if (!providersLoaded) {
-      return [...buckets.keys()].sort((a, b) => a.localeCompare(b)).map((id) => ({
+      apiGroups = [...buckets.keys()].sort((a, b) => a.localeCompare(b)).map((id) => ({
         key: id || '__unknown__',
         title: id || 'Unknown provider',
         provider: null,
         models: buckets.get(id),
         unknown: !id,
       }));
+    } else {
+      apiGroups = [...providersById.keys()]
+        .sort((a, b) => a.localeCompare(b))
+        .filter((id) => providersById.get(id)?.kind !== 'harness' && buckets.has(id))
+        .map((id) => ({
+          key: id,
+          title: id,
+          provider: providersById.get(id),
+          models: buckets.get(id),
+          unknown: false,
+        }));
+      const unknown = [];
+      for (const [id, list] of buckets) {
+        if (!providersById.has(id)) unknown.push(...list);
+      }
+      unknown.sort((a, b) => a.id.localeCompare(b.id));
+      if (unknown.length) {
+        apiGroups.push({ key: '__unknown__', title: 'Unknown provider', provider: null, models: unknown, unknown: true });
+      }
     }
 
-    const groups = [...providersById.keys()]
-      .sort((a, b) => a.localeCompare(b))
-      .filter((id) => buckets.has(id))
-      .map((id) => ({
-        key: id,
-        title: id,
-        provider: providersById.get(id),
-        models: buckets.get(id),
-        unknown: false,
-      }));
-    const unknown = [];
-    for (const [id, list] of buckets) {
-      if (!providersById.has(id)) unknown.push(...list);
+    const harnessBuckets = new Map();
+    for (const m of harnessModels) {
+      const devId = harnessDeviceId(m, providersById.get(m.provider_id)) || '__unknown__';
+      if (!harnessBuckets.has(devId)) harnessBuckets.set(devId, []);
+      harnessBuckets.get(devId).push(m);
     }
-    unknown.sort((a, b) => a.id.localeCompare(b.id));
-    if (unknown.length) {
-      groups.push({ key: '__unknown__', title: 'Unknown provider', provider: null, models: unknown, unknown: true });
+    const harnessProvidersByDevice = new Map();
+    if (providersLoaded) {
+      for (const p of providersById.values()) {
+        if (p.kind !== 'harness') continue;
+        const devId = harnessDeviceId(null, p) || '__unknown__';
+        if (!harnessProvidersByDevice.has(devId)) harnessProvidersByDevice.set(devId, []);
+        harnessProvidersByDevice.get(devId).push(p);
+        if (!harnessBuckets.has(devId)) harnessBuckets.set(devId, []);
+      }
     }
-    return groups;
+
+    const harnessGroups = [...harnessBuckets.keys()].map((devId) => {
+      const list = harnessBuckets.get(devId);
+      list.sort((a, b) => {
+        const ca = harnessCliName(a, providersById.get(a.provider_id));
+        const cb = harnessCliName(b, providersById.get(b.provider_id));
+        return ca.localeCompare(cb) || a.model.localeCompare(b.model) || a.id.localeCompare(b.id);
+      });
+      const devProviders = (harnessProvidersByDevice.get(devId) || []).slice().sort((a, b) =>
+        harnessCliName(null, a).localeCompare(harnessCliName(null, b)) || a.id.localeCompare(b.id),
+      );
+      return {
+        key: `harness:${devId}`,
+        deviceId: devId === '__unknown__' ? '' : devId,
+        title: devId === '__unknown__' ? 'Unknown device' : deviceName(devId),
+        providers: devProviders,
+        models: list,
+      };
+    });
+    harnessGroups.sort((a, b) => a.title.localeCompare(b.title) || a.key.localeCompare(b.key));
+
+    return { apiGroups, harnessGroups };
   }
 
   async function deleteModel(m) {
@@ -147,7 +196,9 @@ export function renderModels(container, { id: targetId = null } = {}) {
   }
 
   function modelActions(m, withText) {
-    const isCatalog = isOpenRouterProvider(providersById.get(m.provider_id));
+    const provider = providersById.get(m.provider_id);
+    const harness = isHarnessModel(m, provider);
+    const isCatalog = !harness && isOpenRouterProvider(provider);
     const btn = (visible, label, ic, title, onclick) =>
       withText
         ? h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, 'aria-label': label, onclick }, icon(ic), visible)
@@ -157,27 +208,59 @@ export function renderModels(container, { id: targetId = null } = {}) {
       { class: withText ? 'bar-actions' : 'table-actions' },
       btn('Edit', `Edit ${m.id}`, 'edit', 'Edit model', () => openEditModelSheet(m)),
       isCatalog ? btn('Refresh prices', `Refresh prices for ${m.id}`, 'refresh', 'Refresh prices from catalog', (e) => refreshModelPrices(m, e.currentTarget)) : null,
-      btn('Run probes', `Run probes for ${m.id}`, 'play', 'Run probes', () => openProbeSheet(m)),
+      !harness ? btn('Run probes', `Run probes for ${m.id}`, 'play', 'Run probes', () => openProbeSheet(m)) : null,
       btn('Delete', `Delete ${m.id}`, 'trash', 'Delete', () => deleteModel(m)),
     );
   }
 
   function narrowCard(m) {
+    const famKey = familyKey(m);
+    const provider = providersById.get(m.provider_id) || null;
+    const harness = isHarnessModel(m, provider);
+    const badge = modelBadge(m, provider, { right: true });
+    const known = m.input_price > 0 || m.output_price > 0;
+    const priceText = harness
+      ? 'Subscription'
+      : !m.free
+        ? (known ? `$${price(m.input_price)} in · $${price(m.output_price)} out / 1M` : 'No price set')
+        : isLocalModel(m, provider) ? 'Free' : null;
+    const cliName = harness ? harnessCliName(m, provider) : '';
+    const devId = harness ? harnessDeviceId(m, provider) : '';
+    const signIn = harness ? harnessSignInInfo(provider) : null;
     return h(
       'li',
       { class: 'list-row model-row', dataset: { modelId: m.id } },
       h(
         'div',
-        { class: 'grow' },
-        h('div', { class: 'row-title' }, m.id),
-        h('div', { class: 'row-sub mono' }, `${m.provider_id} / ${m.model}`),
+        { class: ['model-row-main', 'has-fam', `fam-${famKey}`] },
+        familyMark(famKey),
         h(
           'div',
-          { class: 'meta' },
-          h('span', null, m.roles.length ? m.roles.join(', ') : 'No roles'),
-          h('span', null, `$${m.input_price.toFixed(2)} in / $${m.output_price.toFixed(2)} out`),
-          m.free ? h('span', { class: 'badge accent' }, 'Free') : null,
-          m.local ? h('span', { class: 'badge' }, 'Local') : null,
+          { class: 'grow' },
+          h('div', { class: 'model-row-head' }, h('div', { class: 'row-title' }, m.id), badge),
+          h(
+            'div',
+            { class: 'row-sub model-row-sub' },
+            harness
+              ? [
+                  h('span', { class: 'mono' }, `${cliName} · ${m.model}`),
+                  h('span', null, `${cliName} on ${devId ? deviceName(devId) : 'unknown device'}`),
+                  h('span', null, 'Subscription'),
+                  h('span', null, m.can_orchestrate ? 'Orchestrates via MCP' : 'Standard chats and threads only'),
+                  signIn ? h('span', { class: ['badge', signIn.tone] }, signIn.label) : null,
+                ]
+              : [
+                  h('span', { class: 'mono' }, `${m.provider_id} / ${m.model}`),
+                  priceText ? h('span', null, priceText) : null,
+                ],
+          ),
+          h(
+            'div',
+            { class: 'meta' },
+            h('span', null, m.roles.length ? m.roles.join(', ') : 'No roles'),
+            m.context_window ? h('span', null, `${num(m.context_window)} ctx`) : null,
+            m.use_cases ? h('span', null, m.use_cases) : null,
+          ),
         ),
       ),
       admin ? modelActions(m, true) : null,
@@ -194,19 +277,108 @@ export function renderModels(container, { id: targetId = null } = {}) {
   }
 
   function wideRow(m) {
+    const famKey = familyKey(m);
+    const provider = providersById.get(m.provider_id) || null;
+    const badge = modelBadge(m, provider);
     const note = cacheNote(m);
     return h(
       'tr',
       { class: 'model-row', dataset: { modelId: m.id } },
-      h('td', { class: 'wrap' }, h('strong', null, m.id), m.use_cases ? h('div', { class: 'row-sub' }, m.use_cases) : null),
+      h(
+        'td',
+        { class: 'wrap' },
+        h('div', { class: ['model-id-cell', 'has-fam', `fam-${famKey}`] }, familyMark(famKey), h('strong', null, m.id)),
+        m.use_cases ? h('div', { class: 'row-sub model-use-cases' }, m.use_cases) : null,
+      ),
       h('td', { class: 'mono' }, `${m.provider_id} / ${m.model}`, note ? h('div', { class: 'hint' }, note) : null),
       h('td', null, m.roles.length ? m.roles.join(', ') : '—'),
-      h('td', null, m.free ? h('span', { class: 'badge accent' }, 'Free') : null, ' ', m.local ? h('span', { class: 'badge' }, 'Local') : null),
+      h('td', null, badge || h('span', { class: 'hint' }, '—')),
       h('td', { class: 'num' }, m.context_window ? num(m.context_window) : '—'),
       h('td', { class: 'num' }, m.input_price.toFixed(2)),
       h('td', { class: 'num' }, m.output_price.toFixed(2)),
       h('td', null, admin ? modelActions(m, false) : null),
     );
+  }
+
+  function harnessWideRow(m) {
+    const famKey = familyKey(m);
+    const provider = providersById.get(m.provider_id) || null;
+    const cliName = harnessCliName(m, provider);
+    const signIn = harnessSignInInfo(provider);
+    const ver = typeof provider?.options?.version === 'string' ? provider.options.version.trim() : '';
+    const canOrch = Boolean(m.can_orchestrate);
+    return h(
+      'tr',
+      { class: 'model-row', dataset: { modelId: m.id } },
+      h(
+        'td',
+        { class: 'wrap' },
+        h('div', { class: ['model-id-cell', 'has-fam', `fam-${famKey}`] }, familyMark(famKey), h('strong', null, m.id)),
+        m.use_cases ? h('div', { class: 'row-sub model-use-cases' }, m.use_cases) : null,
+      ),
+      h('td', { class: 'mono' }, `${cliName} · ${m.model}`, ver ? h('div', { class: 'hint' }, `v${ver}`) : null),
+      h('td', null, m.roles.length ? m.roles.join(', ') : '—'),
+      h('td', null, h('span', { class: ['badge', canOrch ? 'accent' : 'muted'] }, canOrch ? 'Orchestrates via MCP' : 'Standard & threads')),
+      h('td', null, signIn ? h('span', { class: ['badge', signIn.tone] }, signIn.label) : h('span', { class: 'hint' }, '—')),
+      h('td', { class: 'num' }, m.context_window ? num(m.context_window) : '—'),
+      h('td', null, 'Subscription'),
+      h('td', null, admin ? modelActions(m, false) : null),
+    );
+  }
+
+  function harnessDeviceSection(group, narrow, collapsed) {
+    const dev = group.deviceId ? store.devices.find((d) => d.id === group.deviceId) : null;
+    const summaryId = `provider-summary-${group.key}`;
+    const summary = h(
+      'summary',
+      { id: summaryId },
+      icon('chevron'),
+      h(
+        'span',
+        { class: 'grow' },
+        h('span', { class: 'provider-id' }, group.title),
+        h(
+          'span',
+          { class: 'provider-meta' },
+          h('span', { class: 'badge accent' }, 'Harness'),
+          dev ? h('span', { class: ['badge', dev.online ? 'ok' : 'muted'] }, dev.online ? 'Online' : 'Offline') : null,
+          group.providers.map((p) => {
+            const signIn = harnessSignInInfo(p);
+            if (!signIn) return null;
+            return h('span', { class: ['badge', signIn.tone] }, `${harnessCliName(null, p)}: ${signIn.label.toLowerCase()}`);
+          }),
+          h('span', { class: 'badge muted' }, plural(group.models.length, 'model')),
+        ),
+      ),
+    );
+    const body = !group.models.length
+      ? h('p', { class: 'hint card-pad' }, 'No active harness models on this device.')
+      : narrow
+        ? h('ul', { class: 'list' }, group.models.map(narrowCard))
+        : h(
+            'div',
+            { class: 'table-wrap', tabindex: '0', role: 'region', 'aria-label': `${group.title} harnesses` },
+            h(
+              'table',
+              { class: 'table' },
+              h(
+                'thead',
+                null,
+                h(
+                  'tr',
+                  null,
+                  ['Id', 'CLI / model', 'Roles', 'Mode', 'Sign-in', 'Context', 'Billing', admin ? 'Actions' : ''].map((t, i) =>
+                    h('th', { class: i === 5 ? 'num' : null, scope: 'col' }, t),
+                  ),
+                ),
+              ),
+              h('tbody', null, group.models.map(harnessWideRow)),
+            ),
+          );
+    const details = h('details', { class: 'provider-group' }, summary, h('div', { class: 'provider-body' }, body));
+    details.open = !collapsed.has(group.key);
+    summary.addEventListener('click', () => rememberCollapsed(group.key, !details.open));
+    return h('div', { class: 'provider-shell' }, details);
   }
 
   function providerSection(group, narrow, collapsed) {
@@ -240,7 +412,7 @@ export function renderModels(container, { id: targetId = null } = {}) {
           { class: 'provider-meta' },
           provider?.kind ? h('span', { class: 'badge' }, provider.kind) : null,
           place ? h('span', { class: 'badge muted' }, place) : null,
-          keyLabel ? h('span', { class: ['badge', provider.has_key ? 'accent' : 'muted'] }, keyLabel) : null,
+          keyLabel ? h('span', { class: ['badge', provider.has_key ? 'ok' : 'muted'] }, keyLabel) : null,
           h('span', { class: 'badge muted' }, plural(group.models.length, 'model')),
         ),
       ),
@@ -304,7 +476,9 @@ export function renderModels(container, { id: targetId = null } = {}) {
       return;
     }
     const models = store.models;
-    if (!models.length) {
+    const narrow = matchMedia('(max-width: 760px)').matches;
+    const { apiGroups, harnessGroups } = groupModels(models);
+    if (!apiGroups.length && !harnessGroups.length) {
       setChildren(
         slots.models,
         head('m-models', 'Models'),
@@ -313,8 +487,6 @@ export function renderModels(container, { id: targetId = null } = {}) {
       showTarget();
       return;
     }
-    const narrow = matchMedia('(max-width: 760px)').matches;
-    const groups = groupModels(models);
     const collapsed = collapsedProviders();
     const unavailable =
       admin && !providersLoaded
@@ -325,8 +497,13 @@ export function renderModels(container, { id: targetId = null } = {}) {
         slots.models,
         head('m-models', 'Models'),
         unavailable,
-        ...groups.map((group) => providerSection(group, narrow, collapsed)),
-        h('p', { class: 'hint' }, 'Prices are USD per million tokens. Edit a model to change roles, prices (including cache prices), context window, use cases or local flag.'),
+        apiGroups.length && harnessGroups.length ? h('h3', { class: 'models-subsection' }, 'API models') : null,
+        ...apiGroups.map((group) => providerSection(group, narrow, collapsed)),
+        harnessGroups.length ? h('h3', { class: 'models-subsection' }, 'Harnesses (subscriptions)') : null,
+        ...harnessGroups.map((group) => harnessDeviceSection(group, narrow, collapsed)),
+        apiGroups.length
+          ? h('p', { class: 'hint' }, 'Prices are USD per million tokens. Edit a model to change roles, prices (including cache prices), context window, use cases or local flag.')
+          : null,
       );
     });
     showTarget();
@@ -369,13 +546,19 @@ export function renderModels(container, { id: targetId = null } = {}) {
   }
 
   function openEditModelSheet(m) {
+    const provider = providersById.get(m.provider_id);
+    const harness = isHarnessModel(m, provider);
     const extraRoles = (m.roles || []).filter((r) => !ROLES.includes(r));
     sheet((close) => {
       const errBox = h('div', { class: 'banner error', role: 'alert', hidden: true });
-      const roleBoxes = ROLES.map((r) => ({
-        role: r,
-        input: h('input', { type: 'checkbox', name: `role-${r}`, checked: (m.roles || []).includes(r) }),
-      }));
+      const roleBoxes = ROLES.map((r) => {
+        const disabled = harness && r === 'orchestrator' && !m.can_orchestrate;
+        return {
+          role: r,
+          disabled,
+          input: h('input', { type: 'checkbox', name: `role-${r}`, checked: (m.roles || []).includes(r), disabled }),
+        };
+      });
       const inputPrice = h('input', { class: 'input mono', type: 'number', min: '0', step: 'any', required: true, value: String(m.input_price ?? 0) });
       const outputPrice = h('input', { class: 'input mono', type: 'number', min: '0', step: 'any', required: true, value: String(m.output_price ?? 0) });
       const cacheRead = h('input', {
@@ -430,7 +613,7 @@ export function renderModels(container, { id: targetId = null } = {}) {
               if (!Number.isFinite(ctx) || ctx < 0 || !Number.isInteger(ctx)) {
                 throw new Error('Context window must be a whole number (zero or more).');
               }
-              const roles = [...roleBoxes.filter((b) => b.input.checked).map((b) => b.role), ...extraRoles];
+              const roles = [...roleBoxes.filter((b) => !b.disabled && b.input.checked).map((b) => b.role), ...extraRoles];
               body = {
                 id: m.id,
                 provider_id: m.provider_id,
@@ -445,6 +628,16 @@ export function renderModels(container, { id: targetId = null } = {}) {
                 roles,
                 local: localCheck.checked,
                 modalities: m.modalities || [],
+                kind: m.kind || 'api',
+                device_id: m.device_id ?? null,
+                can_orchestrate: Boolean(m.can_orchestrate),
+                source: m.source || 'manual',
+                hidden: Boolean(m.hidden),
+                hidden_reason: m.hidden_reason ?? null,
+                last_seen: m.last_seen ?? null,
+                display_name: m.display_name ?? null,
+                price_source: m.price_source || 'manual',
+                tools: m.tools || 'unknown',
               };
             } catch (valErr) {
               errBox.textContent = valErr.message;
@@ -470,7 +663,14 @@ export function renderModels(container, { id: targetId = null } = {}) {
           'fieldset',
           { class: 'row-form plain' },
           h('legend', { class: 'field-label' }, 'Default roles'),
-          roleBoxes.map((b) => h('label', { class: 'check' }, b.input, b.role)),
+          roleBoxes.map((b) =>
+            h(
+              'label',
+              { class: 'check' },
+              b.input,
+              b.disabled ? `${b.role} (standard chats & threads only)` : b.role,
+            ),
+          ),
         ),
         h(
           'div',
@@ -887,7 +1087,7 @@ export function renderModels(container, { id: targetId = null } = {}) {
       slots.import.hidden = true;
       return;
     }
-    const providers = await ensureProviders();
+    const apiProviders = (await ensureProviders()).filter((p) => p.kind !== 'harness');
     if (signal.aborted) return;
     const status = h('div', { role: 'status', class: 'hint' });
     const form = h(
@@ -921,8 +1121,8 @@ export function renderModels(container, { id: targetId = null } = {}) {
           'label',
           { class: 'field' },
           h('span', null, 'Provider'),
-          providers.length
-            ? h('select', { class: 'select', name: 'provider', required: true }, providers.map((p) => h('option', { value: p.id }, `${p.id} (${p.kind})`)))
+          apiProviders.length
+            ? h('select', { class: 'select', name: 'provider', required: true }, apiProviders.map((p) => h('option', { value: p.id }, `${p.id} (${p.kind})`)))
             : h('input', { class: 'input', name: 'provider', required: true, placeholder: 'openrouter' }),
         ),
         h('label', { class: 'field' }, h('span', null, 'Provider’s model name'), h('input', { class: 'input mono', name: 'model', required: true, placeholder: 'anthropic/claude-sonnet-4' })),

@@ -28,7 +28,6 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -408,6 +407,11 @@ impl Hub {
         brief.push_str(&offline_instruction(&device, w.disconnected));
 
         let model = self.db.find_model(&t.model).ok_or_else(|| format!("model {} is no longer registered", t.model))?;
+        if self.harness_placement(&model)?.is_some() {
+            return Err(format!(
+                "{device} hosts this harness thread; the hub can't run that CLI while the device is offline"
+            ));
+        }
         let pcfg = self
             .db
             .provider(&model.provider_id)
@@ -429,6 +433,7 @@ impl Hub {
             device_name: "Hub".into(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
             fallback_models: self.free_alternates(&model.provider_id, &model.model),
+            harness: None,
         };
         let host = Arc::new(HubHost { hub: Arc::downgrade(self) });
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());
@@ -526,7 +531,7 @@ impl Hub {
         let level =
             self.db.permissions(&t.device_id).get("write_file").copied().unwrap_or(Permission::default_for("write_file"));
         if !files.is_empty() && level == Permission::Manual {
-            let approval_id = format!("a{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+            let approval_id = Hub::new_approval_id();
             let (tx, rx) = oneshot::channel();
             let reason = format!("copy {} file(s) the hub prepared into this thread's workspace on {device}", files.len());
             let input = json!({"files": names, "bytes": total});
@@ -645,6 +650,9 @@ impl Hub {
             device_name: device.clone(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
             fallback_models: self.free_alternates(&model.provider_id, &model.model),
+            harness: self
+                .harness_placement(&model)?
+                .map(|place| place.spec(self.db.thread_harness_session(thread_id))),
         };
         if !self.send_to_conn(&t.device_id, conn_id, HubMessage::StartThread { spec: Box::new(spec) }).await {
             self.wait_for_device(thread_id, "the device went offline during the hand-over", true).await;

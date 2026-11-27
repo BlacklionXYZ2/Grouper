@@ -1,0 +1,153 @@
+/* Owned by W6 (brand mark and sign-in; views/login.js, logo.svg, icon.svg). Tokens and base classes live in app.css.
+   The mark is always /app/logo.svg and /app/icon.svg, so swapping those files re-brands everything. */
+
+/* Two columns on desktop: brand panel, then the card. */
+.login.login-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  place-items: stretch;
+  padding: 0;
+  background: var(--bg);
+}
+
+.login-brand {
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  align-content: center;
+  gap: 28px;
+  padding: 48px clamp(32px, 6vw, 96px);
+  background:
+    radial-gradient(60% 50% at 18% 85%, rgba(20, 214, 200, 0.22), transparent 70%),
+    radial-gradient(55% 50% at 85% 20%, rgba(155, 92, 246, 0.22), transparent 70%),
+    radial-gradient(60% 55% at 55% 55%, rgba(59, 130, 246, 0.16), transparent 70%),
+    var(--backdrop);
+  border-right: 1px solid var(--border);
+}
+
+.login-brand-head {
+  display: grid;
+  gap: 14px;
+  justify-items: start;
+}
+
+.login-brand .brand-mark {
+  width: 96px;
+  height: 96px;
+  border-radius: 0;
+  filter: drop-shadow(0 8px 24px rgba(59, 130, 246, 0.35));
+}
+
+.login-wordmark {
+  margin: 0;
+  font-size: 44px;
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  color: var(--text);
+}
+
+.login-tagline {
+  margin: 0;
+  font-size: 20px;
+  color: var(--text-2);
+}
+
+.login-values {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 14px;
+}
+
+.login-values li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.login-values .value-ico {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+}
+
+.login-values .value-ico .icon {
+  width: 20px;
+  height: 20px;
+}
+
+/* One accent colour per line (teal, blue, purple, as in the icon). */
+.login-values li:nth-child(1) .value-ico { color: var(--accent); }
+.login-values li:nth-child(2) .value-ico { color: #2f6fe0; }
+.login-values li:nth-child(3) .value-ico { color: #7c3fd8; }
+:root[data-theme="dark"] .login-values li:nth-child(2) .value-ico { color: #6ea8ff; }
+:root[data-theme="dark"] .login-values li:nth-child(3) .value-ico { color: #b794ff; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .login-values li:nth-child(2) .value-ico { color: #6ea8ff; }
+  :root:not([data-theme="light"]) .login-values li:nth-child(3) .value-ico { color: #b794ff; }
+}
+
+.login-main {
+  display: grid;
+  place-items: center;
+  padding: 32px 24px;
+  overflow-y: auto;
+}
+
+.login-split .login-card .brand-mark {
+  display: none;
+}
+
+.login-split .login-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-float, var(--shadow));
+}
+
+/* Phone: compact brand header above the card, one column. */
+@media (max-width: 860px) {
+  .login.login-split {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
+    align-content: start;
+  }
+
+  .login-brand {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    padding: 24px 16px 8px;
+    background: var(--backdrop);
+    border-right: 0;
+  }
+
+  .login-brand-head {
+    grid-template-columns: auto 1fr;
+    grid-template-areas: "mark word" "mark tag";
+    align-items: center;
+    column-gap: 12px;
+    row-gap: 0;
+  }
+
+  .login-brand .brand-mark {
+    grid-area: mark;
+    width: 48px;
+    height: 48px;
+  }
+
+  .login-wordmark { grid-area: word; font-size: 26px; align-self: end; }
+  .login-tagline { grid-area: tag; font-size: 15px; align-self: start; }
+  .login-values { display: none; }
+  .login-main { padding: 16px; align-items: start; }
+}
+
+@media (forced-colors: active) {
+  .login-brand .brand-mark { filter: none; }
+}

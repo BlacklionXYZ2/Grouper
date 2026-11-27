@@ -168,4 +168,51 @@ final class ThreadPresentationTests: XCTestCase {
         XCTAssertNil(providers[1].viaDevice)
         XCTAssertTrue(providers[1].hasKey)
     }
+
+    func testPlanIsTheLatestUpdatePlanCallAndNotAToolRow() throws {
+        let raws = [
+            #"{"seq":1,"conversation_id":"c","thread_id":"t","ts":1,"kind":"thread_activity","event":{"type":"tool_call","call_id":"p1","name":"update_plan","input":{"items":[{"content":"Read the code","status":"in_progress","active_form":"Reading the code"},{"content":"Write the fix","status":"pending"}]}}}"#,
+            #"{"seq":2,"conversation_id":"c","thread_id":"t","ts":2,"kind":"thread_activity","event":{"type":"tool_result","call_id":"p1","name":"update_plan","ok":true,"output":"ok"}}"#,
+            #"{"seq":3,"conversation_id":"c","thread_id":"t","ts":3,"kind":"thread_activity","event":{"type":"text","text":"Looking"}}"#,
+            #"{"seq":4,"conversation_id":"c","thread_id":"t","ts":4,"kind":"thread_activity","event":{"type":"tool_call","call_id":"p2","name":"update_plan","input":{"items":[{"content":"Read the code","status":"completed"},{"content":"Write the fix","status":"in_progress"},{"content":"  ","status":"pending"},{"content":"Test it","status":"later"}]}}}"#,
+            #"{"seq":5,"conversation_id":"c","thread_id":"t","ts":5,"kind":"thread_activity","event":{"type":"tool_result","call_id":"p2","name":"update_plan","ok":true,"output":"Plan updated: 1 of 3 done."}}"#,
+            // Rejected by the hub: the previous plan stays.
+            #"{"seq":6,"conversation_id":"c","thread_id":"t","ts":6,"kind":"thread_activity","event":{"type":"tool_call","call_id":"p3","name":"update_plan","input":{"items":"oops"}}}"#,
+            #"{"seq":7,"conversation_id":"c","thread_id":"t","ts":7,"kind":"thread_activity","event":{"type":"tool_result","call_id":"p3","name":"update_plan","ok":false,"output":"items must be a list"}}"#,
+        ]
+        var folder = TranscriptFolder(conversationId: "c")
+        for raw in raws { folder.ingest(try event(raw)) }
+        let rows = folder.activity(threadId: "t")
+        let plan = try XCTUnwrap(ThreadPlan.latest(in: rows))
+        XCTAssertEqual(plan.items, [
+            ThreadPlan.Item(content: "Read the code", status: .completed),
+            ThreadPlan.Item(content: "Write the fix", status: .inProgress),
+            ThreadPlan.Item(content: "Test it", status: .pending),
+        ])
+        XCTAssertEqual(plan.progressText, "1 of 3 done")
+        XCTAssertEqual(plan.items[1].displayText, "Write the fix")
+
+        let first = try XCTUnwrap(ThreadPlan(input: .object(["items": .array([
+            .object(["content": .string("Read"), "status": .string("in_progress"), "active_form": .string("Reading")]),
+        ])])))
+        XCTAssertEqual(first.items.first?.displayText, "Reading")
+        XCTAssertNil(ThreadPlan(input: .object(["plan": .array([])])))
+        XCTAssertNil(ThreadPlan.latest(in: []))
+
+        // A call still waiting for its result keeps the previous plan; an accepted
+        // empty list clears it.
+        let pending = rows + [.tool(seq: 8, ts: 8, call: ToolCall(callId: "p4", name: "update_plan", input: .object(["items": .array([])])), result: nil)]
+        XCTAssertEqual(ThreadPlan.latest(in: pending), plan)
+        let cleared = rows + [.tool(seq: 8, ts: 8, call: ToolCall(callId: "p4", name: "update_plan", input: .object(["items": .array([])])),
+                                    result: ToolResult(callId: "p4", name: "update_plan", ok: true, output: "Plan cleared."))]
+        XCTAssertNil(ThreadPlan.latest(in: cleared))
+
+        // The plan calls never show as tool rows in the chat.
+        let transcript = ThreadTranscript(activity: rows)
+        XCTAssertFalse(transcript.messages.contains { message in
+            if case .tool = message { return true }
+            return false
+        })
+        XCTAssertEqual(transcript.messages.count, 2) // "who" + "Looking"
+    }
 }

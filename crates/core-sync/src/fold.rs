@@ -346,7 +346,7 @@ pub fn thread_activity(events: &[Event]) -> Vec<ActivityItem> {
                     approved: None,
                 });
             }
-            EventBody::ApprovalResolved { approval_id, approved: answer } => {
+            EventBody::ApprovalResolved { approval_id, approved: answer, .. } => {
                 if let Some(ActivityItem::Approval { approved, .. }) =
                     approval_at.get(approval_id).and_then(|&i| items.get_mut(i))
                 {
@@ -432,7 +432,7 @@ mod tests {
             ),
             approval(8, "t1", "a1"),
             approval(9, "t2", "a2"),
-            ev(10, Some("t2"), EventBody::ApprovalResolved { approval_id: "a2".into(), approved: true }),
+            ev(10, Some("t2"), EventBody::ApprovalResolved { approval_id: "a2".into(), approved: true, reason: None }),
             ev(11, Some("t2"), EventBody::ThreadWaiting { device_id: "laptop".into(), reason: "offline".into() }),
             ev(12, Some("t2"), EventBody::ThreadCheckpoint { device_id: "laptop".into(), summary: "step 1".into() }),
             ev(13, None, EventBody::Error { message: "oops".into() }),
@@ -542,7 +542,7 @@ mod tests {
             "t1",
             AgentEvent::ToolResult { call_id: "k1".into(), name: "run_shell".into(), ok: false, output: "denied".into() },
         ));
-        events.push(ev(15, Some("t1"), EventBody::ApprovalResolved { approval_id: "a1".into(), approved: false }));
+        events.push(ev(15, Some("t1"), EventBody::ApprovalResolved { approval_id: "a1".into(), approved: false, reason: None }));
         events.push(activity(16, "t1", AgentEvent::TextDelta { text: "ignored".into() }));
         let items = thread_activity(&events);
         assert_eq!(items.len(), 4, "{items:?}");

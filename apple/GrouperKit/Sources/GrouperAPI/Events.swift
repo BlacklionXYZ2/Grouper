@@ -123,7 +123,8 @@ public enum EventBody: Codable, Equatable, Sendable {
     case threadCheckpoint(ThreadCheckpoint)
     case threadHandedOver(ThreadHandedOver)
     case approvalRequested(ApprovalRequest)
-    case approvalResolved(approvalId: String, approved: Bool)
+    /// `reason` is set when no one answered: "timeout", "timeout_stop" or "dropped" (absent from older hubs).
+    case approvalResolved(approvalId: String, approved: Bool, reason: String? = nil)
     case turnFinished(runningThreads: UInt32)
     case error(String)
     case budgetWarning(BudgetWarning)
@@ -160,7 +161,10 @@ public enum EventBody: Codable, Equatable, Sendable {
             tool: try c.decode(String.self, forKey: .tool), input: try c.decode(JSONValue.self, forKey: .input),
             reason: try c.decode(String.self, forKey: .reason)
         ))
-        case "approval_resolved": self = .approvalResolved(approvalId: try c.decode(String.self, forKey: .approvalId), approved: try c.decode(Bool.self, forKey: .approved))
+        case "approval_resolved": self = .approvalResolved(
+            approvalId: try c.decode(String.self, forKey: .approvalId), approved: try c.decode(Bool.self, forKey: .approved),
+            reason: try c.decodeIfPresent(String.self, forKey: .reason)
+        )
         case "turn_finished": self = .turnFinished(runningThreads: try c.decode(UInt32.self, forKey: .runningThreads))
         case "error": self = .error(try c.decode(String.self, forKey: .message))
         case "budget_warning": self = .budgetWarning(BudgetWarning(scope: try c.decode(String.self, forKey: .scope), spent: try c.decode(Double.self, forKey: .spent), limit: try c.decode(Double.self, forKey: .limit)))
@@ -189,7 +193,9 @@ public enum EventBody: Codable, Equatable, Sendable {
         case .approvalRequested(let v):
             try c.encode("approval_requested", forKey: .kind); try c.encode(v.approvalId, forKey: .approvalId); try c.encode(v.deviceId, forKey: .deviceId)
             try c.encode(v.tool, forKey: .tool); try c.encode(v.input, forKey: .input); try c.encode(v.reason, forKey: .reason)
-        case .approvalResolved(let id, let approved): try c.encode("approval_resolved", forKey: .kind); try c.encode(id, forKey: .approvalId); try c.encode(approved, forKey: .approved)
+        case .approvalResolved(let id, let approved, let reason):
+            try c.encode("approval_resolved", forKey: .kind); try c.encode(id, forKey: .approvalId); try c.encode(approved, forKey: .approved)
+            try c.encodeIfPresent(reason, forKey: .reason)
         case .turnFinished(let count): try c.encode("turn_finished", forKey: .kind); try c.encode(count, forKey: .runningThreads)
         case .error(let message): try c.encode("error", forKey: .kind); try c.encode(message, forKey: .message)
         case .budgetWarning(let v): try c.encode("budget_warning", forKey: .kind); try c.encode(v.scope, forKey: .scope); try c.encode(v.spent, forKey: .spent); try c.encode(v.limit, forKey: .limit)

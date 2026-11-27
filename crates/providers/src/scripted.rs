@@ -13,6 +13,7 @@
 //! same script drives the hub and every device. In tool inputs, `$THREAD_ID` is
 //! replaced by the first `Thread t…` id mentioned in the last message. Optional
 //! `"delay_ms"` is how long each reply takes; streamed replies arrive a word at a time.
+//! A rule's own `"delay_ms"` overrides it for that reply (e.g. to pace a demo).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -72,18 +73,25 @@ fn substitute(v: &Value, thread_id: &Option<String>) -> Value {
 }
 
 impl Scripted {
-    fn reply(&self, req: &Request) -> Response {
+    /// The reply, and how long it takes (the rule's `delay_ms`, else the script's).
+    fn reply(&self, req: &Request) -> (Response, std::time::Duration) {
         let last = last_text(req.messages.last());
         let matches = |rule: &Value, key: &str, hay: &str| {
             rule.get(key).and_then(Value::as_str).is_none_or(|needle| hay.contains(needle))
         };
-        let reply = self
+        let rule = self
             .script
             .get("rules")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .find(|r| matches(r, "system", &req.system) && matches(r, "last", &last))
+            .find(|r| matches(r, "system", &req.system) && matches(r, "last", &last));
+        let delay_ms = rule
+            .and_then(|r| r.get("delay_ms"))
+            .or_else(|| self.script.get("delay_ms"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let reply = rule
             .and_then(|r| r.get("reply"))
             .or_else(|| self.script.get("default"))
             .cloned()
@@ -105,17 +113,13 @@ impl Scripted {
         }
         let has_calls = content.iter().any(|b| matches!(b, Block::ToolUse { .. }));
         let chars: usize = req.messages.iter().map(|m| last_text(Some(m)).len()).sum::<usize>() + req.system.len();
-        Response {
+        let resp = Response {
             model: None,
             message: Message { role: Role::Assistant, content, raw: None },
             stop: if has_calls { StopReason::ToolUse } else { StopReason::EndTurn },
             usage: Usage { input_tokens: (chars / 4) as u64, output_tokens: 20, ..Default::default() },
-        }
-    }
-
-    /// `delay_ms` in the script: how long a whole reply takes.
-    fn delay(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.script.get("delay_ms").and_then(Value::as_u64).unwrap_or(0))
+        };
+        (resp, std::time::Duration::from_millis(delay_ms))
     }
 }
 
@@ -143,15 +147,15 @@ fn chunks(text: &str) -> Vec<&str> {
 #[async_trait]
 impl Provider for Scripted {
     async fn complete(&self, req: &Request) -> Result<Response, ProviderError> {
-        let resp = self.reply(req);
-        tokio::time::sleep(self.delay()).await;
+        let (resp, delay) = self.reply(req);
+        tokio::time::sleep(delay).await;
         Ok(resp)
     }
 
     /// Streams text a word at a time: half of `delay_ms` passes before the first
     /// word, the rest is spread between the words.
     async fn complete_stream(&self, req: &Request, on_delta: OnDelta<'_>) -> Result<Response, ProviderError> {
-        let resp = self.reply(req);
+        let (resp, delay) = self.reply(req);
         let texts: Vec<&str> = resp
             .message
             .content
@@ -168,7 +172,6 @@ impl Provider for Scripted {
             }
             pieces.extend(chunks(t).into_iter().map(String::from));
         }
-        let delay = self.delay();
         if pieces.is_empty() {
             tokio::time::sleep(delay).await;
             return Ok(resp);
@@ -210,5 +213,22 @@ mod tests {
         assert!(got.len() > 3);
         let text: String = got.iter().map(|d| if let Delta::Text(t) = d { t.as_str() } else { "" }).collect();
         assert_eq!(text, resp.message.text());
+    }
+
+    #[test]
+    fn a_rule_delay_overrides_the_script_delay() {
+        let p = Scripted {
+            script: json!({"delay_ms": 5000, "rules": [{"last": "quick", "delay_ms": 10, "reply": [{"type": "text", "text": "ok"}]}]}),
+            counter: AtomicU64::new(1),
+        };
+        let req = |text: &str| Request {
+            model: "m".into(),
+            system: "".into(),
+            messages: vec![Message::user_text(text)],
+            tools: vec![],
+            max_tokens: 10,
+        };
+        assert_eq!(p.reply(&req("quick")).1, std::time::Duration::from_millis(10));
+        assert_eq!(p.reply(&req("slow")).1, std::time::Duration::from_millis(5000));
     }
 }

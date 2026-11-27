@@ -1,0 +1,765 @@
+/* Owned by W3 (thread panel and threads list; views/thread.js, views/threads-panel.js).
+   Tokens and base classes live in app.css; this file only adds to them.
+
+   The thread reads as a chat (owner, 26 Nov): the art's header (title, pop-out,
+   close, status chip with elapsed time, device and model chips), a live plan
+   checklist pinned at the top, then the transcript. Colour (V2): teal stays the
+   action colour; the brand purple is the second highlight (the plan's current
+   step and its progress bar, Needs you); model-family colours mark the thread's
+   own turns, dots and pills. */
+
+/* The brand purple tokens (--purple, --purple-fill, --purple-soft) now live in app.css. */
+
+/* ---- pop-out: the same chat at full width, over the chat it came from */
+
+.inspector.thread-view.is-popout {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: var(--sidebar-w);
+  width: auto;
+  margin: 0;
+  z-index: 60;
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  box-shadow: none;
+  animation: none;
+  background: var(--bg);
+}
+
+/* Narrow desktop: the inspector already floats over everything (sidebar inert). */
+@media (max-width: 1180px) {
+  .inspector.thread-view.is-popout {
+    top: 10px;
+    right: 10px;
+    bottom: 10px;
+    left: 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+  }
+}
+
+/* Full width keeps the chat's reading column (transcript max width 720). */
+.thread-view.is-popout > .sheet-head,
+.thread-view.is-popout > .sheet-body,
+.thread-view.is-popout > .sheet-foot {
+  padding-left: max(18px, calc((100% - 760px) / 2));
+  padding-right: max(18px, calc((100% - 760px) / 2));
+}
+
+/* Phones are full screen already: no pop-out. */
+@media (max-width: 760px) {
+  .tv-pop {
+    display: none;
+  }
+}
+
+/* ---- header: title, pop-out, close; chips */
+
+.thread-view .sheet-head {
+  gap: 8px;
+  padding: 12px 10px 12px 18px;
+}
+
+.thread-view .sheet-head-row {
+  align-items: center;
+  gap: 2px;
+}
+
+.thread-view .sheet-head h2 {
+  font-size: 16px;
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+.tv-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-right: 8px;
+}
+
+.thread-pill {
+  display: inline-flex;
+}
+
+/* The art's "Running · 2m": the status pill carries the elapsed time. */
+.status.tv-pill {
+  border: none;
+  min-height: 28px;
+  padding: 3px 10px 3px 9px;
+  font-size: 13px;
+}
+
+.tv-pill .thread-time {
+  gap: 5px;
+}
+
+.tv-sep {
+  opacity: 0.8;
+}
+
+.tv-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 28px;
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.tv-chip[hidden] {
+  display: none;
+}
+
+.tv-chip > .icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+
+.tv-chip-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tv-device .tv-chip-note {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.tv-device .tv-chip-note::before {
+  content: "· ";
+  color: var(--text-3);
+  font-weight: 400;
+}
+
+.tv-device.is-offline {
+  background: var(--warn-soft);
+}
+
+.tv-device.is-offline > .icon {
+  color: var(--warn);
+}
+
+/* The model the orchestrator chose: fixed, not a control. Family mark + name. */
+.tv-model {
+  background: var(--surface-select);
+  color: var(--text);
+  padding-left: 4px;
+}
+
+.tv-model .tv-chip-text {
+  font-size: 12.5px;
+}
+
+.tv-mark {
+  display: inline-flex;
+}
+
+.tv-model a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.tv-model a:hover {
+  text-decoration: underline;
+}
+
+/* The family's colour as a 3px bar across the top of the panel head. */
+.thread-view .thread-head {
+  box-shadow: inset 0 3px 0 var(--fam, var(--fam-unknown));
+}
+
+.tv-reason {
+  margin: 0;
+  font-size: 13px;
+}
+
+.tv-reason > summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  cursor: pointer;
+  color: var(--text-2);
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+}
+
+.tv-reason > summary:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+.tv-reason > summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.tv-reason-text {
+  margin: 4px 0 0;
+}
+
+.tv-reason[hidden] {
+  display: none;
+}
+
+/* Section labels in the panel: sentence case, not the shell's upper-case caps. */
+.thread-view .tv-section-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.tv-meta-sep[hidden] {
+  display: none;
+}
+
+.thread-view .tv-meta {
+  margin: 0;
+  align-items: center;
+}
+
+.thread-view .tv-meta:has(> .thread-started:empty):has(> .thread-tokens[hidden]) {
+  display: none;
+}
+
+/* ---- the plan checklist, pinned at the top of the chat */
+
+.tv-plan-wrap {
+  position: sticky;
+  top: -14px; /* the body's top padding: it pins flush with the header's edge */
+  z-index: 3;
+  margin: -14px -8px 0;
+  padding: 10px 8px 6px;
+  background: var(--bg-tint);
+}
+
+.thread-view.is-popout .tv-plan-wrap {
+  background: var(--bg);
+}
+
+.tv-plan-wrap[hidden] {
+  display: none;
+}
+
+.tv-plan {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.tv-plan > summary {
+  display: grid;
+  gap: 6px;
+  padding: 10px 10px 10px 12px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  list-style: none;
+}
+
+.tv-plan > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tv-plan-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tv-plan-title {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.tv-plan-count {
+  flex: 1;
+  color: var(--text-2);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tv-chev {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+  transform: rotate(90deg);
+  transition: transform 0.15s var(--ease);
+}
+
+details[open] > summary .tv-chev {
+  transform: rotate(-90deg);
+}
+
+/* While folded, the summary still says what the thread is on. */
+.tv-plan-now {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--purple);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.tv-plan[open] .tv-plan-now,
+.tv-plan-now[hidden] {
+  display: none;
+}
+
+.tv-plan-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.tv-plan-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent-fill), var(--purple-fill));
+  transition: width 0.3s var(--ease);
+}
+
+.tv-plan.is-complete .tv-plan-fill {
+  background: var(--ok);
+}
+
+.tv-plan-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 6px 8px;
+  display: grid;
+  gap: 2px;
+  max-height: min(40vh, 320px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.tv-plan-item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.tv-plan-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tv-plan-mark {
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  border-radius: 50%;
+  border: 1.5px solid var(--text-3);
+}
+
+/* In progress: the purple highlight row with a spinner. */
+.tv-plan-item.is-active {
+  background: var(--purple-soft);
+  color: var(--purple);
+  font-weight: 600;
+}
+
+.tv-plan-item.is-active .tv-plan-mark {
+  border: 2px solid color-mix(in srgb, var(--purple) 28%, transparent);
+  border-top-color: var(--purple);
+  animation: tv-spin 0.9s linear infinite;
+}
+
+/* Left in progress by a thread that's over: no spinner, a dashed ring. */
+.tv-plan-item.is-unfinished {
+  color: var(--text-2);
+}
+
+.tv-plan-item.is-unfinished .tv-plan-mark {
+  border: 1.5px dashed var(--purple);
+}
+
+/* Done: a mint tick, muted text. */
+.tv-plan-item.is-done {
+  color: var(--text-3);
+}
+
+.tv-plan-item.is-done .tv-plan-text {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--text-3) 60%, transparent);
+}
+
+.tv-plan-item.is-done .tv-plan-mark {
+  border-color: var(--ok);
+  background: var(--ok);
+  color: var(--bg);
+}
+
+.tv-plan-mark .icon {
+  width: 11px;
+  height: 11px;
+  stroke-width: 3;
+}
+
+@keyframes tv-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tv-plan-item.is-active .tv-plan-mark {
+    animation: none;
+    border-color: var(--purple);
+    box-shadow: inset 0 0 0 3px var(--purple-soft);
+    background: var(--purple);
+  }
+
+  .tv-plan-fill {
+    transition: none;
+  }
+}
+
+/* ---- the chat: family colour on the thread's own turns, purple for its questions */
+
+.thread-view .thread-who {
+  color: var(--fam, var(--text-2));
+}
+
+.thread-view .thread-who .mono {
+  font-weight: 650;
+}
+
+.thread-view .msg-ask {
+  border-left-color: var(--purple);
+}
+
+.thread-view .msg-ask-label {
+  color: var(--purple);
+}
+
+.tv-tool-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.tv-tool-state .icon {
+  width: 13px;
+  height: 13px;
+  stroke-width: 2.4;
+}
+
+.tv-tool-state .live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+/* ---- state cards: waiting for a device, checkpoint, done, failed, stopped */
+
+.tv-state h3 {
+  font-size: 13.5px;
+}
+
+.tv-state p {
+  margin: 4px 0 0;
+}
+
+.callout.warn.tv-state h3,
+.callout.warn.tv-state h3 .icon {
+  color: var(--warn);
+}
+
+.tv-checkpoint {
+  border-left: 3px solid var(--accent);
+}
+
+.tv-checkpoint h3 .icon {
+  color: var(--accent);
+}
+
+.tv-result {
+  display: grid;
+}
+
+.tv-result[hidden] {
+  display: none;
+}
+
+.callout.tv-done {
+  background: var(--ok-soft);
+}
+
+.tv-done h3 {
+  color: var(--ok);
+}
+
+.tv-failed h3 {
+  color: var(--danger);
+}
+
+.callout.tv-stopped {
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+}
+
+.tv-stopped h3 {
+  color: var(--text);
+}
+
+.tv-state h3 .tv-when {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-2);
+}
+
+.tv-summary {
+  color: var(--text);
+}
+
+.tv-summary > :first-child {
+  margin-top: 4px;
+}
+
+.tv-summary > :last-child {
+  margin-bottom: 0;
+}
+
+.tv-error {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  color: var(--danger);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.tv-error .icon {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+}
+
+.tv-state .rating {
+  margin-top: 8px;
+}
+
+/* ---- files: name, size, then the download mark */
+
+.tv-files .file-row > .icon:first-child {
+  color: var(--text-3);
+}
+
+.tv-files .file-row > .icon:last-child {
+  color: var(--accent);
+}
+
+.tv-files .file-row {
+  min-height: 36px;
+}
+
+/* ---- threads list (views/threads-panel.js): sections as threads cards */
+
+.threads-panel-body .tp-group {
+  margin: 0 0 14px;
+}
+
+.threads-panel-body .tp-group[hidden] {
+  display: none;
+}
+
+.tp-group > .thread-group-head {
+  margin: 0;
+}
+
+.tp-count {
+  margin-left: auto;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tp-needs > .thread-group-head > .icon {
+  color: var(--purple);
+}
+
+/* The panel is narrow: dot, title block, pill, chevron; the model chip sits
+   under the title, as the threads card does on phones. */
+.thread-line.tp-row {
+  grid-template-columns: 10px minmax(0, 1fr) max-content 16px;
+  row-gap: 4px;
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+
+.tp-row > .tp-dot,
+.tp-row > .tp-pill,
+.tp-row > .icon:last-child {
+  grid-row: 1 / span 2;
+}
+
+/* The dot sits on the title's line, however tall the row grows. */
+.tp-row > .tp-dot {
+  align-self: start;
+  margin-top: 6px;
+}
+
+.tp-row > .tp-model {
+  grid-column: 2;
+  grid-row: 2;
+  justify-self: start;
+}
+
+.tp-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tp-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 10px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.tp-sub {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.tp-sub[hidden],
+.tp-plan[hidden],
+.tp-ago[hidden] {
+  display: none;
+}
+
+.tp-meta .icon {
+  width: 12px;
+  height: 12px;
+}
+
+/* Plan progress "2/5": the purple highlight, mint once complete. */
+.tp-plan {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--purple);
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.tp-plan.is-complete {
+  color: var(--ok);
+}
+
+.tp-pill {
+  display: inline-flex;
+}
+
+.thread-line.tp-approval {
+  grid-template-columns: 18px minmax(0, 1fr) max-content;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  font: inherit;
+  font-size: 13.5px;
+}
+
+.tp-approval > .icon:first-child {
+  width: 18px;
+  height: 18px;
+  color: var(--warn);
+}
+
+.thread-line:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+/* ---- Increase Contrast and forced colours */
+
+@media (prefers-contrast: more) {
+  .tv-chip,
+  .tv-plan {
+    border: 1px solid var(--border-strong);
+  }
+
+  .tv-plan-item.is-active {
+    box-shadow: inset 3px 0 0 var(--purple);
+  }
+
+  .tv-plan-item.is-done .tv-plan-text {
+    text-decoration-color: currentColor;
+  }
+}
+
+@media (forced-colors: active) {
+  .tv-chip,
+  .tv-plan {
+    border: 1px solid CanvasText;
+  }
+
+  .tv-plan-fill {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+
+  .tv-plan-item.is-active {
+    border: 1px solid Highlight;
+  }
+
+  .tv-plan-item.is-active .tv-plan-mark {
+    border-color: Highlight;
+  }
+
+  .tv-plan-item.is-done .tv-plan-mark {
+    forced-color-adjust: none;
+    background: CanvasText;
+    border-color: CanvasText;
+    color: Canvas;
+  }
+
+  .inspector.thread-view.is-popout {
+    border: 1px solid CanvasText;
+  }
+}

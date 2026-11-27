@@ -9,6 +9,7 @@ struct ChatView: View {
     /// The chat-scoped threads list: a sheet on iPhone, an inspector on Mac.
     @State private var showThreads = false
     @State private var showModelPicker = false
+    @FocusState private var composerFocused: Bool
     /// The one sheet this chat shows (see `ChatSheet`), and the one actually on
     /// screen. `shownSheet` is cleared only when a dismissal finishes, so a new
     /// request waits for the old sheet to go instead of being dropped.
@@ -22,7 +23,7 @@ struct ChatView: View {
                     if !model.online { offlineBanner }
                     if let notice = visibleNotice { noticeBanner(notice) }
                     if model.selectedConversationId == nil { newConversationIntro }
-                    ForEach(model.transcript) { row in transcriptRow(row) }
+                    ForEach(Self.chatItems(model.transcript)) { item in chatItem(item) }
                     if let draft = model.selectedFolder?.assistantDraft, !draft.isEmpty {
                         assistantMessage(draft, streaming: true)
                             .id("streaming")
@@ -31,10 +32,14 @@ struct ChatView: View {
                     Color.clear.frame(height: 1).id("end")
                 }
                 .padding()
+                .frame(maxWidth: Theme.Size.transcriptMax)
+                .frame(maxWidth: .infinity)
             }
+            .background(Theme.bg)
+            .dismissesKeyboardOnTap($composerFocused)
             .onChange(of: model.transcript.count) { _, _ in withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end") } }
             // VERIFY ON MAC: Confirm safeAreaBar(edge: .bottom) scroll-edge blur and Reduce Transparency
-            // with GlassSurface + .glassProminent Send button on both iOS 26 and macOS 26.
+            // with the GlassSurface composer card and its round send button on iOS 26 and macOS 26.
             // While the chat has a pending approval the dock takes the composer's place;
             // `message` lives on this view, so the draft comes back afterwards.
             .safeAreaBar(edge: .bottom) { bottomBar }
@@ -77,13 +82,11 @@ struct ChatView: View {
 
     private func noticeBanner(_ notice: ChatNotice) -> some View {
         HStack(alignment: .firstTextBaseline) {
-            Label(notice.text, systemImage: "info.circle").font(.callout)
+            Label(notice.text, systemImage: "info.circle").font(.callout).foregroundStyle(Theme.text)
             Spacer()
-            Button("Dismiss") { model.chatNotice = nil }.font(.callout).buttonStyle(.borderless)
+            Button("Dismiss") { model.chatNotice = nil }.font(.callout).buttonStyle(.borderless).foregroundStyle(Theme.accent)
         }
-        .padding()
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 12))
+        .grouperCard()
         .accessibilityElement(children: .combine)
     }
 
@@ -160,7 +163,7 @@ struct ChatView: View {
                     Image(systemName: "point.3.connected.trianglepath.dotted")
                     Text("\(count)").monospacedDigit()
                     if needs > 0 {
-                        Circle().fill(Color.orange).frame(width: 8, height: 8)
+                        Circle().fill(Theme.brandFill).frame(width: 8, height: 8)
                     }
                 }
                 .accessibilityElement(children: .ignore)
@@ -173,84 +176,216 @@ struct ChatView: View {
 
     private var offlineBanner: some View {
         Label("Offline. This is the last stored copy; live controls are disabled.", systemImage: "wifi.slash")
-            .font(.callout).padding().frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.orange.opacity(0.12), in: .rect(cornerRadius: 12))
+            .font(.callout).foregroundStyle(Theme.warn)
+            .grouperCard(fill: Theme.warnSoft, stroke: Theme.warnSoft)
     }
 
+    /// A new chat: Grouper's mark and the Project / Standard choice as two cards
+    /// (the choice is fixed after the first message, so it isn't in the composer).
     private var newConversationIntro: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(model.newChatMode == "project" ? "New project chat" : "New standard chat").font(.title2.bold())
-            Text(model.newChatMode == "project"
-                 ? "Ask Grouper to hand work to your Mac, PC, or the hub and follow each thread here."
-                 : "Ask one model a short question without delegated threads.")
-                .foregroundStyle(.secondary)
-        }.padding(.vertical, 24)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                GrouperAvatar(size: 44)
+                Text("New chat").font(.title2.bold()).foregroundStyle(Theme.text)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            HStack(alignment: .top, spacing: 12) {
+                modeCard(mode: "project", title: "Project", systemImage: "point.3.connected.trianglepath.dotted",
+                         text: "Grouper hands work to your Mac, PC or the hub as threads you can follow here.")
+                modeCard(mode: "standard", title: "Standard", systemImage: "bubble.left",
+                         text: "Ask one model a short question, without threads.")
+            }
+        }
+        .padding(.vertical, 20)
+    }
+
+    private func modeCard(mode: String, title: String, systemImage: String, text: String) -> some View {
+        let selected = model.newChatMode == mode
+        return Button {
+            if !selected { model.beginNewChat(mode: mode) }
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                Label(title, systemImage: systemImage)
+                    .font(Theme.Typeface.title)
+                    .foregroundStyle(selected ? Theme.accent : Theme.text)
+                Text(text).font(.callout).foregroundStyle(Theme.text2)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .grouperCard(fill: selected ? Theme.accentSoft : Theme.surface,
+                         stroke: selected ? Theme.accentFillEdge : Theme.border)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityHint("\(title) chat")
+    }
+
+    @ViewBuilder private func chatItem(_ item: ChatItem) -> some View {
+        switch item {
+        case .threads(let cards):
+            ThreadsCard(cards: cards, onOpen: { openThread($0) }, onDetails: { showThreads = true })
+        case .row(let row):
+            transcriptRow(row)
+        }
     }
 
     @ViewBuilder private func transcriptRow(_ row: TranscriptRow) -> some View {
         switch row {
-        case .user(_, _, let text):
-            HStack { Spacer(minLength: 36); Text(text).padding(12).background(Color.grouperSecondaryBackground, in: .rect(cornerRadius: 16)) }
-                .accessibilityElement(children: .combine).accessibilityLabel("You. \(text)")
-        case .assistant(_, _, let text): assistantMessage(text, streaming: false)
+        case .user(_, let ts, let text):
+            HStack(alignment: .top, spacing: 10) {
+                UserAvatar(initial: ownerInitial)
+                Text(text)
+                    .font(Theme.Typeface.body)
+                    .foregroundStyle(Theme.text)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.card))
+                    .overlay { RoundedRectangle(cornerRadius: Theme.Radius.card).strokeBorder(Theme.border, lineWidth: 1) }
+                Spacer(minLength: 8)
+                timeText(ts)
+            }
+            .accessibilityElement(children: .combine).accessibilityLabel("You. \(text)")
+        case .assistant(_, let ts, let text): assistantMessage(text, streaming: false, ts: ts)
         case .thread(let card):
-            Button {
-                model.selectedThreadId = card.threadId
-                #if os(macOS)
-                showThreads = true // the inspector mounts and opens this thread
-                #endif
-            } label: {
-                ThreadChip(card: card, deviceName: deviceName(card.deviceId))
-            }.buttonStyle(.plain)
+            // Grouped into a ThreadsCard by `chatItems`; a lone card still renders.
+            ThreadsCard(cards: [card], onOpen: { openThread($0) }, onDetails: { showThreads = true })
         case .error(_, _, let message): ErrorBanner(message: message)
         case .budgetWarning(_, _, let warning):
             let spent = warning.spent.formatted(.number.precision(.fractionLength(2)))
             let limit = warning.limit.formatted(.number.precision(.fractionLength(2)))
             Label("Estimated \(warning.scope) spend is $\(spent) of $\(limit).", systemImage: "dollarsign.circle")
-                .font(.callout).foregroundStyle(.orange)
+                .font(.callout).foregroundStyle(Theme.warn)
         }
     }
 
-    private func assistantMessage(_ text: String, streaming: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(LocalizedStringKey(text)).textSelection(.enabled)
-            if streaming { Label("Replying", systemImage: "ellipsis").font(.caption).foregroundStyle(.teal) }
+    /// Grouper's turn: the mark, its name, a "Thinking…" chip while the reply
+    /// streams, then the text on the canvas (no bubble).
+    private func assistantMessage(_ text: String, streaming: Bool, ts: UInt64 = 0) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            GrouperAvatar()
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text("Grouper").font(Theme.Typeface.row.weight(.semibold)).foregroundStyle(Theme.text)
+                    if streaming {
+                        Label("Thinking…", systemImage: "ellipsis")
+                            .font(Theme.Typeface.chip)
+                            .foregroundStyle(Theme.brand)
+                            .padding(.horizontal, 8).padding(.vertical, 2)
+                            .background(Theme.brandSoft, in: RoundedRectangle(cornerRadius: Theme.Radius.sm))
+                    }
+                    Spacer(minLength: 8)
+                    timeText(ts)
+                }
+                .frame(minHeight: Theme.Size.avatar)
+                Text(LocalizedStringKey(text))
+                    .font(Theme.Typeface.body)
+                    .foregroundStyle(Theme.text)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(streaming ? "Reply so far. \(text)" : "Grouper. \(text)")
     }
 
-    private var composer: some View {
-        GlassSurface {
-            HStack(alignment: .bottom, spacing: 10) {
-                TextField("Message", text: $message, axis: .vertical)
-                    .lineLimit(1...4).textFieldStyle(.plain).padding(.horizontal, 8).grouperMinimumControlSize()
-                // A covering picker, not a small menu: there are many models.
-                Button { showModelPicker = true } label: {
-                    Group {
-                        if let id = currentModelId {
-                            FamilyMark(family: model.family(ofModel: id))
-                        } else {
-                            Image(systemName: "cpu")
-                        }
-                    }
-                    .grouperMinimumControlSize()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Choose model")
-                .accessibilityValue(currentModelId ?? "Default model")
-                .help(currentModelId.map { "Model: \($0)" } ?? "Model: default")
-                Button { send() } label: {
-                    if sending { ProgressView().frame(width: 22, height: 22) } else { Image(systemName: "arrow.up") }
-                }
-                .buttonStyle(.glassProminent).grouperMinimumControlSize()
-                .accessibilityLabel("Send message")
-                .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.online || sending)
-            }.padding(10)
-        }.padding(.horizontal).padding(.bottom, 6)
+    /// "21:14" beside a message; nothing when the event has no time.
+    @ViewBuilder private func timeText(_ ts: UInt64) -> some View {
+        if ts > 0 {
+            Text(Date(timeIntervalSince1970: TimeInterval(ts)), format: .dateTime.hour().minute())
+                .font(Theme.Typeface.meta)
+                .foregroundStyle(Theme.text3)
+                .padding(.top, 8)
+        }
     }
 
+    /// The owner's initial for the avatar: the linked Google account's name or email.
+    private var ownerInitial: String? {
+        let name = model.linkedGoogle.map { $0.name.isEmpty ? $0.email : $0.name } ?? ""
+        return name.trimmingCharacters(in: .whitespaces).first.map { String($0).uppercased() }
+    }
+
+    private func openThread(_ id: String) {
+        model.selectedThreadId = id
+        #if os(macOS)
+        showThreads = true // the inspector mounts and opens this thread
+        #endif
+    }
+
+    /// The composer card (V8): model chip and the round send button, the text below.
+    /// iPhone keeps it one line and shows the model chip while typing; the chat
+    /// menu also has the model choice. Nothing else sits in it (no dead buttons).
+    private var composer: some View {
+        GlassSurface {
+            #if os(iOS)
+            VStack(alignment: .leading, spacing: 2) {
+                if composerFocused || !message.isEmpty { modelChip }
+                HStack(alignment: .bottom, spacing: 4) {
+                    messageField("Message Grouper…")
+                    sendButton
+                }
+            }
+            .padding(.leading, 12).padding(.trailing, 4).padding(.vertical, 2)
+            #else
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    modelChip
+                    Spacer()
+                    sendButton
+                }
+                messageField("Ask Grouper anything…")
+            }
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            #endif
+        }
+        .frame(maxWidth: Theme.Size.transcriptMax)
+        .padding(.horizontal).padding(.bottom, 6)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func messageField(_ placeholder: String) -> some View {
+        TextField("Message", text: $message, prompt: Text(placeholder).foregroundStyle(Theme.text3), axis: .vertical)
+            .lineLimit(1...4)
+            .textFieldStyle(.plain)
+            .font(Theme.Typeface.body)
+            .foregroundStyle(Theme.text)
+            .focused($composerFocused)
+            .frame(minHeight: 44)
+    }
+
+    /// A covering picker, not a small menu: there are many models.
+    private var modelChip: some View {
+        Button { showModelPicker = true } label: {
+            HStack(spacing: 6) {
+                if let id = currentModelId {
+                    FamilyMark(family: model.family(ofModel: id))
+                } else {
+                    Image(systemName: "sparkles").foregroundStyle(Theme.brand)
+                }
+                Text(currentModelId ?? "Default model")
+                    .font(Theme.Typeface.chip).foregroundStyle(Theme.text).lineLimit(1)
+                Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(Theme.text3)
+            }
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .background(Theme.surfaceSelect, in: RoundedRectangle(cornerRadius: Theme.Radius.sm))
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Choose model")
+        .accessibilityValue(currentModelId ?? "Default model")
+        .help(currentModelId.map { "Model: \($0)" } ?? "Model: default")
+    }
+
+    private var sendButton: some View {
+        Button { send() } label: {
+            if sending { ProgressView().controlSize(.small) } else { Image(systemName: "arrow.up") }
+        }
+        .buttonStyle(SendButtonStyle())
+        .accessibilityLabel("Send message")
+        .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.online || sending)
+    }
     /// Project chats pick an orchestrator model; standard chats a standard one.
     private var chatRole: String {
         (model.selectedConversation?.mode ?? model.newChatMode) == "standard" ? "standard" : "orchestrator"
@@ -268,6 +403,7 @@ struct ChatView: View {
             Menu {
                 Button("New project") { model.beginNewChat(mode: "project") }
                 Button("New standard") { model.beginNewChat(mode: "standard") }
+                Button("Choose model…") { showModelPicker = true }
                 Divider()
                 ForEach(model.conversations) { conversation in
                     Button(conversation.title) { Task { await model.selectConversation(conversation.id) } }
@@ -304,6 +440,38 @@ struct ChatView: View {
     private func deviceName(_ id: String) -> String { model.devices.first { $0.id == id }?.name ?? id }
 }
 
+
+/// The transcript as shown: consecutive thread cards (one delegation burst) become
+/// one `ThreadsCard`; everything else is a row of its own.
+enum ChatItem: Identifiable {
+    case row(TranscriptRow)
+    case threads([ThreadCard])
+
+    var id: String {
+        switch self {
+        case .row(let row): return row.id
+        case .threads(let cards): return "threads:\(cards.first?.threadId ?? "")"
+        }
+    }
+}
+
+extension ChatView {
+    static func chatItems(_ rows: [TranscriptRow]) -> [ChatItem] {
+        var items: [ChatItem] = []
+        for row in rows {
+            guard case .thread(let card) = row else {
+                items.append(.row(row))
+                continue
+            }
+            if case .threads(let cards)? = items.last {
+                items[items.count - 1] = .threads(cards + [card])
+            } else {
+                items.append(.threads([card]))
+            }
+        }
+        return items
+    }
+}
 
 /// The chat's sheets. One `.sheet(item:)` shows them all, so they never compete.
 /// Approvals are not among them: they take the composer's place (`ApprovalDock`).

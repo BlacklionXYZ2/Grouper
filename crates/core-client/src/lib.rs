@@ -8,7 +8,7 @@
 //! and reconnects with backoff.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,8 +19,8 @@ use core_agent::thread::{ApprovalDecision, ThreadControl, ThreadHost, spawn_thre
 use core_agent::tools::{Workspace, file_tools, shell_tool};
 use core_agent::{Tool, ToolOutput};
 use core_protocol::{
-    AgentEvent, Capability, DeviceInfo, HubMessage, MAX_WS_MESSAGE_BYTES, NodeMessage, PING_INTERVAL_SECS,
-    PROTOCOL_VERSION, ProviderConfig, ThreadSpec, ToolDef,
+    AgentEvent, Capability, DeviceInfo, HubMessage, MAX_WS_MESSAGE_BYTES, NodeHostInfo, NodeMessage,
+    PING_INTERVAL_SECS, PROTOCOL_VERSION, ProviderConfig, ThreadSpec, ToolDef,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -31,6 +31,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 pub mod folders;
 mod device_provider;
 mod handover;
+pub mod harness;
 pub mod mcp_host;
 mod mcp_server;
 pub mod usage_probes;
@@ -62,11 +63,97 @@ pub enum Status {
     Unauthorized,
 }
 
+/// Hub move offer delivered to a target node over its WebSocket connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubMoveOfferInfo {
+    pub move_id: String,
+    pub ticket: String,
+    pub target_device_id: String,
+    pub current_epoch: u64,
+    pub snapshot_bytes: u64,
+    pub snapshot_sha256: String,
+}
+
+/// Hub move commit signal delivered to a target node when the old hub is ready to switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubMoveCommitInfo {
+    pub move_id: String,
+    pub ticket: String,
+    pub target_device_id: String,
+    pub new_epoch: u64,
+}
+
 pub trait Events: Send + Sync + 'static {
     fn status(&self, status: Status);
     fn presence(&self, devices: Vec<DeviceInfo>);
     /// A thread started (`running`) or ended (`done`/`failed`/`stopped`) on this device.
     fn thread(&self, _thread_id: &str, _title: &str, _state: &str) {}
+    /// The current hub offered this node a move ticket (`HubMessage::HubMoveOffer`).
+    fn hub_move_offer(&self, _offer: HubMoveOfferInfo) {}
+    /// The current hub told this node to commit a staged hub move (`HubMessage::HubMoveCommit`).
+    fn hub_move_commit(&self, _commit: HubMoveCommitInfo) {}
+    /// The current hub aborted an in-progress move (`HubMessage::HubMoveAbort`).
+    fn hub_move_abort(&self, _move_id: &str, _reason: &str) {}
+}
+
+/// Detect whether this device can host Grouper, its client version, and whether `cloudflared` is installed.
+pub fn detect_host_info() -> NodeHostInfo {
+    NodeHostInfo {
+        can_host: cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+        app_version: CLIENT_VERSION.to_string(),
+        free_bytes: None,
+        cloudflared: has_cloudflared(),
+    }
+}
+
+fn has_cloudflared() -> bool {
+    let names: &[&str] = if cfg!(windows) { &["cloudflared.exe", "cloudflared"] } else { &["cloudflared"] };
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            for name in names {
+                if is_executable_file(&dir.join(name)) {
+                    return true;
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    let extra = {
+        let mut paths = vec![
+            PathBuf::from(r"C:\Program Files (x86)\cloudflared\cloudflared.exe"),
+            PathBuf::from(r"C:\Program Files\cloudflared\cloudflared.exe"),
+        ];
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            paths.push(PathBuf::from(local).join("cloudflared").join("cloudflared.exe"));
+        }
+        paths
+    };
+    #[cfg(not(windows))]
+    let extra = [
+        PathBuf::from("/opt/homebrew/bin/cloudflared"),
+        PathBuf::from("/usr/local/bin/cloudflared"),
+        PathBuf::from("/usr/bin/cloudflared"),
+        PathBuf::from("/snap/bin/cloudflared"),
+    ];
+    extra.iter().any(|p| is_executable_file(p))
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,7 +184,18 @@ enum Outcome {
 }
 
 /// Run until `shutdown` becomes true or the hub rejects the token.
-pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn Events>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn Events>, shutdown: watch::Receiver<bool>) {
+    run_with_host(config, Some(detect_host_info()), handler, events, shutdown).await;
+}
+
+/// Like [`run`], but reports an explicit [`NodeHostInfo`] in the `Hello` frame (or `None` to omit it).
+pub async fn run_with_host(
+    config: Config,
+    host_info: Option<NodeHostInfo>,
+    handler: Arc<dyn ToolHandler>,
+    events: Arc<dyn Events>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let url = match core_protocol::connect_url(&config.hub_url) {
         Ok(u) => u,
         Err(e) => {
@@ -123,7 +221,7 @@ pub async fn run(config: Config, handler: Arc<dyn ToolHandler>, events: Arc<dyn 
         events.status(Status::Connecting);
         let started = tokio::time::Instant::now();
         let outcome = tokio::select! {
-            o = connect_once(&url, &config, &handler, &events, &host, &folders) => o,
+            o = connect_once(&url, &config, host_info.as_ref(), &handler, &events, &host, &folders) => o,
             _ = shutdown.changed() => Outcome::Stop,
         };
         match outcome {
@@ -161,6 +259,10 @@ struct Threads {
     identity: Mutex<Option<(String, String)>>,
     /// Calls this device is executing for the hub, keyed by hub call id.
     model_tasks: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Standard-chat harness turns executing on this device, keyed by conversation id.
+    harness_tasks: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// Harness threads (one CLI session each), keyed by thread id.
+    harness_runs: Mutex<HashMap<String, HarnessThreadRun>>,
     /// Calls a local thread asked the hub to relay, keyed by device call id.
     model_waiters: Mutex<HashMap<String, device_provider::ModelWaiter>>,
     /// Random for each connection, so a reconnect cannot reuse an old approval id.
@@ -182,6 +284,8 @@ impl Threads {
             providers: Mutex::new(Vec::new()),
             identity: Mutex::new(None),
             model_tasks: Mutex::new(HashMap::new()),
+            harness_tasks: Mutex::new(HashMap::new()),
+            harness_runs: Mutex::new(HashMap::new()),
             model_waiters: Mutex::new(HashMap::new()),
             approval_nonce: u64::from_le_bytes(nonce),
             next: AtomicU64::new(1),
@@ -208,7 +312,84 @@ impl Threads {
         for (_, cancel) in self.model_tasks.lock().unwrap().drain() {
             let _ = cancel.send(true);
         }
+        for (_, handle) in self.harness_tasks.lock().unwrap().drain() {
+            handle.abort();
+        }
+        for (_, run) in self.harness_runs.lock().unwrap().drain() {
+            run.abort();
+        }
         self.model_waiters.lock().unwrap().clear();
+    }
+
+    fn push_input(&self, thread_id: &str, from: &str, text: &str) {
+        if let Some(c) = self.controls.lock().unwrap().get(thread_id) {
+            c.send(from, text);
+            return;
+        }
+        if let Some(run) = self.harness_runs.lock().unwrap().get(thread_id) {
+            // Same shape the API loop queues, so a resumed CLI turn can see who spoke.
+            let _ = run.input.send(format!("[Message from the {from}]\n{text}"));
+        }
+    }
+
+    fn stop_one(&self, thread_id: &str) {
+        if let Some(c) = self.controls.lock().unwrap().remove(thread_id) {
+            c.stop();
+        }
+        if let Some(run) = self.harness_runs.lock().unwrap().remove(thread_id) {
+            run.abort();
+        }
+        let prefix = format!("{thread_id}-");
+        self.approvals.lock().unwrap().retain(|id, _| !id.starts_with(&prefix));
+    }
+}
+
+/// One harness thread: aborting it drops the CLI child (`kill_on_drop`).
+struct HarnessThreadRun {
+    abort: tokio::task::AbortHandle,
+    input: mpsc::UnboundedSender<String>,
+}
+
+/// What the harness thread should do after a CLI turn.
+enum HarnessInbox {
+    /// `message_thread` or a step-in arrived; run another turn on the same session.
+    Message(String),
+    /// Nothing queued. The run has been removed so a late message cannot land in the gap.
+    Finished,
+    /// `stop_thread` already dropped the sender (and aborted the task).
+    Stopped,
+}
+
+/// Next queued message, or the decision to end. The empty check and the removal share
+/// `harness_runs`'s lock, which is also what [`Threads::push_input`] holds while it sends,
+/// so a message cannot arrive after we decide the inbox is empty.
+fn poll_harness_inbox(
+    rx: &mut mpsc::UnboundedReceiver<String>,
+    threads: &std::sync::Weak<Threads>,
+    thread_id: &str,
+) -> HarnessInbox {
+    match rx.try_recv() {
+        Ok(message) => return HarnessInbox::Message(message),
+        Err(mpsc::error::TryRecvError::Disconnected) => return HarnessInbox::Stopped,
+        Err(mpsc::error::TryRecvError::Empty) => {}
+    }
+    let Some(t) = threads.upgrade() else {
+        return HarnessInbox::Stopped;
+    };
+    let mut runs = t.harness_runs.lock().unwrap();
+    match rx.try_recv() {
+        Ok(message) => HarnessInbox::Message(message),
+        Err(mpsc::error::TryRecvError::Disconnected) => HarnessInbox::Stopped,
+        Err(mpsc::error::TryRecvError::Empty) => {
+            runs.remove(thread_id);
+            HarnessInbox::Finished
+        }
+    }
+}
+
+impl HarnessThreadRun {
+    fn abort(self) {
+        self.abort.abort();
     }
 }
 
@@ -293,6 +474,20 @@ fn start_thread(
     host: &Arc<McpHost>,
     folders: &Arc<Folders>,
 ) {
+    if spec.harness.is_some() {
+        let Some(root) = config.workspace_root.clone() else {
+            let id = spec.thread_id.clone();
+            events.thread(&id, &spec.title, "failed");
+            threads.send(NodeMessage::ThreadFinished {
+                thread_id: id,
+                ok: false,
+                summary: "This device doesn't run threads.".into(),
+            });
+            return;
+        };
+        start_harness_thread(spec, &root, events, threads, folders, harness::ScanOptions::host());
+        return;
+    }
     let id = spec.thread_id.clone();
     let fail = |msg: String| {
         threads.send(NodeMessage::ThreadFinished { thread_id: id.clone(), ok: false, summary: msg });
@@ -348,9 +543,196 @@ fn start_thread(
     });
 }
 
+/// Run a harness thread with [`harness::turn`] at [`HarnessLevel::Workspace`](harness::HarnessLevel::Workspace).
+///
+/// `opts` is [`harness::ScanOptions::host`] in production, which is what `harness::turn` uses.
+/// Tests pass an isolated scan so the turn runs a fake CLI. The brief is turn 1 and the
+/// working directory is the thread workspace. `message_thread` and a step-in queued during
+/// a turn are further turns that resume the same session. An empty inbox after a turn ends
+/// the thread, and that reply is the summary. The run is registered before the first turn,
+/// and aborting it drops the child (`kill_on_drop`), which is how `stop_thread` kills the process.
+fn start_harness_thread(
+    spec: ThreadSpec,
+    workspace_root: &Path,
+    events: &Arc<dyn Events>,
+    threads: &Arc<Threads>,
+    folders: &Arc<Folders>,
+    opts: harness::ScanOptions,
+) {
+    let id = spec.thread_id.clone();
+    let title = spec.title.clone();
+    let fail = |msg: String| {
+        events.thread(&id, &title, "failed");
+        threads.send(NodeMessage::ThreadFinished { thread_id: id.clone(), ok: false, summary: msg });
+    };
+    let Some(harness_spec) = spec.harness.clone() else {
+        return fail("not a harness thread".into());
+    };
+    let ws = match Workspace::create_scoped(workspace_root.join(&id), folders.clone(), &spec.device_name) {
+        Ok(w) => w,
+        Err(e) => return fail(format!("workspace: {e}")),
+    };
+    let workdir = ws.root().to_path_buf();
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
+    let weak = Arc::downgrade(threads);
+    let task_events = events.clone();
+    let thread_id = id.clone();
+    let brief = spec.brief.clone();
+    let task_title = title.clone();
+    let join = tokio::spawn(async move {
+        // Registered (or shut down) before any CLI process exists.
+        if ready_rx.await.is_err() {
+            return;
+        }
+        let mut session = harness_spec.session.filter(|s| !s.trim().is_empty());
+        let mut last_reply = String::new();
+        let mut upcoming = Some(brief);
+        loop {
+            let message = if let Some(m) = upcoming.take() {
+                m
+            } else {
+                match poll_harness_inbox(&mut input_rx, &weak, &thread_id) {
+                    HarnessInbox::Message(m) => m,
+                    HarnessInbox::Finished => break,
+                    HarnessInbox::Stopped => return,
+                }
+            };
+            // Same call as `harness::turn`, plus the scan options so a test can supply a fake CLI.
+            let result = harness::turn_with(
+                &opts,
+                &harness_spec.agent,
+                &harness_spec.model,
+                session.as_deref(),
+                &message,
+                &workdir,
+                harness::HarnessLevel::Workspace,
+                None,
+            )
+            .await;
+            let Some(t) = weak.upgrade() else { return };
+            match result {
+                Ok(out) => {
+                    if !out.session_id.trim().is_empty() {
+                        session = Some(out.session_id.clone());
+                        t.send(NodeMessage::ThreadHarnessSession {
+                            thread_id: thread_id.clone(),
+                            session_id: out.session_id,
+                        });
+                    }
+                    t.send(NodeMessage::ThreadEvent {
+                        thread_id: thread_id.clone(),
+                        event: AgentEvent::Text { text: out.text.clone() },
+                    });
+                    last_reply = out.text;
+                }
+                Err(error) => {
+                    task_events.thread(&thread_id, &task_title, "failed");
+                    t.harness_runs.lock().unwrap().remove(&thread_id);
+                    t.send(NodeMessage::ThreadFinished { thread_id, ok: false, summary: error });
+                    return;
+                }
+            }
+        }
+        task_events.thread(&thread_id, &task_title, "done");
+        if let Some(t) = weak.upgrade() {
+            t.send(NodeMessage::ThreadFinished { thread_id, ok: true, summary: last_reply });
+        }
+    });
+    let abort = join.abort_handle();
+    let inserted = {
+        let mut runs = threads.harness_runs.lock().unwrap();
+        if threads.closed.load(Ordering::SeqCst) {
+            abort.abort();
+            false
+        } else {
+            runs.insert(id, HarnessThreadRun { abort, input: input_tx });
+            true
+        }
+    };
+    if inserted {
+        events.thread(&spec.thread_id, &spec.title, "running");
+        let _ = ready_tx.send(());
+    }
+}
+
+const MAX_HARNESS_TASKS: usize = 16;
+
+#[allow(clippy::too_many_arguments)]
+fn start_harness_turn(
+    conversation_id: String,
+    agent: String,
+    model: String,
+    session_id: Option<String>,
+    message: String,
+    mcp: Option<core_protocol::HarnessMcp>,
+    allowed_tools: Vec<String>,
+    system_prompt: Option<String>,
+    config: &Config,
+    threads: &Arc<Threads>,
+) {
+    let workdir = match harness::chat_workdir(config.workspace_root.as_deref(), &conversation_id) {
+        Ok(dir) => dir,
+        Err(error) => {
+            threads.send(NodeMessage::HarnessFailed { conversation_id, error });
+            return;
+        }
+    };
+    {
+        let tasks = threads.harness_tasks.lock().unwrap();
+        if !tasks.contains_key(&conversation_id) && tasks.len() >= MAX_HARNESS_TASKS {
+            drop(tasks);
+            threads.send(NodeMessage::HarnessFailed {
+                conversation_id,
+                error: "this device is busy with other harness turns; try again shortly".into(),
+            });
+            return;
+        }
+    }
+    let weak = Arc::downgrade(threads);
+    let conv_key = conversation_id.clone();
+    let join = tokio::spawn(async move {
+        let attach = mcp.as_ref().map(|mcp| harness::ClaudeOrchestrator {
+            mcp,
+            allowed_tools: &allowed_tools,
+            system_prompt: system_prompt.as_deref(),
+        });
+        let result = harness::turn(
+            &agent,
+            &model,
+            session_id.as_deref(),
+            &message,
+            &workdir,
+            harness::HarnessLevel::Confined,
+            attach.as_ref(),
+        )
+        .await;
+        if let Some(t) = weak.upgrade() {
+            t.harness_tasks.lock().unwrap().remove(&conv_key);
+            match result {
+                Ok(out) => t.send(NodeMessage::HarnessFinished {
+                    conversation_id: conv_key,
+                    text: out.text,
+                    session_id: out.session_id,
+                    usage: out.usage,
+                }),
+                Err(error) => t.send(NodeMessage::HarnessFailed { conversation_id: conv_key, error }),
+            }
+        }
+    });
+    let abort = join.abort_handle();
+    let mut tasks = threads.harness_tasks.lock().unwrap();
+    if threads.closed.load(Ordering::SeqCst) {
+        abort.abort();
+    } else if let Some(prev) = tasks.insert(conversation_id, abort) {
+        prev.abort();
+    }
+}
+
 async fn connect_once(
     url: &str,
     config: &Config,
+    host_info: Option<&NodeHostInfo>,
     handler: &Arc<dyn ToolHandler>,
     events: &Arc<dyn Events>,
     host: &Arc<McpHost>,
@@ -383,7 +765,11 @@ async fn connect_once(
     };
     let (mut sink, mut stream) = ws.split();
 
-    let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: CLIENT_VERSION.into() };
+    let hello = NodeMessage::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_version: CLIENT_VERSION.into(),
+        host: host_info.cloned(),
+    };
     if let Err(e) = sink.send(Message::Text(serde_json::to_string(&hello).unwrap().into())).await {
         return Outcome::Retry(e.to_string());
     }
@@ -402,8 +788,9 @@ async fn connect_once(
     let mcp = ServerSession::start(
         DeviceServer::new(config, handler.clone(), host.clone(), folders.clone()),
         out_tx.clone(),
-        on_overflow,
+        on_overflow.clone(),
     );
+    let _harnesses = harness::HarnessSession::start(host.subscribe(), out_tx.clone(), on_overflow);
     let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.tick().await;
 
@@ -460,16 +847,10 @@ async fn connect_once(
                         start_thread(*spec, config, handler, events, &threads, host, folders)
                     }
                     Ok(HubMessage::ThreadInput { thread_id, from, text }) => {
-                        if let Some(c) = threads.controls.lock().unwrap().get(&thread_id) {
-                            c.send(&from, &text);
-                        }
+                        threads.push_input(&thread_id, &from, &text);
                     }
                     Ok(HubMessage::StopThread { thread_id }) => {
-                        if let Some(c) = threads.controls.lock().unwrap().remove(&thread_id) {
-                            c.stop();
-                        }
-                        let prefix = format!("{thread_id}-");
-                        threads.approvals.lock().unwrap().retain(|id, _| !id.starts_with(&prefix));
+                        threads.stop_one(&thread_id);
                     }
                     Ok(HubMessage::ApprovalResult { approval_id, approved, timeout_secs }) => {
                         if let Some(tx) = threads.approvals.lock().unwrap().remove(&approval_id) {
@@ -500,6 +881,57 @@ async fn connect_once(
                             return Outcome::Retry("outgoing queue full".into());
                         }
                     }
+                    Ok(HubMessage::HubMoveOffer {
+                        move_id,
+                        ticket,
+                        target_device_id,
+                        current_epoch,
+                        snapshot_bytes,
+                        snapshot_sha256,
+                    }) => {
+                        events.hub_move_offer(HubMoveOfferInfo {
+                            move_id,
+                            ticket,
+                            target_device_id,
+                            current_epoch,
+                            snapshot_bytes,
+                            snapshot_sha256,
+                        });
+                    }
+                    Ok(HubMessage::HubMoveCommit { move_id, ticket, target_device_id, new_epoch }) => {
+                        events.hub_move_commit(HubMoveCommitInfo {
+                            move_id,
+                            ticket,
+                            target_device_id,
+                            new_epoch,
+                        });
+                    }
+                    Ok(HubMessage::HubMoveAbort { move_id, reason }) => {
+                        events.hub_move_abort(&move_id, &reason);
+                    }
+                    Ok(HubMessage::HarnessTurn {
+                        conversation_id,
+                        agent,
+                        model,
+                        session_id,
+                        message,
+                        mcp,
+                        allowed_tools,
+                        system_prompt,
+                    }) => {
+                        start_harness_turn(
+                            conversation_id,
+                            agent,
+                            model,
+                            session_id,
+                            message,
+                            mcp,
+                            allowed_tools,
+                            system_prompt,
+                            config,
+                            &threads,
+                        );
+                    }
                     Ok(HubMessage::Pong) => {}
                     Ok(HubMessage::Error { message }) => {
                         tracing::warn!("hub error: {message}");
@@ -520,6 +952,23 @@ mod tests {
     use super::*;
     use core_protocol::Permission;
     use serde_json::json;
+
+    #[test]
+    fn detect_host_info_reports_desktop_capability_and_version() {
+        let info = detect_host_info();
+        assert_eq!(info.app_version, CLIENT_VERSION);
+        let expected_can_host = cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"));
+        assert_eq!(info.can_host, expected_can_host);
+        let hello = NodeMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_version: CLIENT_VERSION.into(),
+            host: Some(info.clone()),
+        };
+        let encoded = serde_json::to_value(&hello).unwrap();
+        assert_eq!(encoded["type"], "hello");
+        assert_eq!(encoded["host"]["can_host"], expected_can_host);
+        assert_eq!(encoded["host"]["app_version"], CLIENT_VERSION);
+    }
 
     #[test]
     fn approval_nonce_is_fresh_for_each_connection() {
@@ -561,6 +1010,7 @@ mod tests {
             device_name: "Laptop".into(),
             ask_timeout_secs: Some(core_protocol::DEFAULT_ASK_TIMEOUT_SECS),
             fallback_models: Vec::new(),
+            harness: None,
         };
         let host: Arc<dyn ThreadHost> = threads.clone();
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());
@@ -586,5 +1036,256 @@ mod tests {
         // A late approval request is denied at once.
         assert_eq!(threads.approve("t1", "list_files", &json!({}), "late").await, ApprovalDecision::Denied);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Fake `claude` that records each turn under `$HOME` and, while `hold` exists, waits so a
+    /// test can queue another message or kill the process. Never a real CLI.
+    const FAKE_THREAD_CLAUDE: &str = r#"
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+fn after(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let home = env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+        .expect("home");
+    let pid = std::process::id();
+    fs::write(home.join("pid"), pid.to_string()).unwrap();
+    let mut waited = false;
+    while home.join("hold").exists() {
+        waited = true;
+        thread::sleep(Duration::from_millis(30));
+    }
+    let resume = after(&args, "--resume");
+    let msg = after(&args, "-p").unwrap_or_default();
+    let mode = after(&args, "--permission-mode").unwrap_or_default();
+    let model = after(&args, "--model").unwrap_or_default();
+    let cwd = env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let sid = resume.clone().unwrap_or_else(|| "thread-sess-1".into());
+    let line = format!(
+        "pid={pid}\nwaited={waited}\nresume={}\nmode={mode}\nmodel={model}\ncwd={cwd}\nmsg={msg}\n---\n",
+        resume.unwrap_or_else(|| "NONE".into())
+    );
+    let log = home.join("invocations.log");
+    let prev = fs::read_to_string(&log).unwrap_or_default();
+    fs::write(&log, format!("{prev}{line}")).unwrap();
+    let reply = msg.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "");
+    println!(
+        "{{\"type\":\"result\",\"is_error\":false,\"session_id\":\"{sid}\",\"result\":\"{reply}\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}"
+    );
+}
+"#;
+
+    fn fake_thread_claude() -> PathBuf {
+        static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        BIN.get_or_init(|| {
+            let dir = std::env::temp_dir().join("grouper-h3-fake-claude");
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("fake_thread_claude.rs");
+            std::fs::write(&src, FAKE_THREAD_CLAUDE).unwrap();
+            let exe = dir.join(if cfg!(windows) { "claude.exe" } else { "claude" });
+            let status = std::process::Command::new("rustc")
+                .arg(&src)
+                .arg("-O")
+                .arg("-o")
+                .arg(&exe)
+                .status()
+                .expect("rustc");
+            assert!(status.success(), "compiling fake claude failed");
+            exe
+        })
+        .clone()
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output()
+                .expect("tasklist");
+            String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::Path::new(&format!("/proc/{pid}")).exists()
+        }
+    }
+
+    struct Quiet;
+    impl Events for Quiet {
+        fn status(&self, _status: Status) {}
+        fn presence(&self, _devices: Vec<DeviceInfo>) {}
+    }
+
+    fn harness_thread_spec(id: &str, brief: &str) -> ThreadSpec {
+        ThreadSpec {
+            thread_id: id.into(),
+            conversation_id: "c-harness".into(),
+            title: "Harness thread".into(),
+            provider_id: "claude-code@pc".into(),
+            model: "opus".into(),
+            system: String::new(),
+            brief: brief.into(),
+            permissions: HashMap::new(),
+            max_turns: 4,
+            device_name: "Gaming PC".into(),
+            ask_timeout_secs: Some(core_protocol::DEFAULT_ASK_TIMEOUT_SECS),
+            fallback_models: Vec::new(),
+            harness: Some(core_protocol::HarnessThread {
+                agent: "claude-code".into(),
+                model: "opus".into(),
+                session: None,
+            }),
+        }
+    }
+
+    struct HarnessRun {
+        dir: PathBuf,
+        threads: Arc<Threads>,
+        rx: mpsc::Receiver<NodeMessage>,
+    }
+
+    impl HarnessRun {
+        fn start(id: &str, brief: &str, hold: bool) -> Self {
+            let dir = std::env::temp_dir().join(format!("grouper-h3-thread-{id}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            if hold {
+                std::fs::write(home.join("hold"), "1").unwrap();
+            }
+            let bin = fake_thread_claude();
+            let opts = harness::ScanOptions::isolated(&home, vec![bin.parent().unwrap().to_path_buf()], 1_700_000_000);
+            let (tx, rx) = mpsc::channel(CONN_QUEUE_CAP);
+            let threads = Arc::new(Threads::new(tx, Arc::new(|| {})));
+            let events: Arc<dyn Events> = Arc::new(Quiet);
+            start_harness_thread(
+                harness_thread_spec(id, brief),
+                &dir.join("workspaces"),
+                &events,
+                &threads,
+                &Arc::new(Folders::default()),
+                opts,
+            );
+            Self { dir, threads, rx }
+        }
+
+        fn home(&self) -> PathBuf {
+            self.dir.join("home")
+        }
+
+        async fn recv(&mut self) -> NodeMessage {
+            tokio::time::timeout(Duration::from_secs(20), self.rx.recv())
+                .await
+                .expect("harness thread timed out")
+                .expect("output closed")
+        }
+    }
+
+    impl Drop for HarnessRun {
+        fn drop(&mut self) {
+            let ids: Vec<String> = self.threads.harness_runs.lock().unwrap().keys().cloned().collect();
+            for id in ids {
+                self.threads.stop_one(&id);
+            }
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    async fn wait_pid(home: &Path) -> u32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(home.join("pid"))
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid_alive(pid)
+            {
+                return pid;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("fake claude never started");
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_thread_start_runs_a_turn_and_a_message_resumes_the_session() {
+        let mut run = HarnessRun::start("t-resume", "Write the note.", true);
+        let pid = wait_pid(&run.home()).await;
+        assert!(pid_alive(pid), "first turn should be inside the fake CLI");
+        run.threads.push_input("t-resume", "user", "ship it");
+        std::fs::remove_file(run.home().join("hold")).unwrap();
+
+        let mut session = None;
+        let mut summary = None;
+        let mut saw_text = false;
+        while summary.is_none() {
+            match run.recv().await {
+                NodeMessage::ThreadHarnessSession { thread_id, session_id } => {
+                    assert_eq!(thread_id, "t-resume");
+                    session = Some(session_id);
+                }
+                NodeMessage::ThreadEvent { event: AgentEvent::Text { text }, .. } => {
+                    saw_text = true;
+                    assert!(text.contains("Write the note.") || text.contains("ship it"), "{text}");
+                }
+                NodeMessage::ThreadFinished { thread_id, ok, summary: done } => {
+                    assert_eq!(thread_id, "t-resume");
+                    assert!(ok, "{done}");
+                    summary = Some(done);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(session.as_deref(), Some("thread-sess-1"));
+        assert!(saw_text);
+        let summary = summary.unwrap();
+        assert!(summary.contains("ship it"), "{summary}");
+        assert!(summary.contains("[Message from the user]"), "{summary}");
+
+        let log = std::fs::read_to_string(run.home().join("invocations.log")).unwrap();
+        let turns: Vec<&str> = log.split("---\n").filter(|s| !s.trim().is_empty()).collect();
+        assert_eq!(turns.len(), 2, "{log}");
+        assert!(turns[0].contains("resume=NONE"), "{log}");
+        assert!(turns[0].contains("mode=acceptEdits"), "{log}");
+        assert!(turns[0].contains("model=opus"), "{log}");
+        assert!(turns[0].contains("msg=Write the note."), "{log}");
+        assert!(turns[0].contains("cwd="), "{log}");
+        assert!(
+            turns[0].contains("t-resume"),
+            "workdir should be the thread workspace: {log}"
+        );
+        assert!(turns[1].contains("resume=thread-sess-1"), "{log}");
+        assert!(turns[1].contains("mode=acceptEdits"), "{log}");
+        assert!(turns[1].contains("ship it"), "{log}");
+        assert!(run.threads.harness_runs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn harness_thread_stop_kills_the_cli_process() {
+        let mut run = HarnessRun::start("stop", "Stay running.", true);
+        let pid = wait_pid(&run.home()).await;
+        assert!(pid_alive(pid));
+        run.threads.stop_one("stop");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) {
+            if std::time::Instant::now() > deadline {
+                panic!("stop_thread left fake claude {pid} running");
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(run.threads.harness_runs.lock().unwrap().is_empty());
+        assert!(!run.home().join("invocations.log").exists(), "killed before the CLI finished the turn");
+        let late = tokio::time::timeout(Duration::from_millis(400), run.rx.recv()).await;
+        assert!(late.is_err() || late.unwrap().is_none(), "stop does not finish the thread with the CLI reply");
     }
 }

@@ -103,20 +103,10 @@ impl Provider for ViaDevice {
 }
 
 impl Hub {
-    /// When `model` is a free model, the other free models on the same provider (same key),
-    /// to swap in when it is rate limited. Empty for paid models: those never change silently.
+    /// When `model` is a free API model, the other free API models on the same provider (same key),
+    /// to swap in when it is rate limited. Empty for paid models and harnesses: those never swap in.
     pub(crate) fn free_alternates(&self, provider_id: &str, model: &str) -> Vec<String> {
-        let models = self.db.models();
-        if !models.iter().any(|m| m.provider_id == provider_id && m.model == model && m.free) {
-            return Vec::new();
-        }
-        let mut out: Vec<String> = Vec::new();
-        for m in models {
-            if m.provider_id == provider_id && m.free && m.model != model && !out.contains(&m.model) {
-                out.push(m.model);
-            }
-        }
-        out
+        self.db.free_alternates(provider_id, model)
     }
 
     /// [`build_provider`](Self::build_provider) for calls to `model`, swapping in another
@@ -885,6 +875,7 @@ mod tests {
             roles: vec!["thread".into()],
             local: true,
             modalities: vec!["text".into()],
+            ..Default::default()
         })
         .unwrap();
         let conversation = db.create_conversation("project", "relay").unwrap();
