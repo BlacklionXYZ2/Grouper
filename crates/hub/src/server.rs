@@ -1537,6 +1537,15 @@ async fn delete_memory(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id)
 
 /// `GET /v1/hub`: public identity (no token needed; nothing private).
 /// `key_sha256` is omitted while no hub identity key exists (arrives with LAN TLS).
+/// The account as `GET /v1/hub` shows it: an opaque id, the first 16 bytes of
+/// SHA-256("grouper-account:" + provider + ":" + sub) in hex. `/v1/hub` needs no sign-in, so it
+/// never carries the owner's email; two hubs of one account still get the same id (step-down).
+pub(crate) fn account_id(provider: &str, sub: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("grouper-account:{provider}:{sub}").as_bytes());
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 async fn hub_info(State(hub): State<Arc<Hub>>) -> Response {
     let (hub_device_id, epoch) = match hub.db.ensure_hub_device() {
         Ok(state) => state,
@@ -1546,7 +1555,7 @@ async fn hub_info(State(hub): State<Arc<Hub>>) -> Response {
         hub_id: hub.db.hub_id(),
         hub_version: HUB_VERSION.into(),
         protocol_version: PROTOCOL_VERSION,
-        account: hub.db.owner().map(|owner| owner.email),
+        account: hub.db.owner().map(|owner| account_id(&owner.provider, &owner.sub)),
         hub_device_id,
         epoch,
         key_sha256: hub.db.identity_key_sha256(),

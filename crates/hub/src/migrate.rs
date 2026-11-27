@@ -1098,7 +1098,8 @@ async fn drive_move(
 
     // Wait up to `confirm_timeout` for the new hub to answer `/v1/hub` with `target_device_id` and `epoch >= new_epoch`.
     let client = http_client();
-    let owner_email = hub.db.owner().map(|o| o.email);
+    // /v1/hub shows the opaque account id (server::account_id), never the email.
+    let owner_account = hub.db.owner().map(|o| crate::server::account_id(&o.provider, &o.sub));
     let confirm_deadline = tokio::time::Instant::now() + cfg.confirm_timeout;
 
     let confirmed_url: Option<String> = loop {
@@ -1139,7 +1140,7 @@ async fn drive_move(
             let mut found = None;
             for addr in &candidates {
                 if let Ok(info) = fetch_hub_info(&client, addr).await {
-                    let account_ok = match (&owner_email, &info.account) {
+                    let account_ok = match (&owner_account, &info.account) {
                         (Some(local), Some(remote)) => local.eq_ignore_ascii_case(remote),
                         (None, None) => true,
                         _ => false,
@@ -1153,7 +1154,7 @@ async fn drive_move(
             if let Some((addr, confirmed_epoch)) = found {
                 // Step 6: Old hub steps down and becomes an ordinary device.
                 let stepdown_info = StepDownInfo {
-                    account: owner_email.clone().unwrap_or_default(),
+                    account: owner_account.clone().unwrap_or_default(),
                     local_hub_device_id: current_hub_device_id.clone(),
                     local_epoch: current_epoch,
                     peer_hub_device_id: target_device_id.clone(),
@@ -2243,7 +2244,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_info.hub_id, old_hub.db.hub_id());
-        assert_eq!(new_info.account.as_deref(), Some("oscar@example.com"));
+        assert_eq!(new_info.account.as_deref(), Some(crate::server::account_id("google", "sub-oscar").as_str()));
         assert_eq!(new_info.hub_device_id, target_id);
         assert_eq!(new_info.epoch, 2);
 

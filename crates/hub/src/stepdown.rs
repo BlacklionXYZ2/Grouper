@@ -5,7 +5,7 @@
 //! `cloudflared`, and periodically while it runs, it fetches `<public_address>/v1/hub`.
 //!
 //! If the peer answers with:
-//! - the **same account** (matching owner email, case-insensitively),
+//! - the **same account** (matching opaque account id from `GET /v1/hub`),
 //! - a **different `hub_device_id`**, and
 //! - a **strictly higher `epoch`**,
 //!
@@ -175,9 +175,10 @@ pub async fn check_hub_with_client(hub: &Arc<Hub>, client: &reqwest::Client) -> 
         }
     };
 
-    if should_step_down(Some(&owner.email), &local_hub_device_id, local_epoch, &remote) {
+    let local_account = crate::server::account_id(&owner.provider, &owner.sub);
+    if should_step_down(Some(&local_account), &local_hub_device_id, local_epoch, &remote) {
         let info = StepDownInfo {
-            account: owner.email,
+            account: local_account,
             local_hub_device_id,
             local_epoch,
             peer_hub_device_id: remote.hub_device_id,
@@ -338,7 +339,7 @@ mod tests {
 
         // 2. Start fake peer hub with lower epoch (1 < 2): must not step down.
         let (peer_url, peer_state, peer_task) =
-            start_fake_peer(peer_info(Some("oscar@example.com"), "remote-dev", 1)).await;
+            start_fake_peer(peer_info(Some(&crate::server::account_id("google", "sub-123")), "remote-dev", 1)).await;
         hub.db.set_public_address(Some(&peer_url)).unwrap();
         assert_eq!(check_hub(&hub).await, CheckOutcome::KeepServing);
         assert!(!hub.is_stepped_down());
@@ -360,7 +361,7 @@ mod tests {
         // 5. Same account, same hub_device_id, higher epoch (5 > 2): must not step down.
         {
             let mut s = peer_state.lock().unwrap();
-            s.account = Some("oscar@example.com".into());
+            s.account = Some(crate::server::account_id("google", "sub-123"));
             s.hub_device_id = local_hub_dev.clone();
             s.epoch = 5;
         }
@@ -381,7 +382,7 @@ mod tests {
                 assert_eq!(info.peer_epoch, 3);
                 assert_eq!(info.local_hub_device_id, local_hub_dev);
                 assert_eq!(info.local_epoch, 2);
-                assert_eq!(info.account, "oscar@example.com");
+                assert_eq!(info.account, crate::server::account_id("google", "sub-123"));
             }
             other => panic!("expected SteppedDown, got {other:?}"),
         }
@@ -397,7 +398,7 @@ mod tests {
     async fn periodic_loop_detects_replacement_and_exits() {
         let (hub, dir) = make_hub(Some("oscar@example.com"));
         let (peer_url, peer_state, peer_task) =
-            start_fake_peer(peer_info(Some("oscar@example.com"), "new-pc", 1)).await;
+            start_fake_peer(peer_info(Some(&crate::server::account_id("google", "sub-123")), "new-pc", 1)).await;
         hub.db.set_public_address(Some(&peer_url)).unwrap();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

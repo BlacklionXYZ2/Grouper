@@ -1975,7 +1975,8 @@ pub(crate) mod tests {
 
         f.claim().await;
         let after: Value = f.http.get(f.url("/v1/hub")).send().await.unwrap().json().await.unwrap();
-        assert_eq!(after["account"], format!("{OWNER}@example.com"));
+        assert_eq!(after["account"], crate::server::account_id("google", OWNER));
+        assert!(!after.to_string().contains("@example.com"), "/v1/hub must not show the email");
         assert_eq!(after["hub_device_id"], hub_dev);
         assert_eq!(after["epoch"], 1);
         assert!(after.get("key_sha256").is_none());
