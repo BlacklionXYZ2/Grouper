@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use core_protocol::{ModelEntry, ProviderConfig};
 use hub::{backup, db::Db, host};
@@ -88,6 +88,19 @@ enum Cmd {
         /// Runs on your own hardware (for "sensitive → local" priority rules).
         #[arg(long)]
         local: bool,
+    },
+    /// Set only the prices (USD per 1M tokens) of an existing model, then re-price its past
+    /// unpriced calls. Everything else on the model is kept.
+    ModelPrice {
+        id: String,
+        #[arg(long)]
+        input: f64,
+        #[arg(long)]
+        output: f64,
+        #[arg(long)]
+        cache_read: Option<f64>,
+        #[arg(long)]
+        cache_write: Option<f64>,
     },
 }
 
@@ -231,6 +244,17 @@ async fn main() -> Result<()> {
                 ..Default::default()
             })?;
             println!("Saved model {id}.");
+        }
+        Cmd::ModelPrice { id, input, output, cache_read, cache_write } => {
+            let mut entry = db.find_model(&id).with_context(|| format!("no model {id}"))?;
+            entry.input_price = input;
+            entry.output_price = output;
+            entry.cache_read_price = cache_read;
+            entry.cache_write_price = cache_write;
+            entry.price_source = "manual".into();
+            db.upsert_model(&entry)?;
+            let n = db.reprice_unpriced_usage(&entry)?;
+            println!("Set prices for model {id}; re-priced {n} past call(s) that had no cost.");
         }
     }
     Ok(())

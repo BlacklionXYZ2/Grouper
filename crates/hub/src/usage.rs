@@ -47,6 +47,11 @@ const FREE_LIMIT_DEDUPE_SECS: u64 = 60;
 
 pub use core_registry::cost::parse_time;
 
+/// A provider row `(id, kind, base_url, via_device)` that is a billed API key.
+fn is_billed_key(p: &ProviderRow) -> bool {
+    p.1 != "harness" && p.1 != "scripted" && p.3.is_none() && !p.2.as_deref().is_some_and(core_registry::is_local_url)
+}
+
 #[cfg(test)]
 #[path = "usage_summary_tests.rs"]
 mod summary_tests;
@@ -100,9 +105,10 @@ impl Db {
         }
         let provider_by_id: HashMap<&str, &ProviderRow> = providers.iter().map(|p| (p.0.as_str(), p)).collect();
 
+        // Only a billed API key is listed: not a harness, the scripted test fake, or a local server.
         let mut keys: Vec<UsageSummaryKey> = providers
             .iter()
-            .filter(|(_, kind, ..)| kind != "harness")
+            .filter(|p| is_billed_key(p))
             .map(|(id, kind, base_url, via)| UsageSummaryKey {
                 provider: id.clone(),
                 kind: kind.clone(),
@@ -116,6 +122,10 @@ impl Db {
         let mut total = UsageTotals::default();
         let mut unpriced_calls = 0u64;
         for slice in api {
+            // Rows of a provider that is not a billed key (scripted, local) stay out of the totals.
+            if provider_by_id.get(slice.provider_id.as_str()).is_some_and(|p| !is_billed_key(p) && p.1 != "harness") {
+                continue;
+            }
             let position = match keys.iter().position(|k| k.provider == slice.provider_id) {
                 Some(position) => position,
                 None => {
@@ -207,6 +217,32 @@ impl Db {
         subscriptions.sort_by(|a, b| a.provider.cmp(&b.provider));
 
         Ok(UsageSummary { since, until, total, unpriced_calls, keys, subscriptions })
+    }
+
+    /// Give past API calls of a model that were recorded at cost 0 (no price then) the cost its
+    /// current prices imply. Rows that already have a cost are left alone. Returns the rows changed.
+    pub fn reprice_unpriced_usage(&self, m: &ModelEntry) -> Result<usize> {
+        let kind = self.provider(&m.provider_id)?.map(|p| p.kind);
+        let c = self.c();
+        let rows: Vec<(i64, u64, u64, u64, u64)> = {
+            let mut statement = c.prepare(
+                "SELECT rowid, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens FROM usage
+                 WHERE provider_id = ?1 AND model = ?2 AND billing = 'api' AND cost = 0",
+            )?;
+            statement
+                .query_map(params![m.provider_id, m.model], |r| {
+                    Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64, r.get::<_, i64>(4)? as u64))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut changed = 0;
+        for (rowid, input, output, read, write) in rows {
+            let cost = core_registry::cost::estimate_cost(m, kind.as_deref(), input, output, read, write);
+            if cost > 0.0 {
+                changed += c.execute("UPDATE usage SET cost = ?1 WHERE rowid = ?2", params![cost, rowid])?;
+            }
+        }
+        Ok(changed)
     }
 
     /// Calls to `:free` models recorded in `[since, until)`, per provider id. The usage
