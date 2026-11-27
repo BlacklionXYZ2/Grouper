@@ -409,9 +409,11 @@ pub enum HubMessage {
         move_id: String,
         reason: String,
     },
-    /// Run one turn of a CLI harness for a standard chat on this device.
-    /// `session_id` is `None` on the first harness turn in a chat and `Some` on
-    /// subsequent turns so the harness resumes its own continuous session.
+    /// Run one turn of a CLI harness for a standard chat, or for a project chat whose
+    /// orchestrator is a confinable harness. `session_id` is `None` on the first harness
+    /// turn in a chat and `Some` on subsequent turns so the harness resumes its own
+    /// continuous session. `mcp`, `allowed_tools` and `system_prompt` are set only for
+    /// an orchestrator turn; older peers ignore them and frames without them still decode.
     HarnessTurn {
         conversation_id: String,
         agent: String,
@@ -419,7 +421,30 @@ pub enum HubMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         message: String,
+        /// Loopback MCP endpoint the harness orchestrator must call. Absent for a standard chat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp: Option<HarnessMcp>,
+        /// Tool names the harness may use (`mcp__grouper__*`). Empty for a standard chat.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allowed_tools: Vec<String>,
+        /// Appended to the harness's own prompt for an orchestrator turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
     },
+}
+
+/// Per-turn attachment that points a harness orchestrator at the hub's loopback MCP server.
+/// The bearer token is a secret: debug output redacts it, and callers must not log it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct HarnessMcp {
+    pub url: String,
+    pub bearer_token: String,
+}
+
+impl std::fmt::Debug for HarnessMcp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HarnessMcp").field("url", &self.url).field("bearer_token", &"[redacted]").finish()
+    }
 }
 
 /// A tool definition as models see it.
@@ -1487,11 +1512,21 @@ mod tests {
             model: "sonnet".into(),
             session_id: None,
             message: "hello".into(),
+            mcp: None,
+            allowed_tools: Vec::new(),
+            system_prompt: None,
         };
         let s = serde_json::to_string(&ht_first).unwrap();
         assert!(s.contains(r#""type":"harness_turn""#), "{s}");
         assert!(!s.contains("session_id"), "{s}");
+        assert!(!s.contains("mcp"), "{s}");
+        assert!(!s.contains("allowed_tools"), "{s}");
+        assert!(!s.contains("system_prompt"), "{s}");
         assert_eq!(serde_json::from_str::<HubMessage>(&s).unwrap(), ht_first);
+
+        // Protocol v7 frames from before the orchestrator fields still decode.
+        let legacy = r#"{"type":"harness_turn","conversation_id":"c1","agent":"claude-code","model":"sonnet","message":"hello"}"#;
+        assert_eq!(serde_json::from_str::<HubMessage>(legacy).unwrap(), ht_first);
 
         let ht_resume = HubMessage::HarnessTurn {
             conversation_id: "c1".into(),
@@ -1499,10 +1534,19 @@ mod tests {
             model: "sonnet".into(),
             session_id: Some("sess-42".into()),
             message: "follow up".into(),
+            mcp: Some(HarnessMcp { url: "http://127.0.0.1:9/mcp/orchestrator".into(), bearer_token: "tok-test".into() }),
+            allowed_tools: vec!["mcp__grouper__*".into()],
+            system_prompt: Some("You are the orchestrator.".into()),
         };
         let s = serde_json::to_string(&ht_resume).unwrap();
         assert!(s.contains(r#""session_id":"sess-42""#), "{s}");
+        assert!(s.contains(r#""url":"http://127.0.0.1:9/mcp/orchestrator""#), "{s}");
+        assert!(s.contains("mcp__grouper__*"), "{s}");
+        assert!(s.contains("You are the orchestrator."), "{s}");
         assert_eq!(serde_json::from_str::<HubMessage>(&s).unwrap(), ht_resume);
+        let dbg = format!("{ht_resume:?}");
+        assert!(dbg.contains("[redacted]"), "{dbg}");
+        assert!(!dbg.contains("tok-test"), "{dbg}");
 
         let hf = NodeMessage::HarnessFinished {
             conversation_id: "c1".into(),
