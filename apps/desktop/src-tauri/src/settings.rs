@@ -169,7 +169,6 @@ impl DesktopSettings {
 
     /// Persist a switch to client mode (`AnotherComputer`) after the embedded hub steps down,
     /// pointing at `public_address` and carrying saved admin and node tokens to that address.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn persist_client_mode(&mut self, data_dir: &Path, public_address: Option<&str>) -> Result<String> {
         if let Some(addr) = public_address.map(str::trim).filter(|s| !s.is_empty()) {
             if self.set_choice(HostMode::AnotherComputer, Some(addr)).is_err() {
