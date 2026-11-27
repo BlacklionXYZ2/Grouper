@@ -113,19 +113,41 @@ impl Default for UsageProbeSetting {
 }
 
 /// The providers this device advertises and will run: the supported ones that are switched on
-/// (`selected`, `None` = all) and, for Antigravity, whose CLI is installed here.
+/// (`selected`, `None` = all) **and** whose harness is actually present here (its CLI found by the
+/// harness scan's lookup, or its sign-in file / keychain entry exists). An explicit list only ever
+/// narrows this, so a device that doesn't use Grok never reports a "not signed in" Grok card.
 pub fn enabled_providers(selected: Option<&[String]>) -> Vec<&'static str> {
-    let agy_installed = crate::harness::locate_cli("antigravity").is_some();
-    enabled_providers_with(selected, agy_installed)
+    enabled_providers_with(selected, |p| provider_present(p, None, &|slug| crate::harness::locate_cli(slug).is_some()))
 }
 
-fn enabled_providers_with(selected: Option<&[String]>, agy_installed: bool) -> Vec<&'static str> {
+fn enabled_providers_with(selected: Option<&[String]>, present: impl Fn(&str) -> bool) -> Vec<&'static str> {
     SUPPORTED_PROVIDERS
         .iter()
         .copied()
         .filter(|p| selected.is_none_or(|list| list.iter().any(|s| s.trim().eq_ignore_ascii_case(p))))
-        .filter(|p| *p != "antigravity" || agy_installed)
+        .filter(|p| present(p))
         .collect()
+}
+
+/// Is this provider's harness on the device? `home` overrides the home folder (tests);
+/// `cli_found` answers whether the CLI for a harness slug is installed.
+fn provider_present(provider: &str, home: Option<&Path>, cli_found: &dyn Fn(&str) -> bool) -> bool {
+    let (slug, credential_file) = match provider {
+        "claude" => ("claude-code", claude_credentials_path(home)),
+        "codex" => ("codex", codex_credentials_path(home)),
+        "grok" => ("grok", grok_credentials_path(home)),
+        // Antigravity has no credential read: the CLI is the only thing to find.
+        "antigravity" => ("antigravity", None),
+        _ => return false,
+    };
+    if cli_found(slug) || credential_file.is_some_and(|p| p.is_file()) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    if provider == "claude" && home.is_none() && read_claude_keychain_json().is_some() {
+        return true;
+    }
+    false
 }
 
 fn probe_state() -> &'static tokio::sync::Mutex<Option<ProbeCache>> {
@@ -153,6 +175,7 @@ fn http_client() -> Result<reqwest::Client, String> {
         .build()
         .map_err(|_| "failed to build HTTP client".to_string())
 }
+
 
 /// The providers a `grouper_usage_probe` call will actually run: those named in `args`
 /// (`{"providers": [...]}`; omitted or empty means all supported), limited to the ones switched
@@ -2289,11 +2312,15 @@ mod tests {
     #[test]
     fn only_providers_switched_on_here_are_advertised_and_run() {
         let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(enabled_providers_with(None, true), vec!["claude", "codex", "grok", "antigravity"]);
-        // No agy installed: Antigravity is not advertised even when asked for.
-        assert_eq!(enabled_providers_with(None, false), vec!["claude", "codex", "grok"]);
-        assert_eq!(enabled_providers_with(Some(&strs(&["grok", "antigravity"])), false), vec!["grok"]);
-        assert_eq!(enabled_providers_with(Some(&strs(&["codex", "grok"])), true), vec!["codex", "grok"]);
+        let everything = |_: &str| true;
+        assert_eq!(enabled_providers_with(None, everything), vec!["claude", "codex", "grok", "antigravity"]);
+        // Only providers present on the device are advertised, with or without an explicit list.
+        let only = |present: &'static [&'static str]| move |p: &str| present.contains(&p);
+        assert_eq!(enabled_providers_with(None, only(&["claude", "grok"])), vec!["claude", "grok"]);
+        assert!(enabled_providers_with(None, only(&[])).is_empty());
+        assert_eq!(enabled_providers_with(Some(&strs(&["grok", "antigravity"])), only(&["grok"])), vec!["grok"]);
+        assert!(enabled_providers_with(Some(&strs(&["codex"])), only(&["grok"])).is_empty());
+        assert_eq!(enabled_providers_with(Some(&strs(&["codex", "grok"])), everything), vec!["codex", "grok"]);
 
         // The hub can only narrow, never widen, what is switched on.
         let enabled = ["claude", "grok"];
@@ -2337,5 +2364,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_provider_counts_as_present_by_its_cli_or_its_sign_in_file() {
+        let home = temp_home("present");
+        let no_cli = |_: &str| false;
+        for p in SUPPORTED_PROVIDERS {
+            assert!(!provider_present(p, Some(&home), &no_cli), "{p} must be absent in an empty home");
+        }
+        // A CLI found by the harness scan counts, under the harness's own slug.
+        assert!(provider_present("claude", Some(&home), &|slug| slug == "claude-code"));
+        assert!(!provider_present("claude", Some(&home), &|slug| slug == "claude"));
+        assert!(provider_present("antigravity", Some(&home), &|slug| slug == "antigravity"));
+        // Sign-in files count without the CLI.
+        std::fs::create_dir_all(home.join(".grok")).unwrap();
+        std::fs::write(home.join(".grok").join("auth.json"), "{}").unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".codex").join("auth.json"), "{}").unwrap();
+        assert!(provider_present("grok", Some(&home), &no_cli));
+        assert!(provider_present("codex", Some(&home), &no_cli));
+        assert!(!provider_present("claude", Some(&home), &no_cli));
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude").join(".credentials.json"), "{}").unwrap();
+        assert!(provider_present("claude", Some(&home), &no_cli));
+        // Antigravity is found by its CLI alone.
+        assert!(!provider_present("antigravity", Some(&home), &no_cli));
+        assert!(!provider_present("nonsense", Some(&home), &|_| true));
+        std::fs::remove_dir_all(home).ok();
     }
 }
