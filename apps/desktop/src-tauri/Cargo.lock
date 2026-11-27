@@ -2030,6 +2030,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rusqlite",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2 0.11.2",
@@ -2037,6 +2038,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
