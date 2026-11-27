@@ -170,6 +170,7 @@ impl Hub {
             device_name: device_name.clone(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
             fallback_models: self.free_alternates(&model.provider_id, &model.model),
+            harness: None,
         };
 
         if on_hub {

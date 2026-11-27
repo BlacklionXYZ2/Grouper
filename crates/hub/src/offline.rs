@@ -428,6 +428,7 @@ impl Hub {
             device_name: "Hub".into(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
             fallback_models: self.free_alternates(&model.provider_id, &model.model),
+            harness: None,
         };
         let host = Arc::new(HubHost { hub: Arc::downgrade(self) });
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());
@@ -644,6 +645,7 @@ impl Hub {
             device_name: device.clone(),
             ask_timeout_secs: self.db.limits().ask_timeout_secs,
             fallback_models: self.free_alternates(&model.provider_id, &model.model),
+            harness: None,
         };
         if !self.send_to_conn(&t.device_id, conn_id, HubMessage::StartThread { spec: Box::new(spec) }).await {
             self.wait_for_device(thread_id, "the device went offline during the hand-over", true).await;

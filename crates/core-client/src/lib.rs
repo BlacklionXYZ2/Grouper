@@ -812,6 +812,7 @@ mod tests {
             device_name: "Laptop".into(),
             ask_timeout_secs: Some(core_protocol::DEFAULT_ASK_TIMEOUT_SECS),
             fallback_models: Vec::new(),
+            harness: None,
         };
         let host: Arc<dyn ThreadHost> = threads.clone();
         let (control, handle) = spawn_thread(spec, provider, file_tools(&ws), host, ws.clone());

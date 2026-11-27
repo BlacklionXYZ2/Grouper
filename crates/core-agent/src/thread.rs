@@ -307,6 +307,7 @@ mod tests {
             device_name: "Laptop".into(),
             ask_timeout_secs: ask,
             fallback_models: Vec::new(),
+            harness: None,
         }
     }
 

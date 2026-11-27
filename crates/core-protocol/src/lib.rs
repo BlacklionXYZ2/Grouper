@@ -293,6 +293,9 @@ pub enum NodeMessage {
     ApprovalRequest { approval_id: String, thread_id: String, tool: String, input: Value, reason: String },
     /// A thread needs something from the orchestrator (often another device's data).
     AskOrchestrator { thread_id: String, question: String },
+    /// A harness thread's CLI session id, so a later message resumes the same session.
+    /// Older hubs ignore an unknown frame; the device also keeps the id until the thread ends.
+    ThreadHarnessSession { thread_id: String, session_id: String },
     /// Offline hand-over: acknowledgement for one [`HubMessage::WorkspaceFile`].
     WorkspaceFileResult {
         thread_id: String,
@@ -558,6 +561,21 @@ pub fn mcp_call_timeout(args: &Value) -> std::time::Duration {
     std::time::Duration::from_secs(secs + MCP_GRACE_SECS)
 }
 
+/// A thread that runs as a CLI harness session instead of the API agent loop.
+///
+/// Older hubs omit [`ThreadSpec::harness`]. Devices treat a missing field as an API thread.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HarnessThread {
+    /// Canonical harness slug (`claude-code`, `codex`, …).
+    pub agent: String,
+    /// The harness's own model name, not the registry id.
+    pub model: String,
+    /// CLI session to resume. Absent on the first start; set when the hub restarts
+    /// the thread from the session the device reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
 /// Everything a device needs to run a subagent thread.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ThreadSpec {
@@ -583,6 +601,10 @@ pub struct ThreadSpec {
     /// or unavailable. Empty for paid models. Older hubs don't send it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_models: Vec<String>,
+    /// When set, the device runs this CLI harness instead of the API agent loop.
+    /// Missing on a spec from an older hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessThread>,
 }
 
 /// How long `ask_orchestrator` waits when the account hasn't changed it.
@@ -1679,6 +1701,27 @@ mod tests {
             "system": "", "brief": "b", "permissions": {}, "max_turns": 4, "ask_timeout_secs": 12
         });
         assert_eq!(serde_json::from_value::<ThreadSpec>(custom).unwrap().ask_timeout_secs, Some(12));
+        assert!(spec.harness.is_none(), "an older spec without harness stays an API thread");
+        let with_harness = serde_json::json!({
+            "thread_id": "t", "conversation_id": "c", "title": "T", "provider_id": "p", "model": "m",
+            "system": "", "brief": "b", "permissions": {}, "max_turns": 4,
+            "harness": {"agent": "claude-code", "model": "sonnet"}
+        });
+        let parsed = serde_json::from_value::<ThreadSpec>(with_harness).unwrap();
+        assert_eq!(
+            parsed.harness,
+            Some(HarnessThread { agent: "claude-code".into(), model: "sonnet".into(), session: None })
+        );
+        let wire = serde_json::to_string(&parsed.harness).unwrap();
+        assert!(!wire.contains("session"), "{wire}");
+        let resumed = HarnessThread {
+            agent: "codex".into(),
+            model: "gpt-5.2".into(),
+            session: Some("thr_1".into()),
+        };
+        let resumed_wire = serde_json::to_string(&resumed).unwrap();
+        assert!(resumed_wire.contains(r#""session":"thr_1""#), "{resumed_wire}");
+        assert_eq!(serde_json::from_str::<HarnessThread>(&resumed_wire).unwrap(), resumed);
 
         let old = r#"{"type":"approval_result","approval_id":"a","approved":false}"#;
         assert_eq!(
