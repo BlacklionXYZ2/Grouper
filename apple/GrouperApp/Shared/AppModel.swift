@@ -74,7 +74,8 @@ enum ApprovalAnswer: Equatable {
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var hubURL = ""
+    /// Resolved hub address: saved Settings override, else `HubAddress.defaultAddress`.
+    @Published private(set) var hubURL = HubAddress.defaultAddress
     @Published var adminToken = ""
     /// This Mac's device token, which only the local node uses. Set from the Keychain, an
     /// automatic registration (`POST /v1/devices`) or a verified paste; never the admin token.
@@ -97,11 +98,13 @@ final class AppModel: ObservableObject {
     @Published var errorMessage: String?
     /// `GET /v1/auth/status` for the hub: claimed, and whether Google sign-in is on. Nil while unknown.
     @Published private(set) var authStatus: AuthStatus?
-    /// The hub address (trimmed) `authStatus` was last checked for, so the sign-in screen can
-    /// tell "still checking" from "this hub has no Google sign-in".
+    /// The hub address `authStatus` was last checked for, so the sign-in screen can tell
+    /// "still checking" from a finished check.
     @Published private(set) var authStatusCheckedFor: String?
-    /// The last check couldn't reach a hub at that address (or it isn't a valid address).
+    /// The last check (or sign-in attempt) couldn't reach a hub at `hubURL`.
     @Published private(set) var hubUnreachable = false
+    /// The hub refused Google sign-in because a different Google account owns it.
+    @Published private(set) var refusedDifferentAccount = false
     /// A Google sign-in or link is running (Google's page may be open).
     @Published private(set) var googleBusy = false
     /// Settings > Account: the Google account that owns the hub, once `googleLinkLoaded`.
@@ -158,28 +161,34 @@ final class AppModel: ObservableObject {
     private static let appDevicePlatformKey = "grouper.appDevicePlatform"
     private var deviceHubURL = ""
     private var handlingRejectedToken = false
+    private var checkingAuthStatusFor: String?
     private let streamTask = TaskBox()
     private let accountStreamTask = TaskBox()
     private let settleTask = TaskBox()
+    private let hubChangeTask = TaskBox()
     private var approvalRefreshQueued = false
     private var pendingRoute: ApprovalRoute?
     private var initialLoadDone = false
 
     init() {
-        hubURL = UserDefaults.standard.string(forKey: "grouper.hubURL") ?? ""
+        hubURL = HubAddress.resolve(savedOverride: UserDefaults.standard.string(forKey: HubAddress.overrideKey))
         adminToken = KeychainStore.read(.admin) ?? ""
         #if os(macOS)
         deviceToken = KeychainStore.read(.device) ?? ""
         deviceId = KeychainStore.read(.deviceId) ?? DeviceRegistration.deviceId(ofToken: deviceToken)
-        // Tokens saved before the hub was recorded belong to the saved hub.
-        deviceHubURL = UserDefaults.standard.string(forKey: Self.deviceHubKey) ?? hubURL
+        // Tokens saved before the hub was recorded belong to the resolved hub.
+        let savedDeviceHub = UserDefaults.standard.string(forKey: Self.deviceHubKey)
+        deviceHubURL = savedDeviceHub.flatMap { try? HubAddress.validate($0) } ?? hubURL
         // The node serves with its own token even before (or without) an admin sign-in.
         updateNodeTarget()
         #endif
-        if !hubURL.isEmpty, !adminToken.isEmpty {
+        if !adminToken.isEmpty {
             Task { [weak self] in await self?.connect(save: false) }
         }
     }
+
+    /// True when the app is pointed at the built-in default hub address.
+    var isDefaultHubAddress: Bool { HubAddress.isDefault(hubURL) }
 
     var selectedConversation: ConversationInfo? {
         conversations.first { $0.id == selectedConversationId }
@@ -262,24 +271,23 @@ final class AppModel: ObservableObject {
 
     func connect(save: Bool = true) async {
         errorMessage = nil
-        let trimmedHub = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedAdmin = adminToken.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            let api = try HubClient(baseURL: trimmedHub, token: trimmedAdmin)
+            let resolvedHub = try HubAddress.validate(hubURL)
+            let api = try HubClient(baseURL: resolvedHub, token: trimmedAdmin)
             try await api.health()
             _ = try await api.providers() // proves this is the admin token, not merely a valid device token
-            hubURL = trimmedHub
+            hubURL = resolvedHub
             adminToken = trimmedAdmin
             client = api
             signedIn = true
             online = true
             if save {
-                UserDefaults.standard.set(trimmedHub, forKey: "grouper.hubURL")
                 try KeychainStore.save(trimmedAdmin, as: .admin)
             }
             #if os(macOS)
             // The Mac registers itself; the owner never pastes a device token.
-            await ensureThisMacRegistered(api: api, hubURL: trimmedHub)
+            await ensureThisMacRegistered(api: api, hubURL: resolvedHub)
             #endif
             await loadInitial()
         } catch {
@@ -289,35 +297,99 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // MARK: - Sign in with Google (docs/accounts-design.md)
+    // MARK: - Hub address (docs/local-first-design.md)
+
+    /// Validates and saves a Settings override for the hub address (clearing the override when it
+    /// matches the built-in default). When signed in, signs out of the previous hub and starts
+    /// signing back in at the new address. Returns a validation error message if rejected.
+    @discardableResult
+    func changeHubAddress(to raw: String) -> String? {
+        let validated: String
+        do {
+            validated = try HubAddress.validate(raw)
+        } catch {
+            return error.localizedDescription
+        }
+        applyHubAddress(validated)
+        return nil
+    }
+
+    /// Clears any saved hub address override and switches back to `HubAddress.defaultAddress`.
+    /// When signed in, signs out and starts signing back in at the default hub.
+    func resetHubAddressToDefault() {
+        applyHubAddress(HubAddress.defaultAddress)
+    }
+
+    private func applyHubAddress(_ validated: String) {
+        let changed = !DeviceRegistration.sameHub(hubURL, validated)
+        if validated == HubAddress.defaultAddress {
+            UserDefaults.standard.removeObject(forKey: HubAddress.overrideKey)
+        } else {
+            UserDefaults.standard.set(validated, forKey: HubAddress.overrideKey)
+        }
+        hubURL = validated
+        guard changed else { return }
+
+        let wasSignedIn = signedIn
+        if wasSignedIn {
+            signOut()
+        } else {
+            authStatus = nil
+            authStatusCheckedFor = nil
+            hubUnreachable = false
+            refusedDifferentAccount = false
+            errorMessage = nil
+        }
+
+        hubChangeTask.replace(with: Task { [weak self] in
+            guard let self else { return }
+            await self.checkAuthStatus(force: true)
+            guard !Task.isCancelled, self.hubURL == validated else { return }
+            if wasSignedIn, self.googleSignInAvailable, self.authStatus?.claimed != false {
+                // Let the sign-in screen finish presenting before opening the web auth sheet.
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled, self.hubURL == validated, !self.signedIn else { return }
+                await self.signInWithGoogle(setupCode: "")
+            }
+        })
+    }
+
+    // MARK: - Sign in with Google (docs/accounts-design.md, docs/local-first-design.md)
 
     /// Whether this app has a Google client ID and the hub at `hubURL` allows Google sign-in.
     var googleSignInAvailable: Bool { GoogleSignIn.oauth != nil && authStatus?.google == true }
 
-    /// Sign-in screen: `GET /v1/auth/status` for the address as typed. A hub that answers without
-    /// the route (one from before Google sign-in) leaves it nil, which means token sign-in. A
-    /// hub that can't be reached (or an invalid address) also leaves it nil and sets
-    /// `hubUnreachable`, so the screen says so instead of falling back to the token field.
-    func checkAuthStatus(for typed: String) async {
-        let hub = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Sign-in screen: `GET /v1/auth/status` for the current resolved hub address. A hub that
+    /// answers without the route leaves `authStatus` nil and `hubUnreachable` false. A hub that
+    /// can't be reached sets `hubUnreachable` so the screen offers retry and hub address editing.
+    func checkAuthStatus(force: Bool = false) async {
+        let hub = hubURL
+        if !force, authStatusCheckedFor == hub, !hubUnreachable { return }
+        if !force, checkingAuthStatusFor == hub { return }
+        checkingAuthStatusFor = hub
+        defer {
+            if checkingAuthStatusFor == hub { checkingAuthStatusFor = nil }
+        }
         var status: AuthStatus?
         var unreachable = false
-        if !hub.isEmpty {
-            do {
-                status = try await HubClient(baseURL: hub).authStatus()
-            } catch {
-                switch error as? HubClientError {
-                case .transport?, .invalidBaseURL?:
+        do {
+            let validated = try HubAddress.validate(hub)
+            status = try await HubClient(baseURL: validated).authStatus()
+        } catch {
+            switch error as? HubClientError {
+            case .transport?, .invalidBaseURL?:
+                unreachable = true
+            case .server(let code, _)? where code >= 500:
+                unreachable = true // e.g. the tunnel is up but the hub behind it isn't
+            default:
+                if error is HubAddressError {
                     unreachable = true
-                case .server(let code, _)? where code >= 500:
-                    unreachable = true // e.g. the tunnel is up but the hub behind it isn't
-                default:
-                    break // the hub answered, but not with an auth status: no Google sign-in there
                 }
+                // Otherwise the hub answered without an auth status: Google sign-in isn't on there.
             }
         }
-        // Typed on since: a newer check owns the result.
-        guard hub == hubURL.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+        // Hub address changed while checking: a newer check owns the result.
+        guard hub == hubURL else { return }
         authStatus = status
         hubUnreachable = unreachable
         authStatusCheckedFor = hub
@@ -333,33 +405,59 @@ final class AppModel: ObservableObject {
         googleBusy = true
         defer { googleBusy = false }
         errorMessage = nil
-        let trimmedHub = hubURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        refusedDifferentAccount = false
+        let currentHub = hubURL
         do {
-            let api = try HubClient(baseURL: trimmedHub)
+            let validated = try HubAddress.validate(currentHub)
+            let api = try HubClient(baseURL: validated)
             let nonce = try await api.googleNonce()
             let idToken = try await GoogleSignIn.idToken(oauth: oauth, nonce: nonce.nonce)
             let code = authStatus?.claimed == false ? (SetupCode.normalized(setupCode) ?? setupCode) : nil
             let result = try await api.signInWithGoogle(idToken: idToken, setupCode: code, client: .current,
                                                         deviceName: GoogleSignIn.deviceName, installId: AppInstall.id)
+            // Hub address changed while Google's page was open: ignore the stale result.
+            guard currentHub == hubURL else { return }
             // Kept now, so a connection hiccup below doesn't lose the new token.
-            UserDefaults.standard.set(trimmedHub, forKey: "grouper.hubURL")
             try KeychainStore.save(result.token, as: .admin)
             UserDefaults.standard.set(result.device.name, forKey: Self.appDeviceNameKey)
             UserDefaults.standard.set(result.device.platform, forKey: Self.appDevicePlatformKey)
-            hubURL = trimmedHub
             adminToken = result.token
         } catch {
-            errorMessage = GoogleSignIn.message(for: error)
+            guard currentHub == hubURL else { return }
+            if Self.isDifferentAccountRefusal(error, claimed: authStatus?.claimed) {
+                refusedDifferentAccount = true
+                errorMessage = nil
+                return
+            }
             switch error as? HubClientError {
+            case .transport?:
+                hubUnreachable = true
+                authStatusCheckedFor = currentHub
+                errorMessage = nil
+            case .server(let code, _)? where code >= 500:
+                hubUnreachable = true
+                authStatusCheckedFor = currentHub
+                errorMessage = nil
             case .conflict?, .notFound?:
+                errorMessage = GoogleSignIn.message(for: error)
                 // Claimed a moment ago, or Google sign-in was turned off: show what the hub allows now.
-                await checkAuthStatus(for: trimmedHub)
+                await checkAuthStatus(force: true)
             default:
-                break
+                errorMessage = GoogleSignIn.message(for: error)
             }
             return
         }
         await connect()
+    }
+
+    private static func isDifferentAccountRefusal(_ error: Error, claimed: Bool?) -> Bool {
+        guard case .forbidden(let message) = error as? HubClientError else { return false }
+        if message.localizedCaseInsensitiveContains("different google account")
+            || message.localizedCaseInsensitiveContains("another google account") {
+            return true
+        }
+        // On a hub that already has an owner, 403 from POST /v1/auth/google means another account.
+        return claimed == true && !message.localizedCaseInsensitiveContains("setup code")
     }
 
     /// Settings > Account: this app install's own device on the hub (the one its admin token
@@ -616,6 +714,7 @@ final class AppModel: ObservableObject {
         streamTask.cancel()
         accountStreamTask.cancel()
         settleTask.cancel()
+        hubChangeTask.cancel()
         ApprovalNotifications.remove(approvalIds: Array(approvalBook.pending.keys))
         approvalBook.reset()
         settledApproval = nil
@@ -630,6 +729,10 @@ final class AppModel: ObservableObject {
         online = false
         adminToken = ""
         errorMessage = nil
+        authStatus = nil
+        authStatusCheckedFor = nil
+        hubUnreachable = false
+        refusedDifferentAccount = false
         linkedGoogle = nil
         googleLinkLoaded = false
         accountMessage = nil
