@@ -249,7 +249,7 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         text.push_str("\n\n");
         text.push_str(&block);
     }
-    push_user_text(&mut history, text);
+    push_user_text(&mut history, text.clone());
 
     let finish = |hub: &Arc<Hub>, history: &[providers::Message]| {
         if let Err(e) = hub.db.save_history(conversation_id, from, &history[from..]) {
