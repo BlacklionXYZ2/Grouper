@@ -1,0 +1,453 @@
+/* Hub picking, move progress, and Remote access settings (views/devices.js, views/settings.js).
+   Tokens and base classes (.card, .btn, .badge, .banner, .switch, .list) live in app.css. */
+
+/* ---- Hub card (Devices) */
+
+.hub-card {
+  position: relative;
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  margin: 0 0 18px;
+  border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-left: 4px solid var(--accent);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 55%, var(--surface)) 0%, color-mix(in srgb, var(--purple-soft) 45%, var(--surface)) 55%, var(--surface) 100%);
+  box-shadow: var(--shadow-sm);
+}
+
+.hub-card.is-moving {
+  border-color: color-mix(in srgb, var(--purple) 45%, var(--border));
+  border-left-color: var(--purple-fill);
+}
+
+.hub-card.is-replaced {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  border-left-color: var(--warn);
+  background: color-mix(in srgb, var(--warn-soft) 35%, var(--surface));
+}
+
+.hub-card.is-error {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-left-color: var(--danger);
+}
+
+.hub-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.hub-card-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+  flex: 1 1 240px;
+}
+
+.hub-card-ico {
+  width: 38px;
+  height: 38px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: var(--purple-soft);
+  color: var(--purple);
+  border: 1px solid color-mix(in srgb, var(--purple) 28%, transparent);
+}
+
+.hub-card-ico .icon {
+  width: 20px;
+  height: 20px;
+}
+
+.hub-card-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.hub-card-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+
+.hub-badge {
+  background: var(--purple-soft);
+  color: var(--purple);
+  border: 1px solid color-mix(in srgb, var(--purple) 30%, transparent);
+}
+
+.hub-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ---- Hub move progress */
+
+.hub-move-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.hub-move-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 550;
+  background: var(--surface-2);
+  color: var(--text-2);
+  border: 1px solid var(--border);
+}
+
+.hub-move-step .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.hub-move-step.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.hub-move-step.is-done {
+  background: var(--ok-soft);
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+}
+
+.hub-progress-wrap {
+  display: grid;
+  gap: 6px;
+}
+
+.hub-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.hub-progress-pct {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Native <progress> following modern-web-guidance: never group -webkit- and -moz- selectors. */
+progress.hub-progress {
+  --progress-bar-radius: 1e5px;
+  appearance: none;
+  border: 0 solid;
+  overflow: clip;
+  width: 100%;
+  height: 8px;
+  border-radius: var(--progress-bar-radius);
+  background: var(--surface-3);
+  container-type: inline-size;
+  --progress-bar-indeterminate-size: 32%;
+  --progress-bar-indeterminate-animation-duration: 1.5s;
+}
+
+progress.hub-progress::-webkit-progress-bar {
+  background: transparent;
+}
+
+progress.hub-progress::-webkit-progress-value {
+  background: var(--accent-fill);
+  border-radius: var(--progress-bar-radius);
+  transition: inline-size 0.3s var(--ease);
+  animation: var(--progress-bar-animation, revert-rule);
+}
+
+progress.hub-progress::-moz-progress-bar {
+  background: var(--accent-fill);
+  border-radius: var(--progress-bar-radius);
+  transition: inline-size 0.3s var(--ease);
+  animation: var(--progress-bar-animation, revert-rule);
+}
+
+progress.hub-progress:indeterminate {
+  --progress-bar-animation: hub-progress-indeterminate var(--progress-bar-indeterminate-animation-duration) infinite linear;
+}
+
+progress.hub-progress:dir(rtl):indeterminate {
+  --progress-bar-animation: hub-progress-indeterminate var(--progress-bar-indeterminate-animation-duration) infinite linear reverse;
+}
+
+@keyframes hub-progress-indeterminate {
+  from,
+  to {
+    inline-size: var(--progress-bar-indeterminate-size);
+    margin-right: auto;
+  }
+  from {
+    translate: -100%;
+  }
+  to {
+    translate: 100cqi;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  progress.hub-progress {
+    --progress-bar-indeterminate-animation-duration: 10s;
+  }
+
+  progress.hub-progress::-webkit-progress-value {
+    transition: none;
+  }
+
+  progress.hub-progress::-moz-progress-bar {
+    transition: none;
+  }
+}
+
+/* ---- Change hub picker & confirmation sheets */
+
+.hub-pick-list {
+  overflow: hidden;
+}
+
+.hub-pick-row {
+  min-height: 52px;
+  align-items: center;
+}
+
+.hub-pick-row.is-current {
+  background: color-mix(in srgb, var(--accent-soft) 38%, var(--surface));
+}
+
+.hub-pick-row.is-current .hub-pick-check {
+  color: var(--accent);
+  flex: none;
+}
+
+.hub-pick-row.is-disabled {
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
+.hub-pick-warn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 12.5px;
+  color: var(--warn);
+}
+
+.hub-pick-warn .icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.hub-ineligible-title {
+  margin: 6px 0 6px;
+}
+
+.hub-ineligible-list {
+  background: var(--bg-tint);
+}
+
+.hub-ineligible-row {
+  color: var(--text-3);
+  min-height: 46px;
+  align-items: center;
+}
+
+.hub-ineligible-row .row-title {
+  color: var(--text-2);
+  font-weight: 550;
+}
+
+.hub-threads-choice {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: grid;
+  gap: 10px;
+}
+
+.hub-threads-choice legend {
+  padding: 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.hub-radio-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.hub-radio-opt input[type="radio"] {
+  margin-top: 3px;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  flex: none;
+}
+
+.hub-radio-title {
+  display: block;
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.hub-reauth-box {
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  display: grid;
+  gap: 10px;
+}
+
+.hub-reauth-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+/* ---- Remote access settings */
+
+.remote-status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.remote-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.remote-toggle-label {
+  font-weight: 600;
+  font-size: 14.5px;
+}
+
+.remote-form {
+  display: grid;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.remote-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.remote-install-cmd {
+  display: block;
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: var(--radius-xs);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  user-select: all;
+}
+
+/* ---- Accessibility overrides */
+
+@media (prefers-contrast: more) {
+  .hub-card {
+    border-color: var(--border-strong);
+    border-left-color: var(--accent);
+  }
+
+  .hub-card.is-moving {
+    border-left-color: var(--purple);
+  }
+
+  .hub-move-step {
+    border-color: var(--border-strong);
+  }
+
+  progress.hub-progress {
+    border: 1px solid var(--border-strong);
+  }
+}
+
+@media (forced-colors: active) {
+  .hub-card {
+    background: Canvas;
+    border: 1px solid CanvasText;
+    border-left: 4px solid Highlight;
+  }
+
+  .hub-badge,
+  .hub-move-step.is-active {
+    background: Canvas;
+    color: Highlight;
+    border-color: Highlight;
+  }
+
+  progress.hub-progress {
+    background: Canvas;
+    border: 1px solid CanvasText;
+  }
+
+  progress.hub-progress::-webkit-progress-value {
+    background: Highlight;
+  }
+
+  progress.hub-progress::-moz-progress-bar {
+    background: Highlight;
+  }
+}
+
+@media (max-width: 560px) {
+  .hub-card-actions {
+    width: 100%;
+  }
+
+  .hub-card-actions > .btn {
+    flex: 1 1 auto;
+  }
+}

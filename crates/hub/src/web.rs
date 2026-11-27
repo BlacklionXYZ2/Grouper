@@ -41,6 +41,7 @@ const ASSETS: &[(&str, &[u8])] = assets![
     "css/models.css",
     "css/brand.css",
     "css/link.css",
+    "css/hub.css",
     "icon.svg",
     "logo.svg",
     "logo-glyph.svg",

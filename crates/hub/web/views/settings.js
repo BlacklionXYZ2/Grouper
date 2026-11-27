@@ -3,7 +3,7 @@
 // out. Signing out (or revoking this browser's session) first removes this
 // browser's push subscription from the hub and unsubscribes, best effort.
 
-import { h, icon, setChildren } from '../lib/dom.js';
+import { h, icon, srOnly, setChildren } from '../lib/dom.js';
 import { get, put, del, enc, describe, isAbort } from '../lib/api.js';
 import { store, on, deviceName, isAdmin } from '../lib/store.js';
 import { stopLive, loadDevices } from '../lib/live.js';
@@ -77,6 +77,15 @@ export function renderSettings(container) {
 
   const hubSlot = h('div', { class: 'card card-pad' }, skeleton(2));
   const hub = h('section', { class: 'section', 'aria-labelledby': 's-hub' }, h('div', { class: 'section-head' }, h('h2', { id: 's-hub' }, 'Hub')), hubSlot);
+
+  const remoteSlot = h('div', { class: 'card card-pad stack' }, skeleton(3));
+  const remoteAccess = h(
+    'section',
+    { class: 'section', 'aria-labelledby': 's-remote' },
+    h('div', { class: 'section-head' }, h('h2', { id: 's-remote' }, 'Remote access')),
+    h('p', { class: 'section-note' }, 'Expose this hub away from home through a Cloudflare tunnel running on the hub machine.'),
+    remoteSlot,
+  );
 
   const providersSlot = h('div', null, skeleton(2));
   const addProviderBtn = admin
@@ -163,7 +172,7 @@ export function renderSettings(container) {
     notifyListSlot,
   );
 
-  body.append(account, googleAccount, sessions, providers, hub, appearance, notifications);
+  body.append(account, googleAccount, sessions, providers, hub, remoteAccess, appearance, notifications);
 
   // ---- Google account (hub owner)
   async function loadGoogleAccount() {
@@ -255,10 +264,16 @@ export function renderSettings(container) {
         { class: 'meta' },
         h('span', null, `Version ${hubInfo.hub_version}`),
         h('span', null, `Protocol ${hubInfo.protocol_version}`),
+        hubInfo.epoch ? h('span', null, `Epoch ${hubInfo.epoch}`) : null,
         h('span', null, health === 'healthy' ? 'Healthy' : `Health check: ${health}`),
         h('span', null, store.online ? 'Live events connected' : 'Live events offline'),
       ),
-      h('p', { class: 'hint mono' }, `Hub id ${hubInfo.hub_id}`),
+      h(
+        'p',
+        { class: 'hint mono' },
+        `Hub id ${hubInfo.hub_id}`,
+        hubInfo.hub_device_id ? ` · Device ${hubInfo.hub_device_id}` : '',
+      ),
     );
   }
 
@@ -276,6 +291,368 @@ export function renderSettings(container) {
     } catch (err) {
       if (isAbort(err)) return;
       setChildren(hubSlot, errorBanner(err, loadHub));
+    }
+  }
+
+  // ---- remote access (Cloudflare tunnel)
+  let tunnelData = null;
+  let tunnelTokenSet = false;
+  let tunnelBusy = false;
+  let tunnelPollTimer = null;
+  let remoteMounted = false;
+
+  const remoteStatusSlot = h('div', { class: 'stack' });
+  const remoteToggleInput = h('input', {
+    id: 'remote-enabled',
+    name: 'remote_enabled',
+    type: 'checkbox',
+    switch: true,
+    'data-write': true,
+    'aria-describedby': 'remote-toggle-help',
+  });
+  const remoteAddrInput = h('input', {
+    id: 'remote-address',
+    name: 'public_address',
+    class: 'input mono',
+    type: 'url',
+    spellcheck: 'false',
+    autocapitalize: 'off',
+    placeholder: 'https://grouper.clockmillbarn.uk',
+    'aria-describedby': 'remote-address-help',
+  });
+  const remoteAddrSaveBtn = h('button', { class: 'btn btn-sm', type: 'submit', 'data-write': true }, 'Save address');
+  const remoteAddrResetBtn = h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true }, 'Reset to default');
+  const remoteAddrErr = h('p', { class: 'hint', role: 'alert', hidden: true });
+
+  const tunnelTokenInput = h('input', {
+    id: 'tunnel-token',
+    name: 'token',
+    class: 'input mono',
+    type: 'password',
+    autocomplete: 'new-password',
+    spellcheck: 'false',
+    autocapitalize: 'off',
+    'aria-describedby': 'tunnel-token-help',
+  });
+  const tunnelTokenBadge = h('span', { class: 'badge muted' }, 'No token set');
+  const tunnelTokenSaveBtn = h('button', { class: 'btn btn-sm btn-primary', type: 'submit', 'data-write': true }, 'Save token');
+  const tunnelTokenDeleteBtn = h('button', { class: 'btn btn-sm', type: 'button', 'data-write': true, hidden: true }, 'Remove token');
+  const tunnelTokenErr = h('p', { class: 'hint', role: 'alert', hidden: true });
+
+  const tokenRevealWord = h('span', null, 'Show');
+  const tokenRevealBtn = h(
+    'button',
+    {
+      class: 'btn btn-ghost reveal-btn',
+      type: 'button',
+      'aria-controls': 'tunnel-token',
+      'aria-pressed': 'false',
+      onclick: () => {
+        const show = tunnelTokenInput.type === 'password';
+        tunnelTokenInput.type = show ? 'text' : 'password';
+        tokenRevealWord.textContent = show ? 'Hide' : 'Show';
+        tokenRevealBtn.setAttribute('aria-pressed', show ? 'true' : 'false');
+      },
+    },
+    tokenRevealWord,
+    srOnly(' tunnel token'),
+  );
+
+  function clearTunnelPoll() {
+    if (tunnelPollTimer) {
+      clearTimeout(tunnelPollTimer);
+      tunnelPollTimer = null;
+    }
+  }
+
+  function scheduleTunnelPoll() {
+    clearTunnelPoll();
+    if (signal.aborted || !tunnelData || tunnelData.status !== 'starting') return;
+    tunnelPollTimer = setTimeout(refreshTunnelStatus, 2000);
+  }
+
+  function tunnelStatusBadge(status) {
+    switch (status) {
+      case 'connected':
+        return h('span', { class: 'badge ok' }, icon('check'), 'Connected');
+      case 'starting':
+        return h('span', { class: 'badge accent' }, icon('clock'), 'Starting…');
+      case 'not_found':
+        return h('span', { class: 'badge warn' }, icon('warning'), 'cloudflared not found');
+      case 'failed':
+        return h('span', { class: 'badge danger' }, icon('warning'), 'Failed');
+      default:
+        return h('span', { class: 'badge muted' }, icon('stop'), 'Stopped');
+    }
+  }
+
+  function renderTunnelStatus() {
+    if (!tunnelData) return;
+    remoteToggleInput.checked = Boolean(tunnelData.enabled);
+    remoteToggleInput.disabled = tunnelBusy;
+
+    tunnelTokenSet = Boolean(tunnelData.token_set);
+    tunnelTokenBadge.className = tunnelTokenSet ? 'badge ok' : 'badge muted';
+    tunnelTokenBadge.textContent = tunnelTokenSet ? 'Token stored' : 'No token set';
+    tunnelTokenInput.placeholder = tunnelTokenSet ? 'Stored — enter a new token to replace it' : 'Paste Cloudflare tunnel token';
+    tunnelTokenDeleteBtn.hidden = !tunnelTokenSet;
+    remoteAddrResetBtn.hidden = !tunnelData.custom_address;
+
+    setChildren(
+      remoteStatusSlot,
+      h(
+        'div',
+        { class: 'remote-status-head' },
+        h(
+          'div',
+          { class: 'row-title row-badges' },
+          'Tunnel status',
+          tunnelStatusBadge(tunnelData.status),
+          tunnelData.stepped_down ? h('span', { class: 'badge warn' }, 'Stepped down') : null,
+        ),
+        h(
+          'button',
+          {
+            class: 'btn btn-sm',
+            type: 'button',
+            onclick: () => refreshTunnelStatus(),
+          },
+          icon('refresh'),
+          'Refresh',
+        ),
+      ),
+      h(
+        'div',
+        { class: 'meta' },
+        tunnelData.cloudflared_path ? h('span', { class: 'mono' }, tunnelData.cloudflared_path) : null,
+        tunnelData.restart_count > 0 ? h('span', null, `Restarts: ${tunnelData.restart_count}`) : null,
+      ),
+      tunnelData.stepped_down
+        ? h(
+            'div',
+            { class: 'banner warn', role: 'status' },
+            icon('warning'),
+            h('div', { class: 'grow' }, 'Another hub with a newer epoch is serving this account, so this machine keeps its tunnel stopped.'),
+          )
+        : null,
+      tunnelData.enabled && !tunnelTokenSet
+        ? h('div', { class: 'banner info' }, icon('shield'), h('div', { class: 'grow' }, 'Remote access is turned on. Save a Cloudflare tunnel token below to start the tunnel.'))
+        : null,
+      tunnelData.status === 'not_found'
+        ? h(
+            'div',
+            { class: 'callout warn' },
+            h('div', null, h('strong', null, 'cloudflared is not installed on this hub machine. '), 'Install it and ensure it is on PATH:'),
+            h('code', { class: 'remote-install-cmd' }, 'winget install Cloudflare.cloudflared   # Windows  |  brew install cloudflared   # macOS'),
+          )
+        : null,
+      tunnelData.last_error && tunnelData.status !== 'not_found'
+        ? h('div', { class: 'banner error', role: 'alert' }, icon('warning'), h('div', { class: 'grow' }, tunnelData.last_error))
+        : null,
+    );
+  }
+
+  function mountRemoteControls() {
+    if (remoteMounted) return;
+    remoteMounted = true;
+
+    remoteToggleInput.addEventListener('change', async () => {
+      if (tunnelBusy) {
+        remoteToggleInput.checked = Boolean(tunnelData?.enabled);
+        return;
+      }
+      const next = remoteToggleInput.checked;
+      tunnelBusy = true;
+      remoteToggleInput.disabled = true;
+      try {
+        tunnelData = await put('/v1/tunnel', { enabled: next });
+        if (signal.aborted) return;
+        toast(next ? 'Remote access turned on.' : 'Remote access turned off.');
+        renderTunnelStatus();
+        scheduleTunnelPoll();
+      } catch (err) {
+        remoteToggleInput.checked = Boolean(tunnelData?.enabled);
+        toastError(err);
+      } finally {
+        tunnelBusy = false;
+        remoteToggleInput.disabled = false;
+      }
+    });
+
+    const addressForm = h(
+      'form',
+      {
+        class: 'remote-form',
+        'aria-labelledby': 'remote-address-label',
+        onsubmit: async (e) => {
+          e.preventDefault();
+          remoteAddrErr.hidden = true;
+          const val = remoteAddrInput.value.trim();
+          remoteAddrSaveBtn.disabled = true;
+          remoteAddrResetBtn.disabled = true;
+          try {
+            tunnelData = await put('/v1/tunnel', { public_address: val || null });
+            if (signal.aborted) return;
+            remoteAddrInput.value = tunnelData.public_address || '';
+            toast(val ? 'Public hub address updated.' : 'Public hub address reset to default.');
+            renderTunnelStatus();
+          } catch (err) {
+            remoteAddrErr.textContent = describe(err);
+            remoteAddrErr.hidden = false;
+          } finally {
+            remoteAddrSaveBtn.disabled = false;
+            remoteAddrResetBtn.disabled = false;
+          }
+        },
+      },
+      h('label', { for: 'remote-address' }, h('span', { id: 'remote-address-label', class: 'field-label' }, 'Public hub address')),
+      h('p', { class: 'hint', id: 'remote-address-help' }, 'Default is https://grouper.clockmillbarn.uk. Used by apps and step-down checks.'),
+      remoteAddrInput,
+      remoteAddrErr,
+      h('div', { class: 'remote-inline-actions' }, remoteAddrSaveBtn, remoteAddrResetBtn),
+    );
+
+    remoteAddrResetBtn.addEventListener('click', async () => {
+      remoteAddrErr.hidden = true;
+      remoteAddrSaveBtn.disabled = true;
+      remoteAddrResetBtn.disabled = true;
+      try {
+        tunnelData = await put('/v1/tunnel', { public_address: null });
+        if (signal.aborted) return;
+        remoteAddrInput.value = tunnelData.public_address || '';
+        toast('Public hub address reset to default.');
+        renderTunnelStatus();
+      } catch (err) {
+        toastError(err);
+      } finally {
+        remoteAddrSaveBtn.disabled = false;
+        remoteAddrResetBtn.disabled = false;
+      }
+    });
+
+    const tokenForm = h(
+      'form',
+      {
+        class: 'remote-form',
+        'aria-labelledby': 'tunnel-token-label',
+        onsubmit: async (e) => {
+          e.preventDefault();
+          tunnelTokenErr.hidden = true;
+          const token = tunnelTokenInput.value.trim();
+          if (!token) {
+            tunnelTokenErr.textContent = 'Paste a Cloudflare tunnel token first.';
+            tunnelTokenErr.hidden = false;
+            tunnelTokenInput.focus();
+            return;
+          }
+          tunnelTokenSaveBtn.disabled = true;
+          tunnelTokenDeleteBtn.disabled = true;
+          try {
+            await put('/v1/tunnel/token', { token });
+            tunnelTokenInput.value = '';
+            tunnelTokenInput.type = 'password';
+            tokenRevealWord.textContent = 'Show';
+            tokenRevealBtn.setAttribute('aria-pressed', 'false');
+            toast('Tunnel token saved.');
+            await refreshTunnelStatus();
+          } catch (err) {
+            tunnelTokenErr.textContent = describe(err);
+            tunnelTokenErr.hidden = false;
+          } finally {
+            tunnelTokenSaveBtn.disabled = false;
+            tunnelTokenDeleteBtn.disabled = false;
+          }
+        },
+      },
+      h('div', { class: 'row-badges' }, h('label', { for: 'tunnel-token' }, h('span', { id: 'tunnel-token-label', class: 'field-label' }, 'Cloudflare tunnel token')), tunnelTokenBadge),
+      h('p', { class: 'hint', id: 'tunnel-token-help' }, 'Write-only: sealed under the hub master key and passed via TUNNEL_TOKEN, never displayed again.'),
+      h('div', { class: 'reveal-field' }, tunnelTokenInput, tokenRevealBtn),
+      tunnelTokenErr,
+      h('div', { class: 'remote-inline-actions' }, tunnelTokenSaveBtn, tunnelTokenDeleteBtn),
+    );
+
+    tunnelTokenDeleteBtn.addEventListener('click', async () => {
+      const ok = await confirmAction({
+        title: 'Remove tunnel token?',
+        body: 'This clears the stored Cloudflare tunnel token and stops remote access until you paste a new token.',
+        confirmLabel: 'Remove token',
+        danger: true,
+      });
+      if (!ok) return;
+      tunnelTokenDeleteBtn.disabled = true;
+      try {
+        await del('/v1/tunnel/token');
+        toast('Tunnel token removed.');
+        await refreshTunnelStatus();
+      } catch (err) {
+        toastError(err);
+      } finally {
+        tunnelTokenDeleteBtn.disabled = false;
+      }
+    });
+
+    setChildren(
+      remoteSlot,
+      remoteStatusSlot,
+      h(
+        'div',
+        { class: 'remote-form' },
+        h(
+          'label',
+          { class: 'remote-toggle-row switch', for: 'remote-enabled' },
+          h('span', { class: 'remote-toggle-label' }, 'Enable remote access'),
+          remoteToggleInput,
+        ),
+        h('p', { class: 'hint', id: 'remote-toggle-help' }, 'Runs cloudflared on whichever device is currently the hub.'),
+      ),
+      addressForm,
+      tokenForm,
+    );
+  }
+
+  async function refreshTunnelStatus() {
+    try {
+      const [status, tok] = await Promise.all([
+        get('/v1/tunnel', { signal }),
+        get('/v1/tunnel/token', { signal }).catch(() => null),
+      ]);
+      if (signal.aborted) return;
+      tunnelData = status;
+      if (tok && typeof tok.token_set === 'boolean') {
+        tunnelData.token_set = tok.token_set;
+      }
+      renderTunnelStatus();
+      scheduleTunnelPoll();
+    } catch (err) {
+      if (isAbort(err)) return;
+      if (!tunnelData) setChildren(remoteSlot, errorBanner(err, loadRemoteAccess));
+    }
+  }
+
+  async function loadRemoteAccess() {
+    if (!admin) {
+      setChildren(remoteSlot, h('p', { class: 'hint' }, 'Remote access settings need an admin token.'));
+      return;
+    }
+    if (!remoteMounted) setChildren(remoteSlot, skeleton(3));
+    try {
+      const [status, tok] = await Promise.all([
+        get('/v1/tunnel', { signal }),
+        get('/v1/tunnel/token', { signal }).catch(() => null),
+      ]);
+      if (signal.aborted) return;
+      tunnelData = status;
+      if (tok && typeof tok.token_set === 'boolean') {
+        tunnelData.token_set = tok.token_set;
+      }
+      mountRemoteControls();
+      remoteAddrInput.value = tunnelData.public_address || '';
+      renderTunnelStatus();
+      scheduleTunnelPoll();
+    } catch (err) {
+      if (isAbort(err)) return;
+      remoteMounted = false;
+      setChildren(remoteSlot, errorBanner(err, loadRemoteAccess));
     }
   }
 
@@ -845,12 +1222,14 @@ export function renderSettings(container) {
 
   loadGoogleAccount();
   loadHub();
+  loadRemoteAccess();
   loadSessions();
   loadProviders();
   renderNotify();
   loadNotifyList();
 
   return () => {
+    clearTunnelPoll();
     aborter.abort();
     unguard();
     offs.forEach((off) => off());
