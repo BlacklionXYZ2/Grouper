@@ -346,6 +346,11 @@ enum ModelsCmd {
     },
     /// Run the built-in deterministic probe suite against a registered model and draft use cases.
     Probe { id: String },
+    /// Sync chat-capable models from a provider (or all API providers when omitted).
+    Sync {
+        /// Provider id to sync. Omit to sync all configured API providers.
+        provider: Option<String>,
+    },
     Remove { id: String },
     /// How threads went per model and device, by task type.
     Stats,
@@ -1262,6 +1267,9 @@ async fn run_authed_cmd(api: Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()
                 println!("accept with `grouper models accept {n}` (or `grouper models reject {n}`)");
             }
         }
+        Cmd::Models(ModelsCmd::Sync { provider }) => {
+            sync_models_cmd(&api, provider.as_deref()).await?;
+        }
         Cmd::Models(ModelsCmd::Add {
             id,
             provider,
@@ -1411,6 +1419,70 @@ fn print_probe_report(report: &core_client::core_protocol::ProbeReport) {
     if let Some(why) = &report.stopped_reason {
         eprintln!("probe stopped early: {why}");
     }
+}
+
+fn print_sync_result(result: &::hub::sync::SyncResult) {
+    if let Some(err) = &result.error {
+        eprintln!("{}: sync failed: {err}", result.provider_id);
+        return;
+    }
+    println!(
+        "{}: +{} added, {} updated, {} hidden, {} filtered",
+        result.provider_id, result.added, result.updated, result.hidden, result.filtered
+    );
+    if let Some(defaults) = &result.defaults {
+        let mut parts = Vec::new();
+        if let Some(orch) = &defaults.orchestrator {
+            parts.push(format!("orchestrator={orch}"));
+        }
+        if let Some(std) = &defaults.standard {
+            parts.push(format!("standard={std}"));
+        }
+        if !parts.is_empty() {
+            println!("  defaults: {}", parts.join(", "));
+        }
+    }
+}
+
+async fn sync_models_cmd(api: &Api, provider: Option<&str>) -> Result<()> {
+    let targets: Vec<String> = match provider.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => vec![id.to_string()],
+        None => api
+            .get::<Vec<ProviderInfo>>("/v1/providers")
+            .await?
+            .into_iter()
+            .filter(|p| {
+                matches!(p.kind.as_str(), "openai" | "anthropic")
+                    && p.via_device.is_none()
+                    && (p.has_key || p.base_url.as_deref().is_some_and(::hub::registry::is_local_url))
+            })
+            .map(|p| p.id)
+            .collect(),
+    };
+    if targets.is_empty() {
+        println!("no API providers to sync");
+        return Ok(());
+    }
+    let mut failed = 0usize;
+    for id in targets {
+        match api.post(&format!("/v1/providers/{}/sync", url_segment(&id)), &json!({})).await {
+            Ok(body) => {
+                let result: ::hub::sync::SyncResult = serde_json::from_value(body)?;
+                if result.error.is_some() {
+                    failed += 1;
+                }
+                print_sync_result(&result);
+            }
+            Err(err) => {
+                failed += 1;
+                eprintln!("{id}: sync failed: {err:#}");
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} provider sync(s) failed");
+    }
+    Ok(())
 }
 
 async fn registry_cmd(api: &Api, cmd: ModelsCmd) -> Result<()> {
@@ -1652,5 +1724,81 @@ mod tests {
 
         let take = Cli::try_parse_from(["grouper", "hub", "take"]).expect("hub take");
         assert!(matches!(take.cmd, Cmd::Hub(hub::HubCmd::Take)));
+    }
+
+    #[test]
+    fn models_sync_subcommand_parses() {
+        let all = Cli::try_parse_from(["grouper", "models", "sync"]).expect("models sync");
+        assert!(matches!(all.cmd, Cmd::Models(ModelsCmd::Sync { provider: None })));
+
+        let one = Cli::try_parse_from(["grouper", "models", "sync", "openai"]).expect("models sync openai");
+        assert!(matches!(
+            one.cmd,
+            Cmd::Models(ModelsCmd::Sync { provider: Some(ref p) }) if p == "openai"
+        ));
+    }
+
+    #[tokio::test]
+    async fn models_sync_command_calls_hub_sync_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Fake upstream OpenAI-compatible listing server (no extra dev-dependencies needed).
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_body = json!({
+            "data": [
+                {"id": "gpt-5.4"},
+                {"id": "gpt-5-mini"},
+                {"id": "text-embedding-3-small"}
+            ]
+        })
+        .to_string();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = upstream_listener.accept().await {
+                let body = upstream_body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("grouper-cli-sync-{}", ::hub::db::random_hex(4)));
+        let handle = ::hub::host::start(&dir, &[std::net::SocketAddr::from(([127, 0, 0, 1], 0))]).await.unwrap();
+        let hub_addr = handle.binds()[0];
+        let h = handle.hub().unwrap();
+        let (_, admin_token) = h.db.add_device("Admin", "windows", true).unwrap();
+        h.db.upsert_provider(&ProviderConfig {
+            id: "openai".into(),
+            kind: "openai".into(),
+            base_url: Some(format!("http://{upstream_addr}/v1")),
+            api_key: Some("test-key".into()),
+            options: json!({"preset": "openai"}),
+        })
+        .unwrap();
+
+        let api = Api {
+            base: format!("http://{hub_addr}"),
+            token: admin_token,
+            http: reqwest::Client::new(),
+        };
+        sync_models_cmd(&api, Some("openai")).await.unwrap();
+        let models = h.db.visible_models();
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|m| m.id == "gpt-5.4" && m.roles.contains(&"orchestrator".to_string())));
+        assert!(models.iter().any(|m| m.id == "gpt-5-mini" && m.roles.contains(&"standard".to_string())));
+
+        // Syncing all providers (None) also succeeds cleanly.
+        sync_models_cmd(&api, None).await.unwrap();
+
+        handle.stop().await;
+        std::fs::remove_dir_all(dir).ok();
     }
 }

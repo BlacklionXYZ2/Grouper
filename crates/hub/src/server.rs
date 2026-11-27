@@ -595,6 +595,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/tools", get(list_tools))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}", put(put_provider))
+        .route("/v1/providers/{id}/sync", post(sync_provider_models))
+        .route("/v1/providers/{id}/sync-models", post(sync_provider_models))
         .route("/v1/models", get(list_models))
         .route("/v1/models/{id}", put(put_model).delete(delete_model))
         .route("/v1/usage", get(list_usage))
@@ -847,7 +849,25 @@ async fn put_provider(
         return err(StatusCode::BAD_REQUEST, e);
     }
     hub.broadcast_providers().await;
+    if let Ok(Some(saved)) = hub.db.provider(&p.id)
+        && crate::sync::is_syncable(&saved)
+    {
+        crate::sync::spawn_provider_sync(hub.clone(), p.id.clone());
+    }
     Json(json!({"id": p.id, "saved": true})).into_response()
+}
+
+async fn sync_provider_models(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    admin!(hub, headers);
+    match crate::sync::sync_provider(&hub, &id).await {
+        Ok(result) => Json(result).into_response(),
+        Err(crate::sync::SyncError::NotFound(msg)) => err(StatusCode::NOT_FOUND, msg),
+        Err(crate::sync::SyncError::NotSyncable(msg)) => err(StatusCode::BAD_REQUEST, msg),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -2771,7 +2791,7 @@ mod tests {
         let r = http
             .put(format!("{base}/v1/providers/openai"))
             .bearer_auth(&admin_token)
-            .json(&json!({"id": "openai", "kind": "openai", "base_url": "https://api.openai.com/v1", "api_key": "k"}))
+            .json(&json!({"id": "openai", "kind": "openai", "base_url": "https://api.openai.com/v1"}))
             .send()
             .await
             .unwrap();
