@@ -480,7 +480,8 @@ impl Db {
                 return Ok((cur_id, cur_epoch));
             };
             let legacy_node = legacy_node_install_id(inst);
-            let cur_row: Option<(Option<String>, Option<String>, i64, Option<i64>, i64)> = tx
+            type HubDeviceRow = (Option<String>, Option<String>, i64, Option<i64>, i64);
+            let cur_row: Option<HubDeviceRow> = tx
                 .query_row(
                     "SELECT install_id, install_kind, admin, last_seen, revoked FROM devices WHERE id = ?1",
                     [&cur_id],
