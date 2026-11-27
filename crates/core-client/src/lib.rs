@@ -131,7 +131,7 @@ fn has_cloudflared() -> bool {
         paths
     };
     #[cfg(not(windows))]
-    let extra = vec![
+    let extra = [
         PathBuf::from("/opt/homebrew/bin/cloudflared"),
         PathBuf::from("/usr/local/bin/cloudflared"),
         PathBuf::from("/usr/bin/cloudflared"),
