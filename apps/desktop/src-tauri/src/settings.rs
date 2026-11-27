@@ -157,14 +157,12 @@ impl DesktopSettings {
         Ok(Some(open_token(sealed)?))
     }
 
-    #[allow(dead_code)]
     pub fn set_node_token(&mut self, hub_url: &str, token: &str) -> Result<()> {
         self.node_hub_url = Some(normalize_url_key(hub_url));
         self.node_token = Some(seal_token(token)?);
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn node_token_for(&self, hub_url: &str) -> Result<Option<String>> {
         let Some(saved_hub) = &self.node_hub_url else {
             return Ok(None);

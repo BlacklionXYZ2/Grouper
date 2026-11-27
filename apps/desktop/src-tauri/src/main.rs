@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod node;
 mod oauth;
 mod settings;
 
@@ -9,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use hub::host::HubHandle;
+use node::NodeHandle;
 use serde::Serialize;
 use settings::{DEFAULT_REMOTE_HUB_URL, DesktopSettings, HostMode, LOCAL_HUB_URL, machine_device_name};
 use tauri::image::Image;
@@ -28,17 +30,24 @@ struct DesktopState {
     data_dir: PathBuf,
     settings: Mutex<DesktopSettings>,
     hub: Mutex<Option<Arc<HubHandle>>>,
+    node: Mutex<Option<NodeHandle>>,
     /// One-time `(origin, admin_token)` traded into a session cookie via `POST /v1/session` once
     /// the WebView finishes loading that exact origin.
     pending_session: Mutex<Option<(String, String)>>,
 }
 
 impl DesktopState {
-    fn new(data_dir: PathBuf, settings: DesktopSettings, hub: Option<Arc<HubHandle>>) -> Self {
+    fn new(
+        data_dir: PathBuf,
+        settings: DesktopSettings,
+        hub: Option<Arc<HubHandle>>,
+        node: Option<NodeHandle>,
+    ) -> Self {
         Self {
             data_dir,
             settings: Mutex::new(settings),
             hub: Mutex::new(hub),
+            node: Mutex::new(node),
             pending_session: Mutex::new(None),
         }
     }
@@ -54,6 +63,15 @@ impl DesktopState {
 
     fn take_hub(&self) -> Option<Arc<HubHandle>> {
         self.hub.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn replace_node(&self, next: Option<NodeHandle>) -> Option<NodeHandle> {
+        let mut guard = self.node.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *guard, next)
+    }
+
+    fn take_node(&self) -> Option<NodeHandle> {
+        self.node.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn arm_session_handoff(&self, hub_url: &str, token: String) {
@@ -120,7 +138,11 @@ async fn apply_choice(
     updated.set_choice(mode, remote_hub_url)?;
     let target_url = updated.active_hub_url().expect("mode was just set");
 
-    // Stop any running local hub first if switching to another computer OR if we need port 47600
+    if let Some(prev_node) = state.take_node() {
+        prev_node.stop().await;
+    }
+
+    // Stop any running local hub if switching to another computer OR if we need port 47600
     // temporarily for the Desktop OAuth loopback redirect (`http://localhost:47600/oauth/google/return`).
     if (mode == HostMode::AnotherComputer || sign_in_with_google)
         && let Some(prev) = state.take_hub()
@@ -128,9 +150,9 @@ async fn apply_choice(
         prev.stop().await;
     }
 
-    match mode {
+    let next_node = match mode {
         HostMode::ThisComputer => {
-            if sign_in_with_google {
+            let hub = if sign_in_with_google {
                 let oauth_cfg = oauth::resolve_oauth_config(&updated).context(
                     "GROUPER_GOOGLE_DESKTOP_CLIENT_ID is not set yet (see TODO in src/oauth.rs)",
                 )?;
@@ -144,12 +166,16 @@ async fn apply_choice(
                     .context("claiming local hub with Google account")?;
                 updated.set_admin_token(&target_url, &issued.token)?;
                 state.arm_session_handoff(&target_url, issued.token);
+                hub
             } else {
-                let _ = ensure_embedded_hub(state).await?;
+                let hub = ensure_embedded_hub(state).await?;
                 if let Ok(Some(saved_tok)) = updated.admin_token_for(&target_url) {
                     state.arm_session_handoff(&target_url, saved_tok);
                 }
-            }
+                hub
+            };
+            let node_token = node::ensure_local_node_token(&hub, &target_url, &mut updated)?;
+            Some(NodeHandle::start(&target_url, node_token, &state.data_dir))
         }
         HostMode::AnotherComputer => {
             if sign_in_with_google {
@@ -164,7 +190,19 @@ async fn apply_choice(
             } else if let Ok(Some(saved_tok)) = updated.admin_token_for(&target_url) {
                 state.arm_session_handoff(&target_url, saved_tok);
             }
+            match node::resolve_remote_node_token(&target_url, &mut updated).await {
+                Ok(Some(node_token)) => Some(NodeHandle::start(&target_url, node_token, &state.data_dir)),
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::warn!("could not start remote desktop node yet: {err:#}");
+                    None
+                }
+            }
         }
+    };
+
+    if let Some(prev) = state.replace_node(next_node) {
+        prev.stop().await;
     }
 
     updated.save(&state.data_dir)?;
@@ -222,22 +260,18 @@ fn open_target_in_main_window(app: &AppHandle, target: WebviewUrl) -> tauri::Res
     // Recreate when switching between local Tauri setup (`WebviewUrl::App`) and external hub URLs
     // so Tauri's `local: true` capability boundary applies cleanly only to `index.html`.
     if let Some(existing) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        match &target {
-            WebviewUrl::External(url) => {
-                let current_is_app = existing
-                    .url()
-                    .ok()
-                    .is_some_and(|u| u.scheme() == "tauri" || u.host_str() == Some("tauri.localhost"));
-                if !current_is_app {
-                    let _ = existing.navigate(url.clone());
-                    let _ = existing.unminimize();
-                    existing.show()?;
-                    let _ = existing.set_focus();
-                    return Ok(());
-                }
+        if let WebviewUrl::External(url) = &target {
+            let current_is_app = existing
+                .url()
+                .ok()
+                .is_some_and(|u| u.scheme() == "tauri" || u.host_str() == Some("tauri.localhost"));
+            if !current_is_app {
+                let _ = existing.navigate(url.clone());
+                let _ = existing.unminimize();
+                existing.show()?;
+                let _ = existing.set_focus();
+                return Ok(());
             }
-            WebviewUrl::App(_) => {}
-            _ => {}
         }
         let _ = existing.destroy();
     }
@@ -319,10 +353,13 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
             TRAY_QUIT_ID => {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Some(state) = handle.try_state::<DesktopState>()
-                        && let Some(hub) = state.take_hub()
-                    {
-                        hub.stop().await;
+                    if let Some(state) = handle.try_state::<DesktopState>() {
+                        if let Some(node) = state.take_node() {
+                            node.stop().await;
+                        }
+                        if let Some(hub) = state.take_hub() {
+                            hub.stop().await;
+                        }
                     }
                     handle.exit(0);
                 });
@@ -356,25 +393,47 @@ fn main() {
             let data_dir = app_data_dir()?;
             std::fs::create_dir_all(&data_dir)
                 .with_context(|| format!("creating {}", data_dir.display()))?;
-            let settings = DesktopSettings::load(&data_dir)?;
+            let mut settings = DesktopSettings::load(&data_dir)?;
 
-            let initial_hub = if settings.mode == Some(HostMode::ThisComputer) {
-                let hub_dir = hub_data_dir(&data_dir);
-                let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_HUB_PORT));
-                let handle = tauri::async_runtime::block_on(hub::host::start(&hub_dir, &[bind]))
-                    .with_context(|| format!("starting embedded hub on {bind}"))?;
-                tracing::info!(
-                    client_version = core_client::CLIENT_VERSION,
-                    data_dir = %hub_dir.display(),
-                    "embedded local hub started"
-                );
-                Some(Arc::new(handle))
-            } else {
-                None
+            let (initial_hub, initial_node) = match settings.mode {
+                Some(HostMode::ThisComputer) => {
+                    let hub_dir = hub_data_dir(&data_dir);
+                    let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_HUB_PORT));
+                    let handle = tauri::async_runtime::block_on(hub::host::start(&hub_dir, &[bind]))
+                        .with_context(|| format!("starting embedded hub on {bind}"))?;
+                    tracing::info!(
+                        client_version = core_client::CLIENT_VERSION,
+                        data_dir = %hub_dir.display(),
+                        "embedded local hub started"
+                    );
+                    let node_tok = node::ensure_local_node_token(&handle, LOCAL_HUB_URL, &mut settings)?;
+                    settings.save(&data_dir)?;
+                    let node_handle = NodeHandle::start(LOCAL_HUB_URL, node_tok, &data_dir);
+                    (Some(Arc::new(handle)), Some(node_handle))
+                }
+                Some(HostMode::AnotherComputer) => {
+                    let remote_url = settings.resolved_remote_hub_url();
+                    let node_handle = match tauri::async_runtime::block_on(node::resolve_remote_node_token(
+                        &remote_url,
+                        &mut settings,
+                    )) {
+                        Ok(Some(tok)) => {
+                            let _ = settings.save(&data_dir);
+                            Some(NodeHandle::start(&remote_url, tok, &data_dir))
+                        }
+                        Ok(None) => None,
+                        Err(err) => {
+                            tracing::warn!("could not start remote desktop node on launch: {err:#}");
+                            None
+                        }
+                    };
+                    (None, node_handle)
+                }
+                None => (None, None),
             };
 
             let target = initial_webview_url(&settings);
-            let desktop_state = DesktopState::new(data_dir, settings.clone(), initial_hub);
+            let desktop_state = DesktopState::new(data_dir, settings.clone(), initial_hub, initial_node);
             if let Some(hub_url) = settings.active_hub_url()
                 && let Ok(Some(saved_tok)) = settings.admin_token_for(&hub_url)
             {
