@@ -23,9 +23,13 @@
   /* Every text token is at least 4.5:1 on bg, bg-tint, glass-solid, surface,
      surface-2, surface-3 and surface-select (WCAG 2; pairs in the changelog). */
   --text: #0f1722;
-  --text-2: #46505e;
-  --text-3: #5a6471;
-  --border: #dde3ea;
+  --text-2: #39434f;
+  --text-3: #4c5663;
+  --text-4: #5a6471;
+  --line-1: rgb(15 23 34 / 0.08);
+  --line-2: rgb(15 23 34 / 0.14);
+  --line-3: var(--border-strong);
+  --border: var(--line-2);
   --border-strong: #c3cbd6;
   --border-control: #78828f; /* inputs: 3:1 against bg, surface and glass */
   --backdrop: linear-gradient(160deg, #e8eef5 0%, #f4f6f9 100%);
@@ -46,6 +50,8 @@
   --danger-fill-hover: #9c1d13;
   --danger-fill-ink: #ffffff;
   --focus: #1a73e8; /* blue, so it never reads as the accent */
+  --info: #1f5fcc;
+  --info-soft: #e7f0fc;
   --user-avatar: #3f6fe0;
 
   --glass-bg: rgba(233, 238, 244, 0.8);
@@ -55,8 +61,8 @@
   --glass-highlight: rgba(255, 255, 255, 0.7);
   --shadow-sm: 0 1px 2px rgba(15, 23, 34, 0.05);
   --shadow: 0 4px 16px rgba(15, 23, 34, 0.06), 0 1px 3px rgba(15, 23, 34, 0.05);
-  --shadow-float: 0 8px 28px rgba(15, 23, 34, 0.12), 0 2px 6px rgba(15, 23, 34, 0.06);
-  --shadow-lg: 0 24px 64px rgba(15, 23, 34, 0.18), 0 2px 8px rgba(15, 23, 34, 0.08);
+  --shadow-float: 0 0 0 1px rgb(15 23 34 / 0.06), 0 8px 28px rgba(15, 23, 34, 0.12), 0 2px 6px rgba(15, 23, 34, 0.06);
+  --shadow-lg: 0 0 0 1px rgb(15 23 34 / 0.08), 0 24px 64px rgba(15, 23, 34, 0.18), 0 2px 8px rgba(15, 23, 34, 0.08);
   --scrim: rgba(15, 23, 34, 0.32);
 
   --radius: 12px; /* cards, bubbles, composer, dock */
@@ -67,7 +73,69 @@
   --inspector-w: clamp(384px, 30vw, 420px);
   --tabbar-h: 0px;
   --bar-h: 52px;
-  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1); /* old curve; moves to --ease-out in step 7 */
+
+  /* Design-system tokens (docs/design-system/design-system.md 2.7-2.11). Theme-independent,
+     so declared once. Rules adopt them area by area; the old names stay as aliases. */
+  --r-chip: var(--radius-xs); /* badges, keycaps, family marks */
+  --r-control: var(--radius-sm); /* buttons, inputs, rows, model chips, status pills */
+  --r-card: var(--radius); /* cards, bubbles, dock */
+  --r-sheet: var(--radius-lg); /* sheets, palette, picker, dialogs */
+  --r-composer: 24px; /* the composer only */
+  --r-full: 999px; /* send button, avatars, dots, meter bars */
+
+  --ease-out: cubic-bezier(0.165, 0.84, 0.44, 1); /* default: entering, answering a tap */
+  --ease-snap: cubic-bezier(0.32, 0.72, 0, 1); /* sheets, inspector, dock swap */
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1); /* A to B and stays visible */
+  --dur-instant: 60ms; /* hover and press colour */
+  --dur-fast: 120ms; /* chips, toggles, row selection */
+  --dur-base: 180ms; /* popovers, disclosure, donut focus */
+  --dur-slow: 300ms; /* sheets, inspector, dock swap */
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --h-row: 32px; /* desktop sidebar and list rows, small buttons */
+  --h-control: 36px; /* desktop buttons, inputs, segmented pills */
+  --h-touch: 44px; /* every touch target on phone; Approve and Deny everywhere */
+
+  /* Type: per step a size, line height, weight and tracking (px). Tracking is for the
+     web client only; Apple platforms use their text styles with none. */
+  --type-display-size: 28px;
+  --type-display-lh: 34px;
+  --type-display-weight: 600;
+  --type-display-track: -0.4px;
+  --type-title-size: 20px;
+  --type-title-lh: 26px;
+  --type-title-weight: 600;
+  --type-title-track: -0.25px;
+  --type-heading-size: 17px;
+  --type-heading-lh: 22px;
+  --type-heading-weight: 600;
+  --type-heading-track: -0.2px;
+  --type-body-size: 15px; /* 16 / 24 on phone, see the phone block */
+  --type-body-lh: 22px;
+  --type-body-weight: 400; /* 600 for emphasis */
+  --type-body-track: -0.1px;
+  --type-ui-size: 13.5px;
+  --type-ui-lh: 18px;
+  --type-ui-weight: 500;
+  --type-ui-track: 0;
+  --type-caption-size: 12.5px;
+  --type-caption-lh: 16px;
+  --type-caption-weight: 400; /* 500 in chips, 600 in section labels */
+  --type-caption-track: 0.05px;
+  --type-micro-size: 11.5px;
+  --type-micro-lh: 14px;
+  --type-micro-weight: 500;
+  --type-micro-track: 0.1px; /* 0.7px when uppercase, see .label-mono */
+
+  --brand-gradient: linear-gradient(135deg, #12c4bf 0%, #3b82f6 50%, #8b5cf6 100%); /* the mark's fill */
 }
 
 /* Dark: navy from the concept art. Blue channel above red on every surface. */
@@ -81,8 +149,12 @@
   --text: #f3f6f9;
   --text-2: #c5cfdc;
   --text-3: #a4adbb;
-  --border: #272d36;
-  --border-strong: #3d434d;
+  --text-4: #8c96a5;
+  --line-1: rgb(214 226 245 / 0.06);
+  --line-2: rgb(214 226 245 / 0.08);
+  --line-3: rgb(214 226 245 / 0.14);
+  --border: var(--line-2);
+  --border-strong: var(--line-3);
   --border-control: #656f7e;
   --backdrop: linear-gradient(160deg, #071323 0%, #0a111c 100%);
   --accent: #22d3ce;
@@ -102,6 +174,8 @@
   --danger-fill-hover: #b02c22;
   --danger-fill-ink: #ffffff;
   --focus: #7cb4ff;
+  --info: #7fb0ff;
+  --info-soft: #223048;
   --user-avatar: #5986f4;
   --glass-bg: rgba(20, 24, 33, 0.82);
   --glass-solid: #141821;
@@ -110,8 +184,8 @@
   --glass-highlight: transparent;
   --shadow-sm: none;
   --shadow: none;
-  --shadow-float: 0 10px 32px rgba(2, 6, 14, 0.55), 0 2px 8px rgba(2, 6, 14, 0.4);
-  --shadow-lg: 0 24px 64px rgba(2, 6, 14, 0.6), 0 2px 8px rgba(2, 6, 14, 0.45);
+  --shadow-float: 0 0 0 1px rgb(214 226 245 / 0.08), 0 10px 32px rgba(2, 6, 14, 0.55), 0 2px 8px rgba(2, 6, 14, 0.4);
+  --shadow-lg: 0 0 0 1px rgb(214 226 245 / 0.1), 0 24px 64px rgba(2, 6, 14, 0.6), 0 2px 8px rgba(2, 6, 14, 0.45);
   --scrim: rgba(3, 6, 12, 0.6);
 }
 
@@ -126,8 +200,12 @@
     --text: #f3f6f9;
     --text-2: #c5cfdc;
     --text-3: #a4adbb;
-    --border: #272d36;
-    --border-strong: #3d434d;
+    --text-4: #8c96a5;
+    --line-1: rgb(214 226 245 / 0.06);
+    --line-2: rgb(214 226 245 / 0.08);
+    --line-3: rgb(214 226 245 / 0.14);
+    --border: var(--line-2);
+    --border-strong: var(--line-3);
     --border-control: #656f7e;
     --backdrop: linear-gradient(160deg, #071323 0%, #0a111c 100%);
     --accent: #22d3ce;
@@ -147,6 +225,8 @@
     --danger-fill-hover: #b02c22;
     --danger-fill-ink: #ffffff;
     --focus: #7cb4ff;
+    --info: #7fb0ff;
+    --info-soft: #223048;
     --user-avatar: #5986f4;
     --glass-bg: rgba(20, 24, 33, 0.82);
     --glass-solid: #141821;
@@ -155,8 +235,8 @@
     --glass-highlight: transparent;
     --shadow-sm: none;
     --shadow: none;
-    --shadow-float: 0 10px 32px rgba(2, 6, 14, 0.55), 0 2px 8px rgba(2, 6, 14, 0.4);
-    --shadow-lg: 0 24px 64px rgba(2, 6, 14, 0.6), 0 2px 8px rgba(2, 6, 14, 0.45);
+    --shadow-float: 0 0 0 1px rgb(214 226 245 / 0.08), 0 10px 32px rgba(2, 6, 14, 0.55), 0 2px 8px rgba(2, 6, 14, 0.4);
+    --shadow-lg: 0 0 0 1px rgb(214 226 245 / 0.1), 0 24px 64px rgba(2, 6, 14, 0.6), 0 2px 8px rgba(2, 6, 14, 0.45);
     --scrim: rgba(3, 6, 12, 0.6);
   }
 }
@@ -202,8 +282,12 @@
     --text: #05090f;
     --text-2: #222b38;
     --text-3: #2e3846;
-    --border: #778190;
-    --border-strong: #4f5967;
+    --text-4: #2e3846; /* = --text-3 */
+    --line-1: #778190;
+    --line-2: #778190;
+    --border: var(--line-2);
+    --line-3: #4f5967;
+    --border-strong: var(--line-3);
     --border-control: #4f5967;
     --accent: #044e4d;
     --accent-hover: #10b3ae;
@@ -222,6 +306,8 @@
     --danger-fill-hover: #70110a;
     --danger-fill-ink: #ffffff;
     --focus: #0b57d0;
+    --info: #164aa3;
+    --info-soft: #e7f0fc;
     --glass-bg: var(--glass-solid);
     --glass-solid: #e6ebf1;
     --glass-border: #4f5967;
@@ -239,8 +325,12 @@
     --text: #ffffff;
     --text-2: #e1e7ef;
     --text-3: #cdd5e0;
-    --border: #6b7584;
-    --border-strong: #a3adbb;
+    --text-4: #cdd5e0; /* = --text-3 */
+    --line-1: #6b7584;
+    --line-2: #6b7584;
+    --border: var(--line-2);
+    --line-3: #a3adbb;
+    --border-strong: var(--line-3);
     --border-control: #a3adbb;
     --accent: #5ce6e1;
     --accent-hover: #5ce6e1;
@@ -259,6 +349,8 @@
     --danger-fill-hover: #8f1c13;
     --danger-fill-ink: #ffffff;
     --focus: #9ac7ff;
+    --info: #a9c9ff;
+    --info-soft: #223048;
     --glass-bg: var(--glass-solid);
     --glass-solid: #0e121a;
     --glass-border: #a3adbb;
@@ -278,8 +370,12 @@
     --text: #ffffff;
     --text-2: #e1e7ef;
     --text-3: #cdd5e0;
-    --border: #6b7584;
-    --border-strong: #a3adbb;
+    --text-4: #cdd5e0; /* = --text-3 */
+    --line-1: #6b7584;
+    --line-2: #6b7584;
+    --border: var(--line-2);
+    --line-3: #a3adbb;
+    --border-strong: var(--line-3);
     --border-control: #a3adbb;
     --accent: #5ce6e1;
     --accent-hover: #5ce6e1;
@@ -298,6 +394,8 @@
     --danger-fill-hover: #8f1c13;
     --danger-fill-ink: #ffffff;
     --focus: #9ac7ff;
+    --info: #a9c9ff;
+    --info-soft: #223048;
     --glass-bg: var(--glass-solid);
     --glass-solid: #0e121a;
     --glass-border: #a3adbb;
@@ -306,95 +404,259 @@
   }
 }
 
-/* Model-family colours (thread dots and pills, the family mark, the model chip,
-   the picker). Colour stays by family (owner question Q4); the common families
-   land on the concept art's set: Gemini/Gemma teal, Qwen purple, Llama orange,
-   Radium indigo. Each one is text-safe: at least 4.5:1 against bg, glass,
-   surface, surface-2, surface-select and its own tinted pill (.status.fam-tint)
-   in its scheme (WCAG 2; pairs in the changelog). Colour is never the only cue:
-   every mark carries a glyph and the model's name is always shown as text.
-   Same block order as above. */
+/* Identity hues: ten ramps of four steps (design-system.md 2.6), named by HUE.
+   1 bg (tinted pill), 2 border, 3 solid (dots, donut segments, bars), 4 text.
+   Step 4 is the old per-family text value, so nothing that is text moved. Increase
+   Contrast uses today's high-contrast family values for steps 3 and 4; forced colours
+   ignores the ramp. Same block order as above. */
 :root {
-  --fam-gemini: #0b6b73;
-  --fam-qwen: #5b3fc4;
-  --fam-llama: #9a4a06;
-  --fam-radium: #4d4fc9;
-  --fam-claude: #a12d86;
-  --fam-gpt: #1f5fcc;
-  --fam-deepseek: #0a6f8c;
-  --fam-mistral: #bd2f4a;
-  --fam-nemotron: #436e00;
-  --fam-ernie: #805b00;
+  --hue-teal-bg: #e2f3f2;
+  --hue-teal-border: #93d0ce;
+  --hue-teal-solid: #0e9793;
+  --hue-teal-text: #0b6b73;
+  --hue-purple-bg: #efeafc;
+  --hue-purple-border: #c4aff5;
+  --hue-purple-solid: #7c4de8;
+  --hue-purple-text: #5b3fc4;
+  --hue-orange-bg: #f9eee5;
+  --hue-orange-border: #e7be9e;
+  --hue-orange-solid: #ca6f28;
+  --hue-orange-text: #9a4a06;
+  --hue-pink-bg: #f9e9f5;
+  --hue-pink-border: #e7add8;
+  --hue-pink-solid: #c948a8;
+  --hue-pink-text: #a12d86;
+  --hue-blue-bg: #e7f0fc;
+  --hue-blue-border: #a7c5f4;
+  --hue-blue-solid: #3b7fe6;
+  --hue-blue-text: #1f5fcc;
+  --hue-green-bg: #ebf3e2;
+  --hue-green-border: #b6d091;
+  --hue-green-solid: #5c970a;
+  --hue-green-text: #436e00;
+  --hue-amber-bg: #f5f0e2;
+  --hue-amber-border: #dbc591;
+  --hue-amber-solid: #af7f0a;
+  --hue-amber-text: #805b00;
+  --hue-rose-bg: #fbe9ec;
+  --hue-rose-border: #efaeb9;
+  --hue-rose-solid: #dc4a64;
+  --hue-rose-text: #bd2f4a;
+  --hue-indigo-bg: #ececfb;
+  --hue-indigo-border: #b7b8ef;
+  --hue-indigo-solid: #5f62dc;
+  --hue-indigo-text: #4d4fc9;
+  --hue-cyan-bg: #e3f2f6;
+  --hue-cyan-border: #94cddd;
+  --hue-cyan-solid: #1290b4;
+  --hue-cyan-text: #0a6f8c;
+  --fam-pill: 12%; /* how much family colour tints a pill's surface */
   --fam-grok: #2b2f36;
   --fam-scripted: #636327;
   --fam-unknown: #5b6573;
-  --fam-pill: 12%; /* how much family colour tints a pill's surface */
+
+  /* FAMILY -> HUE MAP. The only place a model family picks a colour, so the only
+     place to edit when identity moves from model families to providers (OpenRouter,
+     Hermes, Anthropic, OpenAI, Radium, ...); the Swift table is its twin. The ramps
+     above change per theme, so these aliases are declared once. --fam-grok,
+     --fam-scripted and --fam-unknown are neutrals outside the ramp. Colour is never
+     the only cue: every mark has a glyph and the model's name is shown as text. */
+  --fam-gemini: var(--hue-teal-text);
+  --fam-qwen: var(--hue-purple-text);
+  --fam-llama: var(--hue-orange-text);
+  --fam-claude: var(--hue-pink-text);
+  --fam-gpt: var(--hue-blue-text);
+  --fam-nemotron: var(--hue-green-text);
+  --fam-ernie: var(--hue-amber-text);
+  --fam-mistral: var(--hue-rose-text);
+  --fam-radium: var(--hue-indigo-text);
+  --fam-deepseek: var(--hue-cyan-text);
 }
 
 :root[data-theme="dark"] {
-  --fam-gemini: #4fe3e6;
-  --fam-qwen: #a78bfa;
-  --fam-llama: #f9a85a;
-  --fam-radium: #8891f0;
-  --fam-claude: #f28ad8;
-  --fam-gpt: #7fb0ff;
-  --fam-deepseek: #5cc8e8;
-  --fam-mistral: #ff8fa0;
-  --fam-nemotron: #9fd24a;
-  --fam-ernie: #e8c04a;
+  --hue-teal-bg: #183940;
+  --hue-teal-border: #1a686b;
+  --hue-teal-solid: #1dd0cb;
+  --hue-teal-text: #4fe3e6;
+  --hue-purple-bg: #2b2646;
+  --hue-purple-border: #4d367c;
+  --hue-purple-solid: #9759f5;
+  --hue-purple-text: #a78bfa;
+  --hue-orange-bg: #3b322e;
+  --hue-orange-border: #76553e;
+  --hue-orange-solid: #f8a360;
+  --hue-orange-text: #f9a85a;
+  --hue-pink-bg: #38293f;
+  --hue-pink-border: #6e3d69;
+  --hue-pink-solid: #e66bc8;
+  --hue-pink-text: #f28ad8;
+  --hue-blue-bg: #223048;
+  --hue-blue-border: #345181;
+  --hue-blue-solid: #5b9bff;
+  --hue-blue-text: #7fb0ff;
+  --hue-green-bg: #283726;
+  --hue-green-border: #456329;
+  --hue-green-solid: #84c52e;
+  --hue-green-text: #9fd24a;
+  --hue-amber-bg: #373424;
+  --hue-amber-border: #6b5a23;
+  --hue-amber-solid: #e0b020;
+  --hue-amber-text: #e8c04a;
+  --hue-rose-bg: #3a2833;
+  --hue-rose-border: #743c4a;
+  --hue-rose-solid: #f4677e;
+  --hue-rose-text: #ff8fa0;
+  --hue-indigo-bg: #252b45;
+  --hue-indigo-border: #3c4379;
+  --hue-indigo-solid: #7078ee;
+  --hue-indigo-text: #8891f0;
+  --hue-cyan-bg: #1c3543;
+  --hue-cyan-border: #255d73;
+  --hue-cyan-solid: #38b6de;
+  --hue-cyan-text: #5cc8e8;
+  --fam-pill: 16%;
   --fam-grok: #e6e8ec;
   --fam-scripted: #c9c97a;
   --fam-unknown: #a3adba;
-  --fam-pill: 16%;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --fam-gemini: #4fe3e6;
-    --fam-qwen: #a78bfa;
-    --fam-llama: #f9a85a;
-    --fam-radium: #8891f0;
-    --fam-claude: #f28ad8;
-    --fam-gpt: #7fb0ff;
-    --fam-deepseek: #5cc8e8;
-    --fam-mistral: #ff8fa0;
-    --fam-nemotron: #9fd24a;
-    --fam-ernie: #e8c04a;
+    --hue-teal-bg: #183940;
+    --hue-teal-border: #1a686b;
+    --hue-teal-solid: #1dd0cb;
+    --hue-teal-text: #4fe3e6;
+    --hue-purple-bg: #2b2646;
+    --hue-purple-border: #4d367c;
+    --hue-purple-solid: #9759f5;
+    --hue-purple-text: #a78bfa;
+    --hue-orange-bg: #3b322e;
+    --hue-orange-border: #76553e;
+    --hue-orange-solid: #f8a360;
+    --hue-orange-text: #f9a85a;
+    --hue-pink-bg: #38293f;
+    --hue-pink-border: #6e3d69;
+    --hue-pink-solid: #e66bc8;
+    --hue-pink-text: #f28ad8;
+    --hue-blue-bg: #223048;
+    --hue-blue-border: #345181;
+    --hue-blue-solid: #5b9bff;
+    --hue-blue-text: #7fb0ff;
+    --hue-green-bg: #283726;
+    --hue-green-border: #456329;
+    --hue-green-solid: #84c52e;
+    --hue-green-text: #9fd24a;
+    --hue-amber-bg: #373424;
+    --hue-amber-border: #6b5a23;
+    --hue-amber-solid: #e0b020;
+    --hue-amber-text: #e8c04a;
+    --hue-rose-bg: #3a2833;
+    --hue-rose-border: #743c4a;
+    --hue-rose-solid: #f4677e;
+    --hue-rose-text: #ff8fa0;
+    --hue-indigo-bg: #252b45;
+    --hue-indigo-border: #3c4379;
+    --hue-indigo-solid: #7078ee;
+    --hue-indigo-text: #8891f0;
+    --hue-cyan-bg: #1c3543;
+    --hue-cyan-border: #255d73;
+    --hue-cyan-solid: #38b6de;
+    --hue-cyan-text: #5cc8e8;
+    --fam-pill: 16%;
     --fam-grok: #e6e8ec;
     --fam-scripted: #c9c97a;
     --fam-unknown: #a3adba;
-    --fam-pill: 16%;
   }
 }
 
 @media (prefers-contrast: more) {
   :root:not([data-theme="dark"]) {
-    --fam-gemini: #06525a;
-    --fam-qwen: #47309f;
-    --fam-llama: #7a3a04;
-    --fam-radium: #3a3ca8;
-    --fam-claude: #82216b;
-    --fam-gpt: #164aa3;
-    --fam-deepseek: #06566d;
-    --fam-mistral: #981f38;
-    --fam-nemotron: #395c00;
-    --fam-ernie: #6a4b00;
+    --hue-teal-bg: #e2f3f2;
+    --hue-teal-border: #93d0ce;
+    --hue-teal-solid: #06525a;
+    --hue-teal-text: #06525a;
+    --hue-purple-bg: #efeafc;
+    --hue-purple-border: #c4aff5;
+    --hue-purple-solid: #47309f;
+    --hue-purple-text: #47309f;
+    --hue-orange-bg: #f9eee5;
+    --hue-orange-border: #e7be9e;
+    --hue-orange-solid: #7a3a04;
+    --hue-orange-text: #7a3a04;
+    --hue-pink-bg: #f9e9f5;
+    --hue-pink-border: #e7add8;
+    --hue-pink-solid: #82216b;
+    --hue-pink-text: #82216b;
+    --hue-blue-bg: #e7f0fc;
+    --hue-blue-border: #a7c5f4;
+    --hue-blue-solid: #164aa3;
+    --hue-blue-text: #164aa3;
+    --hue-green-bg: #ebf3e2;
+    --hue-green-border: #b6d091;
+    --hue-green-solid: #395c00;
+    --hue-green-text: #395c00;
+    --hue-amber-bg: #f5f0e2;
+    --hue-amber-border: #dbc591;
+    --hue-amber-solid: #6a4b00;
+    --hue-amber-text: #6a4b00;
+    --hue-rose-bg: #fbe9ec;
+    --hue-rose-border: #efaeb9;
+    --hue-rose-solid: #981f38;
+    --hue-rose-text: #981f38;
+    --hue-indigo-bg: #ececfb;
+    --hue-indigo-border: #b7b8ef;
+    --hue-indigo-solid: #3a3ca8;
+    --hue-indigo-text: #3a3ca8;
+    --hue-cyan-bg: #e3f2f6;
+    --hue-cyan-border: #94cddd;
+    --hue-cyan-solid: #06566d;
+    --hue-cyan-text: #06566d;
     --fam-grok: #16181c;
     --fam-scripted: #525220;
     --fam-unknown: #434b57;
   }
 
   :root[data-theme="dark"] {
-    --fam-gemini: #7ff0f2;
-    --fam-qwen: #c4b0ff;
-    --fam-llama: #ffc48a;
-    --fam-radium: #b0b6ff;
-    --fam-claude: #f8b0e6;
-    --fam-gpt: #a9c9ff;
-    --fam-deepseek: #8adcf2;
-    --fam-mistral: #ffb3bf;
-    --fam-nemotron: #bfe57a;
-    --fam-ernie: #f5d77a;
+    --hue-teal-bg: #183940;
+    --hue-teal-border: #1a686b;
+    --hue-teal-solid: #7ff0f2;
+    --hue-teal-text: #7ff0f2;
+    --hue-purple-bg: #2b2646;
+    --hue-purple-border: #4d367c;
+    --hue-purple-solid: #c4b0ff;
+    --hue-purple-text: #c4b0ff;
+    --hue-orange-bg: #3b322e;
+    --hue-orange-border: #76553e;
+    --hue-orange-solid: #ffc48a;
+    --hue-orange-text: #ffc48a;
+    --hue-pink-bg: #38293f;
+    --hue-pink-border: #6e3d69;
+    --hue-pink-solid: #f8b0e6;
+    --hue-pink-text: #f8b0e6;
+    --hue-blue-bg: #223048;
+    --hue-blue-border: #345181;
+    --hue-blue-solid: #a9c9ff;
+    --hue-blue-text: #a9c9ff;
+    --hue-green-bg: #283726;
+    --hue-green-border: #456329;
+    --hue-green-solid: #bfe57a;
+    --hue-green-text: #bfe57a;
+    --hue-amber-bg: #373424;
+    --hue-amber-border: #6b5a23;
+    --hue-amber-solid: #f5d77a;
+    --hue-amber-text: #f5d77a;
+    --hue-rose-bg: #3a2833;
+    --hue-rose-border: #743c4a;
+    --hue-rose-solid: #ffb3bf;
+    --hue-rose-text: #ffb3bf;
+    --hue-indigo-bg: #252b45;
+    --hue-indigo-border: #3c4379;
+    --hue-indigo-solid: #b0b6ff;
+    --hue-indigo-text: #b0b6ff;
+    --hue-cyan-bg: #1c3543;
+    --hue-cyan-border: #255d73;
+    --hue-cyan-solid: #8adcf2;
+    --hue-cyan-text: #8adcf2;
     --fam-grok: #ffffff;
     --fam-scripted: #dede9c;
     --fam-unknown: #c2cad4;
@@ -403,20 +665,68 @@
 
 @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --fam-gemini: #7ff0f2;
-    --fam-qwen: #c4b0ff;
-    --fam-llama: #ffc48a;
-    --fam-radium: #b0b6ff;
-    --fam-claude: #f8b0e6;
-    --fam-gpt: #a9c9ff;
-    --fam-deepseek: #8adcf2;
-    --fam-mistral: #ffb3bf;
-    --fam-nemotron: #bfe57a;
-    --fam-ernie: #f5d77a;
+    --hue-teal-bg: #183940;
+    --hue-teal-border: #1a686b;
+    --hue-teal-solid: #7ff0f2;
+    --hue-teal-text: #7ff0f2;
+    --hue-purple-bg: #2b2646;
+    --hue-purple-border: #4d367c;
+    --hue-purple-solid: #c4b0ff;
+    --hue-purple-text: #c4b0ff;
+    --hue-orange-bg: #3b322e;
+    --hue-orange-border: #76553e;
+    --hue-orange-solid: #ffc48a;
+    --hue-orange-text: #ffc48a;
+    --hue-pink-bg: #38293f;
+    --hue-pink-border: #6e3d69;
+    --hue-pink-solid: #f8b0e6;
+    --hue-pink-text: #f8b0e6;
+    --hue-blue-bg: #223048;
+    --hue-blue-border: #345181;
+    --hue-blue-solid: #a9c9ff;
+    --hue-blue-text: #a9c9ff;
+    --hue-green-bg: #283726;
+    --hue-green-border: #456329;
+    --hue-green-solid: #bfe57a;
+    --hue-green-text: #bfe57a;
+    --hue-amber-bg: #373424;
+    --hue-amber-border: #6b5a23;
+    --hue-amber-solid: #f5d77a;
+    --hue-amber-text: #f5d77a;
+    --hue-rose-bg: #3a2833;
+    --hue-rose-border: #743c4a;
+    --hue-rose-solid: #ffb3bf;
+    --hue-rose-text: #ffb3bf;
+    --hue-indigo-bg: #252b45;
+    --hue-indigo-border: #3c4379;
+    --hue-indigo-solid: #b0b6ff;
+    --hue-indigo-text: #b0b6ff;
+    --hue-cyan-bg: #1c3543;
+    --hue-cyan-border: #255d73;
+    --hue-cyan-solid: #8adcf2;
+    --hue-cyan-text: #8adcf2;
     --fam-grok: #ffffff;
     --fam-scripted: #dede9c;
     --fam-unknown: #c2cad4;
   }
+}
+
+/* ---- type utilities (design-system.md 2.7) */
+
+/* Numbers that line up in a column. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Instrument-style eyebrow: micro step in mono, uppercase, +0.7px, text tier four. */
+.label-mono {
+  font-family: var(--mono);
+  font-size: var(--type-micro-size);
+  line-height: var(--type-micro-lh);
+  font-weight: var(--type-micro-weight);
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-4);
 }
 
 /* ---- base */
@@ -2962,6 +3272,8 @@ dialog.sheet-dialog::backdrop {
   :root {
     --tabbar-h: calc(72px + env(safe-area-inset-bottom));
     --bar-h: 52px;
+    --type-body-size: 16px;
+    --type-body-lh: 24px;
   }
 
   /* 16px body so iOS doesn't zoom into inputs. */

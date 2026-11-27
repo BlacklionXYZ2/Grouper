@@ -5,19 +5,19 @@
    Colours are tokens only: the ten key colours alias the family hues, so light, dark
    and increased-contrast values come for free (usage-tab-spec 4.4). */
 
-/* ---- key colours: names alias the family hues */
+/* ---- key colours: the solid step (3) of the hue ramp of the same name (app.css) */
 
 :root {
-  --key-teal: var(--fam-gemini);
-  --key-purple: var(--fam-qwen);
-  --key-orange: var(--fam-llama);
-  --key-pink: var(--fam-claude);
-  --key-blue: var(--fam-gpt);
-  --key-green: var(--fam-nemotron);
-  --key-amber: var(--fam-ernie);
-  --key-rose: var(--fam-mistral);
-  --key-indigo: var(--fam-radium);
-  --key-cyan: var(--fam-deepseek);
+  --key-teal: var(--hue-teal-solid);
+  --key-purple: var(--hue-purple-solid);
+  --key-orange: var(--hue-orange-solid);
+  --key-pink: var(--hue-pink-solid);
+  --key-blue: var(--hue-blue-solid);
+  --key-green: var(--hue-green-solid);
+  --key-amber: var(--hue-amber-solid);
+  --key-rose: var(--hue-rose-solid);
+  --key-indigo: var(--hue-indigo-solid);
+  --key-cyan: var(--hue-cyan-solid);
 }
 
 .key-c-teal { --key-c: var(--key-teal); }
