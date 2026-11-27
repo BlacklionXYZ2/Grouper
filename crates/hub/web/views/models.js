@@ -9,6 +9,7 @@ import { loadModels } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { num, usd, pct, duration, ago, plural } from '../lib/format.js';
 import { familyKey, familyMark } from '../lib/family.js';
+import { keySwatch } from './key-color.js';
 import { isLocalModel, isHarnessModel, harnessDeviceId, harnessCliName, harnessSignInInfo, modelBadge, price } from './model-picker.js';
 
 const CONSTRAINTS = ['local', 'remote', 'free', 'paid'];
@@ -406,7 +407,7 @@ export function renderModels(container, { id: targetId = null } = {}) {
       h(
         'span',
         { class: 'grow' },
-        h('span', { class: 'provider-id' }, group.title),
+        h('span', { class: 'provider-id' }, provider && 'color' in provider ? keySwatch(provider.color) : null, group.title),
         h(
           'span',
           { class: 'provider-meta' },

@@ -3041,7 +3041,7 @@ dialog.sheet-dialog::backdrop {
   /* Floating rounded tab bar (V10): container 18, selected tile 12 on accent-soft. */
   .tabbar {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr); /* Chat, Usage, Devices, More */
     gap: 4px;
     position: fixed;
     left: 12px;

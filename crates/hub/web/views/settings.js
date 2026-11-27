@@ -9,6 +9,7 @@ import { store, on, deviceName, isAdmin } from '../lib/store.js';
 import { stopLive, loadDevices } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
 import { ago, date, dateTime } from '../lib/format.js';
+import { keySwatch, colorPicker, colorUse, setProviderColor, keyColorLabel } from './key-color.js';
 import {
   support as notifySupport,
   permission as notifyPermission,
@@ -1005,6 +1006,7 @@ export function renderSettings(container) {
               h(
                 'div',
                 { class: 'row-title row-badges' },
+                'color' in p ? keySwatch(p.color) : null,
                 p.id,
                 h('span', { class: ['badge', p.has_key ? 'accent' : 'muted'] }, p.has_key ? 'Key stored' : 'No key'),
               ),
@@ -1016,6 +1018,20 @@ export function renderSettings(container) {
                 viaLabel ? h('span', null, `via ${viaLabel}`) : null,
               ),
             ),
+            // The key's colour on the Usage page (usage-tab-spec 4.4); an older hub has no colour field.
+            'color' in p
+              ? h(
+                  'button',
+                  {
+                    class: 'btn btn-sm',
+                    type: 'button',
+                    'data-write': true,
+                    'aria-label': `Change colour of provider ${p.id}`,
+                    onclick: () => openColorSheet(p),
+                  },
+                  'Colour',
+                )
+              : null,
             h(
               'button',
               {
@@ -1032,6 +1048,35 @@ export function renderSettings(container) {
         }),
       ),
     );
+  }
+
+  /** Pick a provider's key colour; it saves at once and every device sees it. */
+  function openColorSheet(p) {
+    sheet((close) => ({
+      title: 'Key colour',
+      caption: p.id,
+      body: [
+        h('p', { class: 'hint' }, 'Used for this key on the Usage page and in Models. A colour another key uses shows that key under it.'),
+        colorPicker({
+          providerId: p.id,
+          current: p.color,
+          others: colorUse(providerList, p.id),
+          idPrefix: 'set-pick',
+          onPick: async (name) => {
+            try {
+              const updated = await setProviderColor(p.id, name);
+              p.color = updated?.color || name;
+              toast(`${p.id} is now ${keyColorLabel(p.color).toLowerCase()}.`);
+              renderProviders();
+              close(true);
+            } catch (err) {
+              toastError(err);
+            }
+          },
+        }),
+      ],
+      foot: [h('button', { class: 'btn', type: 'button', onclick: () => close(false) }, 'Cancel')],
+    }));
   }
 
   function openProviderSheet(existing) {
