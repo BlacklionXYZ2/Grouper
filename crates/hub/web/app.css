@@ -768,7 +768,7 @@ a {
 :focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
-  border-radius: 6px;
+  border-radius: var(--r-chip);
 }
 
 ::selection {
@@ -831,7 +831,7 @@ a {
 .boot-mark {
   width: 44px;
   height: 44px;
-  border-radius: 12px;
+  border-radius: var(--r-card);
   background: url("/app/icon.svg") center / cover;
   box-shadow: var(--shadow);
 }
@@ -881,7 +881,7 @@ a {
   overflow: hidden;
   z-index: 30;
   background: var(--glass-solid);
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--line-2);
 }
 
 /* The sidebar is chrome: it may be glass (V11), but on desktop it sits on the
@@ -891,7 +891,7 @@ a {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   border: none;
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--line-2);
   border-radius: 0;
   box-shadow: none;
 }
@@ -914,7 +914,7 @@ a {
   color: var(--text);
   text-decoration: none;
   margin-right: auto;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
 }
 
 /* Small mark: the 7-fish glyph. Sign-in, welcome and boot keep logo.svg / icon.svg. */
@@ -922,7 +922,7 @@ a {
   width: 28px;
   height: 28px;
   flex: none;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   background: url("/app/logo-glyph.svg") center / contain no-repeat;
 }
 
@@ -933,7 +933,7 @@ a {
   margin: 6px 10px 4px;
   min-height: 38px;
   padding: 7px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--accent-soft);
   color: var(--accent);
   font-size: var(--type-ui-size);
@@ -1025,7 +1025,7 @@ a {
   gap: 10px;
   min-height: 32px;
   padding: 5px 8px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   color: var(--text-2);
   text-decoration: none;
   font-size: var(--type-ui-size);
@@ -1068,7 +1068,7 @@ a {
   flex: none;
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   box-sizing: border-box;
 }
 
@@ -1101,7 +1101,7 @@ a {
 .side-needs {
   margin-top: 12px;
   padding-top: 10px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
 }
 
 .side-needs .side-item {
@@ -1124,7 +1124,7 @@ a {
   content: "";
   width: 6px;
   height: 6px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: var(--warn);
 }
 
@@ -1137,12 +1137,12 @@ a {
   gap: 1px;
   margin-top: 6px;
   padding-top: 6px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
 }
 
 /* Footer: real connection state (Q8). Opens Devices. */
 .side-foot {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding: 6px 10px;
 }
 
@@ -1163,7 +1163,7 @@ a {
 .conn-dot {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   box-sizing: border-box;
   border: 2px solid var(--text-3);
 }
@@ -1214,7 +1214,7 @@ a {
   left: 12px;
   z-index: 200;
   padding: 10px 16px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface);
   color: var(--text);
   font-weight: 600;
@@ -1242,7 +1242,7 @@ a {
 
 .bar.glass {
   border: none;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-2);
   border-radius: 0;
   box-shadow: none;
 }
@@ -1302,7 +1302,7 @@ a {
   min-height: 0;
   margin: 0;
   background: var(--bg-tint);
-  border-left: 1px solid var(--border);
+  border-left: 1px solid var(--line-2);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1337,7 +1337,7 @@ a {
   gap: 6px;
   min-height: 36px;
   padding: 7px 14px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   border: 1px solid var(--border-strong);
   background: var(--surface);
   color: var(--text);
@@ -1421,7 +1421,7 @@ a {
   place-items: center;
   width: 36px;
   height: 36px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   border: none;
   background: transparent;
   color: var(--text-2);
@@ -1470,7 +1470,7 @@ a {
   width: 100%;
   min-height: 40px;
   padding: 8px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   border: 1px solid var(--border-control); /* 3:1 boundary (the card hairline is 1.8:1) */
   background: var(--surface);
   color: var(--text);
@@ -1526,9 +1526,9 @@ a {
   display: inline-flex;
   padding: 3px;
   gap: 2px;
-  border-radius: 10px;
+  border-radius: 10px; /* concentric: 10 around the 7 thumb (design-system.md 2.9) */
   background: var(--surface-2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
 }
 
 .seg label {
@@ -1538,7 +1538,7 @@ a {
   gap: 6px;
   min-height: 32px;
   padding: 4px 14px;
-  border-radius: 7px;
+  border-radius: 7px; /* concentric: thumb inside the 10px pill */
   font-size: var(--type-ui-size);
   font-weight: var(--type-ui-weight);
   color: var(--text-2);
@@ -1588,7 +1588,7 @@ a {
   appearance: none;
   width: 40px;
   height: 24px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface-3);
   border: 1px solid var(--border-control);
   position: relative;
@@ -1604,7 +1604,7 @@ a {
   left: 2px;
   width: 18px;
   height: 18px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: #fff;
   box-shadow: var(--shadow-sm);
   transition: transform 0.15s var(--ease);
@@ -1623,8 +1623,8 @@ a {
 
 .card {
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
   box-shadow: var(--shadow-sm);
 }
 
@@ -1664,8 +1664,8 @@ a {
 }
 
 .provider-group {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
   background: var(--surface);
   box-shadow: var(--shadow-sm);
   overflow: hidden;
@@ -1698,7 +1698,7 @@ a {
 }
 
 .provider-group[open] > summary {
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
 }
 
 .provider-shell.has-add > .provider-group > summary {
@@ -1775,7 +1775,7 @@ tr.model-row.is-target > td:first-child {
 }
 
 .list > li {
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
 }
 
 .list > li:last-child {
@@ -1837,7 +1837,7 @@ button.list-row:hover {
   gap: 4px;
   padding: 1px 7px;
   min-height: 20px;
-  border-radius: var(--radius-xs);
+  border-radius: var(--r-chip);
   font-size: var(--type-micro-size);
   font-weight: 600;
   background: var(--surface-2);
@@ -1889,7 +1889,7 @@ button.list-row:hover {
   min-width: 18px;
   height: 18px;
   padding: 0 5px;
-  border-radius: var(--radius-xs);
+  border-radius: var(--r-chip);
   background: var(--warn);
   color: var(--warn-ink);
   font-size: var(--type-micro-size);
@@ -1909,7 +1909,7 @@ button.list-row:hover {
   width: 8px;
   height: 8px;
   box-sizing: border-box;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   display: inline-block;
   flex: none;
   background: transparent;
@@ -1926,9 +1926,9 @@ button.list-row:hover {
   gap: 10px;
   align-items: center;
   padding: 10px 14px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   background: var(--surface-2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   color: var(--text);
   font-size: var(--type-ui-size);
   margin: 0 0 14px;
@@ -1979,7 +1979,7 @@ button.list-row:hover {
 }
 
 .skeleton {
-  border-radius: 8px;
+  border-radius: var(--r-control);
   background: linear-gradient(90deg, var(--surface-2) 0%, var(--surface-3) 50%, var(--surface-2) 100%);
   background-size: 200% 100%;
   animation: shimmer 1.4s linear infinite;
@@ -2001,7 +2001,7 @@ button.list-row:hover {
 
 .skeleton.block {
   height: 64px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
 }
 
 @keyframes shimmer {
@@ -2012,8 +2012,8 @@ button.list-row:hover {
 
 .table-wrap {
   overflow-x: auto;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  border: 1px solid var(--line-2);
   background: var(--surface);
 }
 
@@ -2027,7 +2027,7 @@ button.list-row:hover {
 .table td {
   padding: 9px 12px;
   text-align: left;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
   white-space: nowrap;
 }
 
@@ -2070,7 +2070,7 @@ code,
 .code {
   margin: 0;
   padding: 10px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-2);
   font-size: var(--type-caption-size);
   line-height: 18px; /* mono role: 12.5 / 18 (design-system.md 2.7) */
@@ -2129,13 +2129,13 @@ code,
 .md code {
   font-size: 0.88em;
   padding: 0.1em 0.35em;
-  border-radius: 5px;
+  border-radius: var(--r-chip);
   background: var(--surface-2);
 }
 
 .md pre.md-code {
   padding: 12px 14px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-2);
   overflow-x: auto;
   line-height: 1.45;
@@ -2155,7 +2155,7 @@ code,
 
 .md hr {
   border: none;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   margin: 1em 0;
 }
 
@@ -2218,7 +2218,7 @@ code,
 .threads-dot {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: var(--warn);
   flex: none;
 }
@@ -2228,9 +2228,9 @@ code,
   flex: none;
   align-self: stretch;
   margin: 10px 10px 10px 0;
-  border-radius: var(--radius-lg);
+  border-radius: var(--r-sheet);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
@@ -2273,7 +2273,7 @@ dialog.threads-sheet[open] .threads-panel {
   align-items: center;
   gap: 8px;
   padding: 8px 14px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface-2);
   color: var(--text-2);
   font-size: var(--type-ui-size);
@@ -2316,7 +2316,7 @@ button.strip:hover {
   max-width: min(82%, 620px);
   background: var(--surface-2);
   padding: 10px 15px;
-  border-radius: 20px 20px 6px 20px;
+  border-radius: 20px 20px 6px 20px; /* bubble with a 6px tail corner */
   white-space: pre-wrap;
 }
 
@@ -2336,7 +2336,7 @@ button.strip:hover {
   color: var(--danger);
   background: var(--danger-soft);
   padding: 10px 14px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   font-size: var(--type-ui-size);
 }
 
@@ -2382,7 +2382,7 @@ button.strip:hover {
 .replying .pulse {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: var(--accent);
   animation: pulse 1.2s ease-in-out infinite;
 }
@@ -2405,9 +2405,9 @@ button.strip:hover {
   gap: 4px;
   text-align: left;
   padding: 12px 14px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   box-shadow: var(--shadow-sm);
   cursor: pointer;
   color: inherit;
@@ -2479,7 +2479,7 @@ button.strip:hover {
   white-space: nowrap;
   padding: 2px 8px 2px 7px;
   border: none;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   min-height: 22px;
 }
 
@@ -2528,7 +2528,7 @@ button.strip:hover {
   flex: none;
   width: 7px;
   height: 7px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: currentColor;
   animation: pulse 1.4s ease-in-out infinite;
 }
@@ -2546,7 +2546,8 @@ button.strip:hover {
 }
 
 .composer {
-  border-radius: 24px;
+  border-radius: var(--r-composer);
+  border-color: var(--line-3); /* composer edge: the floating hairline */
   padding: 8px 8px 8px 16px;
   display: grid;
   gap: 6px;
@@ -2601,7 +2602,7 @@ button.strip:hover {
   min-height: 30px;
   padding: 3px 10px 3px 6px;
   border: 1px solid var(--border-strong);
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface);
   color: var(--text-2);
   font-size: var(--type-ui-size);
@@ -2642,7 +2643,7 @@ button.strip:hover {
 .send-btn {
   width: 38px;
   height: 38px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   border: none;
   display: grid;
   place-items: center;
@@ -2686,7 +2687,7 @@ button.strip:hover {
   translate: -50% 0;
   z-index: 16;
   white-space: nowrap;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   padding: 7px 14px;
   font-size: var(--type-ui-size);
   font-weight: 600;
@@ -2731,7 +2732,7 @@ button.strip:hover {
 
 .sheet-head {
   padding: 16px 16px 12px 18px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
   display: grid;
   gap: 6px;
 }
@@ -2761,7 +2762,7 @@ button.strip:hover {
 }
 
 .sheet-foot {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding: 12px 14px;
   display: grid;
   gap: 10px;
@@ -2781,8 +2782,8 @@ button.strip:hover {
 }
 
 .tool-row {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-control);
   background: var(--surface);
 }
 
@@ -2854,7 +2855,7 @@ button.strip:hover {
 
 .callout {
   padding: 12px 14px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   background: var(--surface-2);
   font-size: var(--type-ui-size);
 }
@@ -2887,7 +2888,7 @@ button.strip:hover {
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
-  border-radius: 8px;
+  border-radius: var(--r-control);
   font-size: var(--type-ui-size);
   text-decoration: none;
   color: var(--text);
@@ -2913,8 +2914,8 @@ button.strip:hover {
 /* ---- dialogs */
 
 dialog.sheet-dialog {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-sheet);
   padding: 0;
   background: var(--surface);
   color: var(--text);
@@ -2979,7 +2980,7 @@ dialog.sheet-dialog::backdrop {
   font-size: var(--type-body-size);
   line-height: var(--type-body-lh);
   padding: 14px 16px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   background: var(--warn-soft);
   display: flex;
   gap: 10px;
@@ -3034,7 +3035,7 @@ dialog.sheet-dialog::backdrop {
 .toast {
   pointer-events: auto;
   padding: 10px 16px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   font-size: var(--type-ui-size);
   display: flex;
   gap: 10px;
@@ -3045,7 +3046,7 @@ dialog.sheet-dialog::backdrop {
 /* Toasts float, so they keep a shadow in dark mode too (V3). */
 .toast.glass {
   background: var(--surface);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--line-3);
   box-shadow: var(--shadow-float);
 }
 
@@ -3201,7 +3202,7 @@ dialog.sheet-dialog::backdrop {
 .login-card {
   width: min(420px, 100%);
   padding: 28px 26px 24px;
-  border-radius: 24px;
+  border-radius: var(--r-sheet);
   display: grid;
   gap: 16px;
 }
@@ -3226,7 +3227,7 @@ dialog.sheet-dialog::backdrop {
 .login-card .brand-mark {
   width: 40px;
   height: 40px;
-  border-radius: 12px;
+  border-radius: var(--r-card);
 }
 
 /* ---- narrow desktop: inspector floats over the content */
@@ -3244,8 +3245,8 @@ dialog.sheet-dialog::backdrop {
     width: min(var(--inspector-w), calc(100vw - 20px));
     margin: 0;
     z-index: 60;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-lg);
+    border: 1px solid var(--line-3);
+    border-radius: var(--r-sheet);
     box-shadow: var(--shadow-lg);
     animation: slide-in 0.22s var(--ease);
   }
@@ -3301,8 +3302,8 @@ dialog.sheet-dialog::backdrop {
     bottom: 0;
     width: min(320px, 86vw);
     margin: 0;
-    border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
-    border-right: 1px solid var(--border-strong);
+    border-radius: 0 var(--r-sheet) var(--r-sheet) 0;
+    border-right: 1px solid var(--line-3);
     transform: translateX(-105%);
     transition: transform 0.24s var(--ease);
     z-index: 70;
@@ -3360,13 +3361,13 @@ dialog.sheet-dialog::backdrop {
     right: 12px;
     bottom: calc(10px + env(safe-area-inset-bottom));
     height: 60px;
-    border-radius: 18px;
+    border-radius: 18px; /* concentric: 12 tile plus 6 padding */
     z-index: 50;
     padding: 5px;
   }
 
   .tabbar.glass {
-    border: 1px solid var(--border-strong);
+    border: 1px solid var(--line-3);
   }
 
   .tab {
@@ -3374,7 +3375,7 @@ dialog.sheet-dialog::backdrop {
     justify-items: center;
     align-content: center;
     gap: 3px;
-    border-radius: 12px;
+    border-radius: var(--r-card);
     color: var(--text-2);
     text-decoration: none;
     font-size: var(--type-micro-size);
@@ -3406,7 +3407,7 @@ dialog.sheet-dialog::backdrop {
     bottom: 0;
     width: 100%;
     height: calc(100dvh - 40px - env(safe-area-inset-top));
-    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    border-radius: var(--r-sheet) var(--r-sheet) 0 0;
     animation: sheet-up 0.26s var(--ease);
     padding-bottom: env(safe-area-inset-bottom);
   }
@@ -3415,7 +3416,7 @@ dialog.sheet-dialog::backdrop {
     width: 100vw;
     max-width: 100vw;
     margin: auto 0 0;
-    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    border-radius: var(--r-sheet) var(--r-sheet) 0 0;
     max-height: 92dvh;
     padding-bottom: env(safe-area-inset-bottom);
   }
@@ -3496,7 +3497,7 @@ dialog.sheet-dialog::backdrop {
   gap: 8px;
   align-items: center;
   padding: 8px 16px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   font-size: var(--type-ui-size);
   font-weight: 600;
   color: var(--warn);
@@ -3562,7 +3563,7 @@ details > summary.list-row:hover {
 .hint code {
   font-size: var(--type-caption-size);
   padding: 1px 5px;
-  border-radius: 5px;
+  border-radius: var(--r-chip);
   background: var(--surface-2);
 }
 
@@ -3679,7 +3680,7 @@ code.nowrap {
   display: flex;
   align-items: center;
   border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface);
   min-height: 40px;
   padding: 0 10px;
@@ -3792,8 +3793,8 @@ code.nowrap {
   flex-direction: column;
   max-height: min(70vh, 640px);
   background: var(--surface);
-  border: 1.5px solid color-mix(in srgb, var(--warn) 45%, var(--border-strong));
-  border-radius: var(--radius-lg);
+  border: 1.5px solid color-mix(in srgb, var(--warn) 45%, var(--line-3));
+  border-radius: var(--r-sheet);
   box-shadow: var(--shadow);
   overflow: hidden;
 }
@@ -3885,7 +3886,7 @@ code.nowrap {
 }
 
 .dock-foot {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding: 10px 16px 12px;
   display: grid;
   gap: 8px;
@@ -3933,7 +3934,7 @@ code.nowrap {
 @media (max-width: 760px) {
   .approval-dock {
     max-height: min(62vh, 560px);
-    border-radius: var(--radius);
+    border-radius: var(--r-card);
   }
 
   /* The arrows and "1 of N" say enough; the buttons keep their full names. */
@@ -3957,7 +3958,7 @@ code.nowrap {
 
 .login-card {
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   box-shadow: var(--shadow);
 }
 
@@ -4017,7 +4018,7 @@ code.nowrap {
 }
 
 .login-disclosure {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   padding-top: 10px;
 }
 
@@ -4085,14 +4086,14 @@ code.nowrap {
   min-width: 230px;
   max-width: min(320px, calc(100vw - 24px));
   padding: 6px;
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
   z-index: 45;
   display: grid;
   gap: 2px;
   align-content: start;
   background: var(--surface);
   color: var(--text);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--line-3);
   box-shadow: var(--shadow-float); /* menus float: a shadow in both modes */
 }
 
@@ -4116,7 +4117,7 @@ code.nowrap {
 
 .menu-sep {
   height: 1px;
-  background: var(--border);
+  background: var(--line-1);
   margin: 4px 6px;
 }
 
@@ -4127,7 +4128,7 @@ code.nowrap {
   width: 100%;
   min-height: 38px;
   padding: 7px 10px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   border: none;
   background: transparent;
   color: var(--text);
@@ -4263,7 +4264,7 @@ code.nowrap {
   .seg {
     flex-wrap: wrap;
     max-width: 100%;
-    border-radius: 16px;
+    border-radius: var(--r-sheet);
   }
 
   .limit-row {
@@ -4443,7 +4444,7 @@ code.nowrap {
   .md pre.md-code,
   .md code,
   .hint code {
-    border: 1px solid var(--border);
+    border: 1px solid var(--line-2);
   }
 
   .msg-inbound.from-orchestrator {
@@ -4487,7 +4488,7 @@ code.nowrap {
   }
 
   .btn-ghost {
-    border-color: var(--border);
+    border-color: var(--line-2);
   }
 
   .btn-ghost:hover,
@@ -4536,7 +4537,7 @@ code.nowrap {
   .meter {
     height: 10px;
     border: 1px solid var(--border-strong);
-    border-radius: 999px;
+    border-radius: var(--r-full);
   }
 
   /* Non-color shape cue on presence dots: hollow when offline, filled when online. */
@@ -5065,7 +5066,7 @@ code.nowrap {
     forced-color-adjust: none;
     height: 10px;
     border: 1px solid CanvasText;
-    border-radius: 999px;
+    border-radius: var(--r-full);
     background: Canvas;
     overflow: hidden;
   }
@@ -5192,7 +5193,7 @@ code.nowrap {
   height: 18px;
   padding: 0 3px;
   border: 1.5px solid var(--fam, var(--text-3));
-  border-radius: 5px;
+  border-radius: var(--r-chip);
   background: var(--surface);
   color: var(--fam, var(--text-3));
   font: 600 var(--type-micro-size)/1 var(--mono); /* was 10px; nothing under 11.5px */
@@ -5287,14 +5288,14 @@ code.nowrap {
 }
 
 .inbox-list {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
   overflow: hidden;
 }
 
 .list.card.inbox-list {
   background: var(--surface);
-  border-radius: var(--radius);
+  border-radius: var(--r-card);
 }
 
 .inbox-row {
@@ -5425,7 +5426,7 @@ code.nowrap {
   padding: 4px 12px 4px 6px;
   border: 1px solid var(--border-strong);
   border-left: 4px solid var(--fam, var(--fam-unknown));
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-2);
   font-size: var(--type-ui-size);
 }
@@ -5620,8 +5621,8 @@ code.nowrap {
 
 .composer.thread-composer {
   background: var(--surface);
-  border: 1px solid var(--border-strong);
-  border-radius: 20px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-composer);
   padding: 6px 6px 6px 14px;
 }
 
@@ -5655,7 +5656,7 @@ dialog.sheet-dialog.model-picker {
   display: grid;
   gap: 8px;
   padding: 16px 16px 12px 20px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
 }
 
 .mp-head h2 {
@@ -5744,7 +5745,7 @@ dialog.sheet-dialog.model-picker {
   gap: 10px;
   padding: 9px 10px;
   border: 2px solid transparent;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   cursor: pointer;
 }
 
@@ -5864,8 +5865,8 @@ dialog.sheet-dialog.model-picker {
 
   .model-chip,
   .composer.thread-composer {
-    border: 1.5px solid var(--border-strong);
-    border-left: 5px solid var(--fam, var(--border-strong));
+    border: 1.5px solid var(--line-3);
+    border-left: 5px solid var(--fam, var(--line-3));
   }
 
   .composer.thread-composer {
@@ -6131,7 +6132,7 @@ dialog.sheet-dialog.model-picker {
   min-height: 32px;
   max-width: 100%;
   padding: 4px 10px 4px 12px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   border: 1px solid var(--accent);
   background: var(--accent-soft);
   color: var(--text);
@@ -6157,7 +6158,7 @@ dialog.sheet-dialog.model-picker {
 }
 
 .u-block {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   margin-top: 10px;
   padding-top: 10px;
 }
@@ -6254,7 +6255,7 @@ dialog.sheet-dialog.model-picker {
 
 .u-meter {
   height: 8px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface-3);
   overflow: hidden;
 }
@@ -6330,9 +6331,9 @@ dialog.sheet-dialog.model-picker {
 .u-cmd {
   margin: 0 0 8px;
   padding: 8px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-2);
   overflow-x: auto;
   font-size: var(--type-ui-size);
 }
@@ -6390,7 +6391,7 @@ dialog.sheet-dialog.model-picker {
   display: inline-block;
   width: 48px;
   height: 6px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   background: var(--surface-3);
   overflow: hidden;
 }
@@ -6535,8 +6536,8 @@ dialog.sheet-dialog.model-picker {
 /* The launcher is the search icon button in every view's bar (lib/ui.js bar()). */
 
 dialog.command-palette {
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-lg);
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-sheet);
   padding: 0;
   background: var(--surface);
   color: var(--text);
@@ -6572,7 +6573,7 @@ dialog.command-palette::backdrop {
   gap: 8px;
   min-width: 0;
   padding: 10px 8px 10px 14px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--line-1);
 }
 
 .palette-close {
@@ -6583,7 +6584,7 @@ dialog.command-palette::backdrop {
   width: 46px;
   margin-right: 4px;
   border-radius: 0;
-  box-shadow: inset 0 -1px 0 var(--border);
+  box-shadow: inset 0 -1px 0 var(--line-1);
 }
 
 .palette-query {
@@ -6653,7 +6654,7 @@ dialog.command-palette::backdrop {
   min-height: 40px;
   padding: 7px 10px;
   border: 1px solid transparent;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: transparent;
   color: var(--text);
   text-align: left;
@@ -6760,7 +6761,7 @@ dialog.command-palette::backdrop {
   flex: none;
   width: 10px;
   height: 10px;
-  border-radius: 50%;
+  border-radius: var(--r-full);
   background: var(--fam, var(--fam-unknown));
 }
 
@@ -6773,7 +6774,7 @@ dialog.command-palette::backdrop {
   gap: 3px;
   padding: 0 6px;
   border: none;
-  border-radius: var(--radius-xs);
+  border-radius: var(--r-chip);
   background: var(--purple-soft);
   color: var(--purple);
   font-weight: 600;
@@ -6797,7 +6798,7 @@ dialog.command-palette::backdrop {
   max-width: 100%;
   min-height: 24px;
   padding: 2px 8px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: var(--surface-select);
   color: var(--text-2);
   font-size: var(--type-caption-size);
@@ -6818,8 +6819,8 @@ dialog.command-palette::backdrop {
    </div> */
 .thread-group {
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
   box-shadow: var(--shadow-sm);
   padding: 6px;
 }
@@ -6855,7 +6856,7 @@ dialog.command-palette::backdrop {
   min-height: 38px;
   padding: 5px 8px;
   border: none;
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-control);
   background: transparent;
   color: var(--text);
   font-size: var(--type-ui-size);
@@ -6887,7 +6888,7 @@ dialog.command-palette::backdrop {
   gap: 6px;
   margin-top: 2px;
   padding: 6px 8px 4px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line-1);
   color: var(--text-3);
   font-size: var(--type-caption-size);
 }
