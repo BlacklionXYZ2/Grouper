@@ -445,6 +445,15 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "push_subscriptions", "session_id", "ALTER TABLE push_subscriptions ADD COLUMN session_id TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS push_subscriptions_session ON push_subscriptions (session_id);")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
+    // Per-chat bearer tokens for the harness orchestrator MCP endpoint. Hashes only.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS orchestrator_tokens (
+           token_hash TEXT PRIMARY KEY,
+           conversation_id TEXT NOT NULL,
+           created INTEGER NOT NULL,
+           revoked INTEGER NOT NULL DEFAULT 0);
+         CREATE INDEX IF NOT EXISTS orchestrator_tokens_conv ON orchestrator_tokens (conversation_id);",
+    )?;
     Ok(conn)
 }
 
@@ -1020,6 +1029,44 @@ impl Db {
             })
             .ok()?;
         ct_eq(&stored, &hash(secret)).then(|| Auth { device_id: id.to_string(), admin: admin != 0 })
+    }
+
+    /// Mint a bearer token for the harness orchestrating `conversation_id`.
+    /// Only the SHA-256 is stored. The raw token is returned once.
+    pub fn mint_orchestrator_token(&self, conversation_id: &str) -> Result<String> {
+        if self.conversation(conversation_id).is_none() {
+            bail!("no such conversation");
+        }
+        let token = random_hex(32);
+        self.c().execute(
+            "INSERT INTO orchestrator_tokens (token_hash, conversation_id, created, revoked) VALUES (?1, ?2, ?3, 0)",
+            params![hash(&token), conversation_id, ts()],
+        )?;
+        Ok(token)
+    }
+
+    /// The conversation a live orchestrator token may act on.
+    pub fn orchestrator_conversation(&self, token: &str) -> Option<String> {
+        let hashed = hash(token);
+        let (stored, conversation_id): (String, String) = self
+            .c()
+            .query_row(
+                "SELECT token_hash, conversation_id FROM orchestrator_tokens WHERE token_hash = ?1 AND revoked = 0",
+                [&hashed],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()?;
+        ct_eq(&stored, &hashed).then_some(conversation_id)
+    }
+
+    /// Revoke one orchestrator token. False when it was already revoked or unknown.
+    pub fn revoke_orchestrator_token(&self, token: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE orchestrator_tokens SET revoked = 1 WHERE token_hash = ?1 AND revoked = 0",
+                params![hash(token)],
+            )
+            .is_ok_and(|n| n > 0)
     }
 
     pub fn touch(&self, id: &str) {

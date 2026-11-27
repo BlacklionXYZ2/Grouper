@@ -11,6 +11,7 @@ pub mod host;
 pub mod limits;
 pub mod link;
 pub mod mcp;
+pub mod mcp_server;
 pub mod memory;
 pub mod migrate;
 pub mod offline;
