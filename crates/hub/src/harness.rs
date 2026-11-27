@@ -11,15 +11,22 @@
 //!   resolving them. `hidden_reason = "user"` is never undone by a report.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
-use core_protocol::{DetectedHarness, HarnessSignIn, ModelEntry, ProviderConfig};
+use core_protocol::{
+    DetectedHarness, EventBody, HarnessSignIn, HarnessUsage, HubMessage, ModelEntry, ProviderConfig,
+};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
 use crate::catalog::derive_registry_id;
 use crate::db::{Db, now};
 use crate::discover::lookup_price;
+use crate::orchestrator::Wake;
+use crate::server::{Hub, QueueResult};
 
 const HARNESS_META_PREFIX: &str = "device_harnesses:";
 
@@ -301,6 +308,404 @@ pub fn apply_report(
     Ok(outcome)
 }
 
+// ---- Standard-chat harness turn execution & session continuity
+
+const HARNESS_TURN_TIMEOUT: Duration = Duration::from_secs(630);
+const MAX_COMPACT_MSG_CHARS: usize = 2_000;
+const MAX_COMPACT_TOTAL_CHARS: usize = 16_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessTurnReply {
+    pub text: String,
+    pub session_id: String,
+    pub usage: HarnessUsage,
+}
+
+pub(crate) struct PendingHarnessTurn {
+    pub(crate) device_id: String,
+    pub(crate) conn_id: u64,
+    pub(crate) tx: oneshot::Sender<std::result::Result<HarnessTurnReply, String>>,
+}
+
+struct ClearPendingOnDrop {
+    hub: Weak<Hub>,
+    conversation_id: Option<String>,
+}
+
+impl ClearPendingOnDrop {
+    fn disarm(&mut self) {
+        self.conversation_id = None;
+    }
+}
+
+impl Drop for ClearPendingOnDrop {
+    fn drop(&mut self) {
+        let (Some(hub), Some(cid)) = (self.hub.upgrade(), self.conversation_id.take()) else {
+            return;
+        };
+        tokio::spawn(async move {
+            hub.harness_turns.lock().await.remove(&cid);
+        });
+    }
+}
+
+/// Canonical CLI agent slug (`claude-code`, `codex`, `antigravity`, `grok`, `hermes`, …) for `model`.
+pub fn harness_agent_of(model: &ModelEntry, provider: Option<&ProviderConfig>) -> Option<String> {
+    if let Some(slug) = provider
+        .and_then(|p| p.options.get("harness"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(slug.to_string());
+    }
+    model
+        .provider_id
+        .split_once('@')
+        .map(|(slug, _)| slug.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn harness_label(model: &ModelEntry, provider: Option<&ProviderConfig>) -> String {
+    let cli = provider
+        .and_then(|p| p.options.get("display_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| harness_agent_of(model, provider))
+        .unwrap_or_else(|| model.provider_id.clone());
+    format!("{cli} ({})", model.model)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut iter = text.chars();
+    let head: String = iter.by_ref().take(max_chars).collect();
+    if iter.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn strip_memory_block(text: &str) -> &str {
+    match text.find("\n\n[Memory]\n") {
+        Some(idx) => &text[..idx],
+        None => text,
+    }
+}
+
+/// Earlier visible `(role, text)` turns in `conversation_id` before `current_wakes`.
+///
+/// Used when switching into a harness mid-chat so its first turn carries a compact
+/// copy of the earlier visible conversation.
+pub(crate) fn prior_visible_turns(
+    db: &Db,
+    conversation_id: &str,
+    current_wakes: &[Wake],
+) -> Vec<(&'static str, String)> {
+    let mut turns: Vec<(&'static str, String)> = db
+        .events(conversation_id, 0, None)
+        .into_iter()
+        .filter_map(|ev| match ev.body {
+            EventBody::UserMessage { text } => {
+                let t = text.trim().to_string();
+                (!t.is_empty()).then_some(("User", t))
+            }
+            EventBody::AssistantMessage { text } => {
+                let t = text.trim().to_string();
+                (!t.is_empty()).then_some(("Assistant", t))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // `Hub::chat` records the current turn's `UserMessage` event before waking the worker;
+    // strip it so the current message is not duplicated in `[Earlier in this conversation]`.
+    for wake in current_wakes.iter().rev() {
+        if let Wake::User(u) = wake {
+            let expected = u.trim();
+            if turns.last().is_some_and(|(role, t)| *role == "User" && t == expected) {
+                turns.pop();
+            }
+        }
+    }
+
+    if !turns.is_empty() {
+        return turns;
+    }
+
+    // Fallback when a test calls `run_turn` directly after populating `db.save_history` without events.
+    db.history(conversation_id)
+        .into_iter()
+        .filter_map(|m| {
+            let role = match m.role {
+                providers::Role::User => "User",
+                providers::Role::Assistant => "Assistant",
+            };
+            let clean = strip_memory_block(&m.text()).trim().to_string();
+            (!clean.is_empty()).then_some((role, clean))
+        })
+        .collect()
+}
+
+/// Build the message sent on the first turn when switching into a harness mid-chat.
+pub fn format_switched_message(prior_turns: &[(&str, String)], message: &str) -> String {
+    if prior_turns.is_empty() {
+        return message.to_string();
+    }
+    let mut selected_rev: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut omitted = 0usize;
+    for (idx, (role, text)) in prior_turns.iter().enumerate().rev() {
+        let line = format!("{role}: {}", truncate_chars(text.trim(), MAX_COMPACT_MSG_CHARS));
+        let len = line.chars().count() + 1;
+        if !selected_rev.is_empty() && used + len > MAX_COMPACT_TOTAL_CHARS {
+            omitted = idx + 1;
+            break;
+        }
+        used += len;
+        selected_rev.push(line);
+    }
+    selected_rev.reverse();
+
+    let mut out = String::from("[Earlier in this conversation]\n");
+    if omitted > 0 {
+        out.push_str(&format!("({omitted} earlier message(s) omitted)\n"));
+    }
+    out.push_str(&selected_rev.join("\n"));
+    out.push_str("\n\n[Current message]\n");
+    out.push_str(message);
+    out
+}
+
+fn probe_provider_for_agent(agent: &str) -> Option<&'static str> {
+    match agent {
+        "claude-code" => Some("claude"),
+        "codex" => Some("codex"),
+        _ => None,
+    }
+}
+
+impl Hub {
+    /// Execute one standard-chat turn on the device hosting `model`, resuming the
+    /// conversation's stored `harness_session` (or seeding a new session with a compact
+    /// copy of earlier visible turns when switching into a harness mid-chat).
+    pub(crate) async fn run_standard_harness_turn(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        model: &ModelEntry,
+        message: &str,
+        wakes: &[Wake],
+    ) -> std::result::Result<HarnessTurnReply, String> {
+        let provider = self
+            .db
+            .provider(&model.provider_id)
+            .map_err(|e| e.to_string())?;
+        let Some(agent) = harness_agent_of(model, provider.as_ref()) else {
+            return Err(format!("harness model {} has no CLI agent configured", model.id));
+        };
+        let label = harness_label(model, provider.as_ref());
+        let host_ref = model
+            .device_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| provider.as_ref().and_then(|p| p.via_device()))
+            .ok_or_else(|| format!("{label} has no hosting device configured"))?;
+
+        let (device_id, device_name) = self
+            .resolve_device(host_ref)
+            .ok_or_else(|| format!("{label} names unknown device {host_ref:?}"))?;
+
+        let conn_id = {
+            let live = self.live.lock().await;
+            let Some(conn) = live.get(&device_id) else {
+                return Err(format!(
+                    "{label} runs on {device_name}, which is offline. Bring {device_name} back online or switch models to continue."
+                ));
+            };
+            conn.conn_id
+        };
+
+        // Clear any uncommitted session if the user switched between two different harness providers,
+        // and check whether this turn resumes an existing continuous session.
+        let stored_session = self
+            .db
+            .conversation_harness_session_for(conversation_id, &model.provider_id);
+
+        let wire_message = if stored_session.is_none() {
+            let prior = prior_visible_turns(&self.db, conversation_id, wakes);
+            format_switched_message(&prior, message)
+        } else {
+            message.to_string()
+        };
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut turns = self.harness_turns.lock().await;
+            if turns.contains_key(conversation_id) {
+                return Err("a harness turn is already running for this conversation".into());
+            }
+            turns.insert(
+                conversation_id.to_string(),
+                PendingHarnessTurn {
+                    device_id: device_id.clone(),
+                    conn_id,
+                    tx,
+                },
+            );
+        }
+        let mut guard = ClearPendingOnDrop {
+            hub: Arc::downgrade(self),
+            conversation_id: Some(conversation_id.to_string()),
+        };
+
+        let queued = self
+            .queue_to_model_host(
+                &device_id,
+                conn_id,
+                HubMessage::HarnessTurn {
+                    conversation_id: conversation_id.to_string(),
+                    agent: agent.clone(),
+                    model: model.model.clone(),
+                    session_id: stored_session,
+                    message: wire_message,
+                },
+            )
+            .await;
+
+        if queued != QueueResult::Sent {
+            self.harness_turns.lock().await.remove(conversation_id);
+            guard.disarm();
+            return Err(if queued == QueueResult::Full {
+                format!("{device_name} is busy; try again shortly.")
+            } else {
+                format!(
+                    "{label} runs on {device_name}, which is offline. Bring {device_name} back online or switch models to continue."
+                )
+            });
+        }
+
+        let outcome = tokio::time::timeout(HARNESS_TURN_TIMEOUT, rx).await;
+        if !self.harness_turns.lock().await.contains_key(conversation_id) {
+            guard.disarm();
+        }
+        let reply = match outcome {
+            Ok(Ok(Ok(reply))) => reply,
+            Ok(Ok(Err(error))) => return Err(error),
+            Ok(Err(_)) => {
+                return Err(format!(
+                    "{device_name} disconnected while running {label}."
+                ));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "{label} on {device_name} timed out."
+                ));
+            }
+        };
+
+        if !reply.session_id.trim().is_empty() {
+            self.db.set_conversation_harness_session(
+                conversation_id,
+                &model.provider_id,
+                Some(reply.session_id.trim()),
+            );
+        }
+        self.db.record_subscription_usage(
+            Some(conversation_id),
+            None,
+            &model.provider_id,
+            &model.model,
+            reply.usage.input_tokens,
+            reply.usage.output_tokens,
+            reply.usage.cache_read_tokens,
+            reply.usage.cache_write_tokens,
+        );
+        if let Some(probe_name) = probe_provider_for_agent(&agent) {
+            let hub = Arc::clone(self);
+            let dev = device_id.clone();
+            tokio::spawn(async move {
+                crate::usage::probe_device(&hub, &dev, Some(&[probe_name])).await;
+            });
+        }
+        Ok(reply)
+    }
+
+    pub(crate) async fn harness_finished(
+        &self,
+        device_id: &str,
+        conn_id: u64,
+        conversation_id: &str,
+        text: String,
+        session_id: String,
+        usage: HarnessUsage,
+    ) {
+        let pending = {
+            let mut turns = self.harness_turns.lock().await;
+            if turns
+                .get(conversation_id)
+                .is_some_and(|p| p.device_id == device_id && p.conn_id == conn_id)
+            {
+                turns.remove(conversation_id)
+            } else {
+                None
+            }
+        };
+        if let Some(p) = pending {
+            let _ = p.tx.send(Ok(HarnessTurnReply { text, session_id, usage }));
+        }
+    }
+
+    pub(crate) async fn harness_failed(
+        &self,
+        device_id: &str,
+        conn_id: u64,
+        conversation_id: &str,
+        error: String,
+    ) {
+        let pending = {
+            let mut turns = self.harness_turns.lock().await;
+            if turns
+                .get(conversation_id)
+                .is_some_and(|p| p.device_id == device_id && p.conn_id == conn_id)
+            {
+                turns.remove(conversation_id)
+            } else {
+                None
+            }
+        };
+        if let Some(p) = pending {
+            let _ = p.tx.send(Err(error));
+        }
+    }
+
+    pub(crate) async fn harness_connection_gone(&self, device_id: &str, conn_id: u64) {
+        let removed: Vec<PendingHarnessTurn> = {
+            let mut turns = self.harness_turns.lock().await;
+            let keys: Vec<String> = turns
+                .iter()
+                .filter(|(_, p)| p.device_id == device_id && p.conn_id == conn_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter().filter_map(|k| turns.remove(&k)).collect()
+        };
+        if removed.is_empty() {
+            return;
+        }
+        let device_name = self
+            .resolve_device(device_id)
+            .map(|(_, name)| name)
+            .unwrap_or_else(|| device_id.to_string());
+        for p in removed {
+            let _ = p.tx.send(Err(format!(
+                "{device_name} went offline while running the harness turn."
+            )));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +887,417 @@ mod tests {
         assert_eq!(visible[0].device_id.as_deref(), Some(mac.id.as_str()));
 
         drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const FAKE_CLAUDE_RUST_SRC: &str = r#"
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut prompt = String::new();
+    let mut resume: Option<String> = None;
+    let mut perm_mode = String::new();
+    let mut model = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" if i + 1 < args.len() => { prompt = args[i + 1].clone(); i += 2; }
+            "--resume" if i + 1 < args.len() => { resume = Some(args[i + 1].clone()); i += 2; }
+            "--permission-mode" if i + 1 < args.len() => { perm_mode = args[i + 1].clone(); i += 2; }
+            "--model" if i + 1 < args.len() => { model = args[i + 1].clone(); i += 2; }
+            _ => { i += 1; }
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let entry = format!(
+            "mode={perm_mode}|model={model}|resume={}|cwd={}|prompt={}\n---\n",
+            resume.as_deref().unwrap_or("NONE"),
+            cwd.display(),
+            prompt
+        );
+        let log_path = PathBuf::from(home).join("invocations.log");
+        let prev = fs::read_to_string(&log_path).unwrap_or_default();
+        let _ = fs::write(&log_path, format!("{prev}{entry}"));
+    }
+    let sid = resume.clone().unwrap_or_else(|| "fake-claude-sess-1".to_string());
+    let tag = if resume.is_some() { "resumed" } else { "started" };
+    let reply = format!("[{tag}:{sid}:{perm_mode}] {prompt}");
+    println!(
+        "{{\"type\":\"result\",\"is_error\":false,\"session_id\":\"{}\",\"result\":\"{}\",\"usage\":{{\"input_tokens\":25,\"output_tokens\":15,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":0}}}}",
+        json_escape(&sid),
+        json_escape(&reply),
+    );
+}
+"#;
+
+    fn compile_fake_claude(bin_dir: &std::path::Path) {
+        std::fs::create_dir_all(bin_dir).unwrap();
+        let src = bin_dir.join("fake_claude.rs");
+        std::fs::write(&src, FAKE_CLAUDE_RUST_SRC).unwrap();
+        let exe = bin_dir.join(if cfg!(windows) { "claude.exe" } else { "claude" });
+        let status = std::process::Command::new("rustc")
+            .arg(&src)
+            .arg("-O")
+            .arg("-o")
+            .arg(&exe)
+            .status()
+            .expect("rustc must be available during cargo test");
+        assert!(status.success(), "compiling fake claude binary failed");
+    }
+
+    async fn wait_for_turn_finished(
+        rx: &mut tokio::sync::broadcast::Receiver<core_protocol::Event>,
+        conv_id: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let ev = rx.recv().await.expect("event stream open");
+                if ev.conversation_id == conv_id
+                    && matches!(ev.body, EventBody::TurnFinished { .. })
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for TurnFinished");
+    }
+
+    #[tokio::test]
+    async fn standard_chat_harness_resumes_session_switches_mid_chat_and_records_subscription_usage() {
+        use core_client::harness::{HarnessLevel, ScanOptions, chat_workdir, turn_with};
+        use core_protocol::{ChatRequest, PROTOCOL_VERSION};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let dir = tmp_dir();
+        let fake_home = dir.join("fake-home");
+        let bin_dir = fake_home.join("bin");
+        compile_fake_claude(&bin_dir);
+        let ws_root = dir.join("device-workspaces");
+        let scan_opts = ScanOptions::isolated(&fake_home, vec![bin_dir], 1_800_000_000);
+
+        let db = Db::open(&dir).unwrap();
+        let (pc, pc_token) = db.add_device("Gaming PC", "windows", false).unwrap();
+        apply_report(
+            &db,
+            &pc.id,
+            &[claude_entry(HarnessSignIn::SignedIn, "1.0.0", &[("sonnet", "Claude Sonnet")])],
+        )
+        .unwrap();
+        let sonnet_id = model_registry_id("claude-code", &pc.id, "sonnet");
+
+        // Also register a scripted API model so we can test mid-chat switching into the harness.
+        db.upsert_provider(&ProviderConfig {
+            id: "scripted".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({
+                "inline": {
+                    "rules": [
+                        {"last": "My code word is cobalt", "reply": [{"type": "text", "text": "Noted: cobalt."}]}
+                    ],
+                    "default": [{"type": "text", "text": "API reply."}]
+                }
+            }),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "api-std".into(),
+            provider_id: "scripted".into(),
+            model: "scripted-1".into(),
+            input_price: 2.0,
+            output_price: 4.0,
+            roles: vec!["standard".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_hub = hub.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, crate::server::router(server_hub)).await;
+        });
+
+        // Connect a simulated device over WebSocket that runs `core_client::harness::turn_with`
+        // against our fake CLI binary (never touching real CLIs).
+        let ws_url = format!("ws://{addr}{}", core_protocol::CONNECT_PATH);
+        let mut req = ws_url.into_client_request().unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {pc_token}").parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let (mut sink, mut stream) = ws.split();
+        let hello = core_protocol::NodeMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "0.1.0".into(),
+            host: None,
+        };
+        sink.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into()))
+            .await
+            .unwrap();
+
+        // Wait until Welcome arrives so `pc` is registered in `hub.live`.
+        loop {
+            let Some(Ok(WsMsg::Text(t))) = stream.next().await else { panic!("ws closed before welcome") };
+            if matches!(serde_json::from_str::<HubMessage>(&t), Ok(HubMessage::Welcome { .. })) {
+                break;
+            }
+        }
+
+        let seen_turns = Arc::new(std::sync::Mutex::new(Vec::<(Option<String>, String)>::new()));
+        let seen_for_dev = seen_turns.clone();
+        let dev_task = tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                let WsMsg::Text(t) = msg else { continue };
+                if let Ok(HubMessage::HarnessTurn {
+                    conversation_id,
+                    agent,
+                    model,
+                    session_id,
+                    message,
+                }) = serde_json::from_str::<HubMessage>(&t)
+                {
+                    seen_for_dev
+                        .lock()
+                        .unwrap()
+                        .push((session_id.clone(), message.clone()));
+                    let workdir = chat_workdir(Some(&ws_root), &conversation_id).unwrap();
+                    let reply = match turn_with(
+                        &scan_opts,
+                        &agent,
+                        &model,
+                        session_id.as_deref(),
+                        &message,
+                        &workdir,
+                        HarnessLevel::Confined,
+                    )
+                    .await
+                    {
+                        Ok(out) => core_protocol::NodeMessage::HarnessFinished {
+                            conversation_id,
+                            text: out.text,
+                            session_id: out.session_id,
+                            usage: out.usage,
+                        },
+                        Err(error) => core_protocol::NodeMessage::HarnessFailed {
+                            conversation_id,
+                            error,
+                        },
+                    };
+                    if sink
+                        .send(WsMsg::Text(serde_json::to_string(&reply).unwrap().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut events_rx = hub.subscribe_events_for_test();
+
+        // 1. Two-turn continuous harness conversation from the start.
+        let conv = hub
+            .chat(ChatRequest {
+                conversation_id: None,
+                mode: Some("standard".into()),
+                text: "Hello turn one".into(),
+                model: Some(sonnet_id.clone()),
+            })
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut events_rx, &conv).await;
+
+        assert_eq!(
+            hub.db.conversation_harness_session(&conv).as_deref(),
+            Some("fake-claude-sess-1"),
+            "turn 1 must store returned session_id in conversations.harness_session"
+        );
+
+        hub.chat(ChatRequest {
+            conversation_id: Some(conv.clone()),
+            mode: None,
+            text: "Follow up turn two".into(),
+            model: None,
+        })
+        .await
+        .unwrap();
+        wait_for_turn_finished(&mut events_rx, &conv).await;
+
+        assert_eq!(
+            hub.db.conversation_harness_session(&conv).as_deref(),
+            Some("fake-claude-sess-1"),
+            "turn 2 must keep the continuous session_id"
+        );
+
+        {
+            let recorded = seen_turns.lock().unwrap();
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(recorded[0].0, None, "turn 1 starts a new session");
+            assert_eq!(recorded[0].1, "Hello turn one");
+            assert_eq!(
+                recorded[1].0.as_deref(),
+                Some("fake-claude-sess-1"),
+                "turn 2 resumes turn 1's session id"
+            );
+            assert_eq!(recorded[1].1, "Follow up turn two");
+        }
+
+        // Verify visible transcript events and zero-cost subscription usage rows.
+        let stored_events = hub.db.events(&conv, 0, None);
+        let assistant_texts: Vec<&str> = stored_events
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::AssistantMessage { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistant_texts.len(), 2);
+        assert!(assistant_texts[0].contains("[started:fake-claude-sess-1:plan] Hello turn one"));
+        assert!(assistant_texts[1].contains("[resumed:fake-claude-sess-1:plan] Follow up turn two"));
+
+        let usage_rows: Vec<(i64, i64, i64, f64, String)> = {
+            let c = hub.db.c();
+            let mut st = c
+                .prepare(
+                    "SELECT input_tokens, output_tokens, cache_read_tokens, cost, billing
+                     FROM usage WHERE conversation_id = ?1 ORDER BY id",
+                )
+                .unwrap();
+            st.query_map([&conv], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        };
+        assert_eq!(usage_rows.len(), 2);
+        for row in &usage_rows {
+            assert_eq!(*row, (25, 15, 5, 0.0, "subscription".to_string()));
+        }
+        assert_eq!(hub.db.spent_by_conversation(&conv), 0.0);
+
+        // 2. Mid-chat switch from API model into harness carries compact visible transcript on the first harness turn only.
+        let switched_conv = hub
+            .chat(ChatRequest {
+                conversation_id: None,
+                mode: Some("standard".into()),
+                text: "My code word is cobalt".into(),
+                model: Some("api-std".into()),
+            })
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut events_rx, &switched_conv).await;
+        assert_eq!(hub.db.conversation_harness_session(&switched_conv), None);
+
+        hub.db
+            .set_conversation_model(&switched_conv, Some(&sonnet_id))
+            .unwrap();
+        hub.chat(ChatRequest {
+            conversation_id: Some(switched_conv.clone()),
+            mode: None,
+            text: "What was my code word?".into(),
+            model: None,
+        })
+        .await
+        .unwrap();
+        wait_for_turn_finished(&mut events_rx, &switched_conv).await;
+
+        hub.chat(ChatRequest {
+            conversation_id: Some(switched_conv.clone()),
+            mode: None,
+            text: "One more turn".into(),
+            model: None,
+        })
+        .await
+        .unwrap();
+        wait_for_turn_finished(&mut events_rx, &switched_conv).await;
+
+        {
+            let recorded = seen_turns.lock().unwrap();
+            assert_eq!(recorded.len(), 4);
+            assert_eq!(recorded[2].0, None, "first turn after switching into harness starts new session");
+            assert!(recorded[2].1.contains("[Earlier in this conversation]"), "{}", recorded[2].1);
+            assert!(recorded[2].1.contains("User: My code word is cobalt"), "{}", recorded[2].1);
+            assert!(recorded[2].1.contains("Assistant: Noted: cobalt."), "{}", recorded[2].1);
+            assert!(recorded[2].1.contains("What was my code word?"), "{}", recorded[2].1);
+            assert_eq!(recorded[3].0.as_deref(), Some("fake-claude-sess-1"));
+            assert!(!recorded[3].1.contains("[Earlier in this conversation]"), "{}", recorded[3].1);
+            assert_eq!(recorded[3].1, "One more turn");
+        }
+
+        dev_task.abort();
+        server_task.abort();
+        drop(hub);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn standard_chat_harness_on_offline_device_emits_clear_error() {
+        use core_protocol::ChatRequest;
+
+        let dir = tmp_dir();
+        let db = Db::open(&dir).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+        apply_report(
+            &db,
+            &pc.id,
+            &[claude_entry(HarnessSignIn::SignedIn, "1.0.0", &[("opus", "Claude Opus")])],
+        )
+        .unwrap();
+        let opus_id = model_registry_id("claude-code", &pc.id, "opus");
+
+        let hub = Hub::new(db, dir.clone());
+        let mut events_rx = hub.subscribe_events_for_test();
+
+        let conv = hub
+            .chat(ChatRequest {
+                conversation_id: None,
+                mode: Some("standard".into()),
+                text: "Are you online?".into(),
+                model: Some(opus_id),
+            })
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut events_rx, &conv).await;
+
+        let events = hub.db.events(&conv, 0, None);
+        let err_msg = events
+            .iter()
+            .find_map(|e| match &e.body {
+                EventBody::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .expect("expected offline Error event in chat");
+        assert!(err_msg.contains("Gaming PC"), "error should name offline device: {err_msg}");
+        assert!(err_msg.contains("offline"), "error should mention offline: {err_msg}");
+        assert_eq!(hub.db.conversation_harness_session(&conv), None);
+
+        drop(hub);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

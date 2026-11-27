@@ -18,7 +18,7 @@ use serde_json::Value;
 pub mod tunnel;
 
 /// Bumped on any breaking change to the frames below.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// WebSocket endpoint for devices, relative to the hub's base URL.
 pub const CONNECT_PATH: &str = "/v1/connect";
@@ -237,6 +237,25 @@ pub struct DetectedHarness {
     pub models: Vec<HarnessModel>,
 }
 
+/// Token counts reported by a CLI harness for one turn.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HarnessUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+}
+
+impl HarnessUsage {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
 /// Device → hub.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -299,6 +318,19 @@ pub enum NodeMessage {
     /// Carries CLI names, sign-in states, capabilities and model lists only; never tokens.
     HarnessReport {
         harnesses: Vec<DetectedHarness>,
+    },
+    /// A standard-chat harness turn completed on this device.
+    HarnessFinished {
+        conversation_id: String,
+        text: String,
+        session_id: String,
+        #[serde(default)]
+        usage: HarnessUsage,
+    },
+    /// A standard-chat harness turn failed on this device.
+    HarnessFailed {
+        conversation_id: String,
+        error: String,
     },
 }
 
@@ -376,6 +408,17 @@ pub enum HubMessage {
     HubMoveAbort {
         move_id: String,
         reason: String,
+    },
+    /// Run one turn of a CLI harness for a standard chat on this device.
+    /// `session_id` is `None` on the first harness turn in a chat and `Some` on
+    /// subsequent turns so the harness resumes its own continuous session.
+    HarnessTurn {
+        conversation_id: String,
+        agent: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        message: String,
     },
 }
 
@@ -1391,9 +1434,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), m);
         // Legacy hello without host field still deserializes cleanly.
         let legacy: NodeMessage = serde_json::from_str(
-            r#"{"type":"hello","protocol_version":6,"client_version":"0.1.0"}"#,
+            r#"{"type":"hello","protocol_version":7,"client_version":"0.1.0"}"#,
         )
         .unwrap();
+        assert_eq!(PROTOCOL_VERSION, 7);
         assert_eq!(
             legacy,
             NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "0.1.0".into(), host: None }
@@ -1436,6 +1480,52 @@ mod tests {
         assert!(s.contains(r#""type":"harness_report""#), "{s}");
         assert!(s.contains(r#""sign_in":"signed_in""#), "{s}");
         assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), hr);
+
+        let ht_first = HubMessage::HarnessTurn {
+            conversation_id: "c1".into(),
+            agent: "claude-code".into(),
+            model: "sonnet".into(),
+            session_id: None,
+            message: "hello".into(),
+        };
+        let s = serde_json::to_string(&ht_first).unwrap();
+        assert!(s.contains(r#""type":"harness_turn""#), "{s}");
+        assert!(!s.contains("session_id"), "{s}");
+        assert_eq!(serde_json::from_str::<HubMessage>(&s).unwrap(), ht_first);
+
+        let ht_resume = HubMessage::HarnessTurn {
+            conversation_id: "c1".into(),
+            agent: "claude-code".into(),
+            model: "sonnet".into(),
+            session_id: Some("sess-42".into()),
+            message: "follow up".into(),
+        };
+        let s = serde_json::to_string(&ht_resume).unwrap();
+        assert!(s.contains(r#""session_id":"sess-42""#), "{s}");
+        assert_eq!(serde_json::from_str::<HubMessage>(&s).unwrap(), ht_resume);
+
+        let hf = NodeMessage::HarnessFinished {
+            conversation_id: "c1".into(),
+            text: "hi there".into(),
+            session_id: "sess-42".into(),
+            usage: HarnessUsage {
+                input_tokens: 12,
+                output_tokens: 8,
+                cache_read_tokens: 4,
+                cache_write_tokens: 0,
+            },
+        };
+        let s = serde_json::to_string(&hf).unwrap();
+        assert!(s.contains(r#""type":"harness_finished""#), "{s}");
+        assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), hf);
+
+        let hfail = NodeMessage::HarnessFailed {
+            conversation_id: "c1".into(),
+            error: "cli exited 1".into(),
+        };
+        let s = serde_json::to_string(&hfail).unwrap();
+        assert!(s.contains(r#""type":"harness_failed""#), "{s}");
+        assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), hfail);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use core_protocol::{
-    DetectedHarness, HarnessCapabilities, HarnessModel, HarnessSignIn, NodeMessage,
+    DetectedHarness, HarnessCapabilities, HarnessModel, HarnessSignIn, HarnessUsage, NodeMessage,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -32,6 +32,35 @@ const CLI_CMD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum stdout bytes read from a CLI listing command.
 const MAX_CLI_STDOUT_BYTES: usize = 64 * 1024;
+
+/// Maximum time a single headless harness turn may run before timing out.
+const TURN_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Maximum stdout/stderr bytes retained from a single harness turn.
+const MAX_TURN_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Confinement level for [`turn`].
+///
+/// Standard chats pass [`HarnessLevel::Confined`] (the most restricted mode each CLI
+/// supports, inside an empty per-chat folder).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HarnessLevel {
+    /// Most restricted mode the agent offers (`plan`, `read-only`, `--no-tools`).
+    #[default]
+    Confined,
+    /// Confined to editing inside `workdir` where supported (`workspace-write`, `acceptEdits`, `accept-edits`).
+    Workspace,
+    /// Full tool permissions without interactive prompts (`danger-full-access`, `bypassPermissions`, `--dangerously-skip-permissions`).
+    Bypass,
+}
+
+/// Output of one headless CLI harness turn from [`turn`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnResult {
+    pub text: String,
+    pub session_id: String,
+    pub usage: HarnessUsage,
+}
 
 /// Supported harness specifications in canonical order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,10 +124,10 @@ pub const HARNESS_DEFS: &[HarnessDef] = &[
         slug: "grok",
         display_name: "Grok",
         binary: "grok",
-        // VERIFY: Grok CLI auth subcommand, session resume, and MCP support.
+        // VERIFY: Grok CLI auth subcommand, `--resume <sessionId>` session resume, and MCP support.
         login_command: "grok auth",
         can_confine_tools: false,
-        supports_resume: false,
+        supports_resume: true,
         supports_mcp: false,
     },
     HarnessDef {
@@ -1069,6 +1098,865 @@ fn extract_json_model_array(arr: &[Value], out: &mut Vec<HarnessModel>) {
     }
 }
 
+// ---- Headless turn execution (`turn`)
+
+struct TempFileGuard {
+    path: PathBuf,
+}
+
+impl TempFileGuard {
+    fn create(prefix: &str, ext: &str) -> Result<Self, String> {
+        let mut rnd = [0u8; 8];
+        getrandom::fill(&mut rnd).map_err(|e| format!("randomness failed: {e}"))?;
+        let hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+        let dir = std::env::temp_dir().join("grouper-harness-tmp");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("creating temp dir {}: {e}", dir.display()))?;
+        Ok(Self { path: dir.join(format!("{prefix}-{hex}.{ext}")) })
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn new_uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    let _ = getrandom::fill(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
+/// Per-conversation empty directory used to confine standard-chat harness turns on a device.
+pub fn chat_workdir(workspace_root: Option<&Path>, conversation_id: &str) -> Result<PathBuf, String> {
+    let id = conversation_id.trim();
+    if id.is_empty()
+        || id.len() > 128
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!("invalid conversation_id {conversation_id:?}"));
+    }
+    let base = match workspace_root {
+        Some(root) => root.join("harness-chats"),
+        None => std::env::temp_dir().join("grouper-harness-chats"),
+    };
+    let dir = base.join(id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("creating harness chat folder {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Run one headless turn of `agent`, starting a new session when `session` is `None`
+/// or resuming `session` when `Some`.
+pub async fn turn(
+    agent: &str,
+    model: &str,
+    session: Option<&str>,
+    message: &str,
+    workdir: &Path,
+    level: HarnessLevel,
+) -> Result<TurnResult, String> {
+    turn_with(&ScanOptions::host(), agent, model, session, message, workdir, level).await
+}
+
+/// Like [`turn`], using explicit [`ScanOptions`] so tests can point at fake CLI binaries
+/// in an isolated directory without touching the host's `$PATH` or `$HOME`.
+pub async fn turn_with(
+    opts: &ScanOptions,
+    agent: &str,
+    model: &str,
+    session: Option<&str>,
+    message: &str,
+    workdir: &Path,
+    level: HarnessLevel,
+) -> Result<TurnResult, String> {
+    let slug = agent.trim();
+    let Some(def) = HARNESS_DEFS.iter().find(|d| d.slug == slug) else {
+        return Err(format!("unsupported harness {slug:?}"));
+    };
+    let Some(bin_path) = find_harness_binary(def, opts) else {
+        return Err(format!("{} ({}) is not installed on this device", def.display_name, def.binary));
+    };
+    std::fs::create_dir_all(workdir)
+        .map_err(|e| format!("creating working directory {}: {e}", workdir.display()))?;
+
+    let session_clean = session.map(str::trim).filter(|s| !s.is_empty());
+    let model_clean = model.trim();
+
+    match slug {
+        "claude-code" => run_claude_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
+        "codex" => run_codex_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
+        "antigravity" => run_antigravity_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
+        "grok" => run_grok_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
+        "hermes" => run_hermes_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
+        "pi" => run_pi_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
+        "opencode" => run_opencode_turn(&bin_path, opts, model_clean, session_clean, message, workdir, level).await,
+        _ => Err(format!("unsupported harness {slug:?}")),
+    }
+}
+
+/// Resolve Windows npm `.cmd`/`.bat` shims to `node <script.js>` or `<target.exe>` when possible
+/// so multiline prompt arguments are not truncated by `cmd.exe` at the first newline.
+#[cfg(windows)]
+fn resolve_windows_shim(shim: &Path, opts: &ScanOptions) -> Option<(PathBuf, Vec<String>)> {
+    let ext = shim.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(ext.as_str(), "cmd" | "bat") {
+        return None;
+    }
+    let text = std::fs::read_to_string(shim).ok()?;
+    let parent = shim.parent()?;
+    for token in text.split(['"', '\r', '\n']).rev() {
+        let trimmed = token.trim();
+        let rel = trimmed
+            .strip_prefix("%~dp0\\")
+            .or_else(|| trimmed.strip_prefix("%dp0%\\"))
+            .or_else(|| trimmed.strip_prefix("%~dp0"))
+            .or_else(|| trimmed.strip_prefix("%dp0%"));
+        let Some(rel) = rel else { continue };
+        let rel = rel.trim_start_matches(['\\', '/']);
+        let lower = rel.to_ascii_lowercase();
+        if !(lower.ends_with(".js") || lower.ends_with(".cjs") || lower.ends_with(".mjs") || lower.ends_with(".exe")) {
+            continue;
+        }
+        let target = parent.join(rel);
+        if !target.is_file() {
+            continue;
+        }
+        if lower.ends_with(".exe") {
+            return Some((target, Vec::new()));
+        }
+        let node_names = candidate_binary_names("node");
+        let node = find_in_dirs(&opts.path_dirs, &node_names).or_else(|| {
+            if opts.include_system_dirs {
+                let sys = [PathBuf::from(r"C:\Program Files\nodejs")];
+                find_in_dirs(&sys, &node_names)
+            } else {
+                None
+            }
+        })?;
+        return Some((node, vec![target.to_string_lossy().to_string()]));
+    }
+    None
+}
+
+async fn run_turn_process(
+    program: &Path,
+    opts: &ScanOptions,
+    args: &[String],
+    workdir: &Path,
+    drop_claude_env: bool,
+) -> Result<(i32, String, String), String> {
+    let mut cmd = {
+        #[cfg(windows)]
+        {
+            if let Some((real_prog, prefix_args)) = resolve_windows_shim(program, opts) {
+                let mut c = tokio::process::Command::new(real_prog);
+                c.args(prefix_args);
+                c
+            } else if program
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "cmd" | "bat"))
+            {
+                let mut c = tokio::process::Command::new("cmd");
+                c.arg("/C").arg(program);
+                c
+            } else {
+                tokio::process::Command::new(program)
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = opts;
+            tokio::process::Command::new(program)
+        }
+    };
+
+    cmd.args(args)
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        let upper = name.to_ascii_uppercase();
+        if upper.starts_with("GROUPER_") {
+            cmd.env_remove(&k);
+        } else if drop_claude_env && upper.starts_with("CLAUDE") && upper != "CLAUDE_CONFIG_DIR" {
+            // Strip parent Claude Code session variables so `claude -p` never thinks it is nested
+            // inside an interactive session; keep `CLAUDE_CONFIG_DIR` for the user's credentials.
+            cmd.env_remove(&k);
+        }
+    }
+    if !opts.include_system_dirs
+        && let Some(home) = opts.home.as_deref()
+    {
+        cmd.env("HOME", home);
+        cmd.env("USERPROFILE", home);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to launch {}: {e}", program.display()))?;
+
+    let output = tokio::time::timeout(TURN_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| format!("harness timed out after {}s", TURN_TIMEOUT.as_secs()))?
+        .map_err(|e| format!("waiting on harness process failed: {e}"))?;
+
+    let cap = |bytes: &[u8]| -> String {
+        let slice = if bytes.len() > MAX_TURN_OUTPUT_BYTES {
+            &bytes[bytes.len() - MAX_TURN_OUTPUT_BYTES..]
+        } else {
+            bytes
+        };
+        String::from_utf8_lossy(slice).trim().to_string()
+    };
+    let code = output.status.code().unwrap_or(-1);
+    Ok((code, cap(&output.stdout), cap(&output.stderr)))
+}
+
+fn parse_jsonl(text: &str) -> Vec<Value> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('{') {
+                serde_json::from_str::<Value>(trimmed).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn last_json_object(text: &str) -> Option<Value> {
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text.trim()) {
+        return Some(Value::Object(map));
+    }
+    for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{')
+            && let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(trimmed)
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn u64_field(obj: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| {
+        obj.get(*k).and_then(|v| v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)))
+    })
+}
+
+fn parse_usage_value(usage: Option<&Value>) -> HarnessUsage {
+    let Some(u) = usage else { return HarnessUsage::default() };
+    let mut input = u64_field(u, &["input_tokens", "prompt_tokens", "input"]).unwrap_or(0);
+    let output = u64_field(u, &["output_tokens", "completion_tokens", "output"]).unwrap_or(0);
+    let cache_read = u64_field(u, &["cache_read_input_tokens", "cache_read_tokens", "cached_input_tokens", "cacheRead"])
+        .or_else(|| u.get("cache").and_then(|c| u64_field(c, &["read"])))
+        .unwrap_or(0);
+    let cache_write = u64_field(u, &["cache_creation_input_tokens", "cache_write_tokens", "cacheWrite"])
+        .or_else(|| u.get("cache").and_then(|c| u64_field(c, &["write"])))
+        .unwrap_or(0);
+    if input == 0
+        && output == 0
+        && cache_read == 0
+        && cache_write == 0
+        && let Some(total) = u64_field(u, &["total_tokens", "totalTokens", "total"])
+    {
+        input = total;
+    }
+    HarnessUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+    }
+}
+
+fn tail_detail(out: &str, err: &str) -> String {
+    let src = if !err.is_empty() { err } else { out };
+    let chars: Vec<char> = src.chars().collect();
+    if chars.len() > 600 {
+        chars[chars.len() - 600..].iter().collect()
+    } else {
+        src.to_string()
+    }
+}
+
+async fn run_claude_turn(
+    bin: &Path,
+    opts: &ScanOptions,
+    model: &str,
+    session: Option<&str>,
+    message: &str,
+    workdir: &Path,
+    level: HarnessLevel,
+) -> Result<TurnResult, String> {
+    // VERIFY: Claude Code `--permission-mode` values (`plan`, `acceptEdits`, `bypassPermissions`).
+    let permission_mode = match level {
+        HarnessLevel::Confined => "plan",
+        HarnessLevel::Workspace => "acceptEdits",
+        HarnessLevel::Bypass => "bypassPermissions",
+    };
+    // VERIFY: Claude Code headless flags (`claude -p <message> --output-format json --permission-mode <mode>`).
+    let mut args = vec![
+        "-p".to_string(),
+        message.to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        "--permission-mode".to_string(),
+        permission_mode.to_string(),
+    ];
+    if !model.is_empty() {
+        // VERIFY: Claude Code `--model <model>`.
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(sid) = session {
+        // VERIFY: Claude Code `--resume <session_id>`.
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+
+    let (code, out, err) = run_turn_process(bin, opts, &args, workdir, true).await?;
+    let Some(result) = last_json_object(&out) else {
+        return Err(format!("Claude Code failed (exit {code}): {}", tail_detail(&out, &err)));
+    };
+    let is_error = result.get("is_error").and_then(Value::as_bool).unwrap_or(false) || code != 0;
+    if is_error {
+        let detail = result
+            .get("result")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| result.get("api_error_code").and_then(Value::as_str))
+            .or_else(|| result.get("subtype").and_then(Value::as_str))
+            .map(String::from)
+            .unwrap_or_else(|| tail_detail(&out, &err));
+        return Err(format!("Claude Code failed: {detail}"));
+    }
+    let session_id = result
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(session)
+        .ok_or_else(|| "Claude Code did not return a session_id".to_string())?
+        .to_string();
+    let text = result
+        .get("result")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let usage = parse_usage_value(result.get("usage"));
+    Ok(TurnResult { text, session_id, usage })
+}
+
+async fn run_codex_turn(
+    bin: &Path,
+    opts: &ScanOptions,
+    model: &str,
+    session: Option<&str>,
+    message: &str,
+    workdir: &Path,
+    level: HarnessLevel,
+) -> Result<TurnResult, String> {
+    // VERIFY: Codex `-c sandbox_mode="..."` values (`read-only`, `workspace-write`, `danger-full-access`).
+    let sandbox = match level {
+        HarnessLevel::Confined => "read-only",
+        HarnessLevel::Workspace => "workspace-write",
+        HarnessLevel::Bypass => "danger-full-access",
+    };
+    // VERIFY: Codex headless flags (`--json --skip-git-repo-check -m <model> -c sandbox_mode=... -c approval_policy="never"`).
+    let mut common = vec![
+        "--json".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "-c".to_string(),
+        format!("sandbox_mode={}", serde_json::to_string(sandbox).unwrap()),
+        "-c".to_string(),
+        "approval_policy=\"never\"".to_string(),
+    ];
+    if !model.is_empty() {
+        common.push("-m".to_string());
+        common.push(model.to_string());
+    }
+    let mut args = vec!["exec".to_string()];
+    if let Some(sid) = session {
+        // VERIFY: Codex `codex exec resume <opts> <thread_id> <message>`.
+        args.push("resume".to_string());
+        args.extend(common);
+        args.push(sid.to_string());
+        args.push(message.to_string());
+    } else {
+        // VERIFY: Codex `codex exec <opts> -C <workdir> <message>`.
+        args.extend(common);
+        args.push("-C".to_string());
+        args.push(workdir.to_string_lossy().to_string());
+        args.push(message.to_string());
+    }
+
+    let (code, out, err) = run_turn_process(bin, opts, &args, workdir, false).await?;
+    let mut thread_id: Option<String> = None;
+    let mut texts: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut usage = HarnessUsage::default();
+    let mut failed = false;
+
+    for ev in parse_jsonl(&out) {
+        match ev.get("type").and_then(Value::as_str) {
+            Some("thread.started") => {
+                if let Some(tid) = ev.get("thread_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                    thread_id = Some(tid.to_string());
+                }
+            }
+            Some("item.completed") => {
+                if let Some(item) = ev.get("item") {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("agent_message") => {
+                            if let Some(t) = item.get("text").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                                texts.push(t.to_string());
+                            }
+                        }
+                        Some("error") => {
+                            let msg = item.get("message").and_then(Value::as_str).unwrap_or("");
+                            if !msg.contains("service tier") && !msg.contains("Model metadata for") && !msg.is_empty() {
+                                errors.push(msg.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("turn.completed") => {
+                usage = parse_usage_value(ev.get("usage"));
+            }
+            Some("turn.failed") => {
+                failed = true;
+                if let Some(msg) = ev.get("error").and_then(|e| e.get("message")).and_then(Value::as_str) {
+                    errors.push(msg.to_string());
+                }
+            }
+            Some("error") => {
+                failed = true;
+                if let Some(msg) = ev.get("message").and_then(Value::as_str) {
+                    errors.push(msg.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if failed || code != 0 {
+        let detail = if !errors.is_empty() {
+            errors.join("; ")
+        } else {
+            tail_detail(&out, &err)
+        };
+        return Err(format!("Codex failed (exit {code}): {detail}"));
+    }
+
+    let session_id = thread_id
+        .as_deref()
+        .or(session)
+        .ok_or_else(|| "Codex did not return a thread_id".to_string())?
+        .to_string();
+    Ok(TurnResult {
+        text: texts.join("\n\n"),
+        session_id,
+        usage,
+    })
+}
+
+async fn run_antigravity_turn(
+    bin: &Path,
+    opts: &ScanOptions,
+    model: &str,
+    session: Option<&str>,
+    message: &str,
+    workdir: &Path,
+    level: HarnessLevel,
+) -> Result<TurnResult, String> {
+    // VERIFY: Antigravity headless invocation (`agy -p <message> --output-format json --print-timeout <secs>s`).
+    let mut args = vec![
+        "-p".to_string(),
+        message.to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        "--print-timeout".to_string(),
+        format!("{}s", TURN_TIMEOUT.as_secs()),
+    ];
+    if !model.is_empty() {
+        // VERIFY: Antigravity `--model <model>`.
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(sid) = session {
+        // VERIFY: Antigravity `--conversation <id>` resume flag.
+        args.push("--conversation".to_string());
+        args.push(sid.to_string());
+    }
+    match level {
+        // VERIFY: Antigravity `--mode plan`, `--mode accept-edits`, and `--dangerously-skip-permissions`.
+        HarnessLevel::Confined => {
+            args.push("--mode".to_string());
+            args.push("plan".to_string());
+        }
+        HarnessLevel::Workspace => {
+            args.push("--mode".to_string());
+            args.push("accept-edits".to_string());
+        }
+        HarnessLevel::Bypass => {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+    }
+
+    let (code, out, err) = run_turn_process(bin, opts, &args, workdir, false).await?;
+    let Some(result) = last_json_object(&out) else {
+        return Err(format!("Antigravity failed (exit {code}): {}", tail_detail(&out, &err)));
+    };
+    let status = result.get("status").and_then(Value::as_str);
+    if code != 0 || status.is_some_and(|s| s != "SUCCESS") {
+        return Err(format!(
+            "Antigravity failed (status {}, exit {code}): {}",
+            status.unwrap_or("unknown"),
+            tail_detail(&out, &err)
+        ));
+    }
+    let session_id = result
+        .get("conversation_id")
+        .or_else(|| result.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(session)
+        .ok_or_else(|| "Antigravity did not return a conversation_id".to_string())?
+        .to_string();
+    let text = result
+        .get("response")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let usage = parse_usage_value(result.get("usage"));
+    Ok(TurnResult { text, session_id, usage })
+}
+
+async fn run_grok_turn(
+    bin: &Path,
+    opts: &ScanOptions,
+    model: &str,
+    session: Option<&str>,
+    message: &str,
+    workdir: &Path,
+    level: HarnessLevel,
+) -> Result<TurnResult, String> {
+    let prompt_file = TempFileGuard::create("grok-prompt", "txt")?;
+    std::fs::write(&prompt_file.path, message)
+        .map_err(|e| format!("writing Grok prompt file: {e}"))?;
+
+    // VERIFY: Grok Build `--permission-mode` (`plan` vs `bypassPermissions`).
+    let perm_mode = match level {
+        HarnessLevel::Confined => "plan",
+        HarnessLevel::Workspace | HarnessLevel::Bypass => "bypassPermissions",
+    };
+    // VERIFY: Grok Build headless flags (`grok --prompt-file <f> --output-format json --cwd <dir> --no-auto-update --permission-mode <mode>`).
+    let mut args = vec![
+        "--prompt-file".to_string(),
+        prompt_file.path.to_string_lossy().to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        "--cwd".to_string(),
+        workdir.to_string_lossy().to_string(),
+        "--no-auto-update".to_string(),
+        "--permission-mode".to_string(),
+        perm_mode.to_string(),
+    ];
+    if !model.is_empty() {
+        // VERIFY: Grok `--model <model>`.
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(sid) = session {
+        // VERIFY: Grok `--resume <sessionId>` flag.
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+
+    let (code, out, err) = run_turn_process(bin, opts, &args, workdir, false).await?;
+    let Some(result) = last_json_object(&out) else {
+        return Err(format!("Grok failed (exit {code}): {}", tail_detail(&out, &err)));
+    };
+    if code != 0 || result.get("type").and_then(Value::as_str) == Some("error") {
+        let msg = result
+            .get("message")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| tail_detail(&out, &err));
+        return Err(format!("Grok failed (exit {code}): {msg}"));
+    }
+    let session_id = result
+        .get("sessionId")
+        .or_else(|| result.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(session)
+        .ok_or_else(|| "Grok did not return a sessionId".to_string())?
+        .to_string();
+    let text = result
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let usage = parse_usage_value(result.get("usage"));
+    Ok(TurnResult { text, session_id, usage })
+}
+
+async fn run_hermes_turn(
+    bin: &Path,
+    opts: &ScanOptions,
+    model: &str,
+    session: Option<&str>,
+    message: &str,
+    workdir: &Path,
+    _level: HarnessLevel,
+) -> Result<TurnResult, String> {
+    let usage_file = TempFileGuard::create("hermes-usage", "json")?;
+    // VERIFY: Hermes CLI headless invocation (`hermes -z <message> [-m <model>] --usage-file <path> --in <dir> [--resume <id>]`).
+    let mut args = vec![
+        "-z".to_string(),
+        message.to_string(),
+        "--usage-file".to_string(),
+        usage_file.path.to_string_lossy().to_string(),
+        "--in".to_string(),
+        workdir.to_string_lossy().to_string(),
+    ];
+    if !model.is_empty() {
+        args.push("-m".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(sid) = session {
+        // VERIFY: Hermes `--resume <session_id>` flag.
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+
+    let (code, out, err) = run_turn_process(bin, opts, &args, workdir, false).await?;
+    let usage_json: Option<Value> = std::fs::read_to_string(&usage_file.path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let failed_flag = usage_json
+        .as_ref()
+        .and_then(|u| u.get("failed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if code != 0 || failed_flag {
+        return Err(format!("Hermes failed (exit {code}): {}", tail_detail(&out, &err)));
+    }
+    let session_id = usage_json
+        .as_ref()
+        .and_then(|u| u.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(session)
+        .ok_or_else(|| "Hermes did not return a session_id".to_string())?
+        .to_string();
+    let usage = parse_usage_value(usage_json.as_ref());
+    Ok(TurnResult {
+        text: out,
+        session_id,
+        usage,
+    })
+}
+
+async fn run_pi_turn(
+    bin: &Path,
+    opts: &ScanOptions,
+    model: &str,
+    session: Option<&str>,
+    message: &str,
+    workdir: &Path,
+    level: HarnessLevel,
+) -> Result<TurnResult, String> {
+    let owned_session;
+    let sid = match session {
+        Some(s) => s,
+        None => {
+            owned_session = new_uuid_v4();
+            &owned_session
+        }
+    };
+    // VERIFY: pi headless invocation (`pi -p --mode json --session-id <uuid> [--model <m>] [--no-tools|--exclude-tools ...] -- <message>`).
+    let mut args = vec![
+        "-p".to_string(),
+        "--mode".to_string(),
+        "json".to_string(),
+        "--session-id".to_string(),
+        sid.to_string(),
+    ];
+    if !model.is_empty() {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    match level {
+        HarnessLevel::Confined => args.push("--no-tools".to_string()),
+        HarnessLevel::Workspace => {
+            args.push("--exclude-tools".to_string());
+            args.push("bash,edit,write".to_string());
+        }
+        HarnessLevel::Bypass => {}
+    }
+    args.push("--".to_string());
+    args.push(message.to_string());
+
+    let (code, out, err) = run_turn_process(bin, opts, &args, workdir, false).await?;
+    let mut last_msg: Option<Value> = None;
+    let mut usage = HarnessUsage::default();
+    for ev in parse_jsonl(&out) {
+        if ev.get("type").and_then(Value::as_str) == Some("message_end")
+            && let Some(msg) = ev.get("message")
+            && msg.get("role").and_then(Value::as_str) == Some("assistant")
+        {
+            let step = parse_usage_value(msg.get("usage"));
+            usage.input_tokens += step.input_tokens;
+            usage.output_tokens += step.output_tokens;
+            usage.cache_read_tokens += step.cache_read_tokens;
+            usage.cache_write_tokens += step.cache_write_tokens;
+            last_msg = Some(msg.clone());
+        }
+    }
+    let Some(last) = last_msg else {
+        return Err(format!("pi failed (exit {code}): {}", tail_detail(&out, &err)));
+    };
+    if code != 0 || last.get("stopReason").and_then(Value::as_str) == Some("error") {
+        let msg = last
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| tail_detail(&out, &err));
+        return Err(format!("pi failed: {msg}"));
+    }
+    let text = last
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|c| c.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|c| c.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Ok(TurnResult {
+        text,
+        session_id: sid.to_string(),
+        usage,
+    })
+}
+
+async fn run_opencode_turn(
+    bin: &Path,
+    opts: &ScanOptions,
+    model: &str,
+    session: Option<&str>,
+    message: &str,
+    workdir: &Path,
+    level: HarnessLevel,
+) -> Result<TurnResult, String> {
+    // VERIFY: OpenCode headless invocation (`opencode run --format json [-m <m>] [--agent plan] --dir <dir> --auto [-s <id>] -- <msg>`).
+    let mut args = vec![
+        "run".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--dir".to_string(),
+        workdir.to_string_lossy().to_string(),
+        "--auto".to_string(),
+    ];
+    if !model.is_empty() {
+        args.push("-m".to_string());
+        args.push(model.to_string());
+    }
+    if level == HarnessLevel::Confined {
+        args.push("--agent".to_string());
+        args.push("plan".to_string());
+    }
+    if let Some(sid) = session {
+        // VERIFY: OpenCode `-s <sessionID>` flag.
+        args.push("-s".to_string());
+        args.push(sid.to_string());
+    }
+    args.push("--".to_string());
+    args.push(message.to_string());
+
+    let (code, out, err) = run_turn_process(bin, opts, &args, workdir, false).await?;
+    let mut found_session: Option<String> = None;
+    let mut texts: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut usage = HarnessUsage::default();
+
+    for ev in parse_jsonl(&out) {
+        if found_session.is_none()
+            && let Some(sid) = ev.get("sessionID").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+        {
+            found_session = Some(sid.to_string());
+        }
+        let part = ev.get("part");
+        match ev.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = part.and_then(|p| p.get("text")).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                    texts.push(t.to_string());
+                }
+            }
+            Some("step_finish") => {
+                let step = parse_usage_value(part.and_then(|p| p.get("tokens")));
+                usage.input_tokens += step.input_tokens;
+                usage.output_tokens += step.output_tokens;
+                usage.cache_read_tokens += step.cache_read_tokens;
+                usage.cache_write_tokens += step.cache_write_tokens;
+            }
+            Some("error") => {
+                if let Some(msg) = ev.get("error").and_then(|e| e.get("message")).and_then(Value::as_str) {
+                    errors.push(msg.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if code != 0 || (!errors.is_empty() && texts.is_empty()) {
+        let detail = if !errors.is_empty() {
+            errors.join("; ")
+        } else {
+            tail_detail(&out, &err)
+        };
+        return Err(format!("opencode failed (exit {code}): {detail}"));
+    }
+    let session_id = found_session
+        .as_deref()
+        .or(session)
+        .ok_or_else(|| "opencode did not return a sessionID".to_string())?
+        .to_string();
+    Ok(TurnResult {
+        text: texts.join("\n\n"),
+        session_id,
+        usage,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1306,5 +2194,174 @@ mod tests {
 
         let grok = parse_grok_models("Available models:\n* grok-4.7 (default)\n- grok-code-fast\n");
         assert_eq!(grok, vec![model("grok-4.7", None), model("grok-code-fast", None)]);
+    }
+
+    const FAKE_MULTI_HARNESS_SRC: &str = r#"
+use std::env;
+use std::fs;
+use std::path::Path;
+
+fn esc(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            x => o.push(x),
+        }
+    }
+    o
+}
+
+fn find_after(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+fn main() {
+    let argv: Vec<String> = env::args().collect();
+    let prog = Path::new(&argv[0])
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let args = &argv[1..];
+    let cwd = env::current_dir().unwrap();
+    // Standard chat folder must contain no pre-existing repo files.
+    assert!(cwd.is_dir(), "workdir must exist");
+
+    match prog.as_str() {
+        "claude" => {
+            let msg = find_after(args, "-p").unwrap_or_default();
+            let mode = find_after(args, "--permission-mode").unwrap_or_default();
+            assert_eq!(mode, "plan", "claude confined mode must be plan");
+            let resume = find_after(args, "--resume");
+            let sid = resume.clone().unwrap_or_else(|| "cc-sess-101".into());
+            let prefix = if resume.is_some() { "resumed" } else { "new" };
+            println!(
+                "{{\"type\":\"result\",\"is_error\":false,\"session_id\":\"{}\",\"result\":\"{}:{}:{}\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":6,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}}",
+                esc(&sid), prefix, esc(&sid), esc(&msg)
+            );
+        }
+        "codex" => {
+            assert_eq!(args.first().map(String::as_str), Some("exec"));
+            assert!(args.iter().any(|a| a == "sandbox_mode=\"read-only\""), "codex must run read-only: {args:?}");
+            let is_resume = args.get(1).map(String::as_str) == Some("resume");
+            let (sid, msg) = if is_resume {
+                (args[args.len() - 2].clone(), args[args.len() - 1].clone())
+            } else {
+                ("cx-thread-202".to_string(), args.last().cloned().unwrap_or_default())
+            };
+            let prefix = if is_resume { "resumed" } else { "new" };
+            println!("{{\"type\":\"thread.started\",\"thread_id\":\"{}\"}}", esc(&sid));
+            println!(
+                "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"{}:{}:{}\"}}}}",
+                prefix, esc(&sid), esc(&msg)
+            );
+            println!("{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":14,\"output_tokens\":7,\"cached_input_tokens\":3}}}}");
+        }
+        "agy" => {
+            let msg = find_after(args, "-p").unwrap_or_default();
+            assert_eq!(find_after(args, "--mode").as_deref(), Some("plan"));
+            assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+            let resume = find_after(args, "--conversation");
+            let sid = resume.clone().unwrap_or_else(|| "agy-conv-303".into());
+            let prefix = if resume.is_some() { "resumed" } else { "new" };
+            println!(
+                "{{\"status\":\"SUCCESS\",\"conversation_id\":\"{}\",\"response\":\"{}:{}:{}\",\"usage\":{{\"total_tokens\":33}}}}",
+                esc(&sid), prefix, esc(&sid), esc(&msg)
+            );
+        }
+        "grok" => {
+            let pfile = find_after(args, "--prompt-file").expect("--prompt-file");
+            let msg = fs::read_to_string(pfile).unwrap();
+            assert_eq!(find_after(args, "--permission-mode").as_deref(), Some("plan"));
+            let resume = find_after(args, "--resume");
+            let sid = resume.clone().unwrap_or_else(|| "grok-sess-404".into());
+            let prefix = if resume.is_some() { "resumed" } else { "new" };
+            println!(
+                "{{\"type\":\"result\",\"sessionId\":\"{}\",\"text\":\"{}:{}:{}\",\"usage\":{{\"total_tokens\":19}}}}",
+                esc(&sid), prefix, esc(&sid), esc(&msg)
+            );
+        }
+        "hermes" => {
+            let msg = find_after(args, "-z").unwrap_or_default();
+            let ufile = find_after(args, "--usage-file").expect("--usage-file");
+            let resume = find_after(args, "--resume");
+            let sid = resume.clone().unwrap_or_else(|| "hermes-sess-505".into());
+            let prefix = if resume.is_some() { "resumed" } else { "new" };
+            fs::write(
+                ufile,
+                format!("{{\"session_id\":\"{}\",\"failed\":false,\"total_tokens\":27}}", esc(&sid)),
+            )
+            .unwrap();
+            println!("{prefix}:{sid}:{msg}");
+        }
+        other => panic!("unexpected fake binary name {other}"),
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn turn_resumes_sessions_and_confines_all_five_harnesses_with_fake_cli() {
+        let home = TempHome::new("turn-multi");
+        let bin_dir = home.path.join("fake-bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let src = bin_dir.join("fake_harness.rs");
+        std::fs::write(&src, FAKE_MULTI_HARNESS_SRC).unwrap();
+        let base_exe = bin_dir.join(if cfg!(windows) { "fake_harness.exe" } else { "fake_harness" });
+        let status = Command::new("rustc")
+            .arg(&src)
+            .arg("-O")
+            .arg("-o")
+            .arg(&base_exe)
+            .status()
+            .expect("rustc available in cargo test");
+        assert!(status.success(), "compiling fake harness failed");
+
+        for name in ["claude", "codex", "agy", "grok", "hermes"] {
+            let dst = bin_dir.join(if cfg!(windows) { format!("{name}.exe") } else { name.to_string() });
+            std::fs::copy(&base_exe, &dst).unwrap();
+        }
+
+        let opts = ScanOptions::isolated(&home.path, vec![bin_dir], FIXED_NOW);
+        let ws_root = home.path.join("workspaces");
+
+        let cases = [
+            ("claude-code", "sonnet", "cc-sess-101", 19u64),
+            ("codex", "gpt-5.2", "cx-thread-202", 24u64),
+            ("antigravity", "gemini-3.1-pro", "agy-conv-303", 33u64),
+            ("grok", "grok-4.7", "grok-sess-404", 19u64),
+            ("hermes", "deepseek-v4-flash", "hermes-sess-505", 27u64),
+        ];
+
+        for (agent, model_name, expected_sid, expected_tokens) in cases {
+            let conv_id = format!("conv-{}", agent);
+            let workdir = chat_workdir(Some(&ws_root), &conv_id).unwrap();
+            assert_eq!(std::fs::read_dir(&workdir).unwrap().count(), 0, "per-chat folder starts empty");
+
+            let t1 = turn_with(&opts, agent, model_name, None, "hello first", &workdir, HarnessLevel::Confined)
+                .await
+                .unwrap_or_else(|e| panic!("{agent} turn 1 failed: {e}"));
+            assert_eq!(t1.session_id, expected_sid, "{agent} turn 1 session_id");
+            assert_eq!(t1.text, format!("new:{expected_sid}:hello first"));
+            assert_eq!(t1.usage.total_tokens(), expected_tokens, "{agent} turn 1 tokens");
+
+            let t2 = turn_with(
+                &opts,
+                agent,
+                model_name,
+                Some(&t1.session_id),
+                "hello second",
+                &workdir,
+                HarnessLevel::Confined,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{agent} turn 2 failed: {e}"));
+            assert_eq!(t2.session_id, expected_sid, "{agent} turn 2 session_id");
+            assert_eq!(t2.text, format!("resumed:{expected_sid}:hello second"));
+        }
     }
 }
