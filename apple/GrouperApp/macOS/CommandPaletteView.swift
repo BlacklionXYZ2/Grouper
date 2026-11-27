@@ -196,7 +196,7 @@ struct CommandPaletteView: View {
             case .needsYou: return "exclamationmark.circle"
             case .devices: return "desktopcomputer"
             case .models: return "cpu"
-            case .usage: return "chart.bar"
+            case .usage: return "chart.pie"
             case .memory: return "brain"
             case .skills: return "sparkles"
             case .settings: return "gear"

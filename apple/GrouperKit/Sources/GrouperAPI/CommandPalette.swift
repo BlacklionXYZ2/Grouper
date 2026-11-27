@@ -10,7 +10,7 @@ public enum PalettePage: String, CaseIterable, Sendable {
         case .needsYou: return "Needs you"
         case .devices: return "Devices"
         case .models: return "Models"
-        case .usage: return "Usage & limits"
+        case .usage: return "Usage"
         case .memory: return "Memory"
         case .skills: return "Skills"
         case .settings: return "Settings"
