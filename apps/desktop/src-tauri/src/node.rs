@@ -32,6 +32,16 @@ pub struct NodeHandle {
 
 impl NodeHandle {
     pub fn start(hub_url: &str, token: String, app_data_dir: &Path) -> Self {
+        Self::start_with_options(hub_url, token, app_data_dir, None, None)
+    }
+
+    fn start_with_options(
+        hub_url: &str,
+        token: String,
+        app_data_dir: &Path,
+        mcp_config: Option<PathBuf>,
+        folders_config: Option<&Path>,
+    ) -> Self {
         let workspace = std::env::var_os(WORKSPACE_ENV)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
@@ -39,7 +49,7 @@ impl NodeHandle {
 
         let allow_shell = !env_flag(NO_SHELL_ENV);
         let usage_probes = env_flag(USAGE_PROBES_ENV);
-        let folders = match core_client::folders::load(None, &[]) {
+        let folders = match core_client::folders::load(folders_config, &[]) {
             Ok(list) => list,
             Err(err) => {
                 tracing::warn!("skipping scoped folders config: {err}");
@@ -64,7 +74,7 @@ impl NodeHandle {
             ],
             workspace_root: Some(workspace),
             allow_shell,
-            mcp_config: None,
+            mcp_config,
             folders,
             usage_probes,
         };
@@ -278,7 +288,13 @@ mod tests {
         let auth = hub_arc.db.authenticate(&token).expect("node token authenticates");
         assert!(!auth.admin, "node must never hold an admin credential");
 
-        let node = NodeHandle::start(&hub_url, token, &app_dir);
+        let node = NodeHandle::start_with_options(
+            &hub_url,
+            token,
+            &app_dir,
+            Some(app_dir.join("mcp.json")),
+            Some(&app_dir.join("folders.json")),
+        );
 
         // Wait until the hub sees this PC's node online with its MCP tools listed.
         tokio::time::timeout(Duration::from_secs(10), async {

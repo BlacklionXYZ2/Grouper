@@ -8,7 +8,8 @@
 //!      hubs trust ID tokens minted for the Windows desktop client without `GROUPER_GOOGLE_CLIENT_IDS`.
 //!   3. Add `"windows"` alongside `"macos"` / `"cli"` in `POST /v1/auth/google` (`crates/hub/src/google_auth.rs`)
 //!      for remote-hub sign-in (`claim_local_client` already accepts `"windows"`).
-//!   Until Q5 is completed, local-hub sign-in works via `http://127.0.0.1:47600/#/token-signin` from loopback.
+//!
+//! Until Q5 is completed, local-hub sign-in works via `http://127.0.0.1:47600/#/token-signin` from loopback.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};

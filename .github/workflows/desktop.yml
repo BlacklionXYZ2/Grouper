@@ -1,0 +1,77 @@
+# Windows desktop app (Tauri 2 shell embedding hub and core-client node).
+# Unsigned build on GitHub-hosted windows-latest.
+# cargo fmt is intentionally not run: the tree is not rustfmt-clean.
+
+name: Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "apps/desktop/**"
+      - "crates/hub/**"
+      - "crates/core-client/**"
+      - "crates/core-agent/**"
+      - "crates/core-protocol/**"
+      - "crates/core-registry/**"
+      - "crates/core-memory/**"
+      - "crates/providers/**"
+      - "Cargo.toml"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "apps/desktop/**"
+      - "crates/hub/**"
+      - "crates/core-client/**"
+      - "crates/core-agent/**"
+      - "crates/core-protocol/**"
+      - "crates/core-registry/**"
+      - "crates/core-memory/**"
+      - "crates/providers/**"
+      - "Cargo.toml"
+      - ".github/workflows/desktop.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: windows-latest
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/desktop/src-tauri -> target"
+
+      - name: Build desktop app (release, unsigned)
+        working-directory: apps/desktop/src-tauri
+        run: cargo build --release --locked
+
+      - name: Test desktop app
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked
+
+      - name: Clippy
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Upload unsigned Windows executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: Grouper-windows-x64
+          path: apps/desktop/src-tauri/target/release/grouper-desktop.exe
+          retention-days: 14
