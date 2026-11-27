@@ -448,6 +448,7 @@ pub fn apply_discovery(
                 modalities: d.modalities.clone(),
                 kind: "api".to_string(),
                 device_id: None,
+                can_orchestrate: false,
                 source: "auto".to_string(),
                 hidden: false,
                 hidden_reason: None,
