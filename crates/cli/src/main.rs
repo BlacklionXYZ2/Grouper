@@ -908,12 +908,12 @@ async fn main() -> Result<()> {
             let cache = cli.cache;
             let (hub, token) = credentials::resolve(cli.hub, cli.token, credentials::DEFAULT_HUB)?;
             let api = Api { base: hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
-            return run_authed_cmd(&api, cache, cmd).await;
+            return run_authed_cmd(api, cache, cmd).await;
         }
     }
 }
 
-async fn run_authed_cmd(api: &Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()> {
+async fn run_authed_cmd(api: Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Login { .. } | Cmd::Logout | Cmd::Hub(_) => unreachable!(),
         Cmd::Connect { workspace, no_shell, mcp_config, folders, folders_config, usage_probes } => {
@@ -1638,7 +1638,7 @@ mod tests {
     #[test]
     fn hub_subcommands_parse() {
         let init = Cli::try_parse_from(["grouper", "hub", "init", "--data", "/tmp/grouper-hub"]).expect("hub init");
-        assert!(matches!(init.cmd, Cmd::Hub(hub::HubCmd::Init { data: Some(p) }) if p == PathBuf::from("/tmp/grouper-hub")));
+        assert!(matches!(init.cmd, Cmd::Hub(hub::HubCmd::Init { data: Some(p) }) if p == std::path::Path::new("/tmp/grouper-hub")));
 
         let run = Cli::try_parse_from(["grouper", "hub", "run"]).expect("hub run");
         assert!(matches!(run.cmd, Cmd::Hub(hub::HubCmd::Run { bind, .. }) if bind.to_string() == hub::DEFAULT_BIND));
