@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/core-protocol", "crates/core-registry", "crates/core-memory", "crates/providers", "crates/core-agent", "crates/core-client", "crates/hub", "crates/core-sync", "crates/ffi", "crates/cli"]
+exclude = ["apps/desktop", "apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
