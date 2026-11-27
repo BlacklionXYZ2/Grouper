@@ -118,6 +118,38 @@ time, `ProviderInfo.viaDevice`) are built and tested, on the Windows toolchain.
   Search… (⌘K) or the sidebar's search button. It has local results only.
   Matching and ranking live in `GrouperAPI.CommandPalette`, which has unit tests.
 
+## Usage widgets (iPhone)
+
+The `GrouperWidgets` extension has two Home Screen widgets and two Lock Screen ones, all opening the
+Usage tab (`grouper://usage`):
+
+- **API costs** (`iOSWidgets/CostsWidgetView.swift`): small is the period's total and a donut by key;
+  medium the donut and the top keys; large the donut and up to eight keys with tokens in and out.
+  Configurable period, Day / Week / Month (rolling, local time, default Day). Lock Screen
+  rectangle: the period's cost.
+- **Subscription usage** (`iOSWidgets/SubscriptionsWidgetView.swift`): small is one account's windows as
+  bars, medium two accounts (or one account's windows once you pick it), large every account as a
+  compact card with Antigravity's group headings. The account is configurable; left empty it is the one
+  closest to a limit. From 80% a bar turns amber with a "Nearly used" word and icon, at 100% red
+  with "Used up". Lock Screen circle: a gauge of the most used window.
+
+**Data.** The widgets have no sign-in and no token, and make no network call. The app writes a compact
+JSON snapshot (`GrouperAPI.WidgetSnapshot`: Day, Week and Month costs without the per-model rows, and
+the subscription cards) to the App Group container whenever the Usage page loads or refreshes
+(`UsageStore.publishToWidgets`, file `usage-widgets.json`), then asks WidgetKit to reload. The widgets
+read that file, redraw every 10 minutes so "resets in" keeps counting down, and look at the file again
+every 30. So they are as fresh as the last time the Usage tab loaded: each says "Updated 12 min ago",
+and from an hour on (or when the figure is from an earlier day, or a device's sign-in has expired)
+reads "Stale" with an icon. With nothing written yet they say "Open Grouper to load usage". Signing out
+deletes the file. Letting the widget fetch for itself would mean putting the admin token in a shared
+Keychain access group; that was left out on purpose.
+
+**App Group.** `group.uk.clockmillbarn.grouper` is in `Entitlements/Grouper-iOS.entitlements` and
+`Entitlements/GrouperWidgets.entitlements` and in `Shared/WidgetSnapshotStore.swift`. Register that
+group under Identifiers > App Groups on the Apple developer account and tick it for both app IDs
+(`uk.clockmillbarn.grouper.ios` and `uk.clockmillbarn.grouper.ios.widgets`) before a signed build. A
+build without the group still runs: nothing is shared, and the widgets show the empty state.
+
 ## Build on a Mac
 
 Requirements: macOS 26 or later, Xcode 26 or later (Xcode 27 for the iOS 27 and macOS 27 SDKs), Swift 6, and XcodeGen.
@@ -164,6 +196,9 @@ go on a phone. From the Mac, with Xcode and a free Apple Account:
 2. Xcode > Settings > Accounts: add your Apple Account (a Personal Team appears).
 3. For the `Grouper-iOS` and `GrouperWidgets` targets, Signing & Capabilities: tick
    "Automatically manage signing" and pick the Personal Team.
+   Both carry the App Group `group.uk.clockmillbarn.grouper` (the usage widgets read their data
+   through it); if Xcode can't provision it for a Personal Team, the app still runs but the widgets
+   stay empty.
 4. Plug in the iPhone, turn on Settings > Privacy & Security > Developer Mode (it
    restarts), select the phone as the run destination and press Run.
 5. On the phone, trust the developer in Settings > General > VPN & Device Management.

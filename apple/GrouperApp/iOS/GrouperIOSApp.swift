@@ -19,7 +19,10 @@ struct GrouperIOSApp: App {
             .onReceive(NotificationCenter.default.publisher(for: .grouperApprovalRoute)) { _ in takeApprovalRoute() }
             // The saved copy of the Usage page holds spend figures: signing out removes it.
             .onChange(of: model.signedIn) { _, signedIn in
-                if !signedIn { UsageCacheStorage.clear() }
+                if !signedIn {
+                    UsageCacheStorage.clear()
+                    WidgetSnapshotStore.clear()
+                }
             }
         }
     }
