@@ -22,7 +22,7 @@
     radial-gradient(55% 50% at 85% 20%, rgba(155, 92, 246, 0.22), transparent 70%),
     radial-gradient(60% 55% at 55% 55%, rgba(59, 130, 246, 0.16), transparent 70%),
     var(--backdrop);
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--line-2);
 }
 
 .login-brand-head {
@@ -38,6 +38,7 @@
   filter: drop-shadow(0 8px 24px rgba(59, 130, 246, 0.35));
 }
 
+/* 44px: the sign-in figure, the one size outside the seven steps. */
 .login-wordmark {
   margin: 0;
   font-size: 44px;
@@ -48,7 +49,7 @@
 
 .login-tagline {
   margin: 0;
-  font-size: 20px;
+  font-size: var(--type-title-size);
   color: var(--text-2);
 }
 
@@ -64,7 +65,7 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  font-size: 16px;
+  font-size: var(--type-body-size);
   color: var(--text);
 }
 
@@ -74,8 +75,8 @@
   height: 36px;
   display: grid;
   place-items: center;
-  border-radius: 10px;
-  border: 1px solid var(--border-strong);
+  border-radius: 10px; /* 36px tile; between control and card, kept literal */
+  border: 1px solid var(--line-2);
   background: var(--surface);
 }
 
@@ -108,7 +109,7 @@
 
 .login-split .login-card {
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--line-3);
   box-shadow: var(--shadow-float, var(--shadow));
 }
 
@@ -142,8 +143,8 @@
     height: 48px;
   }
 
-  .login-wordmark { grid-area: word; font-size: 26px; align-self: end; }
-  .login-tagline { grid-area: tag; font-size: 15px; align-self: start; }
+  .login-wordmark { grid-area: word; font-size: var(--type-title-size); align-self: end; }
+  .login-tagline { grid-area: tag; font-size: var(--type-body-size); align-self: start; }
   .login-values { display: none; }
   .login-main { padding: 16px; align-items: start; }
 }
