@@ -10,7 +10,7 @@ import FoundationNetworking
 // - GET/POST/DELETE /v1/hub/move (crates/hub/src/migrate.rs::{MoveStatus, StartMoveRequest})
 
 /// `GET /v1/hub`: public identity of the hub currently answering at the configured address.
-/// Older hubs omit `account`, `hub_device_id`, `epoch`, and `key_sha256`; they default cleanly.
+/// `account` is an opaque account id (never an email). Older hubs omit `account`, `hub_device_id`, `epoch`, and `key_sha256`; they default cleanly.
 public struct HubIdentity: Codable, Equatable, Sendable {
     public let hubId: String
     public let hubVersion: String

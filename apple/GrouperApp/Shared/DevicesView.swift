@@ -527,11 +527,8 @@ private struct HubSummaryCard: View {
                     Text(subtitleLine)
                         .font(Theme.Typeface.meta)
                         .foregroundStyle(Theme.text2)
-                    if let account = hubIdentity?.account, !account.isEmpty {
-                        Text(account)
-                            .font(Theme.Typeface.meta)
-                            .foregroundStyle(Theme.text3)
-                    }
+                    // `account` from /v1/hub is an opaque id (no email), so it isn't shown;
+                    // Settings > Account shows the signed-in Google email.
                 }
             }
 
