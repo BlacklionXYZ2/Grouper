@@ -1346,7 +1346,7 @@ a {
   cursor: pointer;
   text-decoration: none;
   white-space: nowrap;
-  transition: background 0.15s var(--ease), border-color 0.15s var(--ease), transform 0.1s var(--ease);
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
 }
 
 .btn:hover {
@@ -1544,7 +1544,7 @@ a {
   color: var(--text-2);
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 }
 
 .seg input {
@@ -1594,7 +1594,7 @@ a {
   position: relative;
   cursor: pointer;
   margin: 0;
-  transition: background 0.15s var(--ease);
+  transition: background var(--dur-fast) var(--ease-out);
 }
 
 .switch input::after {
@@ -1607,7 +1607,7 @@ a {
   border-radius: var(--r-full);
   background: #fff;
   box-shadow: var(--shadow-sm);
-  transition: transform 0.15s var(--ease);
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 
 .switch input:checked {
@@ -1690,7 +1690,7 @@ a {
   margin-top: 2px;
   color: var(--text-3);
   flex: none;
-  transition: transform 0.15s var(--ease);
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 
 .provider-group[open] > summary > .icon {
@@ -1710,7 +1710,7 @@ a {
    colour transition, which the reduced-motion rule above cuts to nothing. */
 .model-row,
 .model-row > td {
-  transition: background-color 0.6s var(--ease), box-shadow 0.6s var(--ease);
+  transition: background-color 0.6s var(--ease-out), box-shadow 0.6s var(--ease-out); /* 0.6s target flash: a highlight fade, outside the duration scale */
 }
 
 li.model-row.is-target,
@@ -2412,7 +2412,7 @@ button.strip:hover {
   cursor: pointer;
   color: inherit;
   min-width: 0;
-  transition: border-color 0.15s var(--ease), box-shadow 0.15s var(--ease), transform 0.1s var(--ease);
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
 }
 
 .chip:hover {
@@ -2696,7 +2696,7 @@ button.strip:hover {
   display: inline-flex;
   gap: 6px;
   align-items: center;
-  animation: fade-in 0.2s var(--ease);
+  animation: fade-in var(--dur-base) var(--ease-out);
 }
 
 @keyframes fade-in {
@@ -2803,7 +2803,7 @@ button.strip:hover {
 }
 
 .tool-row > summary .chev {
-  transition: transform 0.15s var(--ease);
+  transition: transform var(--dur-fast) var(--ease-out);
   color: var(--text-3);
   width: 14px;
   height: 14px;
@@ -2928,7 +2928,7 @@ dialog.sheet-dialog {
 dialog.sheet-dialog[open] {
   display: flex;
   flex-direction: column;
-  animation: rise 0.22s var(--ease);
+  animation: rise var(--dur-slow) var(--ease-snap);
 }
 
 dialog.sheet-dialog::backdrop {
@@ -3040,7 +3040,7 @@ dialog.sheet-dialog::backdrop {
   display: flex;
   gap: 10px;
   align-items: center;
-  animation: rise 0.2s var(--ease);
+  animation: rise var(--dur-base) var(--ease-out);
 }
 
 /* Toasts float, so they keep a shadow in dark mode too (V3). */
@@ -3248,7 +3248,7 @@ dialog.sheet-dialog::backdrop {
     border: 1px solid var(--line-3);
     border-radius: var(--r-sheet);
     box-shadow: var(--shadow-lg);
-    animation: slide-in 0.22s var(--ease);
+    animation: slide-in var(--dur-slow) var(--ease-snap);
   }
 
   .inspector-scrim:not([hidden]) {
@@ -3305,7 +3305,7 @@ dialog.sheet-dialog::backdrop {
     border-radius: 0 var(--r-sheet) var(--r-sheet) 0;
     border-right: 1px solid var(--line-3);
     transform: translateX(-105%);
-    transition: transform 0.24s var(--ease);
+    transition: transform var(--dur-slow) var(--ease-snap);
     z-index: 70;
     padding-top: env(safe-area-inset-top);
   }
@@ -3408,7 +3408,7 @@ dialog.sheet-dialog::backdrop {
     width: 100%;
     height: calc(100dvh - 40px - env(safe-area-inset-top));
     border-radius: var(--r-sheet) var(--r-sheet) 0 0;
-    animation: sheet-up 0.26s var(--ease);
+    animation: sheet-up var(--dur-slow) var(--ease-snap);
     padding-bottom: env(safe-area-inset-bottom);
   }
 
@@ -3424,7 +3424,7 @@ dialog.sheet-dialog::backdrop {
   dialog.threads-sheet[open] {
     height: min(92dvh, 100%);
     /* Own slide. `rise` is transform-only too; this sheet travels farther. */
-    animation: threads-sheet-in 0.22s var(--ease);
+    animation: threads-sheet-in var(--dur-slow) var(--ease-snap);
   }
 
   .limit-row {
@@ -3873,7 +3873,7 @@ code.nowrap {
 .dock-input > summary .chev {
   width: 16px;
   height: 16px;
-  transition: rotate 0.15s var(--ease);
+  transition: rotate var(--dur-fast) var(--ease-out);
 }
 
 .dock-input[open] > summary .chev {
@@ -4043,7 +4043,7 @@ code.nowrap {
 .login-disclosure > summary > .icon {
   width: 16px;
   height: 16px;
-  transition: transform 0.15s var(--ease);
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 
 .login-disclosure[open] > summary > .icon {
@@ -5842,7 +5842,7 @@ dialog.sheet-dialog.model-picker {
     border: none;
     border-radius: 0;
     padding-top: env(safe-area-inset-top);
-    animation: threads-sheet-in 0.22s var(--ease);
+    animation: threads-sheet-in var(--dur-slow) var(--ease-snap);
   }
 
   .mp-option {
@@ -6008,7 +6008,7 @@ dialog.sheet-dialog.model-picker {
 .u-track-body[aria-busy="true"] > .u-subgrid,
 .u-breakdown [aria-busy="true"] > .u-table {
   opacity: 0.7;
-  transition: opacity 0.15s var(--ease);
+  transition: opacity var(--dur-fast) var(--ease-out);
 }
 
 .u-banner {
@@ -6550,7 +6550,7 @@ dialog.command-palette {
 dialog.command-palette[open] {
   display: flex;
   flex-direction: column;
-  animation: rise 0.18s var(--ease);
+  animation: rise var(--dur-base) var(--ease-out);
 }
 
 dialog.command-palette::backdrop {
