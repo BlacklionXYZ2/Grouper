@@ -127,6 +127,8 @@ pub struct Hub {
     pub(crate) handover_acks: Mutex<HashMap<String, HandoverAckRoute>>,
     /// Concurrent model calls currently relayed through hosting devices.
     pub(crate) model_calls: Mutex<HashMap<String, ModelRoute>>,
+    /// In-flight standard-chat harness turns waiting on a hosting device, keyed by conversation id.
+    pub(crate) harness_turns: Mutex<HashMap<String, crate::harness::PendingHarnessTurn>>,
     /// Requester call ids already used on each live connection; prevents reuse
     /// after a route finishes as well as simultaneous duplicates.
     pub(crate) model_request_ids: Mutex<HashMap<(String, u64), HashSet<String>>>,
@@ -175,6 +177,7 @@ impl Hub {
             approvals: Mutex::new(HashMap::new()),
             handover_acks: Mutex::new(HashMap::new()),
             model_calls: Mutex::new(HashMap::new()),
+            harness_turns: Mutex::new(HashMap::new()),
             model_request_ids: Mutex::new(HashMap::new()),
             relayed_usage: std::sync::Mutex::new(HashMap::new()),
             probe_runs: std::sync::Mutex::new(HashSet::new()),
@@ -260,6 +263,11 @@ impl Hub {
 
     pub(crate) fn handover_ack_timeout(&self) -> Duration {
         *self.handover_ack_timeout.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribe_events_for_test(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
     }
 
     /// Store an event and send it to everyone watching.
@@ -1466,6 +1474,12 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
                     tracing::warn!(device = %device_id, "applying harness report failed: {e:#}");
                 }
             }
+            Ok(NodeMessage::HarnessFinished { conversation_id, text, session_id, usage }) => {
+                hub.harness_finished(&device_id, conn_id, &conversation_id, text, session_id, usage).await;
+            }
+            Ok(NodeMessage::HarnessFailed { conversation_id, error }) => {
+                hub.harness_failed(&device_id, conn_id, &conversation_id, error).await;
+            }
             Ok(NodeMessage::Hello { .. }) => {
                 if let Err(mpsc::error::TrySendError::Full(_)) =
                     tx.try_send(HubMessage::Error { message: "already said hello".into() })
@@ -1486,6 +1500,7 @@ async fn session(hub: Arc<Hub>, device_id: String, socket: WebSocket) -> Result<
     };
 
     hub.model_connection_gone(&device_id, conn_id).await;
+    hub.harness_connection_gone(&device_id, conn_id).await;
 
     let call_device_gone = {
         let mut live = hub.live.lock().await;

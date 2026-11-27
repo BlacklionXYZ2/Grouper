@@ -216,8 +216,16 @@ pub(crate) async fn resolve_turn_model(
 async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     let Some(conv) = hub.db.conversation(conversation_id) else { return };
     let project = conv.mode == "project";
-    // A spent daily or conversation budget (`limits.rs`): keep what arrived, say why, and stop here.
-    if crate::limits::refuse_turn(hub, conversation_id, &wakes) {
+    // Subscription-billed harnesses in standard chats never spend API budgets; API turns still check limits.
+    let standard_harness = !project
+        && hub
+            .db
+            .conversation_model(conversation_id)
+            .ok()
+            .flatten()
+            .or_else(|| hub.db.default_model("standard"))
+            .is_some_and(|m| m.is_harness());
+    if !standard_harness && crate::limits::refuse_turn(hub, conversation_id, &wakes) {
         return;
     }
 
@@ -255,13 +263,21 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         // Models may exist but all live on devices that are offline, or only non-orchestrating harnesses exist.
         let message = match hub.db.default_model(role) {
             Some(m) => {
-                let host = hub
-                    .db
-                    .provider(&m.provider_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|p| p.via_device().map(String::from))
+                let raw_host = m
+                    .device_id
+                    .clone()
+                    .or_else(|| {
+                        hub.db
+                            .provider(&m.provider_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|p| p.via_device().map(String::from))
+                    })
                     .unwrap_or_else(|| "a device".into());
+                let host = hub
+                    .resolve_device(&raw_host)
+                    .map(|(_, name)| name)
+                    .unwrap_or(raw_host);
                 format!(
                     "Every model for this chat runs on a device that's offline ({} runs on {host}). Bring it back \
                      online, or add a model that doesn't depend on it (`grouper models add`).",
@@ -280,6 +296,33 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         hub.emit(conversation_id, None, EventBody::TurnFinished { running_threads: 0 });
         return;
     };
+
+    if !project && model.is_harness() {
+        match hub
+            .run_standard_harness_turn(conversation_id, &model, &text, &wakes)
+            .await
+        {
+            Ok(reply) => {
+                let clean = without_imitated_notes(&reply.text);
+                if !clean.is_empty() {
+                    hub.emit(conversation_id, None, EventBody::AssistantMessage { text: clean });
+                }
+                history.push(providers::Message {
+                    role: providers::Role::Assistant,
+                    content: vec![providers::Block::Text { text: reply.text }],
+                    raw: None,
+                });
+                finish(hub, &history);
+            }
+            Err(message) => {
+                finish(hub, &history);
+                hub.emit(conversation_id, None, EventBody::Error { message });
+            }
+        }
+        hub.emit(conversation_id, None, EventBody::TurnFinished { running_threads: 0 });
+        return;
+    }
+
     let provider = match hub
         .db
         .provider(&model.provider_id)

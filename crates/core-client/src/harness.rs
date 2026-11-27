@@ -2195,4 +2195,173 @@ mod tests {
         let grok = parse_grok_models("Available models:\n* grok-4.7 (default)\n- grok-code-fast\n");
         assert_eq!(grok, vec![model("grok-4.7", None), model("grok-code-fast", None)]);
     }
+
+    const FAKE_MULTI_HARNESS_SRC: &str = r#"
+use std::env;
+use std::fs;
+use std::path::Path;
+
+fn esc(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            x => o.push(x),
+        }
+    }
+    o
+}
+
+fn find_after(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+fn main() {
+    let argv: Vec<String> = env::args().collect();
+    let prog = Path::new(&argv[0])
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let args = &argv[1..];
+    let cwd = env::current_dir().unwrap();
+    // Standard chat folder must contain no pre-existing repo files.
+    assert!(cwd.is_dir(), "workdir must exist");
+
+    match prog.as_str() {
+        "claude" => {
+            let msg = find_after(args, "-p").unwrap_or_default();
+            let mode = find_after(args, "--permission-mode").unwrap_or_default();
+            assert_eq!(mode, "plan", "claude confined mode must be plan");
+            let resume = find_after(args, "--resume");
+            let sid = resume.clone().unwrap_or_else(|| "cc-sess-101".into());
+            let prefix = if resume.is_some() { "resumed" } else { "new" };
+            println!(
+                "{{\"type\":\"result\",\"is_error\":false,\"session_id\":\"{}\",\"result\":\"{}:{}:{}\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":6,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}}",
+                esc(&sid), prefix, esc(&sid), esc(&msg)
+            );
+        }
+        "codex" => {
+            assert_eq!(args.first().map(String::as_str), Some("exec"));
+            assert!(args.iter().any(|a| a == "sandbox_mode=\"read-only\""), "codex must run read-only: {args:?}");
+            let is_resume = args.get(1).map(String::as_str) == Some("resume");
+            let (sid, msg) = if is_resume {
+                (args[args.len() - 2].clone(), args[args.len() - 1].clone())
+            } else {
+                ("cx-thread-202".to_string(), args.last().cloned().unwrap_or_default())
+            };
+            let prefix = if is_resume { "resumed" } else { "new" };
+            println!("{{\"type\":\"thread.started\",\"thread_id\":\"{}\"}}", esc(&sid));
+            println!(
+                "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"{}:{}:{}\"}}}}",
+                prefix, esc(&sid), esc(&msg)
+            );
+            println!("{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":14,\"output_tokens\":7,\"cached_input_tokens\":3}}}}");
+        }
+        "agy" => {
+            let msg = find_after(args, "-p").unwrap_or_default();
+            assert_eq!(find_after(args, "--mode").as_deref(), Some("plan"));
+            assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+            let resume = find_after(args, "--conversation");
+            let sid = resume.clone().unwrap_or_else(|| "agy-conv-303".into());
+            let prefix = if resume.is_some() { "resumed" } else { "new" };
+            println!(
+                "{{\"status\":\"SUCCESS\",\"conversation_id\":\"{}\",\"response\":\"{}:{}:{}\",\"usage\":{{\"total_tokens\":33}}}}",
+                esc(&sid), prefix, esc(&sid), esc(&msg)
+            );
+        }
+        "grok" => {
+            let pfile = find_after(args, "--prompt-file").expect("--prompt-file");
+            let msg = fs::read_to_string(pfile).unwrap();
+            assert_eq!(find_after(args, "--permission-mode").as_deref(), Some("plan"));
+            let resume = find_after(args, "--resume");
+            let sid = resume.clone().unwrap_or_else(|| "grok-sess-404".into());
+            let prefix = if resume.is_some() { "resumed" } else { "new" };
+            println!(
+                "{{\"type\":\"result\",\"sessionId\":\"{}\",\"text\":\"{}:{}:{}\",\"usage\":{{\"total_tokens\":19}}}}",
+                esc(&sid), prefix, esc(&sid), esc(&msg)
+            );
+        }
+        "hermes" => {
+            let msg = find_after(args, "-z").unwrap_or_default();
+            let ufile = find_after(args, "--usage-file").expect("--usage-file");
+            let resume = find_after(args, "--resume");
+            let sid = resume.clone().unwrap_or_else(|| "hermes-sess-505".into());
+            let prefix = if resume.is_some() { "resumed" } else { "new" };
+            fs::write(
+                ufile,
+                format!("{{\"session_id\":\"{}\",\"failed\":false,\"total_tokens\":27}}", esc(&sid)),
+            )
+            .unwrap();
+            println!("{prefix}:{sid}:{msg}");
+        }
+        other => panic!("unexpected fake binary name {other}"),
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn turn_resumes_sessions_and_confines_all_five_harnesses_with_fake_cli() {
+        let home = TempHome::new("turn-multi");
+        let bin_dir = home.path.join("fake-bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let src = bin_dir.join("fake_harness.rs");
+        std::fs::write(&src, FAKE_MULTI_HARNESS_SRC).unwrap();
+        let base_exe = bin_dir.join(if cfg!(windows) { "fake_harness.exe" } else { "fake_harness" });
+        let status = Command::new("rustc")
+            .arg(&src)
+            .arg("-O")
+            .arg("-o")
+            .arg(&base_exe)
+            .status()
+            .expect("rustc available in cargo test");
+        assert!(status.success(), "compiling fake harness failed");
+
+        for name in ["claude", "codex", "agy", "grok", "hermes"] {
+            let dst = bin_dir.join(if cfg!(windows) { format!("{name}.exe") } else { name.to_string() });
+            std::fs::copy(&base_exe, &dst).unwrap();
+        }
+
+        let opts = ScanOptions::isolated(&home.path, vec![bin_dir], FIXED_NOW);
+        let ws_root = home.path.join("workspaces");
+
+        let cases = [
+            ("claude-code", "sonnet", "cc-sess-101", 19u64),
+            ("codex", "gpt-5.2", "cx-thread-202", 24u64),
+            ("antigravity", "gemini-3.1-pro", "agy-conv-303", 33u64),
+            ("grok", "grok-4.7", "grok-sess-404", 19u64),
+            ("hermes", "deepseek-v4-flash", "hermes-sess-505", 27u64),
+        ];
+
+        for (agent, model_name, expected_sid, expected_tokens) in cases {
+            let conv_id = format!("conv-{}", agent);
+            let workdir = chat_workdir(Some(&ws_root), &conv_id).unwrap();
+            assert_eq!(std::fs::read_dir(&workdir).unwrap().count(), 0, "per-chat folder starts empty");
+
+            let t1 = turn_with(&opts, agent, model_name, None, "hello first", &workdir, HarnessLevel::Confined)
+                .await
+                .unwrap_or_else(|e| panic!("{agent} turn 1 failed: {e}"));
+            assert_eq!(t1.session_id, expected_sid, "{agent} turn 1 session_id");
+            assert_eq!(t1.text, format!("new:{expected_sid}:hello first"));
+            assert_eq!(t1.usage.total_tokens(), expected_tokens, "{agent} turn 1 tokens");
+
+            let t2 = turn_with(
+                &opts,
+                agent,
+                model_name,
+                Some(&t1.session_id),
+                "hello second",
+                &workdir,
+                HarnessLevel::Confined,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{agent} turn 2 failed: {e}"));
+            assert_eq!(t2.session_id, expected_sid, "{agent} turn 2 session_id");
+            assert_eq!(t2.text, format!("resumed:{expected_sid}:hello second"));
+        }
+    }
 }

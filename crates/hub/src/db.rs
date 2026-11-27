@@ -196,7 +196,8 @@ CREATE TABLE IF NOT EXISTS models (
   missed_syncs INTEGER NOT NULL DEFAULT 0, last_seen INTEGER, display_name TEXT,
   price_source TEXT NOT NULL DEFAULT 'manual', tools TEXT NOT NULL DEFAULT 'unknown');
 CREATE TABLE IF NOT EXISTS conversations (
-  id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created INTEGER NOT NULL, model TEXT);
+  id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created INTEGER NOT NULL,
+  model TEXT, harness_session TEXT);
 CREATE TABLE IF NOT EXISTS history (
   conversation_id TEXT NOT NULL, idx INTEGER NOT NULL, message TEXT NOT NULL,
   PRIMARY KEY (conversation_id, idx));
@@ -211,7 +212,8 @@ CREATE INDEX IF NOT EXISTS events_conv ON events (conversation_id, seq);
 CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT, thread_id TEXT, provider_id TEXT NOT NULL,
   model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
-  cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL, cost REAL NOT NULL, ts INTEGER NOT NULL);
+  cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL, cost REAL NOT NULL, ts INTEGER NOT NULL,
+  billing TEXT NOT NULL DEFAULT 'api');
 CREATE TABLE IF NOT EXISTS usage_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL,
   window TEXT NOT NULL, used_pct REAL, used_amount REAL, limit_amount REAL, currency TEXT, resets_at INTEGER,
@@ -418,6 +420,8 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     ensure_column(&conn, "models", "tools", "ALTER TABLE models ADD COLUMN tools TEXT NOT NULL DEFAULT 'unknown'")?;
     ensure_column(&conn, "models", "can_orchestrate", "ALTER TABLE models ADD COLUMN can_orchestrate INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "conversations", "model", "ALTER TABLE conversations ADD COLUMN model TEXT")?;
+    ensure_column(&conn, "conversations", "harness_session", "ALTER TABLE conversations ADD COLUMN harness_session TEXT")?;
+    ensure_column(&conn, "usage", "billing", "ALTER TABLE usage ADD COLUMN billing TEXT NOT NULL DEFAULT 'api'")?;
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
     ensure_column(&conn, "devices", "folders", "ALTER TABLE devices ADD COLUMN folders TEXT NOT NULL DEFAULT '[]'")?;
@@ -1459,8 +1463,95 @@ impl Db {
                 Some(found.id)
             }
         };
-        self.c().execute("UPDATE conversations SET model = ?1 WHERE id = ?2", params![stored, id])?;
+        let new_harness_provider = stored
+            .as_deref()
+            .and_then(|id| self.find_model(id))
+            .filter(|m| m.is_harness())
+            .map(|m| m.provider_id);
+        let prev_harness_provider = self.conversation_harness_provider(id);
+        let clear_session = match (&prev_harness_provider, &new_harness_provider) {
+            (Some(prev), Some(next)) => prev != next,
+            (Some(_), None) => true,
+            (None, None) => true,
+            (None, Some(_)) => false,
+        };
+        {
+            let c = self.c();
+            c.execute("UPDATE conversations SET model = ?1 WHERE id = ?2", params![stored, id])?;
+            if clear_session {
+                let _ = c.execute("UPDATE conversations SET harness_session = NULL WHERE id = ?1", [id]);
+                let _ = c.execute(
+                    "DELETE FROM hub_meta WHERE key = ?1",
+                    [format!("conv_harness_provider:{id}")],
+                );
+            }
+        }
         Ok(self.conversation(id).expect("conversation exists"))
+    }
+
+    /// Stored CLI harness session id on `conversations.harness_session`, if any.
+    pub fn conversation_harness_session(&self, conversation_id: &str) -> Option<String> {
+        self.c()
+            .query_row(
+                "SELECT harness_session FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn conversation_harness_provider(&self, conversation_id: &str) -> Option<String> {
+        self.c()
+            .query_row(
+                "SELECT value FROM hub_meta WHERE key = ?1",
+                [format!("conv_harness_provider:{conversation_id}")],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Stored CLI harness session id for `conversation_id` when continuing on `provider_id`.
+    /// Returns `None` if the stored session belonged to a different harness provider.
+    pub fn conversation_harness_session_for(&self, conversation_id: &str, provider_id: &str) -> Option<String> {
+        let session = self.conversation_harness_session(conversation_id)?;
+        if let Some(prev_provider) = self.conversation_harness_provider(conversation_id)
+            && prev_provider != provider_id
+        {
+            return None;
+        }
+        Some(session)
+    }
+
+    /// Persist or clear `conversations.harness_session` (and record which harness provider owns it).
+    pub fn set_conversation_harness_session(
+        &self,
+        conversation_id: &str,
+        provider_id: &str,
+        session_id: Option<&str>,
+    ) {
+        let clean = session_id.map(str::trim).filter(|s| !s.is_empty());
+        let c = self.c();
+        let _ = c.execute(
+            "UPDATE conversations SET harness_session = ?1 WHERE id = ?2",
+            params![clean, conversation_id],
+        );
+        let meta_key = format!("conv_harness_provider:{conversation_id}");
+        if clean.is_some() {
+            let _ = c.execute(
+                "INSERT OR REPLACE INTO hub_meta (key, value) VALUES (?1, ?2)",
+                params![meta_key, provider_id],
+            );
+        } else {
+            let _ = c.execute("DELETE FROM hub_meta WHERE key = ?1", [meta_key]);
+        }
     }
 
     pub fn history(&self, conversation_id: &str) -> Vec<Message> {
@@ -1643,10 +1734,40 @@ impl Db {
             .unwrap_or(0.0);
         let _ = self.c().execute(
             "INSERT INTO usage (conversation_id, thread_id, provider_id, model, input_tokens, output_tokens,
-               cache_read_tokens, cache_write_tokens, cost, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+               cache_read_tokens, cache_write_tokens, cost, ts, billing) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'api')",
             params![conversation_id, thread_id, provider_id, model, input as i64, output as i64, cache_read as i64, cache_write as i64, cost, ts()],
         );
         cost
+    }
+
+    /// Record subscription-billed harness token usage at API cost `0.0` (`billing = "subscription"`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_subscription_usage(
+        &self,
+        conversation_id: Option<&str>,
+        thread_id: Option<&str>,
+        provider_id: &str,
+        model: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) {
+        let _ = self.c().execute(
+            "INSERT INTO usage (conversation_id, thread_id, provider_id, model, input_tokens, output_tokens,
+               cache_read_tokens, cache_write_tokens, cost, ts, billing) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0.0, ?9, 'subscription')",
+            params![
+                conversation_id,
+                thread_id,
+                provider_id,
+                model,
+                input as i64,
+                output as i64,
+                cache_read as i64,
+                cache_write as i64,
+                ts(),
+            ],
+        );
     }
 
     /// (input tokens, output tokens, cost) for a conversation.
