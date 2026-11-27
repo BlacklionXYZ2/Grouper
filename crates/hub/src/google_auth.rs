@@ -179,16 +179,19 @@ impl Db {
             .flatten()
     }
 
-    /// Set the owner when there is none (and drop setup codes). Returns whether it was set.
+    /// Set the owner when there is none (drop setup codes and link unattributed devices). Returns whether it was set.
     pub(crate) fn set_owner_if_none(&self, o: &Owner) -> Result<bool> {
-        let c = self.c();
-        let set = c.execute(
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let set = tx.execute(
             "INSERT OR IGNORE INTO hub_owner (id, provider, sub, email, name, claimed_at) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
             params![o.provider, o.sub, o.email, o.name, o.claimed_at as i64],
         )? == 1;
         if set {
-            c.execute("DELETE FROM setup_codes", [])?;
+            tx.execute("DELETE FROM setup_codes", [])?;
+            tx.execute("UPDATE devices SET account_sub = ?1 WHERE account_sub IS NULL", [&o.sub])?;
         }
+        tx.commit()?;
         Ok(set)
     }
 
@@ -212,6 +215,7 @@ impl Db {
             params![o.provider, o.sub, o.email, o.name, o.claimed_at as i64],
         )?;
         tx.execute("DELETE FROM setup_codes", [])?;
+        tx.execute("UPDATE devices SET account_sub = ?1 WHERE account_sub IS NULL", [&o.sub])?;
         tx.commit()?;
         Ok(Claim::Claimed)
     }
@@ -224,7 +228,11 @@ impl Db {
     /// Unlink the owner. Device tokens and sessions keep working. Returns who it was.
     pub fn reset_owner(&self) -> Result<Option<Owner>> {
         let owner = self.owner();
-        self.c().execute("DELETE FROM hub_owner", [])?;
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM hub_owner", [])?;
+        tx.execute("UPDATE devices SET account_sub = NULL", [])?;
+        tx.commit()?;
         Ok(owner)
     }
 
@@ -1785,5 +1793,25 @@ mod tests {
         assert!(html.contains("action=\"https://hub.example.com/v1/auth/google/return\""));
         assert!(html.contains("value=\"&quot;&gt;&lt;script&gt;x&lt;/script&gt;\""), "{html}");
         assert!(!html.contains("<script>x"));
+    }
+
+    #[tokio::test]
+    async fn hub_info_reports_account_hub_device_id_and_epoch_and_omits_missing_key() {
+        let f = fixture().await;
+        let before: Value = f.http.get(f.url("/v1/hub")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(before["account"], Value::Null);
+        let hub_dev = before["hub_device_id"].as_str().expect("hub_device_id").to_string();
+        assert!(!hub_dev.is_empty());
+        assert_eq!(before["epoch"], 1);
+        assert!(before.get("key_sha256").is_none(), "no identity key yet, so key_sha256 is omitted: {before}");
+        assert!(f.hub.db.devices().iter().any(|d| d.id == hub_dev && d.account_sub.is_none()));
+
+        f.claim().await;
+        let after: Value = f.http.get(f.url("/v1/hub")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(after["account"], format!("{OWNER}@example.com"));
+        assert_eq!(after["hub_device_id"], hub_dev);
+        assert_eq!(after["epoch"], 1);
+        assert!(after.get("key_sha256").is_none());
+        assert!(f.hub.db.devices().iter().all(|d| d.account_sub.as_deref() == Some(OWNER)));
     }
 }
