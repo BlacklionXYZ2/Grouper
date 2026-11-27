@@ -6,11 +6,12 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use core_client::core_protocol::{Capability, DeviceInfo, default_input_schema};
+use core_client::usage_probes::UsageProbeSetting;
 use core_client::{Events, HubMoveCommitInfo, HubMoveOfferInfo, Status, ToolHandler};
 use hub::db::{Install, NODE_INSTALL};
 use hub::host::HubHandle;
@@ -65,9 +66,37 @@ impl MoveTargetContext {
     }
 }
 
+/// Local usage-reading choice (from desktop.json); GROUPER_USAGE_PROBES overrides it when set.
+static USAGE_SETTING: RwLock<Option<UsageProbeSetting>> = RwLock::new(None);
+
+pub fn set_usage_setting(setting: UsageProbeSetting) {
+    *USAGE_SETTING.write().unwrap_or_else(|e| e.into_inner()) = Some(setting);
+}
+
+fn effective_usage_setting() -> UsageProbeSetting {
+    if let Ok(raw) = std::env::var(USAGE_PROBES_ENV)
+        && let Ok(parsed) = UsageProbeSetting::parse(&raw)
+    {
+        return parsed;
+    }
+    USAGE_SETTING.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+}
+
+/// Everything needed to start the same node again (used when the usage setting changes).
+#[derive(Clone)]
+struct NodeRecipe {
+    hub_url: String,
+    token: String,
+    app_data_dir: PathBuf,
+    mcp_config: Option<PathBuf>,
+    folders_config: Option<PathBuf>,
+    move_target: Option<MoveTargetContext>,
+}
+
 pub struct NodeHandle {
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
+    recipe: NodeRecipe,
 }
 
 impl NodeHandle {
@@ -98,10 +127,9 @@ impl NodeHandle {
             .unwrap_or_else(|| app_data_dir.join("node-workspaces"));
 
         let allow_shell = !env_flag(NO_SHELL_ENV);
-        // On by default (usage belongs to the whole account); `GROUPER_USAGE_PROBES=0` is the local off switch.
-        let usage_probes = std::env::var(USAGE_PROBES_ENV)
-            .ok()
-            .is_none_or(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"));
+        // On by default (usage belongs to the whole account). The local off switch is the setting
+        // in desktop.json; GROUPER_USAGE_PROBES overrides it when set (for testing).
+        let usage = effective_usage_setting();
         let folders = match core_client::folders::load(folders_config, &[]) {
             Ok(list) => list,
             Err(err) => {
@@ -129,8 +157,16 @@ impl NodeHandle {
             allow_shell,
             mcp_config,
             folders,
-            usage_probes,
-            usage_probe_providers: None,
+            usage_probes: usage.enabled,
+            usage_probe_providers: usage.providers,
+        };
+        let recipe = NodeRecipe {
+            hub_url: hub_url.to_string(),
+            token: config.token.clone(),
+            app_data_dir: app_data_dir.to_path_buf(),
+            mcp_config: config.mcp_config.clone(),
+            folders_config: folders_config.map(Path::to_path_buf),
+            move_target: move_target.clone(),
         };
 
         let events = Arc::new(DesktopNodeEvents::new(move_target));
@@ -138,7 +174,14 @@ impl NodeHandle {
         let task = tokio::spawn(async move {
             core_client::run(config, Arc::new(DesktopTools), events, rx).await;
         });
-        Self { shutdown, task }
+        Self { shutdown, task, recipe }
+    }
+
+    /// Stop this node and start an identical one, so the hub sees the current usage advertisement.
+    pub async fn restart(self) -> Self {
+        let r = self.recipe.clone();
+        self.stop().await;
+        Self::start_with_options(&r.hub_url, r.token, &r.app_data_dir, r.mcp_config, r.folders_config.as_deref(), r.move_target)
     }
 
     pub async fn stop(mut self) {

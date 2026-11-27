@@ -5,6 +5,7 @@ mod node;
 mod oauth;
 mod settings;
 mod toasts;
+mod usage_menu;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -746,11 +747,12 @@ fn build_main_window(app: &AppHandle, target: WebviewUrl) -> tauri::Result<()> {
 }
 
 fn install_tray(app: &AppHandle) -> tauri::Result<()> {
+    let usage_item = usage_menu::menu_item(app)?;
     let open_item = MenuItem::with_id(app, TRAY_OPEN_ID, "Open", true, None::<&str>)?;
     let setup_item = MenuItem::with_id(app, TRAY_SETUP_ID, "Where Grouper runs…", true, None::<&str>)?;
     let login_item = autostart::menu_item(app)?;
     let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open_item, &setup_item, &login_item, &quit_item])?;
+    let menu = Menu::with_items(app, &[&open_item, &setup_item, &login_item, &usage_item, &quit_item])?;
     let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
 
     TrayIconBuilder::with_id("grouper-tray")
@@ -766,6 +768,7 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
                 let _ = open_target_in_main_window(app, WebviewUrl::App("index.html".into()));
             }
             autostart::TRAY_ID => autostart::toggle(app),
+            other if usage_menu::handle_event(app, other) => {}
             TRAY_QUIT_ID => {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
@@ -817,6 +820,7 @@ fn main() {
                 .with_context(|| format!("creating {}", data_dir.display()))?;
             let _ = prune_expired_pre_move_dirs(&data_dir, hub::db::now());
             let mut settings = DesktopSettings::load(&data_dir)?;
+            node::set_usage_setting(settings.usage_probe_setting());
 
             let (initial_hub, initial_local_node, initial_remote_node) = match settings.mode {
                 Some(HostMode::ThisComputer) => {

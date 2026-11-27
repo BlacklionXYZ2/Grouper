@@ -15,6 +15,61 @@ final class MacNodeController: ObservableObject {
     /// Bumped on every start and stop, so status from an earlier client can't change this one's.
     private var generation = 0
 
+    /// A subscription whose usage this Mac can read (its sign-in lives on this Mac).
+    struct UsageProvider: Identifiable {
+        let id: String
+        let name: String
+    }
+
+    nonisolated static let usageProviders = [
+        UsageProvider(id: "claude", name: "Claude"),
+        UsageProvider(id: "codex", name: "ChatGPT (Codex)"),
+        UsageProvider(id: "grok", name: "Grok"),
+        UsageProvider(id: "antigravity", name: "Antigravity"),
+    ]
+    nonisolated private static let readUsageKey = "grouper.usageReading"
+    nonisolated private static let usageOffKey = "grouper.usageReadingOff"
+
+    /// "Read subscription usage on this device". On by default: usage belongs to the whole
+    /// account, so this is the device owner's local off switch (nothing can flip it remotely).
+    @Published private(set) var readUsage: Bool = UserDefaults.standard.object(forKey: MacNodeController.readUsageKey) as? Bool ?? true
+    /// Providers switched off one by one.
+    @Published private(set) var usageProvidersOff: Set<String> = Set(UserDefaults.standard.stringArray(forKey: MacNodeController.usageOffKey) ?? [])
+
+    /// What the node is told: `nil` means every provider.
+    private var usageProbeProviders: [String]? {
+        usageProvidersOff.isEmpty ? nil : Self.usageProviders.map(\.id).filter { !usageProvidersOff.contains($0) }
+    }
+
+    /// Reading is on, and at least one provider is left on.
+    private var usageProbesOn: Bool {
+        readUsage && usageProbeProviders?.isEmpty != true
+    }
+
+    func setReadUsage(_ on: Bool) {
+        guard on != readUsage else { return }
+        readUsage = on
+        UserDefaults.standard.set(on, forKey: Self.readUsageKey)
+        restartForUsageChange()
+    }
+
+    func setReadUsage(provider: String, _ on: Bool) {
+        var off = usageProvidersOff
+        if on { off.remove(provider) } else { off.insert(provider) }
+        guard off != usageProvidersOff else { return }
+        usageProvidersOff = off
+        UserDefaults.standard.set(off.sorted(), forKey: Self.usageOffKey)
+        restartForUsageChange()
+    }
+
+    /// Reconnects a running node so the hub sees the new advertisement. A paused node stays
+    /// paused and picks the setting up when it resumes.
+    private func restartForUsageChange() {
+        guard running, let target else { return }
+        stop()
+        start(hubURL: target.hubURL, token: target.token)
+    }
+
     /// This Mac's name as System Settings > General > Sharing shows it, if available.
     nonisolated static func computerName() -> String? {
         SCDynamicStoreCopyComputerName(nil, nil) as String?
@@ -54,6 +109,8 @@ final class MacNodeController: ObservableObject {
                 capabilities: [Capability("mac_info", "Mac hostname, OS, uptime, processors and memory", schema: #"{"type":"object","properties":{}}"#)],
                 workspaceRoot: workspace,
                 allowShell: true,
+                usageProbes: usageProbesOn,
+                usageProbeProviders: usageProbeProviders,
                 handler: createdBridge,
                 listener: createdBridge
             )
