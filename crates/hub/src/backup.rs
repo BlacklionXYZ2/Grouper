@@ -28,7 +28,7 @@ use fs2::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-use crate::secrets::Secrets;
+use crate::secrets::{DPAPI_KEY_FILE, Secrets};
 
 const FORMAT_VERSION: u32 = 1;
 const MANIFEST_NAME: &str = "manifest.json";
@@ -304,7 +304,7 @@ fn host_device_matches_this_machine(name: &str, platform: &str, host_name: &str)
 /// at `epoch + 1`. The same computer is left as the snapshot recorded it.
 /// Returns the new id and epoch when the assignment changes.
 fn adopt_hub_device_for_this_machine(data_dir: &Path) -> Result<Option<(String, u64)>> {
-    let db = crate::db::Db::open(data_dir)
+    let db = crate::secrets::without_migration(|| crate::db::Db::open(data_dir))
         .context("opening the restored database to record which computer is the hub")?;
     let (current_id, epoch) = db.ensure_hub_device()?;
     let host_name = host_device_name();
@@ -340,7 +340,7 @@ fn fill_staging(staging: &Path, data_dir: &Path, include_workspaces: bool) -> Re
             copy_dir(&workspaces, &staging.join(WORKSPACES))?;
         }
     }
-    if staging.join(MASTER_KEY_NAME).exists() {
+    if staging.join(MASTER_KEY_NAME).exists() || staging.join(DPAPI_KEY_FILE).exists() {
         bail!("internal error: backup staging contains {MASTER_KEY_NAME}");
     }
     let nodes = walk(staging)?;
@@ -585,7 +585,7 @@ fn verify_backup(root: &Path) -> Result<Manifest> {
     }
     let mut listed = BTreeSet::new();
     for entry in &manifest.files {
-        if entry.path == MASTER_KEY_NAME {
+        if entry.path == MASTER_KEY_NAME || entry.path == DPAPI_KEY_FILE {
             bail!(
                 "backup lists {MASTER_KEY_NAME}. Hub backups never include the master key; \
                  remove that file from the backup and keep the key separately. Nothing was restored."
@@ -697,21 +697,7 @@ fn clear_sidecars(db_path: &Path) {
 }
 
 fn load_existing_secrets(data_dir: &Path) -> Result<Secrets> {
-    if std::env::var_os("GROUPER_MASTER_KEY").is_some() {
-        return Secrets::load(data_dir).context("reading GROUPER_MASTER_KEY");
-    }
-    let path = std::env::var_os("GROUPER_MASTER_KEY_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir.join(MASTER_KEY_NAME));
-    if !path.is_file() {
-        bail!(
-            "master key missing ({}). This backup does not contain the master key. Restore the same \
-             key with GROUPER_MASTER_KEY or GROUPER_MASTER_KEY_FILE (Docker: /secrets/master.key) \
-             before restoring, or provider keys cannot be decrypted. Nothing was restored",
-            path.display()
-        );
-    }
-    Secrets::load(data_dir).with_context(|| format!("reading master key {}", path.display()))
+    Secrets::load_for_restore(data_dir)
 }
 
 fn install_with_rollback(data_dir: &Path, root: &Path, force: bool) -> Result<Option<PathBuf>> {
@@ -814,12 +800,17 @@ fn hub_entries(data_dir: &Path) -> Result<Vec<PathBuf>> {
     if !data_dir.is_dir() {
         bail!("{} is not a directory", data_dir.display());
     }
+    let has_plain_key = data_dir.join(MASTER_KEY_NAME).is_file();
     let mut paths = Vec::new();
     for entry in
         fs::read_dir(data_dir).with_context(|| format!("reading {}", data_dir.display()))?
     {
         let entry = entry?;
-        if entry.file_name() == MASTER_KEY_NAME || entry.file_name() == LOCK_NAME {
+        let name = entry.file_name();
+        if name == MASTER_KEY_NAME
+            || name == LOCK_NAME
+            || (name == DPAPI_KEY_FILE && !has_plain_key)
+        {
             continue;
         }
         paths.push(entry.path());
@@ -1963,7 +1954,8 @@ mod tests {
 
     fn copy_key(from: &Path, to: &Path) {
         fs::create_dir_all(to).unwrap();
-        fs::copy(from.join(MASTER_KEY_NAME), to.join(MASTER_KEY_NAME)).unwrap();
+        let key = crate::secrets::read_master_key_b64(from).unwrap();
+        fs::write(to.join(MASTER_KEY_NAME), format!("{key}\n")).unwrap();
     }
 
     fn manifest_of(dir: &Path) -> Value {
@@ -2267,7 +2259,7 @@ mod tests {
             let db = crate::db::Db::open(&dest).unwrap();
             db.hub_id()
         };
-        fs::copy(data.join(MASTER_KEY_NAME), dest.join(MASTER_KEY_NAME)).unwrap();
+        copy_key(&data, &dest);
         let key = fs::read(dest.join(MASTER_KEY_NAME)).unwrap();
         restore(&dest, &snap, true).unwrap();
         assert_eq!(fs::read(dest.join(MASTER_KEY_NAME)).unwrap(), key);

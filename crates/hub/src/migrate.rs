@@ -56,11 +56,8 @@ use crate::stepdown::{StepDownInfo, fetch_hub_info, http_client};
 const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SECRETS_KDF_DOMAIN: &[u8] = b"grouper-hub-move-secrets-v1\0";
 const SECRETS_ALGORITHM: &str = "x25519-xchacha20poly1305";
-const MASTER_KEY_NAME: &str = "master.key";
 const IDENTITY_KEY_NAME: &str = "identity.key";
 const IDENTITY_KEY_META: &str = "hub_identity_key";
-const ENV_MASTER_KEY: &str = "GROUPER_MASTER_KEY";
-const ENV_MASTER_KEY_FILE: &str = "GROUPER_MASTER_KEY_FILE";
 const HEADER_SNAPSHOT_SHA256: &str = "x-snapshot-sha256";
 const STOP_TUNNEL_TIMEOUT: Duration = Duration::from_secs(5);
 const FRESH_SIGNIN_MAX_AGE: Duration = Duration::from_secs(300);
@@ -423,22 +420,7 @@ fn derive_secrets_key(shared: &[u8], sender_pub: &[u8], target_pub: &[u8]) -> [u
 }
 
 fn read_master_key_b64(data_dir: &Path) -> Result<String> {
-    let raw = if let Some(encoded) = std::env::var_os(ENV_MASTER_KEY) {
-        encoded
-            .into_string()
-            .map_err(|_| anyhow!("{ENV_MASTER_KEY} is not valid UTF-8"))?
-    } else {
-        let path = std::env::var_os(ENV_MASTER_KEY_FILE)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data_dir.join(MASTER_KEY_NAME));
-        fs::read_to_string(&path).with_context(|| format!("reading master key {}", path.display()))?
-    };
-    let trimmed = raw.trim().to_string();
-    let decoded = STANDARD.decode(&trimmed).context("master key is not valid base64")?;
-    if decoded.len() != 32 {
-        bail!("master key must decode to 32 bytes, got {}", decoded.len());
-    }
-    Ok(trimmed)
+    crate::secrets::read_master_key_b64(data_dir)
 }
 
 fn read_identity_key(data_dir: &Path, db: &Db) -> Option<String> {
@@ -1572,6 +1554,7 @@ pub async fn execute_target_move(
     }
     impl Drop for StagingCleanup {
         fn drop(&mut self) {
+            let _ = crate::secrets::remove_master_key(&self.incoming_dir);
             let _ = fs::remove_dir_all(&self.incoming_dir);
             let _ = fs::remove_file(&self.archive_path);
         }
@@ -1663,7 +1646,7 @@ pub async fn execute_target_move(
     // Stage master key & run the full existing restore verification inside `incoming_dir`
     // (touches nothing in `opts.data_dir` yet!).
     fs::create_dir_all(&incoming_dir)?;
-    write_private_file(&incoming_dir.join(MASTER_KEY_NAME), &secrets.master_key)?;
+    crate::secrets::write_master_key_b64(&incoming_dir, &secrets.master_key)?;
     if let Some(id_key) = &secrets.identity_key {
         write_private_file(&incoming_dir.join(IDENTITY_KEY_NAME), id_key)?;
     }
@@ -1724,8 +1707,9 @@ pub async fn execute_target_move(
 
     let install_res = tokio::task::spawn_blocking(move || -> Result<()> {
         // Remove staging directory before restoring into `target_dir` so restore doesn't move it aside.
+        let _ = crate::secrets::remove_master_key(&remove_incoming);
         let _ = fs::remove_dir_all(&remove_incoming);
-        write_private_file(&target_dir.join(MASTER_KEY_NAME), &install_secrets.master_key)?;
+        crate::secrets::write_master_key_b64(&target_dir, &install_secrets.master_key)?;
         if let Some(id_key) = &install_secrets.identity_key {
             write_private_file(&target_dir.join(IDENTITY_KEY_NAME), id_key)?;
         }
