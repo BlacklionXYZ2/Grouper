@@ -140,6 +140,8 @@ async fn usage_probe_tool_is_unlisted_and_snapshots_persist_when_device_goes_off
                     source: "probe".into(),
                     device_id: None,
                     fetched_at: now.saturating_sub(90),
+                    label: None,
+                    account_key: None,
                 }],
             }],
             now.saturating_sub(90),

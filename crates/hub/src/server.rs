@@ -325,10 +325,13 @@ impl Hub {
             capabilities: vec![],
             last_seen: Some(crate::db::now()),
             folders: vec![],
+            usage_probes: false,
+            usage_probe_providers: vec![],
         }];
         out.extend(self.db.devices().into_iter().filter(|d| !d.revoked).map(|d| {
             let l = live.get(&d.id);
             let folders = self.db.device_folders(&d.id);
+            let (usage_probes, usage_probe_providers) = self.db.device_usage_probes(&d.id);
             DeviceInfo {
                 id: d.id,
                 name: d.name,
@@ -347,6 +350,8 @@ impl Hub {
                     .unwrap_or_default(),
                 last_seen: d.last_seen,
                 folders,
+                usage_probes,
+                usage_probe_providers,
             }
         }));
         out
@@ -649,11 +654,13 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/v1/tools", get(list_tools))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}", put(put_provider))
+        .route("/v1/providers/{id}/color", put(put_provider_color))
         .route("/v1/providers/{id}/sync", post(sync_provider_models))
         .route("/v1/providers/{id}/sync-models", post(sync_provider_models))
         .route("/v1/models", get(list_models))
         .route("/v1/models/{id}", put(put_model).delete(delete_model))
         .route("/v1/usage", get(list_usage))
+        .route("/v1/usage/summary", get(usage_summary))
         .route("/v1/usage/snapshots", get(list_usage_snapshots))
         .route("/v1/usage/refresh", post(refresh_usage))
         .route("/v1/usage/free-requests", get(free_requests_today))
@@ -893,18 +900,68 @@ async fn list_providers(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Resp
         Ok(providers) => providers,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
+    let mut colors = hub.db.provider_colors();
     let list: Vec<ProviderInfo> = providers
         .into_iter()
-        .map(|p| ProviderInfo {
-            via_device: p.via_device().map(String::from),
-            id: p.id,
-            kind: p.kind,
-            base_url: p.base_url,
-            has_key: p.api_key.as_deref().is_some_and(|k| !k.is_empty()),
-            options: p.options,
+        .map(|p| {
+            let color = colors.remove(&p.id);
+            provider_info(p, color)
         })
         .collect();
     Json(list).into_response()
+}
+
+fn provider_info(p: ProviderConfig, color: Option<String>) -> ProviderInfo {
+    ProviderInfo {
+        via_device: p.via_device().map(String::from),
+        id: p.id,
+        kind: p.kind,
+        base_url: p.base_url,
+        has_key: p.api_key.as_deref().is_some_and(|k| !k.is_empty()),
+        options: p.options,
+        color,
+    }
+}
+
+/// `PUT /v1/providers/{id}/color` with `{"color": "purple"}`, or `{"color": null}` to pick one
+/// automatically. 400 for a name outside the palette (or a body without `color`), 404 for an
+/// unknown provider; 200 with the updated provider as listed by `GET /v1/providers`.
+///
+/// The hub has no client-facing "providers changed" event (`broadcast_providers` sends provider
+/// configs to devices, which carry no colour), so nothing is emitted here.
+async fn put_provider_color(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    admin!(hub, headers);
+    let color = match body.get("color") {
+        Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        _ => return err(StatusCode::BAD_REQUEST, "body must be {\"color\": <name>} or {\"color\": null}"),
+    };
+    if let Some(name) = color
+        && core_protocol::parse_key_color(name).is_none()
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("color must be one of {}, or null", core_protocol::KEY_COLORS.join(", ")),
+        );
+    }
+    match hub.db.set_provider_color(&id, color) {
+        Ok(true) => {}
+        Ok(false) => return err(StatusCode::NOT_FOUND, format!("no provider {id}")),
+        Err(error) => return err(StatusCode::BAD_REQUEST, error),
+    }
+    match hub.db.provider(&id) {
+        Ok(Some(p)) => {
+            let color = hub.db.provider_colors().remove(&id);
+            Json(provider_info(p, color)).into_response()
+        }
+        Ok(None) => err(StatusCode::NOT_FOUND, format!("no provider {id}")),
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
 }
 
 async fn put_provider(
@@ -1006,6 +1063,45 @@ async fn list_usage(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q): Q
     match hub.db.usage_totals(since, until, q.group.as_deref().unwrap_or("day"), q.conversation.as_deref(), provider) {
         Ok(rows) => Json(rows).into_response(),
         Err(error) => err(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+#[derive(Deserialize)]
+struct UsageSummaryQuery {
+    since: Option<String>,
+    until: Option<String>,
+    conversation: Option<String>,
+}
+
+/// One call for the Usage tab's donut and key list: API-billed totals per key and model in the
+/// half-open range `[since, until)`. `since` and `until` take the forms `GET /v1/usage` does plus
+/// RFC 3339; `until` defaults to now.
+async fn usage_summary(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Query(q): Query<UsageSummaryQuery>,
+) -> Response {
+    admin!(hub, headers);
+    let current = crate::db::now();
+    let since = match crate::usage::parse_time(q.since.as_deref(), current, false) {
+        Ok(value) => value,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error),
+    };
+    let until = if q.until.as_deref().is_none_or(|value| value.trim().is_empty()) {
+        current
+    } else {
+        match crate::usage::parse_time(q.until.as_deref(), current, true) {
+            Ok(value) => value,
+            Err(error) => return err(StatusCode::BAD_REQUEST, error),
+        }
+    };
+    if since >= until {
+        return err(StatusCode::BAD_REQUEST, "since must be before until");
+    }
+    let conversation = q.conversation.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    match hub.db.usage_summary(since, until, conversation) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
 }
 

@@ -8,8 +8,9 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use core_protocol::tunnel::result_text;
 use core_protocol::{
-    AgentEvent, EventBody, ProviderConfig, USAGE_PROBE_TOOL, UsageProbeEntry, UsageProbeResponse, UsageSnapshot,
-    UsageTotal, mcp_server_of,
+    AgentEvent, EventBody, ModelEntry, ProviderConfig, USAGE_PROBE_TOOL, UsageProbeEntry, UsageProbeResponse,
+    UsageSnapshot, UsageSummary, UsageSummaryKey, UsageSummaryModel, UsageSummarySubscription, UsageTotal,
+    UsageTotals, mcp_server_of,
 };
 use providers::{OnDelta, Provider, ProviderError, Request, Response};
 use rmcp::model::CallToolRequestParams;
@@ -26,7 +27,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROBE_RESULTS: usize = 8;
 const MAX_SNAPSHOTS_PER_ENTRY: usize = 32;
 const MAX_PROBE_STRING_BYTES: usize = 256;
-const PROBE_PROVIDERS: &[&str] = &["claude", "codex"];
+const MAX_LABEL_BYTES: usize = 64;
+const MAX_ACCOUNT_KEY_LEN: usize = 64;
+pub(crate) const PROBE_PROVIDERS: &[&str] = &["claude", "codex", "grok", "antigravity"];
 const PROBE_KINDS: &[&str] = &["window", "spend", "balance", "status"];
 
 /// OpenRouter's account-wide daily free-model allowance, as a usage snapshot.
@@ -56,6 +59,151 @@ impl Db {
         provider: Option<&str>,
     ) -> Result<Vec<UsageTotal>> {
         core_registry::cost::usage_totals(&self.c(), since, until, group, conversation, provider)
+    }
+
+    /// The Usage tab's donut and key list in one value (`GET /v1/usage/summary`), for `[since, until)`.
+    ///
+    /// Only `billing = 'api'` rows feed `total` and `keys`; `billing = 'subscription'` rows are grouped
+    /// by harness provider into `subscriptions`. Every non-harness provider is listed, used or not,
+    /// and a provider id found in the rows with no registry entry is listed as removed. Model names and
+    /// the free / local / priced flags come from the current registry.
+    pub fn usage_summary(&self, since: u64, until: u64, conversation: Option<&str>) -> Result<UsageSummary> {
+        let (api, subscription) = {
+            let c = self.c();
+            (
+                core_registry::cost::usage_by_provider_model(&c, since, until, conversation, "api")?,
+                core_registry::cost::usage_by_provider_model(&c, since, until, conversation, "subscription")?,
+            )
+        };
+        // Providers without their keys, so the summary does not depend on the master key.
+        let providers: Vec<(String, String, Option<String>, Option<String>)> = {
+            let c = self.c();
+            let mut statement = c.prepare("SELECT id, kind, base_url, options FROM providers ORDER BY id")?;
+            statement
+                .query_map([], |r| {
+                    let options: Value = serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or(Value::Null);
+                    let via = options.get("via_device").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, via.map(String::from)))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let colors = self.provider_colors();
+        let models = self.models();
+        // The first registry row for a provider and model name, as `record_usage` prices calls.
+        let mut registry: HashMap<(&str, &str), &ModelEntry> = HashMap::new();
+        for model in &models {
+            registry.entry((model.provider_id.as_str(), model.model.as_str())).or_insert(model);
+        }
+        let provider_by_id: HashMap<&str, &(String, String, Option<String>, Option<String>)> =
+            providers.iter().map(|p| (p.0.as_str(), p)).collect();
+
+        let mut keys: Vec<UsageSummaryKey> = providers
+            .iter()
+            .filter(|(_, kind, ..)| kind != "harness")
+            .map(|(id, kind, base_url, via)| UsageSummaryKey {
+                provider: id.clone(),
+                kind: kind.clone(),
+                color: colors.get(id).cloned(),
+                local: via.is_some() || base_url.as_deref().is_some_and(core_registry::is_local_url),
+                removed: false,
+                totals: UsageTotals::default(),
+                models: Vec::new(),
+            })
+            .collect();
+        let mut total = UsageTotals::default();
+        let mut unpriced_calls = 0u64;
+        for slice in api {
+            let position = match keys.iter().position(|k| k.provider == slice.provider_id) {
+                Some(position) => position,
+                None => {
+                    // Either a harness provider that somehow has API-billed rows, or one that was removed.
+                    let known = provider_by_id.get(slice.provider_id.as_str());
+                    keys.push(UsageSummaryKey {
+                        provider: slice.provider_id.clone(),
+                        kind: known.map(|p| p.1.clone()).unwrap_or_else(|| "unknown".into()),
+                        color: colors.get(&slice.provider_id).cloned(),
+                        local: false,
+                        removed: known.is_none(),
+                        totals: UsageTotals::default(),
+                        models: Vec::new(),
+                    });
+                    keys.len() - 1
+                }
+            };
+            let entry = registry.get(&(slice.provider_id.as_str(), slice.model.as_str())).copied();
+            let (name, free, local, priced) = match entry {
+                Some(entry) => {
+                    let (url, via) = provider_by_id
+                        .get(slice.provider_id.as_str())
+                        .map(|p| (p.2.as_deref(), p.3.is_some()))
+                        .unwrap_or((None, false));
+                    let local = core_registry::model_is_local(entry, url, via);
+                    let name = entry
+                        .display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(&entry.model)
+                        .to_string();
+                    let priced = entry.free || local || entry.input_price > 0.0 || entry.output_price > 0.0;
+                    (name, entry.free, local, priced)
+                }
+                None => (slice.model.clone(), false, false, true),
+            };
+            if !priced {
+                unpriced_calls += slice.totals.calls;
+            }
+            add_totals(&mut total, &slice.totals);
+            add_totals(&mut keys[position].totals, &slice.totals);
+            keys[position].models.push(UsageSummaryModel {
+                model: slice.model,
+                name,
+                free,
+                local,
+                priced,
+                totals: slice.totals,
+            });
+        }
+        for key in &mut keys {
+            key.models.sort_by(|a, b| {
+                b.totals
+                    .cost
+                    .total_cmp(&a.totals.cost)
+                    .then_with(|| tokens(&b.totals).cmp(&tokens(&a.totals)))
+                    .then_with(|| a.model.cmp(&b.model))
+            });
+        }
+        keys.sort_by(|a, b| {
+            b.totals
+                .cost
+                .total_cmp(&a.totals.cost)
+                .then_with(|| tokens(&b.totals).cmp(&tokens(&a.totals)))
+                .then_with(|| a.provider.cmp(&b.provider))
+        });
+
+        let mut subscriptions: Vec<UsageSummarySubscription> = Vec::new();
+        for slice in subscription {
+            if let Some(existing) = subscriptions.iter_mut().find(|s| s.provider == slice.provider_id) {
+                add_totals(&mut existing.totals, &slice.totals);
+                continue;
+            }
+            let (slug, suffix) = match slice.provider_id.split_once('@') {
+                Some((slug, device)) => (slug.to_string(), Some(device.to_string())),
+                None => (slice.provider_id.clone(), None),
+            };
+            let via = provider_by_id.get(slice.provider_id.as_str()).and_then(|p| p.3.clone());
+            let mut totals = UsageTotals::default();
+            add_totals(&mut totals, &slice.totals);
+            subscriptions.push(UsageSummarySubscription {
+                harness: probe_name_of_harness(&slug).to_string(),
+                device_id: via.or(suffix).filter(|device| !device.is_empty()),
+                provider: slice.provider_id,
+                totals,
+            });
+        }
+        subscriptions.sort_by(|a, b| a.provider.cmp(&b.provider));
+
+        Ok(UsageSummary { since, until, total, unpriced_calls, keys, subscriptions })
     }
 
     /// Calls to `:free` models recorded in `[since, until)`, per provider id. The usage
@@ -106,8 +254,8 @@ impl Db {
             tx.execute(
                 "INSERT INTO usage_snapshots
                  (account, provider, kind, window, used_pct, used_amount, limit_amount, currency,
-                  resets_at, source, device_id, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  resets_at, source, device_id, fetched_at, label, account_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     snapshot.account,
                     snapshot.provider,
@@ -121,6 +269,8 @@ impl Db {
                     snapshot.source,
                     snapshot.device_id,
                     snapshot.fetched_at as i64,
+                    snapshot.label.as_deref().and_then(clean_label),
+                    snapshot.account_key.as_deref().and_then(clean_account_key),
                 ],
             )?;
         }
@@ -173,11 +323,13 @@ impl Db {
                     });
                     let window = cap_probe_string(snap.window.trim().to_string());
                     let currency = snap.currency.as_deref().map(|s| cap_probe_string(s.trim().to_string()));
+                    let label = snap.label.as_deref().and_then(clean_label);
+                    let account_key = snap.account_key.as_deref().and_then(clean_account_key);
                     tx.execute(
                         "INSERT INTO usage_snapshots
                          (account, provider, kind, window, used_pct, used_amount, limit_amount, currency,
-                          resets_at, source, device_id, fetched_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                          resets_at, source, device_id, fetched_at, label, account_key)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                         params![
                             account,
                             snap_provider,
@@ -191,6 +343,8 @@ impl Db {
                             "probe",
                             Some(device_id),
                             fetched_at as i64,
+                            label,
+                            account_key,
                         ],
                     )?;
                     stored += 1;
@@ -224,7 +378,7 @@ impl Db {
         let c = self.c();
         let mut statement = c.prepare(
             "SELECT account, provider, kind, window, used_pct, used_amount, limit_amount, currency,
-                    resets_at, source, device_id, fetched_at
+                    resets_at, source, device_id, fetched_at, label, account_key
              FROM usage_snapshots s
              WHERE id = (
                SELECT id FROM usage_snapshots newest
@@ -250,10 +404,55 @@ impl Db {
                     source: row.get(9)?,
                     device_id: row.get(10)?,
                     fetched_at: row.get::<_, i64>(11)? as u64,
+                    label: row.get(12)?,
+                    account_key: row.get(13)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
+}
+
+fn add_totals(into: &mut UsageTotals, from: &UsageTotals) {
+    into.calls += from.calls;
+    into.input_tokens += from.input_tokens;
+    into.output_tokens += from.output_tokens;
+    into.cache_read_tokens += from.cache_read_tokens;
+    into.cache_write_tokens += from.cache_write_tokens;
+    into.cost += from.cost;
+}
+
+fn tokens(totals: &UsageTotals) -> u64 {
+    totals.input_tokens + totals.output_tokens + totals.cache_read_tokens + totals.cache_write_tokens
+}
+
+/// The probe provider name that reads a harness's plan (`claude-code` -> `claude`); a harness
+/// without a probe keeps its own slug.
+fn probe_name_of_harness(slug: &str) -> &str {
+    match slug {
+        "claude-code" => "claude",
+        other => other,
+    }
+}
+
+/// A window label from a device: control characters removed, trimmed, at most 64 bytes.
+/// `None` when nothing is left.
+fn clean_label(value: &str) -> Option<String> {
+    let text: String = value.chars().filter(|c| !c.is_control()).collect();
+    let mut text = text.trim().to_string();
+    let mut end = text.len().min(MAX_LABEL_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    let text = text.trim_end().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// An account fingerprint: at most 64 hex characters, else dropped. Lower-cased.
+fn clean_account_key(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= MAX_ACCOUNT_KEY_LEN && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_lowercase())
 }
 
 fn cap_probe_string(mut value: String) -> String {
@@ -308,9 +507,17 @@ pub async fn probe_device(hub: &Hub, device_id: &str, providers: Option<&[&str]>
         }
     };
     let Some(peer) = peer else { return 0 };
-    let args = match providers {
-        Some(list) if !list.is_empty() => json!({"providers": list}),
-        _ => json!({}),
+    // Only ask for readings the device advertised; the hub never widens what a device reads.
+    let advertised = hub.db.device_usage_probes(device_id).1;
+    let wanted: Option<Vec<&str>> = providers
+        .filter(|list| !list.is_empty())
+        .map(|list| list.iter().copied().filter(|p| advertised.iter().any(|a| a == p)).collect());
+    if wanted.as_ref().is_some_and(|list| list.is_empty()) {
+        return 0;
+    }
+    let args = match wanted {
+        Some(list) => json!({"providers": list}),
+        None => json!({}),
     };
     let Value::Object(arguments) = args else { return 0 };
     let params = CallToolRequestParams::new(USAGE_PROBE_TOOL.to_string()).with_arguments(arguments);
@@ -378,6 +585,15 @@ fn classify_probe_provider(provider_id: &str, kind: Option<&str>, model: &str) -
         return Some("claude");
     }
     let p = provider_id.to_ascii_lowercase();
+    // Grok and Antigravity are only matched as harness providers (`grok@<device>`): the same models
+    // reached with an API key don't spend the subscription those probes read.
+    if kind == Some("harness") {
+        match p.split('@').next() {
+            Some("grok") => return Some("grok"),
+            Some("antigravity") => return Some("antigravity"),
+            _ => {}
+        }
+    }
     let m = model.to_ascii_lowercase();
     if p.contains("anthropic") || p.contains("claude") || m.contains("claude") {
         return Some("claude");
@@ -388,7 +604,7 @@ fn classify_probe_provider(provider_id: &str, kind: Option<&str>, model: &str) -
     None
 }
 
-/// Determine which subscription probe providers (`claude`, `codex`) a device thread used.
+/// Determine which subscription probe providers (`claude`, `codex`, `grok`, `antigravity`) a device thread used.
 pub(crate) fn matching_probe_providers(db: &Db, thread_id: &str) -> Vec<&'static str> {
     let mut providers: Vec<&'static str> = Vec::new();
     let mut push = |p: &'static str| {
@@ -411,6 +627,8 @@ pub(crate) fn matching_probe_providers(db: &Db, thread_id: &str) -> Vec<&'static
                 AgentEvent::ToolCall { name, .. } => match mcp_server_of(&name) {
                     Some("claude-code") => push("claude"),
                     Some("codex") => push("codex"),
+                    Some("grok") => push("grok"),
+                    Some("antigravity") => push("antigravity"),
                     _ => {}
                 },
                 AgentEvent::Usage { provider_id, model, .. } => {
@@ -426,7 +644,7 @@ pub(crate) fn matching_probe_providers(db: &Db, thread_id: &str) -> Vec<&'static
     providers
 }
 
-/// Called right after a device thread finishes: if the thread used Claude or Codex
+/// Called right after a device thread finishes: if the thread used a probed harness
 /// and the device opted in to usage probes, refresh the matching probe(s) right away.
 pub(crate) fn after_device_thread(hub: &Arc<Hub>, device_id: &str, thread_id: &str) {
     let providers = matching_probe_providers(&hub.db, thread_id);
@@ -572,6 +790,8 @@ fn snapshot(provider: &str, kind: &str, window: &str, fetched_at: u64) -> UsageS
         source: "admin_api".into(),
         device_id: None,
         fetched_at,
+        label: None,
+        account_key: None,
     }
 }
 
@@ -742,6 +962,8 @@ pub fn free_limit_snapshot(provider: &str, limit: &FreeLimit, fetched_at: u64) -
         source: FREE_LIMIT_SOURCE.into(),
         device_id: None,
         fetched_at,
+        label: None,
+        account_key: None,
     }
 }
 
@@ -1248,6 +1470,8 @@ mod tests {
             source: "spoofed".into(), // hub must overwrite to "probe"
             device_id: Some("wrong".into()), // hub must overwrite to actual device_id
             fetched_at,
+            label: None,
+            account_key: None,
         };
 
         // Store healthy probe on dev_a and an unavailable status on dev_b.
@@ -1361,6 +1585,8 @@ mod tests {
                     source: "spoofed".into(),
                     device_id: Some("spoofed".into()),
                     fetched_at: 1,
+                    label: None,
+                    account_key: None,
                 }],
             })
             .collect();

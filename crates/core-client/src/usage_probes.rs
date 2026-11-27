@@ -632,6 +632,8 @@ pub fn parse_claude_usage(body: &Value, account: &str, fetched_at: u64) -> Resul
             source: "probe".into(),
             device_id: None,
             fetched_at,
+            label: None,
+            account_key: None,
         });
     }
 
@@ -659,6 +661,8 @@ pub fn parse_claude_usage(body: &Value, account: &str, fetched_at: u64) -> Resul
                 source: "probe".into(),
                 device_id: None,
                 fetched_at,
+                label: None,
+                account_key: None,
             });
         }
     }
@@ -711,6 +715,8 @@ fn push_codex_window(
         source: "probe".into(),
         device_id: None,
         fetched_at,
+        label: None,
+        account_key: None,
     });
 }
 
@@ -775,6 +781,8 @@ pub fn parse_codex_usage(body: &Value, fetched_at: u64) -> Result<Vec<UsageSnaps
             source: "probe".into(),
             device_id: None,
             fetched_at,
+            label: None,
+            account_key: None,
         });
     }
 
