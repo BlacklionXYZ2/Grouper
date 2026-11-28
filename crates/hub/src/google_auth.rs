@@ -65,6 +65,10 @@ const ENV_RETURN_URL: &str = "GROUPER_GOOGLE_RETURN_URL";
 const ENV_PUBLIC_URL: &str = "GROUPER_PUBLIC_URL";
 const GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+/// Test-only overrides: point the key-set and sign-in URLs at a fake Google (relay and hub tests use
+/// these with fake credentials). Never set in production; unset means Google's real URLs.
+const ENV_JWKS_URL: &str = "GROUPER_GOOGLE_JWKS_URL";
+const ENV_AUTH_URL: &str = "GROUPER_GOOGLE_AUTH_URL";
 const GOOGLE_ISSUERS: &[&str] = &["https://accounts.google.com", "accounts.google.com"];
 const PROVIDER: &str = "google";
 
@@ -299,6 +303,11 @@ pub fn announce_setup_code(hub: &Hub) {
     }
 }
 
+/// A URL from a test-only environment variable (see [`ENV_JWKS_URL`]); `None` when unset or empty.
+fn env_url(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 fn public_url() -> Option<String> {
     std::env::var(ENV_PUBLIC_URL).ok().map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| !v.is_empty())
 }
@@ -334,7 +343,7 @@ impl Config {
             web_client_id,
             return_url,
             public_url: public_url(),
-            jwks_url: GOOGLE_JWKS_URL.into(),
+            jwks_url: env_url(ENV_JWKS_URL).unwrap_or_else(|| GOOGLE_JWKS_URL.into()),
             issuers: GOOGLE_ISSUERS.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -822,6 +831,21 @@ impl Hub {
     }
 }
 
+/// Check that `id_token` is a valid Google ID token (signature, issuer, audience, times, verified email)
+/// whose `sub` is this hub's owner, without using up a hub nonce (the caller's own service checks
+/// its nonce). Returns the token's email.
+pub(crate) async fn verify_owner_token(hub: &Hub, id_token: &str) -> Result<String, (StatusCode, String)> {
+    let id = hub.google.verify_without_nonce(id_token).await.map_err(|r| (r.status, r.message))?;
+    match hub.db.owner() {
+        Some(owner) if owner.provider == PROVIDER && owner.sub == id.sub => Ok(id.email),
+        Some(_) => {
+            tracing::info!(sub = %sub_tag(&id.sub), "Google ID token refused: not this hub's owner");
+            Err((StatusCode::FORBIDDEN, "this hub belongs to a different Google account".into()))
+        }
+        None => Err((StatusCode::FORBIDDEN, "this hub has no owner yet".into())),
+    }
+}
+
 /// Verify a fresh Google ID token for a sensitive owner action (such as moving the hub):
 /// checks signature, issuer, audience, expiry and `email_verified`, consumes a one-time hub
 /// nonce, requires `iat` within `max_age`, and requires `sub` to equal the hub owner's.
@@ -1031,8 +1055,9 @@ async fn start(State(hub): State<Arc<Hub>>, headers: HeaderMap, ext: Extensions,
         Ok(s) => s,
         Err(r) => return r.into_response(),
     };
+    let google_auth_url = env_url(ENV_AUTH_URL).unwrap_or_else(|| GOOGLE_AUTH_URL.into());
     let auth_url = url::Url::parse_with_params(
-        GOOGLE_AUTH_URL,
+        &google_auth_url,
         [
             ("client_id", cfg.web_client_id.as_str()),
             ("redirect_uri", cfg.return_url.as_str()),

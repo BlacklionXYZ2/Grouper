@@ -19,6 +19,7 @@ pub mod orchestrator;
 pub mod probes;
 pub mod push;
 pub mod registry;
+pub mod relay;
 pub mod secrets;
 pub mod server;
 pub mod session;

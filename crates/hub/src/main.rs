@@ -35,6 +35,9 @@ enum Cmd {
     /// The Google account that owns this hub.
     #[command(subcommand)]
     Owner(OwnerCmd),
+    /// The connection to the Grouper relay (reach this hub away from home without a tunnel).
+    #[command(subcommand)]
+    Relay(RelayCmd),
     /// Add or update a model provider (keys can also be set from any device: `grouper keys set`).
     Provider {
         id: String,
@@ -147,6 +150,16 @@ enum OwnerCmd {
     Reset,
 }
 
+#[derive(Subcommand)]
+enum RelayCmd {
+    /// Show the relay address, whether relaying is on and which Google account the hub is linked to.
+    /// The secret is never printed.
+    Status,
+    /// Tell the relay to forget this hub, then delete the stored secret and turn relaying off.
+    /// A running hub notices within about 30 seconds.
+    Unlink,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -234,6 +247,27 @@ async fn main() -> Result<()> {
             ),
             None => println!("No owner to unlink."),
         },
+        Cmd::Relay(RelayCmd::Status) => {
+            println!("Relay address: {}", db.relay_url().as_deref().unwrap_or("not set"));
+            println!("Enabled: {}", if db.relay_enabled() { "yes" } else { "no" });
+            match (db.has_relay_secret(), db.relay_account_email()) {
+                (true, Some(email)) => println!("Linked: yes ({email})"),
+                (true, None) => println!("Linked: yes"),
+                (false, _) => println!("Linked: no (link the hub from Grouper, or POST /v1/relay/link)"),
+            }
+        }
+        Cmd::Relay(RelayCmd::Unlink) => {
+            if !db.has_relay_secret() {
+                println!("This hub isn't linked to a relay.");
+            } else if hub::relay::unlink(&db).await? {
+                println!("The relay forgot this hub. Relaying is off and the secret is deleted.");
+            } else {
+                println!(
+                    "Deleted the secret and turned relaying off, but the relay didn't confirm (it may be unreachable); \
+                     its record of this hub expires when another hub claims the account."
+                );
+            }
+        }
         Cmd::Provider { id, kind, base_url, key, options } => {
             let options = match options {
                 Some(o) => serde_json::from_str(&o)?,
