@@ -171,7 +171,12 @@ impl NodeHandle {
 
         let events = Arc::new(DesktopNodeEvents::new(move_target));
         let (shutdown, rx) = watch::channel(false);
-        let task = tokio::spawn(async move {
+        // `start` is also called from Tauri's synchronous setup hook, where no Tokio runtime is
+        // current; a bare tokio::spawn panicked there and the app quit on launch. Use the
+        // current runtime when there is one (async commands, tests), else Tauri's own.
+        let runtime = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tauri::async_runtime::handle().inner().clone());
+        let task = runtime.spawn(async move {
             core_client::run(config, Arc::new(DesktopTools), events, rx).await;
         });
         Self { shutdown, task, recipe }
@@ -504,6 +509,17 @@ async fn ensure_plain_device_token(http: &reqwest::Client, base: &str, token: &s
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
+
+    // Tauri's setup hook is synchronous: starting the node there must not need a current
+    // Tokio runtime. (A bare tokio::spawn here made the installed app quit on launch.)
+    #[test]
+    fn node_starts_outside_a_tokio_runtime() {
+        let app_dir = std::env::temp_dir().join(format!("grouper-desktop-sync-{}", hub::db::random_hex(4)));
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let handle = NodeHandle::start("http://127.0.0.1:9", "test-token".into(), &app_dir);
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&app_dir);
+    }
 
     #[tokio::test]
     async fn in_process_node_connects_to_embedded_hub_and_serves_tools() {
