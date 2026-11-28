@@ -56,6 +56,8 @@ use crate::registry::deny_unless_admin;
 use crate::server::{Hub, err};
 
 const META_URL: &str = "relay_url";
+/// The address a hub uses until told otherwise (`PUT /v1/relay {url}`).
+pub const DEFAULT_RELAY_URL: &str = "https://grouper.clockmillbarn.uk";
 const META_ENABLED: &str = "relay_enabled";
 const META_SECRET: &str = "relay_hub_secret";
 const META_EMAIL: &str = "relay_account_email";
@@ -232,12 +234,12 @@ impl Db {
         Ok(())
     }
 
-    /// The relay's address (normalized), if set.
+    /// The relay's address (normalized): the one set, else [`DEFAULT_RELAY_URL`]. Always `Some`.
     pub fn relay_url(&self) -> Option<String> {
-        self.relay_meta(META_URL)
+        Some(self.relay_meta(META_URL).unwrap_or_else(|| DEFAULT_RELAY_URL.to_string()))
     }
 
-    /// Set or clear (`None` or empty) the relay address.
+    /// Set the relay address, or clear it (`None` or empty) to go back to the default.
     pub fn set_relay_url(&self, url: Option<&str>) -> Result<()> {
         match url.map(str::trim).filter(|s| !s.is_empty()) {
             None => self.del_relay_meta(META_URL),
@@ -1025,6 +1027,7 @@ pub(crate) fn routes() -> Router<Arc<Hub>> {
         .route("/v1/relay", get(get_relay).put(put_relay).delete(delete_relay))
         .route("/v1/relay/nonce", post(post_nonce))
         .route("/v1/relay/link", post(post_link))
+        .route("/v1/relay/link/start", post(post_link_start))
 }
 
 /// The status document. Never contains the hub secret.
@@ -1089,7 +1092,7 @@ async fn put_relay(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): 
         },
     };
     if let Some(new) = &new_url
-        && *new != hub.db.relay_url()
+        && new.as_deref().unwrap_or(DEFAULT_RELAY_URL) != hub.db.relay_url().as_deref().unwrap_or(DEFAULT_RELAY_URL)
         && hub.db.has_relay_secret()
     {
         return err(
@@ -1111,9 +1114,20 @@ async fn put_relay(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): 
     Json(status_payload(&hub)).into_response()
 }
 
-/// A relay call that failed, as the response the admin sees.
-fn relay_unavailable(what: &str, e: impl std::fmt::Display) -> Response {
-    err(StatusCode::BAD_GATEWAY, format!("couldn't {what} through the relay: {e}"))
+/// Ask the relay for a fresh nonce.
+async fn fetch_nonce(url: &str) -> Result<Value, (StatusCode, String)> {
+    let resp = relay_http()
+        .post(format!("{url}/relay/v1/nonce"))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("couldn't get a nonce through the relay: {e}")))?;
+    if !resp.status().is_success() {
+        return Err((StatusCode::BAD_GATEWAY, relay_error(resp).await));
+    }
+    match resp.json::<Value>().await {
+        Ok(v) if v["nonce"].is_string() => Ok(v),
+        _ => Err((StatusCode::BAD_GATEWAY, "the relay's nonce answer wasn't understood".into())),
+    }
 }
 
 async fn post_nonce(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
@@ -1123,16 +1137,9 @@ async fn post_nonce(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response
     let Some(url) = hub.db.relay_url() else {
         return err(StatusCode::BAD_REQUEST, "set the relay address first (PUT /v1/relay)");
     };
-    let resp = match relay_http().post(format!("{url}/relay/v1/nonce")).send().await {
-        Ok(r) => r,
-        Err(e) => return relay_unavailable("get a nonce", e),
-    };
-    if !resp.status().is_success() {
-        return err(StatusCode::BAD_GATEWAY, relay_error(resp).await);
-    }
-    match resp.json::<Value>().await {
-        Ok(v) if v["nonce"].is_string() => Json(json!({"nonce": v["nonce"], "expires": v["expires"]})).into_response(),
-        _ => err(StatusCode::BAD_GATEWAY, "the relay's nonce answer wasn't understood"),
+    match fetch_nonce(&url).await {
+        Ok(v) => Json(json!({"nonce": v["nonce"], "expires": v["expires"]})).into_response(),
+        Err((status, message)) => err(status, message),
     }
 }
 
@@ -1142,35 +1149,63 @@ struct LinkBody {
     relay_nonce: String,
 }
 
+/// Link this hub to the relay account of its owner: the hub checks the token's signature and that it
+/// is the owner's, the relay checks its own nonce and claims the hub. Stores the secret and turns relaying on.
+pub(crate) async fn link_hub(hub: &Hub, id_token: &str, relay_nonce: &str) -> Result<(), (StatusCode, String)> {
+    let Some(url) = hub.db.relay_url() else {
+        return Err((StatusCode::BAD_REQUEST, "set the relay address first (PUT /v1/relay)".into()));
+    };
+    crate::google_auth::verify_owner_token(hub, id_token).await?;
+    let bad_gateway = |m: String| (StatusCode::BAD_GATEWAY, m);
+    let claim = json!({"hub_id": hub.db.hub_id(), "id_token": id_token, "relay_nonce": relay_nonce});
+    let resp = relay_http()
+        .post(format!("{url}/relay/v1/hubs/claim"))
+        .json(&claim)
+        .send()
+        .await
+        .map_err(|e| bad_gateway(format!("couldn't link this hub through the relay: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(bad_gateway(relay_error(resp).await));
+    }
+    let answer = resp.json::<Value>().await.unwrap_or(Value::Null);
+    let (Some(secret), email) = (answer["hub_secret"].as_str(), answer["account_email"].as_str().unwrap_or("")) else {
+        return Err(bad_gateway("the relay's link answer wasn't understood".into()));
+    };
+    hub.db
+        .set_relay_link(secret, email)
+        .and_then(|()| hub.db.set_relay_enabled(true))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    tracing::info!(email, "relay: hub linked");
+    hub.relay.notify_changed();
+    Ok(())
+}
+
 async fn post_link(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Json<LinkBody>) -> Response {
+    if let Some(r) = deny_unless_admin(&hub, &headers) {
+        return r;
+    }
+    match link_hub(&hub, &body.id_token, &body.relay_nonce).await {
+        Ok(()) => Json(status_payload(&hub)).into_response(),
+        Err((status, message)) => err(status, message),
+    }
+}
+
+/// `POST /v1/relay/link/start` (admin): linking from a browser. Gets a relay nonce, remembers it under a fresh
+/// browser `state` with purpose "relay link", and returns the Google sign-in URL whose `nonce` is the
+/// relay's domain-separated hash of it. Google returns through the shared return page to
+/// `/v1/auth/google/return`, which links the hub and redirects to Settings.
+async fn post_link_start(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     if let Some(r) = deny_unless_admin(&hub, &headers) {
         return r;
     }
     let Some(url) = hub.db.relay_url() else {
         return err(StatusCode::BAD_REQUEST, "set the relay address first (PUT /v1/relay)");
     };
-    // The relay checks its own nonce; the hub checks the signature and that this is its owner.
-    if let Err((status, message)) = crate::google_auth::verify_owner_token(&hub, &body.id_token).await {
-        return err(status, message);
-    }
-    let claim = json!({"hub_id": hub.db.hub_id(), "id_token": body.id_token, "relay_nonce": body.relay_nonce});
-    let resp = match relay_http().post(format!("{url}/relay/v1/hubs/claim")).json(&claim).send().await {
-        Ok(r) => r,
-        Err(e) => return relay_unavailable("link this hub", e),
+    let nonce = match fetch_nonce(&url).await {
+        Ok(v) => v["nonce"].as_str().unwrap_or_default().to_string(),
+        Err((status, message)) => return err(status, message),
     };
-    if !resp.status().is_success() {
-        return err(StatusCode::BAD_GATEWAY, relay_error(resp).await);
-    }
-    let answer = resp.json::<Value>().await.unwrap_or(Value::Null);
-    let (Some(secret), email) = (answer["hub_secret"].as_str(), answer["account_email"].as_str().unwrap_or("")) else {
-        return err(StatusCode::BAD_GATEWAY, "the relay's link answer wasn't understood");
-    };
-    if let Err(e) = hub.db.set_relay_link(secret, email).and_then(|()| hub.db.set_relay_enabled(true)) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-    tracing::info!(email, "relay: hub linked");
-    hub.relay.notify_changed();
-    Json(status_payload(&hub)).into_response()
+    crate::google_auth::start_relay_link(&hub, &headers, &nonce)
 }
 
 async fn delete_relay(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
@@ -1299,6 +1334,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("grouper-relay-db-{}", random_hex(4)));
         let db = Db::open(&dir).unwrap();
         assert!(!db.relay_enabled() && !db.has_relay_secret() && db.relay_secret().unwrap().is_none());
+        assert_eq!(db.relay_url().as_deref(), Some("https://grouper.clockmillbarn.uk"), "the default address");
+        db.set_relay_url(Some("http://127.0.0.1:9/")).unwrap();
+        assert_eq!(db.relay_url().as_deref(), Some("http://127.0.0.1:9"));
+        db.set_relay_url(None).unwrap();
+        assert_eq!(db.relay_url().as_deref(), Some(DEFAULT_RELAY_URL));
         db.set_relay_link(SECRET, "me@example.com").unwrap();
         db.set_relay_enabled(true).unwrap();
         assert_eq!(db.relay_secret().unwrap().as_deref(), Some(SECRET));
@@ -2217,9 +2257,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(json_of(&text)["url"], f.relay.base);
         let (_, text) = admin.call(M::PUT, "/v1/relay", Some(json!({"url": null}))).await;
-        assert_eq!(json_of(&text)["url"], Value::Null);
-        assert_eq!(admin.call(M::POST, "/v1/relay/nonce", None).await.0, 400, "needs an address");
-        assert_eq!(admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": "x", "relay_nonce": "rn.fake.1.2.3"}))).await.0, 400);
+        assert_eq!(json_of(&text)["url"], DEFAULT_RELAY_URL, "clearing goes back to the default address");
         let (_, text) = admin.call(M::PUT, "/v1/relay", Some(json!({"url": f.relay.base.clone(), "enabled": true}))).await;
         transcript.push(text.clone());
         let s = json_of(&text);
@@ -2298,6 +2336,117 @@ mod tests {
         for text in &transcript {
             assert!(!text.contains(SECRET) && !text.contains(LATER_SECRET) && !text.contains("hub_secret"), "leaked: {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn linking_from_a_browser_goes_through_start_google_and_the_return_page() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use sha2::{Digest, Sha256};
+
+        let f = fixture_with(false, |hub| router(hub.clone())).await;
+        crate::google_auth::tests::configure_hub_for_test(&f.hub).await;
+        let owner_sub = "100000000000000000009";
+        f.hub
+            .db
+            .set_owner_if_none(&Owner {
+                provider: "google".into(),
+                sub: owner_sub.into(),
+                email: "owner@example.com".into(),
+                name: "Owner".into(),
+                claimed_at: 1,
+            })
+            .unwrap();
+        let (_, admin_token) = f.hub.db.add_device("Laptop", "windows", true).unwrap();
+        let (_, plain_token) = f.hub.db.add_device("Node", "linux", false).unwrap();
+        let base = format!("http://{}", f.addr);
+        let admin = Admin { http: reqwest::Client::new(), base: base.clone(), token: admin_token };
+        let plain = Admin { http: reqwest::Client::new(), base: base.clone(), token: plain_token };
+        let nonce = "rn.fake.1.2.3";
+        let hashed = URL_SAFE_NO_PAD.encode(Sha256::digest(format!("grouper-relay-v1:{nonce}").as_bytes()));
+        assert_eq!(hashed.len(), 43);
+        use reqwest::Method as M;
+
+        // Admin only, and no token at all.
+        assert_eq!(plain.call(M::POST, "/v1/relay/link/start", Some(json!({}))).await.0, 403);
+        let anon = reqwest::Client::new().post(format!("{base}/v1/relay/link/start")).send().await.unwrap();
+        assert_eq!(anon.status(), 401);
+
+        // Start: Google's URL carries the hashed relay nonce and a state; the raw nonce is only on the hub.
+        let start = |admin: &Admin| {
+            let admin = Admin { http: admin.http.clone(), base: admin.base.clone(), token: admin.token.clone() };
+            async move { admin.call(M::POST, "/v1/relay/link/start", Some(json!({}))).await }
+        };
+        let (status, text) = start(&admin).await;
+        assert_eq!(status, 200, "{text}");
+        assert!(!text.contains(nonce), "the raw relay nonce stays on the hub: {text}");
+        let started = json_of(&text);
+        let state = started["state"].as_str().unwrap().to_string();
+        let auth = url::Url::parse(started["auth_url"].as_str().unwrap()).unwrap();
+        let q: HashMap<String, String> = auth.query_pairs().into_owned().collect();
+        assert_eq!(q["nonce"], hashed);
+        assert_eq!(q["state"], state);
+        assert_eq!(q["response_mode"], "form_post");
+        assert_eq!(q["response_type"], "id_token");
+
+        let browser = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        let ret = |pairs: Vec<(&'static str, String)>| {
+            let browser = browser.clone();
+            let url = format!("{base}/v1/auth/google/return");
+            async move {
+                let r = browser
+                    .post(url)
+                    .header("origin", "https://accounts.google.com")
+                    .header("sec-fetch-site", "cross-site")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs.iter().map(|(k, v)| (*k, v.as_str()))).finish())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), 303);
+                (r.headers()["location"].to_str().unwrap().to_string(), r.headers().get("set-cookie").is_some())
+            }
+        };
+
+        // A token for the wrong nonce (a hub nonce or an unhashed relay nonce) is refused, and the state is used up.
+        let wrong = crate::google_auth::tests::mint_for_test(nonce, owner_sub);
+        let (location, cookie) = ret(vec![("id_token", wrong), ("state", state.clone())]).await;
+        assert!(location.starts_with("/app/#/settings?relay_error="), "{location}");
+        assert!(!cookie && !f.hub.db.has_relay_secret() && f.relay.shared.claims.lock().unwrap().is_empty());
+        let good = crate::google_auth::tests::mint_for_test(&hashed, owner_sub);
+        let (location, _) = ret(vec![("id_token", good.clone()), ("state", state)]).await;
+        assert!(location.starts_with("/#/claim?error="), "a used state is unknown to the hub now: {location}");
+        assert!(f.relay.shared.claims.lock().unwrap().is_empty());
+
+        // A stranger's token never reaches the relay.
+        let (_, text) = start(&admin).await;
+        let state = json_of(&text)["state"].as_str().unwrap().to_string();
+        let stranger = crate::google_auth::tests::mint_for_test(&hashed, "100000000000000000010");
+        let (location, _) = ret(vec![("id_token", stranger), ("state", state)]).await;
+        assert!(location.starts_with("/app/#/settings?relay_error="), "{location}");
+        assert!(location.contains("different"), "{location}");
+        assert!(f.relay.shared.claims.lock().unwrap().is_empty());
+
+        // Google refusing sign-in comes back to Settings with the reason.
+        let (_, text) = start(&admin).await;
+        let state = json_of(&text)["state"].as_str().unwrap().to_string();
+        let (location, _) = ret(vec![("error", "access_denied".into()), ("state", state)]).await;
+        assert!(location.starts_with("/app/#/settings?relay_error=") && location.contains("access_denied"), "{location}");
+
+        // The owner's token links the hub with the stored raw nonce.
+        let (_, text) = start(&admin).await;
+        let state = json_of(&text)["state"].as_str().unwrap().to_string();
+        let (location, cookie) = ret(vec![("id_token", good), ("state", state)]).await;
+        assert_eq!(location, "/app/#/settings?relay=linked");
+        assert!(!cookie, "linking doesn't start a session");
+        {
+            let claims = f.relay.shared.claims.lock().unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0]["relay_nonce"], nonce);
+            assert_eq!(claims[0]["hub_id"], f.hub.db.hub_id());
+        }
+        assert!(f.hub.db.has_relay_secret() && f.hub.db.relay_enabled());
+        assert_eq!(f.hub.db.relay_account_email().as_deref(), Some("owner@example.com"));
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 mod autostart;
 mod node;
 mod oauth;
+mod phone_access;
 mod settings;
 mod toasts;
 mod usage_menu;
@@ -752,7 +753,8 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     let setup_item = MenuItem::with_id(app, TRAY_SETUP_ID, "Where Grouper runs…", true, None::<&str>)?;
     let login_item = autostart::menu_item(app)?;
     let quit_item = MenuItem::with_id(app, TRAY_QUIT_ID, "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open_item, &setup_item, &login_item, &usage_item, &quit_item])?;
+    let phone_item = phone_access::menu_item(app)?;
+    let menu = Menu::with_items(app, &[&open_item, &setup_item, &phone_item, &login_item, &usage_item, &quit_item])?;
     let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
 
     TrayIconBuilder::with_id("grouper-tray")
@@ -768,6 +770,7 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
                 let _ = open_target_in_main_window(app, WebviewUrl::App("index.html".into()));
             }
             autostart::TRAY_ID => autostart::toggle(app),
+            other if phone_access::handle_event(app, other) => {}
             other if usage_menu::handle_event(app, other) => {}
             TRAY_QUIT_ID => {
                 let handle = app.clone();
@@ -900,6 +903,7 @@ fn main() {
             autostart::apply_default(app.handle());
             install_tray(app.handle())?;
             toasts::start(app.handle());
+            phone_access::start(app.handle());
             build_main_window(app.handle(), target)?;
             Ok(())
         })

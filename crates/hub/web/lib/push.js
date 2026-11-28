@@ -1,6 +1,7 @@
 // Approval notifications in this browser (gui-spec 5.14).
 //
-// Web Push goes through the service worker at /sw.js (scope /), subscribed with the
+// Web Push goes through the service worker at /sw.js (scope /app/: behind the relay the website owns /,
+// so the hub never controls it), subscribed with the
 // hub's VAPID key and registered with the hub (`/v1/push/...`). The owner opts in
 // from Settings > Notifications only: permission is never asked on load, at
 // sign-in or because an approval arrived. Each browser opts in for itself
@@ -28,6 +29,8 @@ import { navigate } from './ui.js';
 const OPT_IN = 'grouper.notify'; // '1': this browser opted in
 const SUB_ID = 'grouper.push.id'; // the hub's id for this browser's subscription
 const SW_URL = '/sw.js';
+// A script at /sw.js may register any scope under /, so /app/ needs no Service-Worker-Allowed header.
+const SW_SCOPE = '/app/';
 export const TITLE = 'Grouper needs your review';
 
 function readKey(key) {
@@ -114,9 +117,19 @@ export function notifyHintWanted() {
 async function existingRegistration() {
   if (!('serviceWorker' in navigator)) return null;
   try {
-    return (await navigator.serviceWorker.getRegistration('/')) || null;
+    return (await navigator.serviceWorker.getRegistration(SW_SCOPE)) || null;
   } catch {
     return null;
+  }
+}
+
+/** Earlier versions registered the worker at scope `/`; remove that one so the hub no longer controls the site root. */
+async function dropRootRegistration() {
+  try {
+    const old = await navigator.serviceWorker.getRegistration('/');
+    if (old && new URL(old.scope).pathname === '/') await old.unregister();
+  } catch {
+    /* best effort */
   }
 }
 
@@ -155,7 +168,8 @@ export function browserLabel() {
 
 /** Subscribe (or refresh the subscription) and register it with the hub. Permission must already be granted. */
 async function subscribeAndRegister() {
-  const reg = await navigator.serviceWorker.register(SW_URL, { scope: '/' });
+  await dropRootRegistration();
+  const reg = await navigator.serviceWorker.register(SW_URL, { scope: SW_SCOPE });
   await navigator.serviceWorker.ready;
   let keyResp;
   try {

@@ -368,6 +368,8 @@ struct Pending {
     origin: String,
     nonce: String,
     setup_code: Option<String>,
+    /// Set for a relay-link sign-in (purpose "relay_link"): the relay's raw nonce. Then `nonce` is its hash.
+    relay_nonce: Option<String>,
 }
 
 #[derive(Default)]
@@ -524,7 +526,7 @@ impl GoogleAuth {
 
     /// A browser `state`: base64url JSON `{"o": origin, "id": random}`. The origin is in clear so
     /// the shared return page (maybe on another hub) knows where to forward; the id is kept here.
-    fn new_state(&self, origin: &str, nonce: &str, setup_code: Option<String>) -> Result<String, Refusal> {
+    fn new_state(&self, origin: &str, nonce: &str, setup_code: Option<String>, relay_nonce: Option<String>) -> Result<String, Refusal> {
         let now = now();
         let mut s = self.issued();
         s.states.retain(|_, p| p.expires > now);
@@ -532,7 +534,7 @@ impl GoogleAuth {
             return Err(Refusal::new(StatusCode::TOO_MANY_REQUESTS, "too many sign-ins in progress; try again in a few minutes"));
         }
         let id = random_hex(16);
-        let pending = Pending { expires: now + NONCE_TTL_SECS, origin: origin.into(), nonce: nonce.into(), setup_code };
+        let pending = Pending { expires: now + NONCE_TTL_SECS, origin: origin.into(), nonce: nonce.into(), setup_code, relay_nonce };
         s.states.insert(id.clone(), pending);
         Ok(URL_SAFE_NO_PAD.encode(json!({"o": origin, "id": id}).to_string()))
     }
@@ -1055,25 +1057,11 @@ async fn start(State(hub): State<Arc<Hub>>, headers: HeaderMap, ext: Extensions,
             "claiming over HTTP is disabled in local mode; sign in through Grouper on this computer",
         );
     }
-    let state = match hub.google.new_state(&origin, &nonce, setup_code) {
+    let state = match hub.google.new_state(&origin, &nonce, setup_code, None) {
         Ok(s) => s,
         Err(r) => return r.into_response(),
     };
-    let google_auth_url = env_url(ENV_AUTH_URL).unwrap_or_else(|| GOOGLE_AUTH_URL.into());
-    let auth_url = url::Url::parse_with_params(
-        &google_auth_url,
-        [
-            ("client_id", cfg.web_client_id.as_str()),
-            ("redirect_uri", cfg.return_url.as_str()),
-            ("response_type", "id_token"),
-            ("scope", "openid email profile"),
-            ("response_mode", "form_post"),
-            ("prompt", "select_account"),
-            ("nonce", nonce.as_str()),
-            ("state", state.as_str()),
-        ],
-    )
-    .expect("constant URL");
+    let auth_url = google_auth_url(&cfg, &nonce, &state);
     Json(json!({
         "nonce": nonce,
         "state": state,
@@ -1083,6 +1071,82 @@ async fn start(State(hub): State<Arc<Hub>>, headers: HeaderMap, ext: Extensions,
         "expires": expires,
     }))
     .into_response()
+}
+
+/// The Google sign-in URL for a browser: `nonce` is sent to Google as is.
+fn google_auth_url(cfg: &Config, nonce: &str, state: &str) -> url::Url {
+    let base = env_url(ENV_AUTH_URL).unwrap_or_else(|| GOOGLE_AUTH_URL.into());
+    url::Url::parse_with_params(
+        &base,
+        [
+            ("client_id", cfg.web_client_id.as_str()),
+            ("redirect_uri", cfg.return_url.as_str()),
+            ("response_type", "id_token"),
+            ("scope", "openid email profile"),
+            ("response_mode", "form_post"),
+            ("prompt", "select_account"),
+            ("nonce", nonce),
+            ("state", state),
+        ],
+    )
+    .expect("constant URL")
+}
+
+/// What a relay accepts as a Google token's `nonce` for a relay nonce:
+/// `b64url_nopad(SHA-256("grouper-relay-v1:" + nonce))` (docs/relay-design.md).
+pub fn relay_google_nonce(relay_nonce: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(format!("grouper-relay-v1:{relay_nonce}").as_bytes()))
+}
+
+/// The response of `POST /v1/relay/link/start`: a browser `state` that remembers `relay_nonce` (purpose
+/// "relay_link") and the Google URL to send the browser to, with the hashed nonce. The caller has checked
+/// that the requester is an admin.
+pub(crate) fn start_relay_link(hub: &Hub, headers: &HeaderMap, relay_nonce: &str) -> Response {
+    let cfg = hub.google.config();
+    if cfg.web_client_id.is_empty() {
+        return err(StatusCode::NOT_FOUND, "browser Google sign-in isn't turned on for this hub (GROUPER_GOOGLE_WEB_CLIENT_ID)");
+    }
+    let Some(origin) = hub_origin(&cfg, headers) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "browser Google sign-in needs the hub on HTTPS (or localhost); set GROUPER_PUBLIC_URL to its https:// address",
+        );
+    };
+    let google_nonce = relay_google_nonce(relay_nonce);
+    let state = match hub.google.new_state(&origin, &google_nonce, None, Some(relay_nonce.to_string())) {
+        Ok(s) => s,
+        Err(r) => return r.into_response(),
+    };
+    let auth_url = google_auth_url(&cfg, &google_nonce, &state);
+    Json(json!({"auth_url": auth_url.as_str(), "state": state, "expires": now() + NONCE_TTL_SECS})).into_response()
+}
+
+/// A relay-link sign-in came back: link the hub with the remembered relay nonce and go to Settings.
+async fn finish_relay_link(hub: &Hub, params: &HashMap<String, String>, pending: &Pending, relay_nonce: &str) -> Response {
+    let to_settings = |query: &str| see_other(&format!("/app/#/settings?{query}"));
+    let failed = |message: &str| {
+        tracing::info!("relay link sign-in refused: {message}");
+        let message: String = url::form_urlencoded::byte_serialize(message.as_bytes()).collect();
+        to_settings(&format!("relay_error={message}"))
+    };
+    if let Some(e) = params.get("error") {
+        let e: String = e.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(40).collect();
+        return failed(&format!("Google didn't sign you in ({e})"));
+    }
+    let Some(id_token) = params.get("id_token") else {
+        return failed("Google didn't send a sign-in; start again");
+    };
+    let id = match hub.google.verify_without_nonce(id_token).await {
+        Ok(id) => id,
+        Err(r) => return failed(&r.message),
+    };
+    if id.nonce != pending.nonce {
+        return failed("this sign-in wasn't started here, or took too long; start again");
+    }
+    match crate::relay::link_hub(hub, id_token, relay_nonce).await {
+        Ok(()) => to_settings("relay=linked"),
+        Err((_, message)) => failed(&message),
+    }
 }
 
 fn form(bytes: &[u8]) -> HashMap<String, String> {
@@ -1182,6 +1246,9 @@ async fn finish(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) ->
         Ok(p) => p,
         Err(why) => return return_failed(why),
     };
+    if let Some(relay_nonce) = pending.relay_nonce.clone() {
+        return finish_relay_link(&hub, &params, &pending, &relay_nonce).await;
+    }
     // The state is used up; its nonce goes with it whatever happens next.
     let nonce_ok = hub.google.consume_nonce(&pending.nonce);
     if let Some(e) = params.get("error") {
