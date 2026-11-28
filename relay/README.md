@@ -42,6 +42,7 @@ Set in `wrangler.toml` `[vars]` (non-secret) or as a secret.
 | `RELAY_SECRET` (secret) | HMAC key for nonces, relay tokens and account keys. Long random string. Rotating it signs everyone out and orphans every account (new account keys). |
 | `GOOGLE_CLIENT_IDS` | Comma-separated audiences accepted in ID tokens (iOS, Mac, web, desktop clients). |
 | `GOOGLE_WEB_CLIENT_ID` | OAuth client used by the relay's own browser sign-in page. Its authorized redirect URI must be `https://<relay host>/relay/auth/return`. |
+| `RELAY_WEB_CLIENT_ID` (optional) | When set, browser sign-in uses this client and accepts only this audience. Recommended: a dedicated web client. |
 | `GOOGLE_JWKS_URL` | Default `https://www.googleapis.com/oauth2/v3/certs`. |
 | `GOOGLE_AUTH_URL` | Default `https://accounts.google.com/o/oauth2/v2/auth`. |
 | `GOOGLE_ISSUERS` | Default `https://accounts.google.com,accounts.google.com`. |
@@ -59,6 +60,9 @@ Set in `wrangler.toml` `[vars]` (non-secret) or as a secret.
 ## Behaviour notes
 
 - Times in nonces and tokens are unix **seconds**.
+- Google `nonce` claims must be `b64url(SHA-256("grouper-relay-v1:" + relay_nonce))`, and sign-in and claim bodies carry the raw `relay_nonce` (see the spec, "Nonce domain separation").
+- Browser sign-in sets `grouper_relay_state` (SameSite=None; Secure on HTTPS, Lax on HTTP dev) and requires it back on `/relay/auth/return`.
+- Hub secrets are `hs.<acct>.<rand>.<tag>`; the Worker checks the tag before waking any Durable Object.
 - A hub that sends nothing for 90 s is closed (code 4003). Idle checks run from an alarm every
   60 s, so the close happens 90-150 s after the last frame. The exact text frame `{"t":"ping"}` is
   answered with `{"t":"pong"}` by the platform without waking the object (this also applies to a

@@ -22,7 +22,7 @@
 //! - `GET /v1/relay` — `{enabled, url, linked, status, last_error, account_email}`.
 //! - `PUT /v1/relay` — `{url?, enabled?}`.
 //! - `POST /v1/relay/nonce` — asks the relay for a nonce (the app runs Google sign-in with it).
-//! - `POST /v1/relay/link` — `{id_token}`: the owner's Google ID token; claims the hub on the relay.
+//! - `POST /v1/relay/link` — `{id_token, relay_nonce}`: the owner's Google ID token (its nonce is the hash of `relay_nonce`); claims the hub on the relay.
 //! - `DELETE /v1/relay` — forgets the hub on the relay and clears the secret.
 
 use std::collections::HashMap;
@@ -1139,6 +1139,7 @@ async fn post_nonce(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response
 #[derive(Deserialize)]
 struct LinkBody {
     id_token: String,
+    relay_nonce: String,
 }
 
 async fn post_link(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): Json<LinkBody>) -> Response {
@@ -1152,7 +1153,7 @@ async fn post_link(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): 
     if let Err((status, message)) = crate::google_auth::verify_owner_token(&hub, &body.id_token).await {
         return err(status, message);
     }
-    let claim = json!({"hub_id": hub.db.hub_id(), "id_token": body.id_token});
+    let claim = json!({"hub_id": hub.db.hub_id(), "id_token": body.id_token, "relay_nonce": body.relay_nonce});
     let resp = match relay_http().post(format!("{url}/relay/v1/hubs/claim")).json(&claim).send().await {
         Ok(r) => r,
         Err(e) => return relay_unavailable("link this hub", e),
@@ -2197,7 +2198,7 @@ mod tests {
         for (m, p) in [(M::GET, "/v1/relay"), (M::PUT, "/v1/relay"), (M::DELETE, "/v1/relay"), (M::POST, "/v1/relay/nonce")] {
             assert_eq!(plain.call(m.clone(), p, Some(json!({}))).await.0, 403, "{m} {p}");
         }
-        assert_eq!(plain.call(M::POST, "/v1/relay/link", Some(json!({"id_token": "x"}))).await.0, 403);
+        assert_eq!(plain.call(M::POST, "/v1/relay/link", Some(json!({"id_token": "x", "relay_nonce": "rn.fake.1.2.3"}))).await.0, 403);
 
         // Status before anything is set up.
         let (status, text) = admin.call(M::GET, "/v1/relay", None).await;
@@ -2218,7 +2219,7 @@ mod tests {
         let (_, text) = admin.call(M::PUT, "/v1/relay", Some(json!({"url": null}))).await;
         assert_eq!(json_of(&text)["url"], Value::Null);
         assert_eq!(admin.call(M::POST, "/v1/relay/nonce", None).await.0, 400, "needs an address");
-        assert_eq!(admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": "x"}))).await.0, 400);
+        assert_eq!(admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": "x", "relay_nonce": "rn.fake.1.2.3"}))).await.0, 400);
         let (_, text) = admin.call(M::PUT, "/v1/relay", Some(json!({"url": f.relay.base.clone(), "enabled": true}))).await;
         transcript.push(text.clone());
         let s = json_of(&text);
@@ -2232,10 +2233,10 @@ mod tests {
         assert!(json_of(&text)["expires"].as_u64().unwrap() > 0);
 
         // Linking needs the owner's token: junk, a stranger and an unsigned token never reach the relay.
-        let (status, _) = admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": "junk"}))).await;
+        let (status, _) = admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": "junk", "relay_nonce": "rn.fake.1.2.3"}))).await;
         assert_eq!(status, 401);
         let stranger = crate::google_auth::tests::mint_for_test("n", "100000000000000000010");
-        let (status, text) = admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": stranger}))).await;
+        let (status, text) = admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": stranger, "relay_nonce": "rn.fake.1.2.3"}))).await;
         assert_eq!(status, 403, "{text}");
         assert!(f.relay.shared.claims.lock().unwrap().is_empty());
         assert!(!f.hub.db.has_relay_secret());
@@ -2243,15 +2244,15 @@ mod tests {
         // A relay that refuses the claim leaves the hub unlinked and says why.
         let owner_token = crate::google_auth::tests::mint_for_test("n", owner_sub);
         f.relay.shared.fail_claim.store(true, Ordering::SeqCst);
-        let (status, text) = admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": owner_token}))).await;
+        let (status, text) = admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": owner_token, "relay_nonce": "rn.fake.1.2.3"}))).await;
         assert_eq!(status, 502);
         assert!(json_of(&text)["error"].as_str().unwrap().contains("already linked elsewhere"), "{text}");
         assert!(!f.hub.db.has_relay_secret());
         f.relay.shared.fail_claim.store(false, Ordering::SeqCst);
 
-        // The owner's token links the hub: the relay gets {hub_id, id_token}, the secret is stored
+        // The owner's token links the hub: the relay gets {hub_id, id_token, relay_nonce}, the secret is stored
         // sealed, relaying turns on and the connector connects with the new secret.
-        let (status, text) = admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": owner_token}))).await;
+        let (status, text) = admin.call(M::POST, "/v1/relay/link", Some(json!({"id_token": owner_token, "relay_nonce": "rn.fake.1.2.3"}))).await;
         transcript.push(text.clone());
         assert_eq!(status, 200, "{text}");
         let s = json_of(&text);
@@ -2261,7 +2262,8 @@ mod tests {
             let claim = claims.last().unwrap();
             assert_eq!(claim["hub_id"], f.hub.db.hub_id());
             assert_eq!(claim["id_token"], owner_token);
-            assert_eq!(claim.as_object().unwrap().len(), 2);
+            assert_eq!(claim["relay_nonce"], "rn.fake.1.2.3");
+            assert_eq!(claim.as_object().unwrap().len(), 3);
         }
         assert_eq!(f.hub.db.relay_secret().unwrap().as_deref(), Some(LATER_SECRET));
         let mut conn = f.relay.accept(&f.hub).await;

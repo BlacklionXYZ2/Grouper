@@ -5,21 +5,23 @@ export { Account } from "./account";
 import { AuthError, DEFAULT_AUTH_URL, verifyIdToken, type GoogleClaims } from "./google";
 import { errorPage, signInPage } from "./pages";
 import {
-  ACCT_RE,
   APP_TOKEN_TTL,
   WEB_TOKEN_TTL,
   acctKey,
   checkNonce,
-  hubSecretAcct,
   makeHubSecret,
+  nonceClaim,
+  verifyHubSecret,
   makeNonce,
   makeRelayToken,
   readRelayToken,
   type RelayClaims,
 } from "./tokens";
-import { json, nowSec, relayError, sha256Hex, type Env } from "./util";
+import { json, nowSec, randomB64url, relayError, safeEqual, sha256Hex, type Env } from "./util";
 
 const COOKIE = "grouper_relay";
+const STATE_COOKIE = "grouper_relay_state";
+const STATE_TTL = 600;
 const MAX_JSON = 16 * 1024;
 
 type Stub = DurableObjectStub<import("./account").Account>;
@@ -33,6 +35,7 @@ export default {
     try {
       return await route(request, env);
     } catch (e) {
+      if (e instanceof GuardError) return e.response;
       if (e instanceof AuthError) return relayError(401, e.message);
       if (e instanceof HttpError) return relayError(e.status, e.message);
       console.error("relay error", e instanceof Error ? e.message : String(e));
@@ -40,6 +43,12 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+class GuardError extends Error {
+  constructor(public response: Response) {
+    super("guard");
+  }
+}
 
 class HttpError extends Error {
   constructor(
@@ -87,9 +96,20 @@ function need(method: string, want: string): Response | null {
   return method === want ? null : relayError(405, `use ${want}`, { allow: want });
 }
 
-// ---- helpers --------------------------------------------------------------------------------
+// ---- helpers ----
+
+/** State-changing JSON endpoints: JSON content type (no cross-site form posts) and same-origin Origin. */
+function guardJson(request: Request): Response | null {
+  const ct = (request.headers.get("content-type") ?? "").toLowerCase();
+  if (!ct.startsWith("application/json")) return relayError(415, "content-type must be application/json");
+  const origin = request.headers.get("origin");
+  if (origin !== null && origin !== new URL(request.url).origin) return relayError(403, "cross-origin request refused");
+  return null;
+}
 
 async function readJson(request: Request): Promise<Record<string, unknown>> {
+  const bad = guardJson(request);
+  if (bad) throw new GuardError(bad);
   const text = await request.text();
   if (text.length > MAX_JSON) throw new HttpError(413, "body too large");
   try {
@@ -137,17 +157,25 @@ async function authenticate(request: Request, env: Env): Promise<{ claims: Relay
   return { claims, stub };
 }
 
-/** Full ID-token check including the relay nonce (and its one-time use). Returns claims + account. */
+/**
+ * Full ID-token check including the relay nonce. The token's `nonce` claim must be the domain-separated
+ * hash of `relayNonce`, and `relayNonce` must be ours, unexpired and unused (consumed here).
+ */
 async function verifySignIn(
   env: Env,
   idToken: unknown,
+  relayNonce: unknown,
+  audiences?: string[],
 ): Promise<{ g: GoogleClaims; acct: string; stub: Stub }> {
-  const g = await verifyIdToken(env, idToken);
-  const exp = await checkNonce(env.RELAY_SECRET, g.nonce);
-  if (exp === null || typeof g.nonce !== "string") throw new AuthError("missing or invalid relay nonce");
+  const g = await verifyIdToken(env, idToken, audiences);
+  const exp = await checkNonce(env.RELAY_SECRET, relayNonce);
+  if (exp === null || typeof relayNonce !== "string") throw new AuthError("missing or invalid relay nonce");
+  if (typeof g.nonce !== "string" || !safeEqual(g.nonce, await nonceClaim(relayNonce))) {
+    throw new AuthError("id_token was not issued for this relay nonce");
+  }
   const acct = await acctKey(env.RELAY_SECRET, g.sub);
   const stub = stubFor(env, acct);
-  if (!(await stub.consumeNonce(g.nonce, exp))) throw new AuthError("relay nonce already used");
+  if (!(await stub.consumeNonce(relayNonce, exp))) throw new AuthError("relay nonce already used");
   return { g, acct, stub };
 }
 
@@ -175,7 +203,7 @@ async function signInApi(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const client = body.client;
   if (client !== "web" && client !== "app") throw new HttpError(400, 'client must be "web" or "app"');
-  const { g, acct, stub } = await verifySignIn(env, body.id_token);
+  const { g, acct, stub } = await verifySignIn(env, body.id_token, body.relay_nonce);
   const { token, expires } = await issueToken(env, acct, g.email, client, stub);
   const hub_connected = (await stub.hubInfo()).hub_connected;
   if (client === "web") {
@@ -185,6 +213,8 @@ async function signInApi(request: Request, env: Env): Promise<Response> {
 }
 
 async function signOut(request: Request, env: Env): Promise<Response> {
+  const bad = guardJson(request);
+  if (bad) return bad;
   const auth = await authenticate(request, env);
   if (!auth) return relayError(401, "sign in to the Grouper relay first");
   const body = await readJson(request);
@@ -204,8 +234,8 @@ async function claimHub(request: Request, env: Env): Promise<Response> {
   if (typeof body.hub_id !== "string" || !body.hub_id || body.hub_id.length > 200) {
     throw new HttpError(400, "hub_id is required");
   }
-  const { g, acct, stub } = await verifySignIn(env, body.id_token);
-  const secret = makeHubSecret(acct);
+  const { g, acct, stub } = await verifySignIn(env, body.id_token, body.relay_nonce);
+  const secret = await makeHubSecret(env.RELAY_SECRET, acct);
   await stub.claimHub(body.hub_id, await sha256Hex(secret));
   return json(200, { hub_secret: secret, account_email: g.email });
 }
@@ -216,15 +246,15 @@ function bearer(request: Request): string {
 
 async function deleteHub(request: Request, env: Env): Promise<Response> {
   const secret = bearer(request);
-  const acct = hubSecretAcct(secret);
+  const acct = await verifyHubSecret(env.RELAY_SECRET, secret);
   if (!acct || !(await stubFor(env, acct).forgetHub(secret))) return relayError(401, "wrong hub secret");
   return json(200, { ok: true });
 }
 
 async function hubConnect(request: Request, env: Env): Promise<Response> {
   const secret = bearer(request);
-  const acct = hubSecretAcct(secret);
-  if (!acct || !ACCT_RE.test(acct)) return relayError(401, "wrong hub secret or hub id");
+  const acct = await verifyHubSecret(env.RELAY_SECRET, secret);
+  if (!acct) return relayError(401, "wrong hub secret or hub id");
   const headers = new Headers();
   for (const k of ["upgrade", "connection", "authorization", "grouper-hub-id", "sec-websocket-key", "sec-websocket-version"]) {
     const v = request.headers.get(k);
@@ -236,34 +266,70 @@ async function hubConnect(request: Request, env: Env): Promise<Response> {
 
 // ---- browser sign-in ------------------------------------------------------------------------
 
+function webAudiences(env: Env): string[] | undefined {
+  return env.RELAY_WEB_CLIENT_ID ? [env.RELAY_WEB_CLIENT_ID] : undefined;
+}
+
+/** Cookie for the state binding. SameSite=None on HTTPS because Google's form_post is a cross-site POST. */
+function stateCookie(url: URL, value: string, maxAge: number): string {
+  const https = url.protocol === "https:";
+  return `${STATE_COOKIE}=${value}; HttpOnly; SameSite=${https ? "None; Secure" : "Lax"}; Path=/relay/auth; Max-Age=${maxAge}`;
+}
+
 async function authStart(url: URL, env: Env): Promise<Response> {
   const { nonce } = await makeNonce(env.RELAY_SECRET);
+  const state = randomB64url(18);
   const g = new URL(env.GOOGLE_AUTH_URL || DEFAULT_AUTH_URL);
-  g.searchParams.set("client_id", env.GOOGLE_WEB_CLIENT_ID);
+  g.searchParams.set("client_id", env.RELAY_WEB_CLIENT_ID || env.GOOGLE_WEB_CLIENT_ID);
   g.searchParams.set("redirect_uri", url.origin + "/relay/auth/return");
   g.searchParams.set("response_type", "id_token");
   g.searchParams.set("response_mode", "form_post");
   g.searchParams.set("scope", "openid email");
-  g.searchParams.set("nonce", nonce);
-  return new Response(null, { status: 302, headers: { location: g.toString(), "cache-control": "no-store" } });
+  g.searchParams.set("nonce", await nonceClaim(nonce));
+  g.searchParams.set("state", state);
+  // The relay nonce rides in the cookie, so only this browser can complete this sign-in.
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: g.toString(),
+      "set-cookie": stateCookie(url, `${state}.${nonce}`, STATE_TTL),
+      "cache-control": "no-store",
+    },
+  });
 }
 
 async function authReturn(request: Request, env: Env): Promise<Response> {
-  let idToken: unknown;
+  const url = new URL(request.url);
+  const clear = stateCookie(url, "", 0);
+  let form: FormData;
   try {
-    idToken = (await request.formData()).get("id_token");
+    form = await request.formData();
   } catch {
     return errorPage(400, "The sign-in response was malformed.");
   }
+  const cookie = cookieValue(request.headers.get("cookie"), STATE_COOKIE) ?? "";
+  const dot = cookie.indexOf(".");
+  const cState = dot > 0 ? cookie.slice(0, dot) : "";
+  const cNonce = dot > 0 ? cookie.slice(dot + 1) : "";
+  const posted = form.get("state");
+  if (!cState || typeof posted !== "string" || !safeEqual(posted, cState)) {
+    const r = errorPage(401, "This sign-in wasn't started in this browser. Try again.");
+    r.headers.append("set-cookie", clear);
+    return r;
+  }
   try {
-    const { g, acct, stub } = await verifySignIn(env, idToken);
+    const { g, acct, stub } = await verifySignIn(env, form.get("id_token"), cNonce, webAudiences(env));
     const { token } = await issueToken(env, acct, g.email, "web", stub);
-    return new Response(null, {
-      status: 303,
-      headers: { location: "/", "set-cookie": setCookie(new URL(request.url), token, WEB_TOKEN_TTL), "cache-control": "no-store" },
-    });
+    const headers = new Headers({ location: "/", "cache-control": "no-store" });
+    headers.append("set-cookie", setCookie(url, token, WEB_TOKEN_TTL));
+    headers.append("set-cookie", clear);
+    return new Response(null, { status: 303, headers });
   } catch (e) {
-    if (e instanceof AuthError) return errorPage(401, e.message);
+    if (e instanceof AuthError) {
+      const r = errorPage(401, e.message);
+      r.headers.append("set-cookie", clear);
+      return r;
+    }
     throw e;
   }
 }

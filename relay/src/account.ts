@@ -90,9 +90,23 @@ export class Account extends DurableObject<Env> {
     return (this.ctx.storage.kv.get("generation") as number | undefined) ?? 0;
   }
 
+  /** Invalidates every relay token and cuts live client traffic: sockets (4401), in-flight requests. */
   bumpGeneration(): number {
     const g = this.generation() + 1;
     this.ctx.storage.kv.put("generation", g);
+    this.closeClients(4401, "signed out");
+    for (const [id, p] of [...this.reqs]) {
+      this.sendHub(p.hub, { t: "cancel", id });
+      if (!p.settled) {
+        p.settled = true;
+        p.resolve(relayError(401, "signed out"));
+      } else {
+        try {
+          p.ctl?.error(new Error("signed out"));
+        } catch {}
+      }
+      this.finishReq(id);
+    }
     return g;
   }
 
@@ -425,6 +439,8 @@ export class Account extends DurableObject<Env> {
     const headers = new Headers();
     for (const [k, v] of f.headers ?? []) {
       if (isHopByHop(k)) continue;
+      // A hub must not be able to set or clear the relay's own cookies.
+      if (k.toLowerCase() === "set-cookie" && /^\s*grouper_relay(_state)?\s*=/i.test(v)) continue;
       try {
         headers.append(k, v);
       } catch {}

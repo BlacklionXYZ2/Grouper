@@ -5,6 +5,8 @@ export interface Env {
   RELAY_SECRET: string;
   GOOGLE_CLIENT_IDS: string;
   GOOGLE_WEB_CLIENT_ID: string;
+  /** Optional: when set, /relay/auth/* uses and requires only this audience. */
+  RELAY_WEB_CLIENT_ID?: string;
   GOOGLE_JWKS_URL?: string;
   GOOGLE_AUTH_URL?: string;
   GOOGLE_ISSUERS?: string;
