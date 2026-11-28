@@ -305,7 +305,11 @@ pub fn announce_setup_code(hub: &Hub) {
 
 /// A URL from a test-only environment variable (see [`ENV_JWKS_URL`]); `None` when unset or empty.
 fn env_url(name: &str) -> Option<String> {
-    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    let url = std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())?;
+    // Read at runtime, so a release build honours it too: shout, because anyone who can set this
+    // can sign in to this hub with keys they made up.
+    tracing::warn!(variable = name, %url, "TEST ONLY: Google sign-in is checked against a non-Google URL");
+    Some(url)
 }
 
 fn public_url() -> Option<String> {
