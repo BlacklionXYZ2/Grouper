@@ -42,6 +42,7 @@ struct Running {
     shutdown: watch::Sender<bool>,
     collector: JoinHandle<()>,
     tunnel: JoinHandle<()>,
+    relay: JoinHandle<()>,
     stepdown: JoinHandle<()>,
     servers: Vec<JoinHandle<io::Result<()>>>,
     _lock: DataLock,
@@ -132,6 +133,13 @@ async fn start_inner(
     let (shutdown, shutdown_rx) = watch::channel(false);
     let tunnel = tokio::spawn(crate::tunnel::supervisor_loop(hub.clone(), shutdown_rx.clone()));
     let stepdown = tokio::spawn(crate::stepdown::stepdown_loop(hub.clone(), shutdown_rx.clone()));
+    // The relay connector calls the hub back on its own loopback listener.
+    let relay_addr = local_addrs
+        .iter()
+        .find(|addr| addr.ip().is_loopback())
+        .copied()
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], local_addrs[0].port())));
+    let relay = tokio::spawn(crate::relay::supervisor_loop(hub.clone(), relay_addr, shutdown_rx.clone()));
     let mut servers = Vec::with_capacity(listeners.len());
     for (listener, bound) in listeners {
         tracing::info!("grouper-hub listening on {bound}, data in {}", data_dir.display());
@@ -150,7 +158,7 @@ async fn start_inner(
     Ok(HubHandle {
         data_dir,
         binds: local_addrs,
-        running: Mutex::new(Some(Running { hub, shutdown, collector, tunnel, stepdown, servers, _lock: lock })),
+        running: Mutex::new(Some(Running { hub, shutdown, collector, tunnel, relay, stepdown, servers, _lock: lock })),
     })
 }
 
@@ -196,7 +204,7 @@ impl HubHandle {
     /// Stop all listeners, background loops and live connections, releasing the data-directory lock.
     /// Calling `stop` more than once is a safe no-op.
     pub async fn stop(&self) {
-        let Some(Running { hub, shutdown, collector, mut tunnel, mut stepdown, servers, _lock }) =
+        let Some(Running { hub, shutdown, collector, mut tunnel, mut relay, mut stepdown, servers, _lock }) =
             self.running.lock().unwrap_or_else(|e| e.into_inner()).take()
         else {
             return;
@@ -205,6 +213,9 @@ impl HubHandle {
         collector.abort();
         if tokio::time::timeout(STOP_GRACE, &mut tunnel).await.is_err() {
             tunnel.abort();
+        }
+        if tokio::time::timeout(STOP_GRACE, &mut relay).await.is_err() {
+            relay.abort();
         }
         if tokio::time::timeout(STOP_GRACE, &mut stepdown).await.is_err() {
             stepdown.abort();
@@ -226,6 +237,7 @@ impl Drop for HubHandle {
             let _ = running.shutdown.send(true);
             running.collector.abort();
             running.tunnel.abort();
+            running.relay.abort();
             running.stepdown.abort();
             for server in running.servers {
                 server.abort();

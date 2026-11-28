@@ -159,6 +159,8 @@ pub struct Hub {
     pub(crate) link: crate::link::LinkState,
     /// Cloudflare tunnel supervisor state ([`crate::tunnel`]).
     pub(crate) tunnel: crate::tunnel::TunnelState,
+    /// Relay connector state ([`crate::relay`]).
+    pub(crate) relay: crate::relay::RelayState,
     /// Step-down detection state ([`crate::stepdown`]).
     pub(crate) stepdown: crate::stepdown::StepDownState,
     /// Hub move state machine ([`crate::migrate`]).
@@ -199,6 +201,7 @@ impl Hub {
             push: crate::push::PushState::new(hub.clone(), initial_push_subs),
             link: Default::default(),
             tunnel: crate::tunnel::TunnelState::new(),
+            relay: crate::relay::RelayState::new(),
             stepdown: crate::stepdown::StepDownState::new(),
             migrate: crate::migrate::MigrateState::new(),
             host_info: std::sync::Mutex::new(HashMap::new()),
@@ -228,6 +231,11 @@ impl Hub {
     /// Cloudflare tunnel supervisor state and status.
     pub fn tunnel(&self) -> &crate::tunnel::TunnelState {
         &self.tunnel
+    }
+
+    /// Relay connector state and status.
+    pub fn relay(&self) -> &crate::relay::RelayState {
+        &self.relay
     }
 
     /// Step-down state (whether a newer hub for this account replaced us).
@@ -697,6 +705,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .merge(crate::link::routes())
         .merge(crate::push::routes())
         .merge(crate::tunnel::routes())
+        .merge(crate::relay::routes())
         .merge(crate::devices::routes())
         .merge(crate::migrate::routes())
         .merge(crate::web::routes())
