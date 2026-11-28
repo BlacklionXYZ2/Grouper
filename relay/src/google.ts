@@ -99,7 +99,7 @@ function parseJson(bytes: Uint8Array): Record<string, unknown> {
  * Verifies signature, iss, aud, exp, iat, email_verified. The nonce is checked by the caller
  * (it needs the relay secret and account storage).
  */
-export async function verifyIdToken(env: Env, token: unknown): Promise<GoogleClaims> {
+export async function verifyIdToken(env: Env, token: unknown, audiences?: string[]): Promise<GoogleClaims> {
   if (typeof token !== "string" || token.length > 8192) throw new AuthError("missing id_token");
   const parts = token.split(".");
   if (parts.length !== 3) throw new AuthError("malformed id_token");
@@ -123,7 +123,7 @@ export async function verifyIdToken(env: Env, token: unknown): Promise<GoogleCla
   const c = claims as unknown as GoogleClaims;
   const issuers = list(env.GOOGLE_ISSUERS || DEFAULT_ISSUERS);
   if (typeof c.iss !== "string" || !issuers.includes(c.iss)) throw new AuthError("wrong issuer");
-  const auds = list(env.GOOGLE_CLIENT_IDS);
+  const auds = audiences ?? list(env.GOOGLE_CLIENT_IDS);
   if (typeof c.aud !== "string" || !auds.includes(c.aud)) throw new AuthError("wrong audience");
   const now = nowSec();
   if (typeof c.exp !== "number" || c.exp <= now) throw new AuthError("id_token expired");

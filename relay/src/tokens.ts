@@ -3,6 +3,11 @@
 
 import { b64urlDecode, b64urlEncode, hex, hmac, nowSec, randomB64url, safeEqual, utf8 } from "./util";
 
+/** Domain-separated Google `nonce` claim for a relay nonce: b64url(SHA-256("grouper-relay-v1:" + nonce)). */
+export async function nonceClaim(relayNonce: string): Promise<string> {
+  return b64urlEncode(new Uint8Array(await crypto.subtle.digest("SHA-256", utf8("grouper-relay-v1:" + relayNonce))));
+}
+
 export const NONCE_TTL = 600;
 export const WEB_TOKEN_TTL = 30 * 86400;
 export const APP_TOKEN_TTL = 365 * 86400;
@@ -73,13 +78,19 @@ export async function readRelayToken(secret: string, token: string | null | unde
   }
 }
 
-export function makeHubSecret(acct: string): string {
-  return `hs.${acct}.${randomB64url(32)}`;
+/** `hs.<acct>.<rand>.<tag>`; the tag lets the Worker reject forged secrets without touching a Durable Object. */
+export async function makeHubSecret(secret: string, acct: string): Promise<string> {
+  const rand = randomB64url(32);
+  return `hs.${acct}.${rand}.${await hubTag(secret, acct, rand)}`;
 }
 
-/** Splits a hub secret into its account key; null if malformed. */
-export function hubSecretAcct(secret: string): string | null {
-  const p = secret.split(".");
-  if (p.length !== 3 || p[0] !== "hs" || !ACCT_RE.test(p[1]!) || !p[2]) return null;
-  return p[1]!;
+async function hubTag(secret: string, acct: string, rand: string): Promise<string> {
+  return b64urlEncode((await hmac(secret, `hs:${acct}.${rand}`)).slice(0, 16));
+}
+
+/** The account key in a hub secret whose tag verifies (constant time); null if malformed or forged. */
+export async function verifyHubSecret(secret: string, hubSecret: string): Promise<string | null> {
+  const p = hubSecret.split(".");
+  if (p.length !== 4 || p[0] !== "hs" || !ACCT_RE.test(p[1]!) || !p[2] || !p[3]) return null;
+  return safeEqual(await hubTag(secret, p[1]!, p[2]), p[3]) ? p[1]! : null;
 }

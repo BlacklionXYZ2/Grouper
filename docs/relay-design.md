@@ -29,6 +29,7 @@ Configuration (Worker vars / secrets):
 | `RELAY_SECRET` (secret) | HMAC key for nonces, relay tokens and account keys. |
 | `GOOGLE_CLIENT_IDS` | Comma-separated audiences accepted in ID tokens (iOS, Mac, web, desktop clients). |
 | `GOOGLE_WEB_CLIENT_ID` | Client used by the relay's own browser sign-in page. |
+| `RELAY_WEB_CLIENT_ID` (optional) | When set, browser sign-in (`/relay/auth/*`) uses this client and accepts **only** this audience, so the relay's page is not a way to turn tokens minted for the apps into relay sessions. Takes precedence over `GOOGLE_WEB_CLIENT_ID`. |
 | `GOOGLE_JWKS_URL` | Default `https://www.googleapis.com/oauth2/v3/certs`. Tests point it at a fake. |
 | `GOOGLE_AUTH_URL` | Default `https://accounts.google.com/o/oauth2/v2/auth`. Tests point it at a fake. |
 | `GOOGLE_ISSUERS` | Default `https://accounts.google.com,accounts.google.com`. |
@@ -41,8 +42,19 @@ Configuration (Worker vars / secrets):
 - **Google ID token checks** (every place a token is accepted): RS256 signature against the JWKS
   (cached per `Cache-Control`, refetch on unknown `kid`), `iss` in `GOOGLE_ISSUERS`, `aud` in
   `GOOGLE_CLIENT_IDS`, `exp` in the future, `iat` within the last 10 minutes and not more than
-  5 minutes ahead, `email_verified` true, and `nonce` a **relay nonce** (below) that has not been
-  used. One-time use is recorded in the account's Durable Object.
+  5 minutes ahead, `email_verified` true, and `nonce` the **domain-separated hash of a relay
+  nonce** (below) that has not been used. One-time use is recorded in the account's Durable Object.
+- **Nonce domain separation.** A relay nonce is just a string anyone can obtain, and hubs run
+  Google sign-in with their own nonces for the same audiences. If the relay accepted the raw relay
+  nonce as the token's `nonce`, a malicious hub could hand a victim a relay nonce as its "hub
+  nonce" and replay the resulting ID token to the relay. So the Google `nonce` claim the relay
+  accepts is `b64url(SHA-256("grouper-relay-v1:" + relay_nonce))` (43 characters), never the relay
+  nonce itself. Requests carry the raw `relay_nonce` next to `id_token`; the relay checks that
+  nonce's HMAC, expiry and one-time use, and that the token's `nonce` equals its hash. Hub nonces
+  are 32 hex characters, so a hash can never be produced by a client that sends a hub's nonce
+  verbatim. **Apps must send a hub-issued nonce to Google verbatim only if it matches
+  `/^[0-9a-f]{32}$/`, and must always hash relay nonces** (the hub-side nonce shape is what makes
+  the two namespaces disjoint).
 - **Relay nonce:** `POST /relay/v1/nonce` returns `{nonce, expires}` where
   `nonce = "rn." + rand(16 bytes b64url) + "." + exp + "." + b64url(HMAC(RELAY_SECRET, rand + "." + exp))`,
   valid 10 minutes. Stateless until used; the account object keeps used nonces until they expire.
@@ -50,31 +62,50 @@ Configuration (Worker vars / secrets):
   `"rt." + b64url(json {a: acct, e: email, k: "web"|"app", g: generation, x: expires}) + "." + b64url(HMAC)`.
   Web tokens live 30 days, app tokens 365 days. `g` must equal the account object's current
   generation; "sign out everywhere" bumps it.
-- **Hub secret** (what a hub presents): `"hs." + acct + "." + rand(32 bytes b64url)`. The account
-  object stores only its SHA-256. Claiming again replaces it (one hub per account; the old hub's
+- **Hub secret** (what a hub presents): `"hs." + acct + "." + rand(32 bytes b64url) + "." + tag`,
+  where `tag = b64url(HMAC(RELAY_SECRET, "hs:" + acct + "." + rand))` truncated to 16 bytes. The
+  Worker verifies the tag (constant time) before touching any Durable Object, so forged secrets
+  can't create or wake account objects. The account object stores only the secret's SHA-256 and
+  still checks it. Claiming again replaces it (one hub per account; the old hub's
   socket is closed with code 4001 "replaced").
 
 How a client presents its relay token:
 - Browsers: cookie `grouper_relay` (HttpOnly, `SameSite=Lax`, `Path=/`, `Secure` when the relay
-  is on HTTPS). Lax, not Strict, so the cookie is sent on the top-level return from Google.
+  is on HTTPS). Lax, not Strict, so the cookie is sent on top-level navigations arriving from
+  other sites.
 - Apps and CLIs: header `Grouper-Relay: <token>` (HTTP and the WebSocket handshake).
 
 The relay **removes** `grouper_relay` from the `Cookie` header and drops `Grouper-Relay` before
-forwarding, so the hub never sees relay credentials.
+forwarding, so the hub never sees relay credentials. In the other direction it drops any
+`Set-Cookie` from a hub response that sets `grouper_relay` or `grouper_relay_state` (a hub can't
+set, replace or clear the relay's cookies).
+
+Cross-site protections on the JSON API: `POST /relay/v1/sign-in`, `/sign-out` and `/hubs/claim`
+require `Content-Type: application/json` (otherwise 415, so a cross-site HTML form can't post to
+them) and, when an `Origin` header is present, it must equal the relay's own origin (otherwise
+403).
 
 ## Relay HTTP API (all under `/relay/v1/`, JSON)
 
 | Route | Auth | Does |
 |---|---|---|
 | `POST /relay/v1/nonce` | none (rate-limit later) | `{nonce, expires}` |
-| `POST /relay/v1/sign-in` `{id_token, client: "web"\|"app"}` | ID token with relay nonce | web: sets the cookie, returns `{email, hub_connected}`; app: returns `{relay_token, email, hub_connected, expires}` |
-| `POST /relay/v1/sign-out` `{everywhere?: bool}` | relay token | clears the cookie; `everywhere` bumps the generation |
+| `POST /relay/v1/sign-in` `{id_token, relay_nonce, client: "web"\|"app"}` | ID token whose nonce is the hash of `relay_nonce` | web: sets the cookie, returns `{email, hub_connected}`; app: returns `{relay_token, email, hub_connected, expires}` |
+| `POST /relay/v1/sign-out` `{everywhere?: bool}` | relay token | clears the cookie; `everywhere` bumps the generation, closes every open client WebSocket of the account with code 4401 and aborts its in-flight streamed responses |
 | `GET /relay/v1/me` | relay token (optional) | `{signed_in, email?, hub_connected?, hub_id?}` |
-| `POST /relay/v1/hubs/claim` `{hub_id, id_token}` | ID token with relay nonce | stores the hub id and a new hub secret for that account; returns `{hub_secret, account_email}` |
+| `POST /relay/v1/hubs/claim` `{hub_id, id_token, relay_nonce}` | ID token whose nonce is the hash of `relay_nonce` | stores the hub id and a new hub secret for that account; returns `{hub_secret, account_email}` |
 | `DELETE /relay/v1/hubs` | `Authorization: Bearer <hub secret>` | forgets the hub, closes its socket |
 | `GET /relay/v1/hub/connect` (WebSocket) | `Authorization: Bearer <hub secret>`, `Grouper-Hub-Id: <hub_id>` | the hub's tunnel socket; 401 on a wrong secret or hub id |
-| `GET /relay/auth/start` | none | browser sign-in: redirects to Google (`response_type=id_token`, `response_mode=form_post`, relay nonce, `redirect_uri=<relay>/relay/auth/return`) |
-| `POST /relay/auth/return` | form `id_token` | verifies as sign-in `web`, sets the cookie, redirects to `/` |
+| `GET /relay/auth/start` | none | browser sign-in: sets the `grouper_relay_state` cookie and redirects to Google (`response_type=id_token`, `response_mode=form_post`, `nonce` = hash of a fresh relay nonce, `state`, `redirect_uri=<relay>/relay/auth/return`) |
+| `POST /relay/auth/return` | form `id_token`, `state` + the state cookie | verifies as sign-in `web`, sets the cookie, clears the state cookie, redirects to `/` |
+
+Browser sign-in is bound to the browser that started it (login CSRF): `/relay/auth/start` sets
+`grouper_relay_state=<state>.<relay_nonce>` (HttpOnly, `Path=/relay/auth`, 10 minutes;
+`SameSite=None; Secure` on HTTPS because Google's `form_post` return is a cross-site POST, `Lax`
+on plain-HTTP development) and sends `state` to Google. `/relay/auth/return` requires the posted
+`state` to equal the cookie's (constant time), takes the relay nonce **from the cookie** (never
+from the form), then clears the cookie. A sign-in response replayed from another browser has no
+matching cookie and is refused.
 
 Everything else (any path, including `/`, `/v1/...`, `/oauth/google/return`, the web app's
 files): with a valid relay token, forwarded to that account's hub; without one, `/` and other
@@ -135,11 +166,11 @@ each answers. The relay closes a hub socket that sends nothing for 90 s; the hub
 - Admin endpoints:
   - `GET /v1/relay` → `{enabled, url, linked, status: "off"|"connecting"|"connected"|"failed", last_error, account_email}`
   - `PUT /v1/relay` `{url?, enabled?}`
-  - `POST /v1/relay/nonce` → asks the relay for a nonce and returns it (the UI runs Google
+  - `POST /v1/relay/nonce` → asks the relay for a nonce and returns it (the UI hashes it as above and runs Google
     sign-in with it).
-  - `POST /v1/relay/link` `{id_token}` → checks the token is the hub owner's (`sub` matches;
+  - `POST /v1/relay/link` `{id_token, relay_nonce}` → checks the token is the hub owner's (`sub` matches;
     signature checked, nonce not required here because the relay checks its own), calls
-    `POST /relay/v1/hubs/claim`, stores the secret, enables and starts the connector.
+    `POST /relay/v1/hubs/claim` with `{hub_id, id_token, relay_nonce}`, stores the secret, enables and starts the connector.
   - `DELETE /v1/relay` → calls `DELETE /relay/v1/hubs`, clears the secret, stops.
 - A supervisor (like the tunnel's) connects to `<relay_url>/relay/v1/hub/connect` when enabled
   and linked and not stepped down, reconnects with backoff (1 s doubling to 60 s), and serves

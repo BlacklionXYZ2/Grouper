@@ -10,7 +10,7 @@
 // Users: alice (owns hub A), bob (owns hub B), carol (no hub).
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { generateKeyPairSync, createSign, randomBytes } from "node:crypto";
+import { generateKeyPairSync, createSign, randomBytes, createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -33,7 +33,10 @@ const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 20
 const KID = "fake-" + randomBytes(4).toString("hex");
 const jwk = { ...publicKey.export({ format: "jwk" }), kid: KID, alg: "RS256", use: "sig" };
 const b64u = (b) => Buffer.from(b).toString("base64url");
-function mint(user, { aud = IOS, nonce, iatOffset = 0, expOffset = 3600, iss = "https://accounts.google.com" } = {}) {
+// Relay flows put the domain-separated hash of the relay nonce in the Google `nonce` claim.
+const relayClaim = (n) => b64u(createHash("sha256").update("grouper-relay-v1:" + n).digest());
+function mint(user, { aud = IOS, nonce, relay = false, iatOffset = 0, expOffset = 3600, iss = "https://accounts.google.com" } = {}) {
+  if (relay && nonce) nonce = relayClaim(nonce);
   const u = USERS[user], now = Math.floor(Date.now() / 1000) + iatOffset;
   const head = b64u(JSON.stringify({ alg: "RS256", kid: KID, typ: "JWT" }));
   const body = b64u(JSON.stringify({ iss, aud, sub: u.sub, email: u.email, email_verified: true, name: u.name, iat: now, exp: now + expOffset, ...(nonce ? { nonce } : {}) }));
@@ -119,8 +122,12 @@ async function http(base, path, { method = "GET", headers = {}, body, raw } = {}
   return { status: r.status, json, text, headers: r.headers };
 }
 const relayNonce = async () => (await http(RELAY, "/relay/v1/nonce", { method: "POST" })).json.nonce;
+async function relayBody(user, client, o = {}) {
+  const n = o.nonce ?? await relayNonce();
+  return { id_token: mint(user, { ...o, nonce: n, relay: true }), relay_nonce: n, client };
+}
 async function relaySignIn(user, client = "app") {
-  const r = await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: mint(user, { nonce: await relayNonce() }), client } });
+  const r = await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: await relayBody(user, client) });
   return r;
 }
 
@@ -140,7 +147,7 @@ async function setupHub(label, owner, port) {
   const hubId = (await http(base, "/v1/hub")).json.hub_id;
   await http(base, "/v1/relay", { method: "PUT", headers: admin, body: { url: RELAY } });
   const rn = (await http(base, "/v1/relay/nonce", { method: "POST", headers: admin })).json?.nonce;
-  const link = await http(base, "/v1/relay/link", { method: "POST", headers: admin, body: { id_token: mint(owner, { nonce: rn }) } });
+  const link = await http(base, "/v1/relay/link", { method: "POST", headers: admin, body: { id_token: mint(owner, { nonce: rn, relay: true }), relay_nonce: rn } });
   if (link.status !== 200) throw new Error(`linking hub ${label} failed: ${link.status} ${link.text}`);
   await waitFor(`hub ${label} connected to relay`, async () => (await http(base, "/v1/relay", { headers: admin })).json?.status === "connected", 30000);
   return { label, base, admin, hubId, data, proc: hub };
@@ -166,13 +173,17 @@ async function main() {
   check("alice, bob and carol get relay tokens", aliceRelay && bobRelay && carolRelay);
   const asA = { "grouper-relay": aliceRelay }, asB = { "grouper-relay": bobRelay }, asC = { "grouper-relay": carolRelay };
 
-  const n1 = await relayNonce(), t1 = mint("alice", { nonce: n1 });
-  check("a relay nonce works once", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: t1, client: "app" } })).status === 200);
-  check("…and is refused the second time", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: t1, client: "app" } })).status >= 400);
-  check("a nonce the relay didn't issue is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: mint("alice", { nonce: "made-up" }), client: "app" } })).status >= 400);
-  check("a token for an unknown app (aud) is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: mint("alice", { aud: "evil.apps.googleusercontent.com", nonce: await relayNonce() }), client: "app" } })).status >= 400);
-  check("an expired token is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: mint("alice", { nonce: await relayNonce(), iatOffset: -7200, expOffset: 3600 }), client: "app" } })).status >= 400);
-  check("a token signed by another key is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: mint("alice", { nonce: await relayNonce() }).replace(/\.[^.]+$/, "." + b64u(randomBytes(256))), client: "app" } })).status >= 400);
+  const n1 = await relayNonce(), t1 = mint("alice", { nonce: n1, relay: true });
+  check("a relay nonce works once", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: t1, relay_nonce: n1, client: "app" } })).status === 200);
+  check("…and is refused the second time", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: t1, relay_nonce: n1, client: "app" } })).status >= 400);
+  // A token minted for a hub-style nonce (what a malicious hub could hand a victim) must not sign in.
+  const rawN = await relayNonce();
+  check("a token carrying the raw relay nonce is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: mint("alice", { nonce: rawN }), relay_nonce: rawN, client: "app" } })).status >= 400);
+  check("a cross-site form post to sign-in is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, raw: "id_token=x" })).status === 415);
+  check("a nonce the relay didn't issue is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { id_token: mint("alice", { nonce: "made-up", relay: true }), relay_nonce: "made-up", client: "app" } })).status >= 400);
+  check("a token for an unknown app (aud) is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: await relayBody("alice", "app", { aud: "evil.apps.googleusercontent.com" }) })).status >= 400);
+  check("an expired token is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: await relayBody("alice", "app", { iatOffset: -7200, expOffset: 3600 }) })).status >= 400);
+  check("a token signed by another key is refused", (await http(RELAY, "/relay/v1/sign-in", { method: "POST", body: { ...(await relayBody("alice", "app")), id_token: undefined, ...(await (async () => { const b = await relayBody("alice", "app"); return { id_token: b.id_token.replace(/\.[^.]+$/, "." + b64u(randomBytes(256))), relay_nonce: b.relay_nonce }; })()) } })).status >= 400);
 
   console.log("Routing");
   check("alice reaches hub A", (await http(RELAY, "/v1/hub", { headers: asA })).json?.hub_id === A.hubId);
@@ -231,7 +242,7 @@ async function main() {
   // Hub B claims alice's account: only possible with alice's own fresh Google sign-in, and hub B's
   // owner check refuses it, so the relay route for alice can't be taken by bob's hub.
   const rnB = (await http(B.base, "/v1/relay/nonce", { method: "POST", headers: B.admin })).json?.nonce;
-  const steal = await http(B.base, "/v1/relay/link", { method: "POST", headers: B.admin, body: { id_token: mint("alice", { nonce: rnB }) } });
+  const steal = await http(B.base, "/v1/relay/link", { method: "POST", headers: B.admin, body: { id_token: mint("alice", { nonce: rnB, relay: true }), relay_nonce: rnB } });
   check("hub B can't link itself to alice's relay account", steal.status >= 400, `${steal.status}`);
   check("alice still reaches hub A", (await http(RELAY, "/v1/hub", { headers: asA })).json?.hub_id === A.hubId);
 

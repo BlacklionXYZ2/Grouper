@@ -38,6 +38,8 @@ const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", { modulusLen
 const other = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
 const jwk = { ...publicKey.export({ format: "jwk" }), kid: "test-kid", alg: "RS256", use: "sig" };
 const b64u = (b) => Buffer.from(b).toString("base64url");
+// The Google nonce claim the relay accepts for a relay nonce (domain separated).
+const claimOf = (n) => b64u(crypto.createHash("sha256").update("grouper-relay-v1:" + n).digest());
 
 function mint(o) {
   const now = Math.floor(Date.now() / 1000);
@@ -51,7 +53,7 @@ function mint(o) {
     exp: now + 3600,
     ...o.claims,
   };
-  if (o.nonce !== undefined) claims.nonce = o.nonce;
+  if (o.nonce !== undefined) claims.nonce = o.rawClaim ? o.nonce : claimOf(o.nonce);
   const head = b64u(JSON.stringify({ alg: "RS256", kid: "test-kid", typ: "JWT" }));
   const body = b64u(JSON.stringify(claims));
   const sig = crypto.sign("sha256", Buffer.from(`${head}.${body}`), o.key ?? privateKey);
@@ -126,13 +128,17 @@ async function api(method, p, { body, headers } = {}) {
   return { status: r.status, json: j, text, headers: r.headers };
 }
 
+async function signInBody(o, client) {
+  return { id_token: mint(o), relay_nonce: o.nonce, client };
+}
+
 async function newNonce() {
   return (await api("POST", "/relay/v1/nonce")).json.nonce;
 }
 
 async function appSignIn(user) {
   const nonce = await newNonce();
-  const r = await api("POST", "/relay/v1/sign-in", { body: { id_token: mint({ ...user, nonce }), client: "app" } });
+  const r = await api("POST", "/relay/v1/sign-in", { body: { id_token: mint({ ...user, nonce }), relay_nonce: nonce, client: "app" } });
   return r.json?.relay_token;
 }
 
@@ -178,6 +184,15 @@ class FakeHub {
     if (f.t === "ws_close") return void this.wsClosed.push(f);
     if (f.t !== "req") return;
     if (f.path.startsWith("/hang")) return;
+    if (f.path.startsWith("/evilcookie")) {
+      this.send({ t: "res", id: f.id, status: 200, headers: [["set-cookie", "grouper_relay=evil; Path=/"], ["set-cookie", "grouper_relay_state=evil"], ["set-cookie", " Grouper_Relay=evil2"], ["set-cookie", "app=ok"]] });
+      return this.send({ t: "end", id: f.id });
+    }
+    if (f.path.startsWith("/slowstream")) {
+      this.send({ t: "res", id: f.id, status: 200, headers: [["content-type", "application/octet-stream"]] });
+      this.send({ t: "data", id: f.id, b64: Buffer.from("first").toString("base64") });
+      return; // never ends
+    }
     if (f.path.startsWith("/boom")) return this.send({ t: "err", id: f.id, message: "kaput" });
     if (f.path.startsWith("/cut")) {
       this.send({ t: "res", id: f.id, status: 200, headers: [["content-type", "text/plain"]] });
@@ -203,7 +218,7 @@ class FakeHub {
 
 async function claim(user, hubId) {
   const nonce = await newNonce();
-  const r = await api("POST", "/relay/v1/hubs/claim", { body: { hub_id: hubId, id_token: mint({ ...user, nonce }) } });
+  const r = await api("POST", "/relay/v1/hubs/claim", { body: { hub_id: hubId, id_token: mint({ ...user, nonce }), relay_nonce: nonce } });
   return r;
 }
 
@@ -235,30 +250,57 @@ async function main() {
     const n = await api("POST", "/relay/v1/nonce");
     check("nonce shape", /^rn\.[\w-]+\.\d+\.[\w-]+$/.test(n.json.nonce) && n.json.expires > Date.now() / 1000);
 
-    const si = (idt, client = "app") => api("POST", "/relay/v1/sign-in", { body: { id_token: idt, client } });
-    const good = await si(mint({ ...A, nonce: n.json.nonce }));
+    const si = (o, relayNonce = o.nonce, client = "app") => api("POST", "/relay/v1/sign-in", { body: { id_token: mint(o), relay_nonce: relayNonce, client } });
+    const good = await si({ ...A, nonce: n.json.nonce });
     check("valid sign-in (app) returns token", good.status === 200 && good.json.relay_token?.startsWith("rt.") && good.json.email === A.email, good.text);
     check("sign-in reports no hub yet", good.json.hub_connected === false);
 
-    const reuse = await si(mint({ ...A, nonce: n.json.nonce }));
+    const reuse = await si({ ...A, nonce: n.json.nonce });
     check("reused nonce refused", reuse.status === 401, reuse.text);
 
     const n2 = (await api("POST", "/relay/v1/nonce")).json.nonce;
-    check("garbage nonce refused", (await si(mint({ ...A, nonce: "rn.x.9999999999.zzz" }))).status === 401);
-    check("missing nonce refused", (await si(mint({ ...A }))).status === 401);
+    check("garbage nonce refused", (await si({ ...A, nonce: "rn.x.9999999999.zzz" })).status === 401);
+    check("missing nonce refused", (await si({ ...A })).status === 401);
     const tampered = n2.replace(/\.[^.]+$/, ".AAAA");
-    check("tampered nonce signature refused", (await si(mint({ ...A, nonce: tampered }))).status === 401);
+    check("tampered nonce signature refused", (await si({ ...A, nonce: tampered })).status === 401);
     const n3 = (await api("POST", "/relay/v1/nonce")).json.nonce;
-    check("wrong audience refused", (await si(mint({ ...A, nonce: n3, claims: { aud: "evil" } }))).status === 401);
+    check("wrong audience refused", (await si({ ...A, nonce: n3, claims: { aud: "evil" } })).status === 401);
     const now = Math.floor(Date.now() / 1000);
-    check("expired token refused", (await si(mint({ ...A, nonce: n3, claims: { iat: now - 120, exp: now - 10 } }))).status === 401);
-    check("old iat refused", (await si(mint({ ...A, nonce: n3, claims: { iat: now - 1200 } }))).status === 401);
-    check("future iat refused", (await si(mint({ ...A, nonce: n3, claims: { iat: now + 1200 } }))).status === 401);
-    check("wrong issuer refused", (await si(mint({ ...A, nonce: n3, claims: { iss: "https://evil.example" } }))).status === 401);
-    check("unverified email refused", (await si(mint({ ...A, nonce: n3, claims: { email_verified: false } }))).status === 401);
-    check("bad signature refused", (await si(mint({ ...A, nonce: n3, key: other.privateKey }))).status === 401);
-    check("none of those burned the nonce", (await si(mint({ ...A, nonce: n3 }))).status === 200);
-    check("bad client value refused", (await si(mint({ ...A, nonce: await newNonce() }), "x")).status === 400);
+    check("expired token refused", (await si({ ...A, nonce: n3, claims: { iat: now - 120, exp: now - 10 } })).status === 401);
+    check("old iat refused", (await si({ ...A, nonce: n3, claims: { iat: now - 1200 } })).status === 401);
+    check("future iat refused", (await si({ ...A, nonce: n3, claims: { iat: now + 1200 } })).status === 401);
+    check("wrong issuer refused", (await si({ ...A, nonce: n3, claims: { iss: "https://evil.example" } })).status === 401);
+    check("unverified email refused", (await si({ ...A, nonce: n3, claims: { email_verified: false } })).status === 401);
+    check("bad signature refused", (await si({ ...A, nonce: n3, key: other.privateKey })).status === 401);
+    check("none of those burned the nonce", (await si({ ...A, nonce: n3 })).status === 200);
+    check("bad client value refused", (await si({ ...A, nonce: await newNonce() }, undefined, "x")).status === 400);
+
+    // Domain separation: a token minted with the RAW relay nonce (what a malicious hub would hand a
+    // victim as its "hub nonce") is refused, as is a relay_nonce that doesn't match the token.
+    const nr = await newNonce();
+    check("token carrying the raw relay nonce refused", (await si({ ...A, nonce: nr, rawClaim: true })).status === 401);
+    const nOther = await newNonce();
+    check("relay_nonce that doesn't match the token's hash refused", (await si({ ...A, nonce: nr }, nOther)).status === 401);
+    check("missing relay_nonce refused", (await si({ ...A, nonce: nr }, null)).status === 401);
+    check("hashed claim with the right relay_nonce still works afterwards", (await si({ ...A, nonce: nr })).status === 200);
+    const nc = await newNonce();
+    const rawClaim = await api("POST", "/relay/v1/hubs/claim", { body: { hub_id: "evil", id_token: mint({ ...A, nonce: nc, rawClaim: true }), relay_nonce: nc } });
+    check("claim with a raw-nonce token refused", rawClaim.status === 401);
+    check("hub-style hex nonce can't be replayed as a relay nonce", (await si({ ...A, nonce: "0123456789abcdef0123456789abcdef", rawClaim: true }, nr)).status === 401);
+
+    // Content type and origin.
+    const jb = async () => { const nn = await newNonce(); return JSON.stringify({ id_token: mint({ ...A, nonce: nn }), relay_nonce: nn, client: "app" }); };
+    const raw = (headers, body) => fetch(`${BASE}/relay/v1/sign-in`, { method: "POST", headers, body });
+    check("form-encoded sign-in refused (415)", (await raw({ "content-type": "application/x-www-form-urlencoded" }, await jb())).status === 415);
+    check("text/plain sign-in refused (415)", (await raw({ "content-type": "text/plain" }, await jb())).status === 415);
+    check("no content-type refused (415)", (await raw({}, await jb())).status === 415);
+    check("cross-origin sign-in refused (403)", (await raw({ "content-type": "application/json", origin: "https://evil.example" }, await jb())).status === 403);
+    check("same-origin Origin accepted", (await raw({ "content-type": "application/json", origin: BASE }, await jb())).status === 200);
+    const nn2 = await newNonce();
+    check("cross-origin claim refused (403)", (await fetch(`${BASE}/relay/v1/hubs/claim`, { method: "POST", headers: { "content-type": "application/json", origin: "https://evil.example" }, body: JSON.stringify({ hub_id: "h", id_token: mint({ ...A, nonce: nn2 }), relay_nonce: nn2 }) })).status === 403);
+    check("form-encoded claim refused (415)", (await fetch(`${BASE}/relay/v1/hubs/claim`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "x=1" })).status === 415);
+    check("form-encoded sign-out refused (415)", (await fetch(`${BASE}/relay/v1/sign-out`, { method: "POST", headers: { "content-type": "text/plain", "grouper-relay": await appSignIn(A) }, body: "{}" })).status === 415);
+    check("cross-origin sign-out refused (403)", (await fetch(`${BASE}/relay/v1/sign-out`, { method: "POST", headers: { "content-type": "application/json", origin: "https://evil.example", "grouper-relay": await appSignIn(A) }, body: "{}" })).status === 403);
   }
 
   console.log("claim + tunnel");
@@ -268,7 +310,7 @@ async function main() {
   const claimA = await claim(A, "hub-a");
   const claimB = await claim(B, "hub-b");
   check("claim returns hub secret", claimA.status === 200 && claimA.json.hub_secret?.startsWith("hs.") && claimA.json.account_email === A.email, claimA.text);
-  check("claim reuse of id token refused", (await api("POST", "/relay/v1/hubs/claim", { body: { hub_id: "x", id_token: mint({ ...A, nonce: "bogus" }) } })).status === 401);
+  check("claim reuse of id token refused", (await api("POST", "/relay/v1/hubs/claim", { body: { hub_id: "x", id_token: mint({ ...A, nonce: "bogus" }), relay_nonce: "bogus" } })).status === 401);
   check("A and B get different secrets", claimA.json.hub_secret !== claimB.json.hub_secret);
 
   const hubA = new FakeHub("A");
@@ -279,6 +321,19 @@ async function main() {
   refused = null;
   await new FakeHub("x").connect(claimA.json.hub_secret, "hub-wrong").catch((e) => (refused = e.status));
   check("wrong hub id refused (401)", refused === 401);
+  {
+    const parts = claimA.json.hub_secret.split(".");
+    check("hub secret has acct, rand and tag", parts.length === 4 && parts[0] === "hs");
+    const forgedTag = [...parts.slice(0, 3), "A".repeat(parts[3].length)].join(".");
+    const noTag = parts.slice(0, 3).join(".");
+    const otherAcct = ["hs", "0".repeat(32), parts[2], parts[3]].join(".");
+    for (const [label, sec] of [["forged tag", forgedTag], ["missing tag", noTag], ["tag from another account", otherAcct]]) {
+      let st = null;
+      await new FakeHub("x").connect(sec, "hub-a").catch((e) => (st = e.status));
+      check(`hub secret with ${label} refused (401)`, st === 401);
+      check(`DELETE /hubs with ${label} refused (401)`, (await api("DELETE", "/relay/v1/hubs", { headers: { authorization: `Bearer ${sec}` } })).status === 401);
+    }
+  }
   await hubA.connect(claimA.json.hub_secret, "hub-a");
   await hubB.connect(claimB.json.hub_secret, "hub-b");
 
@@ -320,6 +375,9 @@ async function main() {
   let cutText = "";
   try { cutText = await cut.text(); } catch (e) { cutErr = true; cutText = String(e); }
   check("err after res never ends as a clean 200 body", cutErr || cut.status !== 200, JSON.stringify(cutText));
+  const ec = await fetch(`${BASE}/evilcookie`, { headers: { "grouper-relay": tokA } });
+  const ecCookies = ec.headers.getSetCookie();
+  check("hub Set-Cookie for relay cookies stripped, others kept", ecCookies.length === 1 && ecCookies[0] === "app=ok", JSON.stringify(ecCookies));
   const boom = await api("GET", "/boom", { headers: { "grouper-relay": tokA } });
   check("err before res is 502", boom.status === 502 && boom.json?.relay === true, boom.text);
 
@@ -348,17 +406,36 @@ async function main() {
     const s = await api("GET", "/relay/auth/start");
     const loc = new URL(s.headers.get("location"));
     check("auth/start redirects to Google", s.status === 302 && loc.origin === GOOGLE && loc.searchParams.get("response_type") === "id_token" && loc.searchParams.get("response_mode") === "form_post" && loc.searchParams.get("redirect_uri") === `${BASE}/relay/auth/return` && loc.searchParams.get("client_id") === CLIENT_ID);
-    const nonce = loc.searchParams.get("nonce");
-    const form = (idt) => fetch(`${BASE}/relay/auth/return`, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ id_token: idt }) });
+    const claimNonce = loc.searchParams.get("nonce");
+    const state = loc.searchParams.get("state");
+    const stateSet = s.headers.getSetCookie().find((c) => c.startsWith("grouper_relay_state=")) ?? "";
+    const stateCookie = stateSet.split(";")[0];
+    check("auth/start sets a short-lived HttpOnly state cookie", /HttpOnly/i.test(stateSet) && /Max-Age=600/.test(stateSet) && stateCookie.includes(state), stateSet);
+    check("auth/start's Google nonce is the hashed form (not an rn. string)", !!claimNonce && !claimNonce.startsWith("rn.") && /^[\w-]{43}$/.test(claimNonce));
+    const relayNonceInCookie = stateCookie.slice(stateCookie.indexOf(".") + 1);
+    check("hashed nonce matches the cookie's relay nonce", claimOf(relayNonceInCookie) === claimNonce);
+    const form = (idt, { st = state, ck = stateCookie } = {}) => fetch(`${BASE}/relay/auth/return`, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", ...(ck ? { cookie: ck } : {}) }, body: new URLSearchParams({ id_token: idt, ...(st ? { state: st } : {}) }) });
+    const goodTok = () => mint({ ...A, nonce: relayNonceInCookie });
+    check("auth/return without the state cookie refused", (await form(goodTok(), { ck: "" })).status === 401);
+    check("auth/return with a wrong state cookie refused", (await form(goodTok(), { ck: "grouper_relay_state=zzz." + relayNonceInCookie })).status === 401);
+    check("auth/return with a wrong posted state refused", (await form(goodTok(), { st: "nope" })).status === 401);
+    check("auth/return without posted state refused", (await form(goodTok(), { st: "" })).status === 401);
+    const swapped = await form(mint({ ...A, nonce: relayNonceInCookie, rawClaim: true }));
+    check("auth/return with a raw-nonce token refused", swapped.status === 401);
+    const other = (await api("GET", "/relay/auth/start")).headers.getSetCookie()[0].split(";")[0];
+    check("auth/return with another flow's cookie refused", (await form(goodTok(), { ck: other })).status === 401);
     const bad = await form(mint({ ...A, nonce: "nope" }));
     check("auth/return refuses a bad nonce", bad.status === 401);
-    const ok = await form(mint({ ...A, nonce }));
-    const sc = ok.headers.get("set-cookie") ?? "";
+    const ok = await form(goodTok());
+    const cks = ok.headers.getSetCookie();
+    const sc = cks.find((c) => c.startsWith("grouper_relay=")) ?? "";
+    check("auth/return clears the state cookie", cks.some((c) => c.startsWith("grouper_relay_state=;") && /Max-Age=0/.test(c)));
+    check("state/nonce are single use", (await form(goodTok())).status === 401);
     check("auth/return sets cookie and redirects to /", ok.status === 303 && ok.headers.get("location") === "/" && /grouper_relay=rt\./.test(sc) && /HttpOnly/i.test(sc) && /SameSite=Lax/i.test(sc) && /Path=\//.test(sc), sc);
     const cookie = sc.split(";")[0];
     const viaCookie = await api("GET", "/", { headers: { cookie: `${cookie}; other=1`, accept: "text/html" } });
     check("cookie reaches hub A, stripped", viaCookie.json?.hub === "A" && Object.fromEntries(viaCookie.json.headers).cookie === "other=1", viaCookie.text);
-    const web = await api("POST", "/relay/v1/sign-in", { body: { id_token: mint({ ...A, nonce: await newNonce() }), client: "web" } });
+    const web = await api("POST", "/relay/v1/sign-in", { body: await signInBody({ ...A, nonce: await newNonce() }, "web") });
     check("web sign-in sets cookie, no token in body", web.status === 200 && !web.json.relay_token && /grouper_relay=/.test(web.headers.get("set-cookie") ?? ""));
   }
 
@@ -404,7 +481,18 @@ async function main() {
     check("sign-out clears cookie", plain.status === 200 && /Max-Age=0/i.test(plain.headers.get("set-cookie") ?? ""));
     check("plain sign-out leaves tokens valid", (await api("GET", "/v1/x", { headers: { "grouper-relay": t2 } })).status === 201);
     check("sign-out needs a token", (await api("POST", "/relay/v1/sign-out", { body: {} })).status === 401);
+    const wsLive = await clientWs("/v1/events", { "grouper-relay": t2 });
+    const wsLiveClosed = closed(wsLive);
+    const streaming = await fetch(`${BASE}/slowstream`, { headers: { "grouper-relay": t2 } });
+    const reader = streaming.body.getReader();
+    const firstChunk = await reader.read();
+    check("streaming response started", !firstChunk.done);
+    const streamEnd = reader.read().then((r) => (r.done ? "clean" : "data"), () => "aborted");
     const all = await api("POST", "/relay/v1/sign-out", { body: { everywhere: true }, headers: { "grouper-relay": t1 } });
+    const t0 = Date.now();
+    const wsCode = await Promise.race([wsLiveClosed, sleep(60000).then(() => "timeout")]);
+    check("sign-out everywhere closes client sockets with 4401", wsCode === 4401, `${wsCode} after ${Date.now() - t0}ms`);
+    check("sign-out everywhere aborts in-flight streams", (await Promise.race([streamEnd, sleep(5000).then(() => "timeout")])) === "aborted");
     check("sign-out everywhere ok", all.status === 200);
     const after = await Promise.all([t1, t2, tokA].map((t) => api("GET", "/v1/x", { headers: { "grouper-relay": t } })));
     check("old tokens invalid after sign-out everywhere", after.every((r) => r.status === 401));
