@@ -1,0 +1,19 @@
+{
+  "name": "grouper-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Grouper relay: Cloudflare Worker + Durable Objects tunnel between signed-in clients and each user's hub",
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "test": "node test/smoke.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261128.1",
+    "typescript": "7.0.2",
+    "wrangler": "4.169.0",
+    "ws": "8.23.1"
+  }
+}

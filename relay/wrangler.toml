@@ -1,0 +1,19 @@
+name = "grouper-relay"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+[durable_objects]
+bindings = [{ name = "ACCOUNT", class_name = "Account" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Account"]
+
+# Non-secret config. RELAY_SECRET is a secret: `npx wrangler secret put RELAY_SECRET`
+# (local dev: copy .dev.vars.example to .dev.vars).
+[vars]
+GOOGLE_CLIENT_IDS = "REPLACE_ME.apps.googleusercontent.com"
+GOOGLE_WEB_CLIENT_ID = "REPLACE_ME.apps.googleusercontent.com"
+GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_ISSUERS = "https://accounts.google.com,accounts.google.com"
