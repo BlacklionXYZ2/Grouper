@@ -67,7 +67,7 @@ final class MacNodeController: ObservableObject {
     private func restartForUsageChange() {
         guard running, let target else { return }
         stop()
-        start(hubURL: target.hubURL, token: target.token)
+        start(hubURL: target.hubURL, token: target.token, relayToken: target.relayToken)
     }
 
     /// This Mac's name as System Settings > General > Sharing shows it, if available.
@@ -81,17 +81,19 @@ final class MacNodeController: ObservableObject {
         guard newTarget != target else { return }
         target = newTarget
         stop()
-        if let newTarget { start(hubURL: newTarget.hubURL, token: newTarget.token) }
+        if let newTarget { start(hubURL: newTarget.hubURL, token: newTarget.token, relayToken: newTarget.relayToken) }
     }
 
     /// Menu bar > Resume this Mac.
     func resume() {
         guard let target, !running else { return }
         stop()
-        start(hubURL: target.hubURL, token: target.token)
+        start(hubURL: target.hubURL, token: target.token, relayToken: target.relayToken)
     }
 
-    private func start(hubURL: String, token: String) {
+    /// `relayToken`: the relay sign-in token when `hubURL` is a relay; the Rust core sends it as
+    /// `Grouper-Relay` on its WebSocket handshake.
+    private func start(hubURL: String, token: String, relayToken: String?) {
         guard !token.isEmpty, client == nil else { return }
         tokenRejected = false
         generation += 1
@@ -111,6 +113,7 @@ final class MacNodeController: ObservableObject {
                 allowShell: true,
                 usageProbes: usageProbesOn,
                 usageProbeProviders: usageProbeProviders,
+                relayToken: relayToken,
                 handler: createdBridge,
                 listener: createdBridge
             )

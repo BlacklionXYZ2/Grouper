@@ -237,6 +237,7 @@ impl RunningLocalHub {
             folders,
             usage_probes: opts.usage_probes,
             usage_probe_providers: opts.usage_probe_providers,
+            relay_token: None,
         };
 
         let (node_shutdown, node_rx) = watch::channel(false);

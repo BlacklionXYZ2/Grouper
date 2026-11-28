@@ -80,6 +80,8 @@ do {
         allowShell: true,
         usageProbes: env["GROUPER_USAGE_PROBES"].map { !["0", "false", "no", "off"].contains($0.lowercased()) } ?? true,
         usageProbeProviders: nil,
+        // A hub behind the relay: the relay sign-in token (docs/relay-design.md, "Clients").
+        relayToken: env["GROUPER_RELAY_TOKEN"],
         handler: MacTools(),
         listener: Printer()
     )

@@ -126,13 +126,21 @@ struct SignInView: View {
 
     @ViewBuilder private var unreachableSection: some View {
         Section {
-            Text("Can't reach your Grouper hub")
+            // The relay answered but the hub behind it is offline: say so plainly.
+            Text(model.relayProblem == nil ? "Can't reach your Grouper hub" : "Your hub is offline")
                 .font(.headline)
                 .foregroundStyle(Theme.text)
+            if let problem = model.relayProblem {
+                Text(problem)
+                    .font(.callout)
+                    .foregroundStyle(Theme.text2)
+            }
             #if os(iOS)
-            Text("Grouper runs on one of your computers. Install it on a Mac or PC and sign in with your Google account, or check that your hub is online.")
-                .font(.callout)
-                .foregroundStyle(Theme.text2)
+            if model.relayProblem == nil {
+                Text("Grouper runs on one of your computers. Install it on a Mac or PC and sign in with your Google account, or check that your hub is online.")
+                    .font(.callout)
+                    .foregroundStyle(Theme.text2)
+            }
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
                 Text("Checking again automatically…")
@@ -140,9 +148,11 @@ struct SignInView: View {
             .font(.caption)
             .foregroundStyle(Theme.text3)
             #else
-            Text("Check that your hub is running and reachable at \(HubAddress.displayHost(model.hubURL)).")
-                .font(.callout)
-                .foregroundStyle(Theme.text2)
+            if model.relayProblem == nil {
+                Text("Check that your hub is running and reachable at \(HubAddress.displayHost(model.hubURL)).")
+                    .font(.callout)
+                    .foregroundStyle(Theme.text2)
+            }
             #endif
             Button("Try again") {
                 Task { await model.checkAuthStatus(force: true) }
@@ -185,6 +195,12 @@ struct SignInView: View {
                     .font(.caption).foregroundStyle(Theme.text2)
             } header: {
                 Text("Setup code")
+            }
+        }
+        if model.relaySignInNeeded {
+            Section {
+                Text("\(HubAddress.displayHost(model.hubURL)) is reached through the Grouper relay. You'll sign in with Google twice: once for the relay, then for your hub.")
+                    .font(.caption).foregroundStyle(Theme.text2)
             }
         }
         Section {

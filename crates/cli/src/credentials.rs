@@ -23,10 +23,17 @@ pub const DEFAULT_HUB: &str = "https://grouper.clockmillbarn.uk";
 const KEYCHAIN_SERVICE: &str = "dev.grouper.cli";
 #[cfg(target_os = "macos")]
 const KEYCHAIN_ACCOUNT: &str = "device-token";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_RELAY_ACCOUNT: &str = "relay-token";
+/// Relay token for the process, instead of the saved one (automation).
+const RELAY_TOKEN_ENV: &str = "GROUPER_RELAY_TOKEN";
 
 pub struct Credentials {
     pub hub: String,
     pub token: Option<String>,
+    /// The relay sign-in token, when the hub address is a relay. Loaded with the token.
+    #[allow(dead_code)] // read by tests; commands use relay_token_for(hub)
+    pub relay_token: Option<String>,
 }
 
 /// `<config dir>/grouper/credentials.json`. The token is DPAPI-protected on Windows, in the
@@ -40,6 +47,9 @@ struct StoredCredentials {
     token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     install_id: Option<String>,
+    /// The relay token, protected like `token` (DPAPI / Keychain / 0600 file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_token: Option<String>,
 }
 
 /// A fresh install id: 32 random hex characters.
@@ -188,20 +198,70 @@ pub fn load(with_token: bool) -> Result<Option<Credentials>> {
     }
     let Some(stored) = read_stored()? else { return Ok(None) };
     let Some(hub) = stored.hub.clone() else { return Ok(None) };
-    let token = if with_token {
-        Some(load_token(&stored)?.context("saved credentials do not contain a device token")?)
+    let (token, relay_token) = if with_token {
+        let token = load_token(&stored)?.context("saved credentials do not contain a device token")?;
+        (Some(token), load_relay_token(&stored)?)
     } else {
-        None
+        (None, None)
     };
-    Ok(Some(Credentials { hub, token }))
+    Ok(Some(Credentials { hub, token, relay_token }))
+}
+
+/// The relay token to send to `hub`: `GROUPER_RELAY_TOKEN`, else the saved one when the saved hub
+/// is this hub. `None` for a hub that isn't behind a relay (or no relay sign-in yet).
+pub fn relay_token_for(hub: &str) -> Result<Option<String>> {
+    if let Some(t) = std::env::var(RELAY_TOKEN_ENV).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        return Ok(Some(t));
+    }
+    if std::env::var_os(THREAD_SHELL_ENV).is_some() {
+        return Ok(None);
+    }
+    let Some(stored) = read_stored()? else { return Ok(None) };
+    if stored.hub.as_deref().map(normalize_hub) != Some(normalize_hub(hub)) {
+        return Ok(None);
+    }
+    load_relay_token(&stored)
+}
+
+/// Save (or clear, with `None`) the relay token for `hub`. The relay step of `grouper login` runs
+/// before the device is approved, so this may be the first thing saved for the hub.
+pub fn save_relay_token(hub: &str, relay_token: Option<&str>) -> Result<()> {
+    let mut stored = read_stored().ok().flatten().unwrap_or_default();
+    if stored.hub.as_deref().map(normalize_hub) != Some(normalize_hub(hub)) {
+        // A different hub's credentials don't carry over.
+        stored = StoredCredentials { install_id: stored.install_id, ..Default::default() };
+        stored.hub = Some(hub.to_string());
+    }
+    stored.relay_token = match relay_token {
+        Some(t) => save_secret(RELAY_ACCOUNT, t)?,
+        None => {
+            remove_secret(RELAY_ACCOUNT)?;
+            None
+        }
+    };
+    write_stored(&stored)
+}
+
+fn load_relay_token(stored: &StoredCredentials) -> Result<Option<String>> {
+    match &stored.relay_token {
+        None => load_secret_keychain_only(RELAY_ACCOUNT),
+        Some(v) => load_secret(RELAY_ACCOUNT, Some(v)),
+    }
 }
 
 /// Save the hub and token from `grouper login`, keeping this install's id.
 pub fn save(hub: &str, token: &str, install_id: &str) -> Result<()> {
+    // Keep the relay token when it's for this same hub (login saves it first).
+    let relay_token = read_stored()
+        .ok()
+        .flatten()
+        .filter(|s| s.hub.as_deref().map(normalize_hub) == Some(normalize_hub(hub)))
+        .and_then(|s| s.relay_token);
     let stored = StoredCredentials {
         hub: Some(hub.to_string()),
         token: save_token(token)?,
         install_id: Some(install_id.to_string()),
+        relay_token,
     };
     write_stored(&stored)
 }
@@ -243,6 +303,7 @@ fn write_stored(stored: &StoredCredentials) -> Result<()> {
 /// Returns the hub it was signed in to, if any.
 pub fn remove() -> Result<Option<String>> {
     remove_token()?;
+    remove_secret(RELAY_ACCOUNT)?;
     // An unreadable file is removed outright.
     let stored = read_stored().unwrap_or_default();
     let hub = stored.as_ref().and_then(|s| s.hub.clone());
@@ -272,8 +333,32 @@ fn credentials_path() -> Result<PathBuf> {
     Ok(config.join("grouper").join(FILE_NAME))
 }
 
-#[cfg(windows)]
+// Secrets (the device token and the relay token) are stored per "account": `TOKEN_ACCOUNT` and
+// `RELAY_ACCOUNT`. Windows: DPAPI in the file. macOS: Keychain, one item per account. Elsewhere:
+// plain in the 0600 file.
+#[cfg(target_os = "macos")]
+const TOKEN_ACCOUNT: &str = KEYCHAIN_ACCOUNT;
+#[cfg(target_os = "macos")]
+const RELAY_ACCOUNT: &str = KEYCHAIN_RELAY_ACCOUNT;
+#[cfg(not(target_os = "macos"))]
+const TOKEN_ACCOUNT: &str = "device-token";
+#[cfg(not(target_os = "macos"))]
+const RELAY_ACCOUNT: &str = "relay-token";
+
 fn save_token(token: &str) -> Result<Option<String>> {
+    save_secret(TOKEN_ACCOUNT, token)
+}
+
+fn load_token(stored: &StoredCredentials) -> Result<Option<String>> {
+    load_secret(TOKEN_ACCOUNT, stored.token.as_ref())
+}
+
+fn remove_token() -> Result<()> {
+    remove_secret(TOKEN_ACCOUNT)
+}
+
+#[cfg(windows)]
+fn save_secret(_account: &str, token: &str) -> Result<Option<String>> {
     Ok(Some(format!(
         "dpapi:{}",
         STANDARD.encode(dpapi::protect(token.as_bytes())?)
@@ -281,8 +366,13 @@ fn save_token(token: &str) -> Result<Option<String>> {
 }
 
 #[cfg(windows)]
-fn load_token(stored: &StoredCredentials) -> Result<Option<String>> {
-    let Some(value) = &stored.token else {
+fn load_secret_keychain_only(_account: &str) -> Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn load_secret(_account: &str, value: Option<&String>) -> Result<Option<String>> {
+    let Some(value) = value else {
         return Ok(None);
     };
     let encoded = value
@@ -298,55 +388,60 @@ fn load_token(stored: &StoredCredentials) -> Result<Option<String>> {
 }
 
 #[cfg(windows)]
-fn remove_token() -> Result<()> {
+fn remove_secret(_account: &str) -> Result<()> {
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn save_token(token: &str) -> Result<Option<String>> {
-    security_framework::passwords::set_generic_password(
-        KEYCHAIN_SERVICE,
-        KEYCHAIN_ACCOUNT,
-        token.as_bytes(),
-    )
-    .context("saving device token in macOS Keychain")?;
+fn save_secret(account: &str, token: &str) -> Result<Option<String>> {
+    security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, account, token.as_bytes())
+        .context("saving token in macOS Keychain")?;
     Ok(None)
 }
 
 #[cfg(target_os = "macos")]
-fn load_token(_stored: &StoredCredentials) -> Result<Option<String>> {
-    let bytes =
-        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .context("reading device token from macOS Keychain")?;
-    Ok(Some(
-        String::from_utf8(bytes).context("saved token is not valid UTF-8")?,
-    ))
+fn load_secret_keychain_only(account: &str) -> Result<Option<String>> {
+    load_secret(account, None)
 }
 
 #[cfg(target_os = "macos")]
-fn remove_token() -> Result<()> {
-    match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-    {
+fn load_secret(account: &str, _value: Option<&String>) -> Result<Option<String>> {
+    match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, account) {
+        Ok(bytes) => Ok(Some(String::from_utf8(bytes).context("saved token is not valid UTF-8")?)),
+        // errSecItemNotFound: the relay token is optional.
+        Err(error) if error.code() == -25300 && account == KEYCHAIN_RELAY_ACCOUNT => Ok(None),
+        Err(error) => Err(error).context("reading token from macOS Keychain"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_secret(account: &str) -> Result<()> {
+    match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, account) {
         Ok(()) => Ok(()),
         Err(error) if error.code() == -25300 => Ok(()),
-        Err(error) => Err(error).context("removing device token from macOS Keychain"),
+        Err(error) => Err(error).context("removing token from macOS Keychain"),
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn save_token(token: &str) -> Result<Option<String>> {
+fn save_secret(_account: &str, token: &str) -> Result<Option<String>> {
     // There is no universal OS key store on Unix. The token is not encrypted;
     // access is restricted with the credentials file's 0600 mode instead.
     Ok(Some(token.to_string()))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn load_token(stored: &StoredCredentials) -> Result<Option<String>> {
-    Ok(stored.token.clone())
+fn load_secret_keychain_only(_account: &str) -> Result<Option<String>> {
+    Ok(None)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn remove_token() -> Result<()> {
+fn load_secret(_account: &str, value: Option<&String>) -> Result<Option<String>> {
+    Ok(value.cloned())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn remove_secret(_account: &str) -> Result<()> {
     Ok(())
 }
 
@@ -502,6 +597,7 @@ mod tests {
             Ok(Some(Credentials {
                 hub: "https://hub.example.com".into(),
                 token: with_token.then(|| "saved.tok".into()),
+                relay_token: None,
             }))
         };
 
@@ -532,6 +628,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!((hub.as_str(), tok.as_str()), ("https://other.example.com", "explicit.tok"));
+    }
+
+    #[test]
+    fn relay_token_is_saved_per_hub_and_kept_through_login_save() {
+        let _lock = super::test_env::lock();
+        let path = std::env::temp_dir().join(format!(
+            "grouper-cli-relay-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _creds = super::test_env::VarGuard::set(PATH_ENV, &path);
+        let _env = super::test_env::VarGuard::unset(RELAY_TOKEN_ENV);
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _remove = RemoveFile(path.clone());
+        let hub = "https://relay.example";
+
+        assert_eq!(relay_token_for(hub).unwrap(), None);
+        // The relay step comes first: only the relay token is saved so far.
+        save_relay_token(hub, Some("rt_one")).unwrap();
+        assert_eq!(relay_token_for(hub).unwrap().as_deref(), Some("rt_one"));
+        assert_eq!(relay_token_for("HTTPS://Relay.Example/").unwrap().as_deref(), Some("rt_one"));
+        assert_eq!(relay_token_for("https://other.example").unwrap(), None);
+
+        // The device token arrives later and must not drop the relay token.
+        save(hub, "dev.secret", &"a".repeat(32)).unwrap();
+        let creds = load(true).unwrap().unwrap();
+        assert_eq!(creds.token.as_deref(), Some("dev.secret"));
+        assert_eq!(creds.relay_token.as_deref(), Some("rt_one"));
+
+        // Windows protects it with DPAPI, so it is not readable in the file.
+        let text = std::fs::read_to_string(&path).unwrap();
+        if cfg!(windows) {
+            assert!(!text.contains("rt_one"), "{text}");
+        }
+
+        // The environment override wins.
+        {
+            let _e = super::test_env::VarGuard::set(RELAY_TOKEN_ENV, " rt_env ");
+            assert_eq!(relay_token_for("https://anything.example").unwrap().as_deref(), Some("rt_env"));
+        }
+
+        // Saving for a different hub starts clean; logout clears it.
+        save_relay_token("https://elsewhere.example", Some("rt_two")).unwrap();
+        assert_eq!(relay_token_for(hub).unwrap(), None);
+        assert_eq!(relay_token_for("https://elsewhere.example").unwrap().as_deref(), Some("rt_two"));
+        assert_eq!(remove().unwrap().as_deref(), Some("https://elsewhere.example"));
+        assert_eq!(relay_token_for("https://elsewhere.example").unwrap(), None);
     }
 
     #[test]

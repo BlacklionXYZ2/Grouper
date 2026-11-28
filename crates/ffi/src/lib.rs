@@ -181,6 +181,7 @@ impl GrouperClient {
     /// On by default in the apps; this is the device owner's local off switch.
     /// `usage_probe_providers` narrows it to some of claude, codex, grok and antigravity
     /// (`None`: all of them).
+    /// `relay_token`: the relay sign-in token when `hub_url` is a relay; sent as `Grouper-Relay`.
     #[uniffi::constructor]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -191,6 +192,7 @@ impl GrouperClient {
         allow_shell: bool,
         usage_probes: bool,
         usage_probe_providers: Option<Vec<String>>,
+        relay_token: Option<String>,
         handler: Arc<dyn ToolHandler>,
         listener: Arc<dyn ClientListener>,
     ) -> Result<Arc<Self>, ClientError> {
@@ -223,6 +225,7 @@ impl GrouperClient {
                 }),
                 usage_probes: usage.enabled,
                 usage_probe_providers: usage.providers,
+                relay_token: relay_token.filter(|t| !t.trim().is_empty()),
             },
             handler,
             listener,
@@ -365,10 +368,15 @@ impl SyncStore {
     /// Open (or create) the cache at `cache_path`. Without `hub_url` and `token` it
     /// only reads (`sync_once` then fails).
     #[uniffi::constructor]
-    pub fn open(cache_path: String, hub_url: Option<String>, token: Option<String>) -> Result<Arc<Self>, SyncStoreError> {
+    pub fn open(
+        cache_path: String,
+        hub_url: Option<String>,
+        token: Option<String>,
+        relay_token: Option<String>,
+    ) -> Result<Arc<Self>, SyncStoreError> {
         let store = Arc::new(core_sync::Store::open(&cache_path)?);
         let client = match (hub_url, token) {
-            (Some(hub), Some(token)) => Some(core_sync::SyncClient::new(&hub, &token, store.clone())?),
+            (Some(hub), Some(token)) => Some(core_sync::SyncClient::new(&hub, &token, store.clone())?.with_relay_token(relay_token)),
             _ => None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -503,14 +511,14 @@ mod tests {
     fn sync_store_reads_an_empty_cache_and_needs_a_hub_to_sync() {
         let dir = std::env::temp_dir().join(format!("grouper-ffi-sync-{}", std::process::id()));
         let path = dir.join("cache.db").to_string_lossy().to_string();
-        let store = SyncStore::open(path.clone(), None, None).unwrap();
+        let store = SyncStore::open(path.clone(), None, None, None).unwrap();
         assert!(store.conversations().unwrap().is_empty());
         assert!(store.messages("nope".into()).unwrap().is_empty());
         assert!(store.pending_approvals(None).unwrap().is_empty());
         assert!(matches!(store.sync_once(), Err(SyncStoreError::Failed { .. })));
         drop(store);
         // Nothing listens on port 9: unreachable, not a crash.
-        let store = SyncStore::open(path, Some("http://127.0.0.1:9".into()), Some("d.s".into())).unwrap();
+        let store = SyncStore::open(path, Some("http://127.0.0.1:9".into()), Some("d.s".into()), None).unwrap();
         assert!(matches!(store.sync_once(), Err(SyncStoreError::Unreachable { .. })));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
