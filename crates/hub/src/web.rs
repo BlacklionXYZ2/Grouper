@@ -2,8 +2,8 @@
 //!
 //! `GET /` and `GET /app` serve the page; `GET /app/<file>` its scripts, styles,
 //! icon and web app manifest. `GET /sw.js` serves the service worker (approval
-//! notifications only: no fetch handler, no cache) from the site root, so its scope
-//! covers the whole app; a worker's scope can't reach above its own path. The source is plain HTML, CSS and ES modules in `crates/hub/web/` (no build
+//! notifications only: no fetch handler, no cache) from the site root; the app registers it with scope `/app/` (a worker's scope can't reach above its
+//! own path, and `/app/` is under `/`, so no `Service-Worker-Allowed` header is needed; the hub never controls `/`). The source is plain HTML, CSS and ES modules in `crates/hub/web/` (no build
 //! step, no CDN). Every response carries a strict Content-Security-Policy (no inline
 //! script or style, nothing from other origins, no framing), `nosniff` and
 //! `Referrer-Policy: no-referrer`. The page signs in through `/v1/session`

@@ -4,7 +4,7 @@
 // browser's push subscription from the hub and unsubscribes, best effort.
 
 import { h, icon, srOnly, setChildren } from '../lib/dom.js';
-import { get, put, del, enc, describe, isAbort } from '../lib/api.js';
+import { get, post, put, del, enc, describe, isAbort } from '../lib/api.js';
 import { store, on, deviceName, findDevice, isAdmin } from '../lib/store.js';
 import { stopLive, loadDevices } from '../lib/live.js';
 import { bar, sheet, confirmAction, toast, toastError, skeleton, errorBanner, guardWrites } from '../lib/ui.js';
@@ -80,12 +80,25 @@ export function renderSettings(container) {
   const hubSlot = h('div', { class: 'card card-pad' }, skeleton(2));
   const hub = h('section', { class: 'section', 'aria-labelledby': 's-hub' }, h('div', { class: 'section-head' }, h('h2', { id: 's-hub' }, 'Hub')), hubSlot);
 
+  const relaySlot = h('div', { class: 'card card-pad stack' }, skeleton(3));
+  const relayAccess = h(
+    'section',
+    { class: 'section', 'aria-labelledby': 's-relay' },
+    h('div', { class: 'section-head' }, h('h2', { id: 's-relay' }, 'Remote access')),
+    h(
+      'p',
+      { class: 'section-note' },
+      'Reach this hub from your phone or any browser, away from home, with no domain or tunnel to set up. The hub connects out to the Grouper relay; you sign in with the same Google account, and the relay only joins you to your own hub.',
+    ),
+    relaySlot,
+  );
+
   const remoteSlot = h('div', { class: 'card card-pad stack' }, skeleton(3));
   const remoteAccess = h(
     'section',
     { class: 'section', 'aria-labelledby': 's-remote' },
-    h('div', { class: 'section-head' }, h('h2', { id: 's-remote' }, 'Remote access')),
-    h('p', { class: 'section-note' }, 'Expose this hub away from home through a Cloudflare tunnel running on the hub machine.'),
+    h('div', { class: 'section-head' }, h('h2', { id: 's-remote' }, 'Cloudflare tunnel')),
+    h('p', { class: 'section-note' }, 'Advanced: expose this hub through your own Cloudflare tunnel running on the hub machine, instead of the relay above.'),
     remoteSlot,
   );
 
@@ -181,7 +194,7 @@ export function renderSettings(container) {
     notifyListSlot,
   );
 
-  body.append(account, googleAccount, sessions, providers, hub, remoteAccess, appearance, notifications);
+  body.append(account, googleAccount, sessions, providers, hub, relayAccess, remoteAccess, appearance, notifications);
 
   // ---- Google account (hub owner)
   async function loadGoogleAccount() {
@@ -301,6 +314,143 @@ export function renderSettings(container) {
       if (isAbort(err)) return;
       setChildren(hubSlot, errorBanner(err, loadHub));
     }
+  }
+
+  // ---- remote access (the Grouper relay)
+  let relayData = null;
+  let relayBusy = false;
+  let relayPollTimer = null;
+
+  function clearRelayPoll() {
+    if (relayPollTimer) {
+      clearTimeout(relayPollTimer);
+      relayPollTimer = null;
+    }
+  }
+
+  function scheduleRelayPoll() {
+    clearRelayPoll();
+    if (signal.aborted || !relayData || relayData.status !== 'connecting') return;
+    relayPollTimer = setTimeout(refreshRelay, 2000);
+  }
+
+  function relayBadge(status) {
+    switch (status) {
+      case 'connected':
+        return h('span', { class: 'badge ok' }, icon('check'), 'Connected');
+      case 'connecting':
+        return h('span', { class: 'badge accent' }, icon('clock'), 'Connecting…');
+      case 'failed':
+        return h('span', { class: 'badge danger' }, icon('warning'), 'Failed');
+      default:
+        return h('span', { class: 'badge muted' }, icon('stop'), 'Off');
+    }
+  }
+
+  function renderRelay() {
+    if (!relayData) return;
+    const linked = Boolean(relayData.linked);
+    setChildren(
+      relaySlot,
+      h(
+        'div',
+        { class: 'remote-status-head' },
+        h('div', null, h('div', { class: 'row-title' }, linked ? 'Phone and web access' : 'Phone and web access is off'), linked && relayData.account_email ? h('div', { class: 'meta' }, h('span', null, relayData.account_email)) : null),
+        relayBadge(relayData.status),
+      ),
+      relayData.last_error ? h('div', { class: 'banner error', role: 'alert' }, icon('warning'), h('div', { class: 'grow' }, relayData.last_error)) : null,
+      h(
+        'p',
+        { class: 'hint' },
+        linked
+          ? ['Open ', h('span', { class: 'mono' }, relayData.url || ''), ' on any device and sign in with Google. Turning it off disconnects this hub from the relay and signs those devices out of it.']
+          : ['Turning it on asks you to sign in with the Google account that owns this hub, then connects this hub to ', h('span', { class: 'mono' }, relayData.url || ''), '.'],
+      ),
+      h(
+        'div',
+        { class: 'section-actions' },
+        linked
+          ? h('button', { class: 'btn', type: 'button', 'data-write': true, disabled: relayBusy, onclick: turnOffRelay }, 'Turn off')
+          : h('button', { class: 'btn btn-primary', type: 'button', 'data-write': true, disabled: relayBusy, onclick: turnOnRelay }, icon('devices'), 'Turn on phone and web access'),
+      ),
+    );
+  }
+
+  async function refreshRelay() {
+    try {
+      const data = await get('/v1/relay', { signal });
+      if (signal.aborted) return;
+      relayData = data;
+      renderRelay();
+      scheduleRelayPoll();
+    } catch (err) {
+      if (isAbort(err)) return;
+      if (!relayData) setChildren(relaySlot, errorBanner(err, loadRelay));
+    }
+  }
+
+  async function loadRelay() {
+    if (!admin) {
+      setChildren(relaySlot, h('p', { class: 'hint' }, 'Remote access settings need an admin token.'));
+      return;
+    }
+    setChildren(relaySlot, skeleton(3));
+    relayData = null;
+    await refreshRelay();
+  }
+
+  /** Linking runs Google sign-in with the relay's nonce (the hub keeps it and hashes it); Google returns to this page. */
+  async function turnOnRelay() {
+    if (relayBusy) return;
+    relayBusy = true;
+    renderRelay();
+    try {
+      const res = await post('/v1/relay/link/start');
+      if (!res?.auth_url) throw new Error("The hub didn't return a Google sign-in address.");
+      location.assign(res.auth_url);
+    } catch (err) {
+      relayBusy = false;
+      renderRelay();
+      toastError(err);
+    }
+  }
+
+  async function turnOffRelay() {
+    if (relayBusy) return;
+    const ok = await confirmAction({
+      title: 'Turn off phone and web access?',
+      body: 'This hub disconnects from the Grouper relay and forgets its link, so your phone and other browsers can’t reach it away from home until you turn it on again.',
+      confirmLabel: 'Turn off',
+      danger: true,
+    });
+    if (!ok) return;
+    relayBusy = true;
+    renderRelay();
+    try {
+      relayData = await del('/v1/relay');
+      if (signal.aborted) return;
+      toast('Phone and web access turned off.');
+    } catch (err) {
+      toastError(err);
+    } finally {
+      relayBusy = false;
+      renderRelay();
+      scheduleRelayPoll();
+    }
+  }
+
+  /** Back from Google: the hub put the outcome in the address (`?relay=linked` or `?relay_error=…`). */
+  function reportRelayReturn() {
+    const raw = location.hash.replace(/^#\/?/, '');
+    const q = raw.indexOf('?');
+    if (q < 0 || raw.slice(0, q) !== 'settings') return;
+    const query = new URLSearchParams(raw.slice(q + 1));
+    const error = query.get('relay_error');
+    const linked = query.get('relay') === 'linked';
+    if (!error && !linked) return;
+    history.replaceState(null, '', '#/settings');
+    if (linked) toast('Phone and web access is on.');
+    else toast(error, 'error');
   }
 
   // ---- remote access (Cloudflare tunnel)
@@ -1275,14 +1425,18 @@ export function renderSettings(container) {
 
   loadGoogleAccount();
   loadHub();
+  loadRelay();
   loadRemoteAccess();
   loadSessions();
   loadProviders();
   renderNotify();
   loadNotifyList();
 
+  reportRelayReturn();
+
   return () => {
     clearTunnelPoll();
+    clearRelayPoll();
     aborter.abort();
     unguard();
     offs.forEach((off) => off());

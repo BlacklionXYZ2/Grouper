@@ -1,5 +1,6 @@
 // Grouper's service worker: approval notifications only (gui-spec 5.14). Served
-// at /sw.js so its scope is the whole app. It has no fetch handler and caches
+// at /sw.js and registered with scope /app/ (never /: behind the relay the website
+// owns /). It has no fetch handler and caches
 // nothing.
 //
 // userVisibleOnly compliance:
