@@ -5,3 +5,6 @@ apple/GrouperKit/lib
 .DS_Store
 .env
 .claude/worktrees/
+relay/node_modules
+relay/.dev.vars
+relay/.wrangler
