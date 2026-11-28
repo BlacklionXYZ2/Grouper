@@ -31,6 +31,8 @@ struct ChatNotice: Equatable {
 struct NodeTarget: Equatable, Sendable {
     let hubURL: String
     let token: String
+    /// The relay token when `hubURL` is a relay address; the node sends it as `Grouper-Relay`.
+    var relayToken: String?
 }
 
 /// The name and platform of a device, for Settings > Account (never its id or token).
@@ -111,6 +113,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var linkedGoogle: LinkedGoogleAccount?
     @Published private(set) var googleLinkLoaded = false
     @Published private(set) var accountMessage: String?
+    /// The relay's answer for `hubURL` (`GET /relay/v1/me`); nil when the address isn't a relay.
+    @Published private(set) var relayStatus: RelayStatus?
+    /// `hubURL` is a relay and this app has no valid relay sign-in for it yet. The hub can't be
+    /// asked anything until the relay step of "Sign in with Google" has run.
+    @Published private(set) var relaySignInNeeded = false
+    /// Plain words from the relay (your hub is offline, your relay sign-in expired), when that is
+    /// what's wrong. The sign-in screen shows it in place of the generic "can't reach".
+    @Published private(set) var relayProblem: String?
 
     @Published private(set) var conversations: [ConversationInfo] = []
     @Published var selectedConversationId: String?
@@ -159,6 +169,10 @@ final class AppModel: ObservableObject {
     /// (Settings > Account shows them when the devices list doesn't have the device).
     private static let appDeviceNameKey = "grouper.appDeviceName"
     private static let appDevicePlatformKey = "grouper.appDevicePlatform"
+    /// The hub address the saved relay token belongs to.
+    private static let relayHubKey = "grouper.relayHubURL"
+    private var relayTokenValue = ""
+    private var relayHubURL = ""
     private var deviceHubURL = ""
     private var handlingRejectedToken = false
     private var checkingAuthStatusFor: String?
@@ -173,6 +187,8 @@ final class AppModel: ObservableObject {
     init() {
         hubURL = HubAddress.resolve(savedOverride: UserDefaults.standard.string(forKey: HubAddress.overrideKey))
         adminToken = KeychainStore.read(.admin) ?? ""
+        relayTokenValue = KeychainStore.read(.relay) ?? ""
+        relayHubURL = UserDefaults.standard.string(forKey: Self.relayHubKey) ?? ""
         #if os(macOS)
         deviceToken = KeychainStore.read(.device) ?? ""
         deviceId = KeychainStore.read(.deviceId) ?? DeviceRegistration.deviceId(ofToken: deviceToken)
@@ -185,6 +201,72 @@ final class AppModel: ObservableObject {
         if !adminToken.isEmpty {
             Task { [weak self] in await self?.connect(save: false) }
         }
+    }
+
+    // MARK: - Relay (docs/relay-design.md, "Clients")
+
+    /// The relay token to send to `hub`: the saved one, only for the address it was made for.
+    func relayToken(for hub: String) -> String? {
+        guard !relayTokenValue.isEmpty, !relayHubURL.isEmpty, DeviceRegistration.sameHub(relayHubURL, hub) else { return nil }
+        return relayTokenValue
+    }
+
+    /// The relay token for the current hub address (nil: not a relay, or not signed in to it).
+    var currentRelayToken: String? { relayToken(for: hubURL) }
+
+    /// A client for `hub` that sends the relay token when there is one.
+    private func makeClient(hub: String, token: String = "") throws -> HubClient {
+        try HubClient(baseURL: hub, token: token, relayToken: relayToken(for: hub))
+    }
+
+    private func saveRelayToken(_ token: String, hub: String) throws {
+        try KeychainStore.save(token, as: .relay)
+        UserDefaults.standard.set(hub, forKey: Self.relayHubKey)
+        relayTokenValue = token
+        relayHubURL = hub
+        #if os(macOS)
+        updateNodeTarget() // the Mac's node reconnects with the new relay token
+        #endif
+    }
+
+    private func forgetRelayToken() {
+        KeychainStore.delete(.relay)
+        UserDefaults.standard.removeObject(forKey: Self.relayHubKey)
+        relayTokenValue = ""
+        relayHubURL = ""
+        #if os(macOS)
+        updateNodeTarget()
+        #endif
+    }
+
+    /// Asks `hub` whether it is a relay and whether this app's relay token is accepted.
+    /// Sets `relayStatus` and `relaySignInNeeded`. Anything unexpected (a plain hub, or no answer)
+    /// means "not a relay", and the hub call that follows shows any real problem.
+    private func detectRelay(hub: String) async {
+        var status: RelayStatus?
+        if let relay = try? RelayClient(baseURL: hub, relayToken: relayToken(for: hub)) {
+            status = try? await relay.status()
+        }
+        guard hub == hubURL else { return }
+        if let status, !status.signedIn, relayToken(for: hub) != nil {
+            forgetRelayToken() // expired or revoked: the saved token is no use
+        }
+        relayStatus = status
+        relaySignInNeeded = status != nil && status?.signedIn != true
+    }
+
+    /// The relay step of Google sign-in: a relay nonce, Google's page for its hash, then
+    /// `POST /relay/v1/sign-in`. Saves the relay token. Throws like any Google sign-in.
+    private func signInToRelay(hub: String, oauth: GoogleOAuth) async throws -> RelaySignInResult {
+        let relay = try RelayClient(baseURL: hub)
+        let nonce = try await relay.nonce()
+        let idToken = try await GoogleSignIn.idToken(oauth: oauth, nonce: RelayNonce.hashed(nonce.nonce))
+        let result = try await relay.signIn(idToken: idToken, relayNonce: nonce.nonce)
+        guard hub == hubURL else { throw CancellationError() }
+        try saveRelayToken(result.relayToken, hub: hub)
+        relayStatus = RelayStatus(signedIn: true, email: result.email, hubConnected: result.hubConnected)
+        relaySignInNeeded = false
+        return result
     }
 
     /// True when the app is pointed at the built-in default hub address.
@@ -274,7 +356,7 @@ final class AppModel: ObservableObject {
         let trimmedAdmin = adminToken.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             let resolvedHub = try HubAddress.validate(hubURL)
-            let api = try HubClient(baseURL: resolvedHub, token: trimmedAdmin)
+            let api = try makeClient(hub: resolvedHub, token: trimmedAdmin)
             try await api.health()
             _ = try await api.providers() // proves this is the admin token, not merely a valid device token
             hubURL = resolvedHub
@@ -357,7 +439,8 @@ final class AppModel: ObservableObject {
     // MARK: - Sign in with Google (docs/accounts-design.md, docs/local-first-design.md)
 
     /// Whether this app has a Google client ID and the hub at `hubURL` allows Google sign-in.
-    var googleSignInAvailable: Bool { GoogleSignIn.oauth != nil && authStatus?.google == true }
+    /// A relay address that wants its sign-in first counts: the relay step runs inside the same button.
+    var googleSignInAvailable: Bool { GoogleSignIn.oauth != nil && (authStatus?.google == true || relaySignInNeeded) }
 
     /// Sign-in screen: `GET /v1/auth/status` for the current resolved hub address. A hub that
     /// answers without the route leaves `authStatus` nil and `hubUnreachable` false. A hub that
@@ -372,11 +455,22 @@ final class AppModel: ObservableObject {
         }
         var status: AuthStatus?
         var unreachable = false
+        var problem: String?
         do {
             let validated = try HubAddress.validate(hub)
-            status = try await HubClient(baseURL: validated).authStatus()
+            await detectRelay(hub: validated)
+            // Behind a relay that hasn't signed this app in, the hub can't be asked yet.
+            if !relaySignInNeeded {
+                status = try await makeClient(hub: validated).authStatus()
+            }
         } catch {
             switch error as? HubClientError {
+            case .hubOffline?:
+                unreachable = true
+                problem = error.localizedDescription
+            case .relayUnauthorized?:
+                forgetRelayToken()
+                relaySignInNeeded = true
             case .transport?, .invalidBaseURL?:
                 unreachable = true
             case .server(let code, _)? where code >= 500:
@@ -392,6 +486,7 @@ final class AppModel: ObservableObject {
         guard hub == hubURL else { return }
         authStatus = status
         hubUnreachable = unreachable
+        relayProblem = problem
         authStatusCheckedFor = hub
     }
 
@@ -409,7 +504,24 @@ final class AppModel: ObservableObject {
         let currentHub = hubURL
         do {
             let validated = try HubAddress.validate(currentHub)
-            let api = try HubClient(baseURL: validated)
+            if relaySignInNeeded {
+                // One button, two steps: the relay first, then the hub.
+                let relayResult = try await signInToRelay(hub: validated, oauth: oauth)
+                if relayResult.hubConnected == false {
+                    hubUnreachable = true
+                    relayProblem = HubClientError.hubOffline("").relayProblem
+                    authStatusCheckedFor = currentHub
+                    return
+                }
+                // Now that the relay lets us through, learn whether the hub is claimed (setup code).
+                await checkAuthStatus(force: true)
+                guard currentHub == hubURL else { return }
+                if authStatus?.claimed == false, SetupCode.normalized(setupCode) == nil {
+                    errorMessage = "Signed in to the relay. This hub has no owner yet: enter its setup code, then sign in with Google again."
+                    return
+                }
+            }
+            let api = try makeClient(hub: validated)
             let nonce = try await api.googleNonce()
             let idToken = try await GoogleSignIn.idToken(oauth: oauth, nonce: nonce.nonce)
             let code = authStatus?.claimed == false ? (SetupCode.normalized(setupCode) ?? setupCode) : nil
@@ -438,6 +550,15 @@ final class AppModel: ObservableObject {
                 hubUnreachable = true
                 authStatusCheckedFor = currentHub
                 errorMessage = nil
+            case .hubOffline?:
+                hubUnreachable = true
+                relayProblem = error.localizedDescription
+                authStatusCheckedFor = currentHub
+                errorMessage = nil
+            case .relayUnauthorized?:
+                forgetRelayToken()
+                relaySignInNeeded = true
+                errorMessage = GoogleSignIn.message(for: error)
             case .conflict?, .notFound?:
                 errorMessage = GoogleSignIn.message(for: error)
                 // Claimed a moment ago, or Google sign-in was turned off: show what the hub allows now.
@@ -670,7 +791,7 @@ final class AppModel: ObservableObject {
     }
 
     private func check(deviceToken token: String, hubURL: String) async -> DeviceTokenCheck {
-        guard let deviceAPI = try? HubClient(baseURL: hubURL, token: token) else { return .unknown }
+        guard let deviceAPI = try? makeClient(hub: hubURL, token: token) else { return .unknown }
         do {
             _ = try await deviceAPI.providers()
             return .admin
@@ -708,7 +829,9 @@ final class AppModel: ObservableObject {
     }
 
     private func updateNodeTarget() {
-        let target = deviceToken.isEmpty || deviceHubURL.isEmpty ? nil : NodeTarget(hubURL: deviceHubURL, token: deviceToken)
+        let target = deviceToken.isEmpty || deviceHubURL.isEmpty
+            ? nil
+            : NodeTarget(hubURL: deviceHubURL, token: deviceToken, relayToken: relayToken(for: deviceHubURL))
         if target != nodeTarget { nodeTarget = target }
     }
     #endif

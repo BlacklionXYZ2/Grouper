@@ -460,7 +460,24 @@ fn url_segment(s: &str) -> String {
 pub(crate) struct Api {
     base: String,
     token: String,
+    /// Sent as `Grouper-Relay` when the hub address is a relay (see docs/relay-design.md).
+    relay_token: Option<String>,
     http: reqwest::Client,
+}
+
+/// An HTTP client that sends `Grouper-Relay: <token>` on every request when there is one.
+fn http_client(relay_token: Option<&str>, timeout: Option<std::time::Duration>) -> Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(t) = relay_token.map(str::trim).filter(|t| !t.is_empty()) {
+        let mut v = reqwest::header::HeaderValue::from_str(t).context("the relay token isn't a valid header value")?;
+        v.set_sensitive(true);
+        headers.insert("grouper-relay", v);
+    }
+    let mut b = reqwest::Client::builder().default_headers(headers);
+    if let Some(t) = timeout {
+        b = b.timeout(t);
+    }
+    Ok(b.build()?)
 }
 
 impl Api {
@@ -516,6 +533,9 @@ impl Api {
         }
         let mut req = url.into_client_request()?;
         req.headers_mut().insert("authorization", format!("Bearer {}", self.token).parse()?);
+        if let Some(relay) = &self.relay_token {
+            req.headers_mut().insert("grouper-relay", relay.trim().parse()?);
+        }
         let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
         ws_config.max_message_size = Some(core_client::core_protocol::MAX_WS_MESSAGE_BYTES);
         ws_config.max_frame_size = Some(core_client::core_protocol::MAX_WS_MESSAGE_BYTES);
@@ -834,7 +854,20 @@ async fn login(cli_hub: Option<&str>, name: Option<&str>, no_browser: bool) -> R
         if host.is_empty() { "Grouper CLI".into() } else { host }
     });
     let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
-    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+    let timeout = Some(std::time::Duration::from_secs(30));
+    // A relay address needs a relay sign-in first; its token rides on every request below.
+    let mut relay_token = None;
+    let mut new_relay_token = false;
+    if relay_detect(&http_client(None, timeout)?, &hub).await {
+        match credentials::relay_token_for(&hub)? {
+            Some(saved) if relay_signed_in(&http_client(Some(&saved), timeout)?, &hub).await => relay_token = Some(saved),
+            _ => {
+                relay_token = Some(relay_sign_in(&http_client(None, timeout)?, &hub, no_browser).await?);
+                new_relay_token = true;
+            }
+        }
+    }
+    let http = http_client(relay_token.as_deref(), timeout)?;
 
     let start = http
         .post(format!("{hub}/v1/auth/link/start"))
@@ -895,6 +928,9 @@ async fn login(cli_hub: Option<&str>, name: Option<&str>, no_browser: bool) -> R
             Some("expired") => bail!("the code expired before it was approved; run `grouper login` again"),
             Some("approved") => {
                 let token = body["token"].as_str().context("the hub approved the sign-in but sent no token")?;
+                if new_relay_token {
+                    credentials::save_relay_token(&hub, relay_token.as_deref())?;
+                }
                 credentials::save(&hub, token, &install_id)?;
                 let device = body["device"]["name"].as_str().unwrap_or(&name);
                 println!("Signed in to {hub} as \"{device}\".");
@@ -904,6 +940,104 @@ async fn login(cli_hub: Option<&str>, name: Option<&str>, no_browser: bool) -> R
             other => bail!("the hub answered with an unknown status {other:?}"),
         }
     }
+}
+
+/// Does `hub` answer like a relay? `GET /relay/v1/me` returns JSON with a `signed_in` field.
+async fn relay_detect(http: &reqwest::Client, hub: &str) -> bool {
+    let Ok(r) = http.get(format!("{hub}/relay/v1/me")).send().await else { return false };
+    r.json::<Value>().await.is_ok_and(|v| v.get("signed_in").is_some())
+}
+
+/// Is the relay token this client sends accepted by the relay?
+async fn relay_signed_in(http: &reqwest::Client, hub: &str) -> bool {
+    let Ok(r) = http.get(format!("{hub}/relay/v1/me")).send().await else { return false };
+    r.json::<Value>().await.is_ok_and(|v| v["signed_in"].as_bool() == Some(true))
+}
+
+/// Where the browser is sent for the CLI's relay sign-in: the relay's own sign-in page, then on to
+/// the relay's `cli-token` endpoint, which redirects to this CLI's loopback listener with a
+/// single-use code (docs/relay-design.md, Clients).
+fn relay_sign_in_url(hub: &str, port: u16, state: &str) -> String {
+    let next = format!("/relay/v1/cli-token?port={port}&state={state}");
+    let encoded: String = next
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("{hub}/relay/sign-in?next={encoded}")
+}
+
+/// The `code` in a loopback callback's request line (`GET /?code=...&state=... HTTP/1.1`), only
+/// when its `state` is the one this login made.
+fn callback_code(request_line: &str, state: &str) -> Option<String> {
+    let target = request_line.strip_prefix("GET ")?.split_whitespace().next()?;
+    let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}")).ok()?;
+    let (mut code, mut got_state) = (None, None);
+    for (k, v) in url.query_pairs() {
+        match &*k {
+            "code" => code = Some(v.into_owned()),
+            "state" => got_state = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    (got_state.as_deref() == Some(state)).then_some(code).flatten().filter(|c| !c.is_empty() && c.len() <= 256)
+}
+
+/// The relay step of `grouper login`: the CLI can't do Google itself, so the browser signs in at the
+/// relay and comes back to a loopback listener with a single-use code, which the CLI exchanges for a
+/// relay token.
+async fn relay_sign_in(http: &reqwest::Client, hub: &str, no_browser: bool) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.context("opening a local port for the relay sign-in")?;
+    let port = listener.local_addr()?.port();
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("system randomness: {e}"))?;
+    let state = hex::encode(buf);
+    let url = relay_sign_in_url(hub, port, &state);
+
+    println!("{hub} is behind the Grouper relay. Sign in to it first, in a browser:");
+    println!();
+    println!("    {url}");
+    println!();
+    if !no_browser && open_browser(&url) {
+        println!("(Opened it in your browser.)");
+    }
+    println!("Waiting for the relay sign-in… (Ctrl-C to cancel)");
+
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(300));
+    tokio::pin!(deadline);
+    let code = loop {
+        let (mut sock, _) = tokio::select! {
+            r = listener.accept() => r?,
+            _ = &mut deadline => bail!("the relay sign-in timed out; run `grouper login` again"),
+            _ = tokio::signal::ctrl_c() => bail!("cancelled; nothing was saved"),
+        };
+        let mut req = vec![0u8; 4096];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut req)).await.ok().and_then(Result::ok).unwrap_or(0);
+        let line = String::from_utf8_lossy(&req[..n]).lines().next().unwrap_or("").to_string();
+        let found = callback_code(&line, &state);
+        let (status, body) = if found.is_some() {
+            ("200 OK", "Signed in to the relay. You can close this tab and go back to the terminal.")
+        } else {
+            ("400 Bad Request", "Not the sign-in this terminal is waiting for.")
+        };
+        let _ = sock
+            .write_all(format!("HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())
+            .await;
+        if let Some(code) = found {
+            break code;
+        }
+    };
+    let r = http
+        .post(format!("{hub}/relay/v1/cli-token/exchange"))
+        .json(&json!({"code": code, "state": state}))
+        .send()
+        .await
+        .with_context(|| format!("couldn't reach the relay at {hub}"))?;
+    let body = hub_json(r).await.context("the relay refused the sign-in")?;
+    Ok(body["relay_token"].as_str().context("the relay sent no relay token")?.to_string())
 }
 
 #[tokio::main]
@@ -925,7 +1059,9 @@ async fn main() -> Result<()> {
         cmd => {
             let cache = cli.cache;
             let (hub, token) = credentials::resolve(cli.hub, cli.token, credentials::DEFAULT_HUB)?;
-            let api = Api { base: hub.trim_end_matches('/').to_string(), token, http: reqwest::Client::new() };
+            let relay_token = credentials::relay_token_for(&hub)?;
+            let http = http_client(relay_token.as_deref(), None)?;
+            let api = Api { base: hub.trim_end_matches('/').to_string(), token, relay_token, http };
             return run_authed_cmd(api, cache, cmd).await;
         }
     }
@@ -978,6 +1114,7 @@ async fn run_authed_cmd(api: Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()
                 folders,
                 usage_probes: probe_setting.enabled,
                 usage_probe_providers: probe_setting.providers,
+                relay_token: api.relay_token.clone(),
             };
             let (tx, rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
@@ -1077,7 +1214,9 @@ async fn run_authed_cmd(api: Api, cache: Option<PathBuf>, cmd: Cmd) -> Result<()
         Cmd::Sync => {
             let path = cache_path(cache)?;
             let store = Arc::new(core_sync::Store::open(&path)?);
-            let report = core_sync::SyncClient::new(&api.base, &api.token, store)?.sync_once().await?;
+            let report = core_sync::SyncClient::new(&api.base, &api.token, store)?
+                .with_relay_token(api.relay_token.clone())
+                .sync_once().await?;
             let memories = match report.memories {
                 Some(n) => format!("{n} memories"),
                 None => "no memories (they need an admin token)".into(),
@@ -1858,6 +1997,7 @@ mod tests {
         let api = Api {
             base: format!("http://{hub_addr}"),
             token: admin_token,
+            relay_token: None,
             http: reqwest::Client::new(),
         };
         sync_models_cmd(&api, Some("openai")).await.unwrap();
@@ -1871,5 +2011,47 @@ mod tests {
 
         handle.stop().await;
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn relay_sign_in_url_goes_through_the_relay_sign_in_page() {
+        let url = relay_sign_in_url("https://relay.example", 4242, "abcd");
+        assert_eq!(
+            url,
+            "https://relay.example/relay/sign-in?next=/relay/v1/cli-token%3Fport%3D4242%26state%3Dabcd"
+        );
+    }
+
+    #[test]
+    fn callback_code_needs_the_matching_state() {
+        assert_eq!(callback_code("GET /?code=abc&state=s1 HTTP/1.1", "s1").as_deref(), Some("abc"));
+        assert_eq!(callback_code("GET /?state=s1&code=a%20b HTTP/1.1", "s1").as_deref(), Some("a b"));
+        assert_eq!(callback_code("GET /?code=abc&state=other HTTP/1.1", "s1"), None);
+        assert_eq!(callback_code("GET /?code=abc HTTP/1.1", "s1"), None);
+        assert_eq!(callback_code("GET /?code=&state=s1 HTTP/1.1", "s1"), None);
+        assert_eq!(callback_code("POST /?code=abc&state=s1 HTTP/1.1", "s1"), None);
+        assert_eq!(callback_code("", "s1"), None);
+    }
+
+    #[tokio::test]
+    async fn http_client_sends_the_relay_header_only_with_a_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn one_request(client: reqwest::Client) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap();
+                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+            });
+            client.get(format!("http://{addr}/v1/x")).send().await.unwrap();
+            server.await.unwrap()
+        }
+        let with = one_request(http_client(Some(" rt_abc "), None).unwrap()).await;
+        assert!(with.contains("grouper-relay: rt_abc\r\n"), "{with}");
+        let without = one_request(http_client(None, None).unwrap()).await;
+        assert!(!without.contains("grouper-relay"), "{without}");
     }
 }

@@ -241,3 +241,37 @@ treats an address as a relay when `GET /relay/v1/me` answers JSON with a `signed
 nonce → `POST /v1/relay/link` `{id_token, relay_nonce}`. Offered in the Windows app's tray menu
 ("Turn on phone and web access") using its desktop Google client, and in the web app's Settings →
 Remote access. The hub's default relay URL is `https://grouper.clockmillbarn.uk`.
+
+### What the shipped clients do
+
+- **Swift apps** (`apple/`): `RelayClient` (GrouperAPI) does `nonce`, `sign-in` and `me`; the relay nonce
+  is hashed by `RelayNonce.hashed` (the package's own SHA-256, the same one PKCE uses). The relay token
+  lives in the Keychain (`grouper.relay`) with the hub address it was made for in `UserDefaults`.
+  `HubClient`, `HubMoveClient` and `EventStream` take a `relayToken` and send `Grouper-Relay` on every
+  request and the WebSocket handshake. `HubClient.googleNonce()` refuses anything that isn't 32
+  lowercase hex characters. "Sign in with Google" on a relay address runs two Google sessions back to
+  back (relay, then hub). A relay `503` shows "Your hub is offline"; a relay `401` drops the saved relay
+  token and asks for sign-in again.
+- **Rust** (`core-client`, used by the Mac app through `crates/ffi`, and by the CLI): `Config.relay_token`
+  is sent as `Grouper-Relay` on the `/v1/connect` handshake; a `401`/`503` handshake answer with
+  `"relay": true` is retried (it is not a rejected device token); `core-sync`'s `SyncClient` has
+  `with_relay_token` for its HTTP calls and the `/v1/events` handshake.
+- **CLI sign-in** (`grouper login`): the CLI can't do Google, and `/v1/auth/link/*` is the hub's own flow,
+  so against a relay address it first gets a relay token by a loopback code exchange (the OAuth
+  native-app pattern; the token never appears in a URL):
+  1. `GET /relay/v1/me` answers JSON with `signed_in` → the address is a relay. If the saved relay token
+     is still accepted, skip to step 5.
+  2. The CLI listens on `127.0.0.1:<port>` and opens
+     `<hub>/relay/sign-in?next=/relay/v1/cli-token?port=<port>&state=<random>`. The browser signs in at
+     the relay as for the web app.
+  3. **Needs a relay endpoint (not built yet):** `GET /relay/v1/cli-token?port&state`, requires the relay
+     session cookie, accepts only a loopback `port` (1024–65535), mints a single-use code bound to the
+     account and `state` (valid about 60 seconds), and redirects to `http://127.0.0.1:<port>/?code=<code>&state=<state>`.
+  4. **Needs a relay endpoint (not built yet):** `POST /relay/v1/cli-token/exchange` `{code, state}` →
+     `{relay_token, expires}`; the code works once; the token is the same kind `sign-in` with
+     `client: "app"` returns. The CLI checks `state` before it exchanges.
+  5. The CLI runs the existing link flow with `Grouper-Relay: <relay_token>` on every call; the
+     approving browser reaches `/#/link?code=...` through the relay with its cookie. On approval the CLI
+     saves the relay token (`credentials.json`, protected like the device token: DPAPI, Keychain
+     account `relay-token`, or the 0600 file) beside the hub and device token. Every later command sends
+     it; `GROUPER_RELAY_TOKEN` overrides it for automation.

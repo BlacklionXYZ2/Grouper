@@ -82,6 +82,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub struct SyncClient {
     base: String,
     token: String,
+    /// Sent as `Grouper-Relay` when the hub is reached through the relay.
+    relay_token: Option<String>,
     http: reqwest::Client,
     store: Arc<Store>,
 }
@@ -97,7 +99,13 @@ impl SyncClient {
             .timeout(Duration::from_secs(120))
             .build()
             .map_err(|e| SyncError::Protocol(e.to_string()))?;
-        Ok(Self { base, token: token.trim().to_string(), http, store })
+        Ok(Self { base, token: token.trim().to_string(), relay_token: None, http, store })
+    }
+
+    /// Send `Grouper-Relay: <token>` on every request and the event-stream handshake.
+    pub fn with_relay_token(mut self, relay_token: Option<String>) -> Self {
+        self.relay_token = relay_token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        self
     }
 
     pub fn store(&self) -> &Arc<Store> {
@@ -109,10 +117,11 @@ impl SyncClient {
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
-        let resp = self
-            .http
-            .get(format!("{}{path}", self.base))
-            .bearer_auth(&self.token)
+        let mut req = self.http.get(format!("{}{path}", self.base)).bearer_auth(&self.token);
+        if let Some(relay) = &self.relay_token {
+            req = req.header("grouper-relay", relay);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| SyncError::Unreachable(error_chain(&e)))?;
@@ -188,6 +197,9 @@ impl SyncClient {
         let mut req = url.into_client_request().map_err(|e| SyncError::Protocol(e.to_string()))?;
         let auth = format!("Bearer {}", self.token).parse().map_err(|_| SyncError::Unauthorized)?;
         req.headers_mut().insert("authorization", auth);
+        if let Some(relay) = &self.relay_token {
+            req.headers_mut().insert("grouper-relay", relay.parse().map_err(|_| SyncError::Unauthorized)?);
+        }
         let mut config = tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(core_protocol::MAX_WS_MESSAGE_BYTES);
         config.max_frame_size = Some(core_protocol::MAX_WS_MESSAGE_BYTES);
@@ -424,5 +436,15 @@ mod tests {
         let c = SyncClient::new("https://hub.example.com/ ", "a.b", store).unwrap();
         assert_eq!(c.hub(), "https://hub.example.com");
         assert_eq!(segment("a b/c"), "a%20b%2Fc");
+    }
+
+    #[test]
+    fn relay_token_is_trimmed_and_blank_means_none() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let c = SyncClient::new("https://hub.example.com", "a.b", store.clone()).unwrap();
+        assert!(c.relay_token.is_none());
+        let c = c.with_relay_token(Some(" rt_x ".into()));
+        assert_eq!(c.relay_token.as_deref(), Some("rt_x"));
+        assert!(c.with_relay_token(Some("  ".into())).relay_token.is_none());
     }
 }

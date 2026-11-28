@@ -309,7 +309,7 @@ final class HubMoveStore: ObservableObject {
 
     func refresh(model: AppModel) async {
         guard model.signedIn, !model.adminToken.isEmpty else { return }
-        guard let moveClient = try? HubMoveClient(baseURL: model.hubURL, token: model.adminToken) else { return }
+        guard let moveClient = try? HubMoveClient(baseURL: model.hubURL, token: model.adminToken, relayToken: model.currentRelayToken) else { return }
         loading = true
         defer { loading = false }
 
@@ -394,7 +394,7 @@ final class HubMoveStore: ObservableObject {
             // Section 4a: confirming a hub move always requires a fresh Google sign-in with a hub nonce.
             let nonce = try await client.googleNonce()
             let idToken = try await GoogleSignIn.idToken(oauth: oauth, nonce: nonce.nonce)
-            let moveClient = try HubMoveClient(baseURL: model.hubURL, token: model.adminToken)
+            let moveClient = try HubMoveClient(baseURL: model.hubURL, token: model.adminToken, relayToken: model.currentRelayToken)
             let targetId = target.nodeDeviceId ?? target.deviceId
             let started = try await moveClient.startMove(targetDevice: targetId, idToken: idToken, threads: threads)
             moveStatus = started
@@ -407,7 +407,7 @@ final class HubMoveStore: ObservableObject {
 
     func cancelMove(model: AppModel) async {
         guard moveStatus.state.canCancel, !cancelling else { return }
-        guard let moveClient = try? HubMoveClient(baseURL: model.hubURL, token: model.adminToken) else { return }
+        guard let moveClient = try? HubMoveClient(baseURL: model.hubURL, token: model.adminToken, relayToken: model.currentRelayToken) else { return }
         cancelling = true
         actionError = nil
         defer { cancelling = false }

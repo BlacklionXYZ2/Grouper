@@ -190,7 +190,7 @@ final class GoogleSignInTests: XCTestCase {
             case ("GET"?, "/v1/auth/status"?):
                 return (200, #"{"claimed":false,"google":true,"google_web":false}"#)
             case ("POST"?, "/v1/auth/google/nonce"?):
-                return (200, #"{"nonce":"abc123","expires":1795000000}"#)
+                return (200, #"{"nonce":"0123456789abcdef0123456789abcdef","expires":1795000000}"#)
             case ("POST"?, "/v1/auth/google"?):
                 return (200, #"{"token":"dev1.secret","device":{"id":"dev1","name":"Grouper on iPhone","platform":"ios","admin":true}}"#)
             default:
@@ -202,7 +202,7 @@ final class GoogleSignInTests: XCTestCase {
         let status = try await hub.authStatus()
         XCTAssertEqual(status, AuthStatus(claimed: false, google: true, googleWeb: false))
         let nonce = try await hub.googleNonce()
-        XCTAssertEqual(nonce, GoogleNonce(nonce: "abc123", expires: 1_795_000_000))
+        XCTAssertEqual(nonce, GoogleNonce(nonce: "0123456789abcdef0123456789abcdef", expires: 1_795_000_000))
         let result = try await hub.signInWithGoogle(idToken: "eyJ.id.token", setupCode: " K7PM-3XQR-T9WD ",
                                                     client: .ios, deviceName: "Grouper on iPhone",
                                                     installId: "Ab3_-xYz0123456789abcdefghijKLMN")

@@ -55,6 +55,8 @@ enum GoogleSignIn {
             return "The hub refused that Google account: \(message)"
         case .conflict(let message)?:
             return message
+        case .some(let relayError) where relayError.relayProblem != nil:
+            return relayError.relayProblem
         default:
             return error.localizedDescription
         }

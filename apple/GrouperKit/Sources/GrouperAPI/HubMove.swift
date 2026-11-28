@@ -616,24 +616,27 @@ public enum HubMoveFormatting: Sendable {
 public actor HubMoveClient {
     public nonisolated let baseURL: URL
     private nonisolated let token: String
+    /// Sent as `Grouper-Relay` when the hub address is a relay.
+    private nonisolated let relayToken: String?
     private let session: URLSession
     private let encoder = JSONEncoder.grouper
     private let decoder = JSONDecoder.grouper
 
-    public init(baseURL: URL, token: String, session: URLSession = .shared) throws {
+    public init(baseURL: URL, token: String, relayToken: String? = nil, session: URLSession = .shared) throws {
         guard let scheme = baseURL.scheme?.lowercased(), scheme == "http" || scheme == "https", baseURL.host != nil else {
             throw HubClientError.invalidBaseURL
         }
         self.baseURL = baseURL
         self.token = token
+        self.relayToken = relayToken.flatMap { $0.isEmpty ? nil : $0 }
         self.session = session
     }
 
-    public init(baseURL: String, token: String, session: URLSession = .shared) throws {
+    public init(baseURL: String, token: String, relayToken: String? = nil, session: URLSession = .shared) throws {
         guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw HubClientError.invalidBaseURL
         }
-        try self.init(baseURL: url, token: token, session: session)
+        try self.init(baseURL: url, token: token, relayToken: relayToken, session: session)
     }
 
     /// `GET /v1/hub` (unauthenticated): hub id, account, `hub_device_id`, and `epoch`.
@@ -719,6 +722,7 @@ public actor HubMoveClient {
         if authenticated, !token.isEmpty {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
+        if let relayToken { request.setValue(relayToken, forHTTPHeaderField: RelayHeader.name) }
         if let body {
             request.httpBody = body
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -737,18 +741,6 @@ public actor HubMoveClient {
     }
 
     private func mapError(status: Int, data: Data) -> HubClientError {
-        let message = (try? decoder.decode(MoveErrorEnvelope.self, from: data).error) ?? String(decoding: data, as: UTF8.self)
-        switch status {
-        case 400: return .badRequest(message)
-        case 401: return .unauthorized(message)
-        case 403: return .forbidden(message)
-        case 404: return .notFound(message)
-        case 409: return .conflict(message)
-        default: return .server(status: status, message: message)
-        }
+        HubClientError.map(status: status, data: data)
     }
-}
-
-private struct MoveErrorEnvelope: Codable {
-    let error: String
 }

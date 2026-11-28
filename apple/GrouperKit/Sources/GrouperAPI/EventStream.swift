@@ -20,13 +20,16 @@ public final class EventStream: @unchecked Sendable {
     public let baseURL: URL
     public let conversationId: String?
     private let token: String
+    /// Sent as `Grouper-Relay` on the WebSocket handshake and the catch-up calls (a relay address).
+    private let relayToken: String?
     private let session: URLSession
     private let socketLock = NSLock()
     private var currentSocket: URLSessionWebSocketTask?
 
-    public init(baseURL: URL, token: String, conversationId: String? = nil, session: URLSession = .shared) {
+    public init(baseURL: URL, token: String, conversationId: String? = nil, relayToken: String? = nil, session: URLSession = .shared) {
         self.baseURL = baseURL
         self.token = token
+        self.relayToken = relayToken.flatMap { $0.isEmpty ? nil : $0 }
         self.conversationId = conversationId
         self.session = session
     }
@@ -64,9 +67,8 @@ public final class EventStream: @unchecked Sendable {
             continuation.yield(.state(.connecting(attempt: attempt)))
             var socket: URLSessionWebSocketTask?
             do {
-                let client = try HubClient(baseURL: baseURL, token: token, session: session)
-                var request = URLRequest(url: try websocketURL())
-                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                let client = try HubClient(baseURL: baseURL, token: token, relayToken: relayToken, session: session)
+                let request = handshakeRequest(url: try websocketURL())
                 let opened = session.webSocketTask(with: request)
                 socket = opened
                 setCurrentSocket(opened)
@@ -118,6 +120,8 @@ public final class EventStream: @unchecked Sendable {
                 clearCurrentSocket(socket)
                 if case .unauthorized = error { continuation.finish(throwing: error); return }
                 if case .forbidden = error { continuation.finish(throwing: error); return }
+                // The relay sign-in expired: reconnecting can't fix that, the app must sign in again.
+                if case .relayUnauthorized = error { continuation.finish(throwing: error); return }
             } catch {
                 socket?.cancel(with: .goingAway, reason: nil)
                 clearCurrentSocket(socket)
@@ -130,6 +134,14 @@ public final class EventStream: @unchecked Sendable {
         }
         continuation.yield(.state(.disconnected))
         continuation.finish()
+    }
+
+    /// The WebSocket upgrade request: the device token, plus the relay token for a relay address.
+    func handshakeRequest(url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let relayToken { request.setValue(relayToken, forHTTPHeaderField: RelayHeader.name) }
+        return request
     }
 
     private func setCurrentSocket(_ socket: URLSessionWebSocketTask) {
