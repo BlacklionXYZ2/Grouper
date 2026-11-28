@@ -1,6 +1,17 @@
 name = "grouper-relay"
 main = "src/index.ts"
 compatibility_date = "2025-09-01"
+workers_dev = true
+
+# One host, three parts (docs/relay-design.md, "Deployment layout"): the Worker owns every path on
+# grouper.clockmillbarn.uk. The existing proxied DNS record stays; this is a zone route.
+routes = [{ pattern = "grouper.clockmillbarn.uk/*", zone_name = "clockmillbarn.uk" }]
+
+# The website (relay/site). The Worker runs first and decides which paths are the site's.
+[assets]
+directory = "./site"
+binding = "ASSETS"
+run_worker_first = true
 
 [durable_objects]
 bindings = [{ name = "ACCOUNT", class_name = "Account" }]
@@ -9,12 +20,12 @@ bindings = [{ name = "ACCOUNT", class_name = "Account" }]
 tag = "v1"
 new_sqlite_classes = ["Account"]
 
-# Non-secret config. RELAY_SECRET is a secret: `npx wrangler secret put RELAY_SECRET`
-# (local dev: copy .dev.vars.example to .dev.vars).
+# Non-secret config (all public client IDs). RELAY_SECRET is a secret: `npx wrangler secret put RELAY_SECRET`
+# (local dev: copy .dev.vars.example to .dev.vars). Tests override these with --var.
 [vars]
-GOOGLE_CLIENT_IDS = "REPLACE_ME.apps.googleusercontent.com"
-GOOGLE_WEB_CLIENT_ID = "REPLACE_ME.apps.googleusercontent.com"
-# Optional dedicated browser sign-in client; when set, /relay/auth/* accepts only this audience.
+GOOGLE_WEB_CLIENT_ID = "998648431961-dh13qf3a3c596iadav1vmfnljr3j0dhr.apps.googleusercontent.com"
+GOOGLE_CLIENT_IDS = "998648431961-aeomun58v9i625ofsprfc5oroalv233t.apps.googleusercontent.com,998648431961-cnc9c9930iacdrs9u7b25cgtp7g26f9q.apps.googleusercontent.com,998648431961-dh13qf3a3c596iadav1vmfnljr3j0dhr.apps.googleusercontent.com,998648431961-cnsmfnl624ctrmrk8b5dp06g09h64qns.apps.googleusercontent.com"
+# Optional dedicated browser sign-in client; when set, browser sign-in accepts only this audience.
 # RELAY_WEB_CLIENT_ID = "REPLACE_ME.apps.googleusercontent.com"
 GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"

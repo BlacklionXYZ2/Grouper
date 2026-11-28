@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const KEEP = process.argv.includes("--keep");
-const GOOGLE_PORT = 8790, RELAY_PORT = 8799;
+const GOOGLE_PORT = Number(process.env.RELAY_E2E_GOOGLE_PORT ?? 8790), RELAY_PORT = Number(process.env.RELAY_E2E_PORT ?? 8799);
 const GOOGLE = `http://127.0.0.1:${GOOGLE_PORT}`, RELAY = `http://127.0.0.1:${RELAY_PORT}`;
 const IOS = "test-ios.apps.googleusercontent.com", WEB = "test-web.apps.googleusercontent.com";
 const HUB_BIN = join(ROOT, "target", "release", process.platform === "win32" ? "grouper-hub.exe" : "grouper-hub");
@@ -155,7 +155,7 @@ async function setupHub(label, owner, port) {
 
 async function main() {
   await new Promise((r) => google.listen(GOOGLE_PORT, "127.0.0.1", r));
-  const relay = start("relay", "npx", ["wrangler", "dev", "--local", "--port", String(RELAY_PORT), "--ip", "127.0.0.1",
+  const relay = start("relay", "npx", ["wrangler", "dev", "--local", "--port", String(RELAY_PORT), "--local-upstream", `127.0.0.1:${RELAY_PORT}`, "--ip", "127.0.0.1",
     "--var", `GOOGLE_JWKS_URL:${GOOGLE}/jwks`, "--var", `GOOGLE_AUTH_URL:${GOOGLE}/authorize`,
     "--var", `GOOGLE_CLIENT_IDS:${IOS},${WEB}`, "--var", `GOOGLE_WEB_CLIENT_ID:${WEB}`,
     "--var", `RELAY_SECRET:${randomBytes(32).toString("hex")}`], { cwd: join(ROOT, "relay") });
@@ -193,8 +193,12 @@ async function main() {
   check("carol (no hub) gets 503", carolHub.status === 503, `${carolHub.status}`);
   const anon = await http(RELAY, "/v1/hub");
   check("no relay token: 401 JSON", anon.status === 401 && anon.json?.relay === true, `${anon.status}`);
-  const anonPage = await http(RELAY, "/", { headers: { accept: "text/html" } });
-  check("no relay token: / shows the relay sign-in page", anonPage.status === 200 && /sign in/i.test(anonPage.text));
+  const anonPage = await http(RELAY, "/app", { headers: { accept: "text/html" } });
+  check("no relay token: /app redirects to the relay sign-in page", anonPage.status === 302 && anonPage.headers.get("location") === "/relay/sign-in?next=%2Fapp");
+  const signInPage = await http(RELAY, "/relay/sign-in?next=%2Fapp", { headers: { accept: "text/html" } });
+  check("the relay sign-in page offers Google", signInPage.status === 200 && /sign in with google/i.test(signInPage.text));
+  const siteHome = await http(RELAY, "/", { headers: { accept: "text/html" } });
+  check("/ is the public website, no sign-in", siteHome.status === 200 && siteHome.text.includes("Open Grouper"));
   const forged = aliceRelay.slice(0, -4) + (aliceRelay.endsWith("AAAA") ? "BBBB" : "AAAA");
   check("a tampered relay token is refused", (await http(RELAY, "/v1/hub", { headers: { "grouper-relay": forged } })).status === 401);
 
@@ -225,8 +229,24 @@ async function main() {
   const webIn = await relaySignIn("alice", "web");
   const relayCookie = (webIn.headers.get("set-cookie") || "").split(";")[0];
   check("web relay sign-in sets the grouper_relay cookie", relayCookie.startsWith("grouper_relay="));
-  const page = await http(RELAY, "/", { headers: { cookie: relayCookie, accept: "text/html" } });
-  check("with the cookie, / is hub A's web app", page.status === 200 && /<script|app\.js/i.test(page.text) && !/relay\/auth\/start/.test(page.text));
+  const page = await http(RELAY, "/app", { headers: { cookie: relayCookie, accept: "text/html" } });
+  check("with the cookie, /app is hub A's web app", page.status === 200 && /<script|app\.js/i.test(page.text) && !/relay\/auth\/start/.test(page.text));
+
+  console.log("Browser sign-in through Google's return page");
+  {
+    const start = await http(RELAY, "/relay/auth/start?next=%2Fapp%2Fsettings");
+    const stCookie = (start.headers.getSetCookie().find((c) => c.startsWith("grouper_relay_state=")) || "").split(";")[0];
+    const g = new URL(start.headers.get("location"));
+    check("browser sign-in returns to /oauth/google/return", g.searchParams.get("redirect_uri") === `${RELAY}/oauth/google/return`, g.searchParams.get("redirect_uri"));
+    const q = new URLSearchParams(g.search); q.set("user", "alice");
+    const gForm = await (await fetch(`${GOOGLE}/authorize?${q}`)).text();
+    const tok = /name="id_token" value="([^"]+)"/.exec(gForm)?.[1];
+    const st = /name="state" value="([^"]+)"/.exec(gForm)?.[1];
+    const back = await http(RELAY, "/oauth/google/return", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", cookie: stCookie }, raw: new URLSearchParams({ id_token: tok, state: st }).toString() });
+    check("the relay completes it and sends the browser to next", back.status === 303 && back.headers.get("location") === "/app/settings" && (back.headers.get("set-cookie") || "").includes("grouper_relay="), `${back.status} ${back.headers.get("location")}`);
+    const hubReturn = await http(RELAY, "/oauth/google/return", { method: "POST", headers: { ...asA, "content-type": "application/x-www-form-urlencoded" }, raw: "id_token=x&state=hub-own-state" });
+    check("a return page post with no relay state goes to the hub", hubReturn.status !== 303 && !(hubReturn.headers.get("set-cookie") || "").includes("grouper_relay="), `${hubReturn.status}`);
+  }
 
   console.log("WebSockets through the relay");
   const wsUrl = RELAY.replace("http", "ws") + "/v1/events";

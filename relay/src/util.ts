@@ -1,6 +1,7 @@
 // Small shared helpers: encodings, HMAC, hashing, JSON responses.
 
 export interface Env {
+  ASSETS: Fetcher;
   ACCOUNT: DurableObjectNamespace<import("./account").Account>;
   RELAY_SECRET: string;
   GOOGLE_CLIENT_IDS: string;

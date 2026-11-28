@@ -17,7 +17,7 @@ import {
   readRelayToken,
   type RelayClaims,
 } from "./tokens";
-import { json, nowSec, randomB64url, relayError, safeEqual, sha256Hex, type Env } from "./util";
+import { b64urlDecode, b64urlEncode, json, nowSec, randomB64url, relayError, safeEqual, sha256Hex, utf8, type Env } from "./util";
 
 const COOKIE = "grouper_relay";
 const STATE_COOKIE = "grouper_relay_state";
@@ -89,7 +89,86 @@ async function route(request: Request, env: Env): Promise<Response> {
         return relayError(404, "unknown relay route");
     }
   }
-  return forward(request, env, url);
+  if (p === "/relay/sign-in") {
+    return need(m, "GET") ?? signInPage(safeNext(url.searchParams.get("next")));
+  }
+  if (p.startsWith("/relay/")) return relayError(404, "unknown relay route");
+
+  if (isHubPath(p)) {
+    // The relay's own browser sign-in returns to the path Google has registered for the hub.
+    if (p === "/oauth/google/return" && m === "POST" && (await isRelayReturn(request))) return authReturn(request, env);
+    return forward(request, env, url);
+  }
+  return website(request, env);
+}
+
+/** Paths forwarded to the signed-in account's hub. Everything else is the website. */
+function isHubPath(p: string): boolean {
+  return (
+    p === "/app" ||
+    p.startsWith("/app/") ||
+    p.startsWith("/v1/") ||
+    p === "/sw.js" ||
+    p === "/oauth" ||
+    p.startsWith("/oauth/") ||
+    p === "/favicon.ico" ||
+    p === "/healthz"
+  );
+}
+
+/** A same-origin relative path, or the default. Refuses scheme-relative URLs, backslashes and control characters. */
+function safeNext(raw: string | null | undefined): string {
+  const d = "/app";
+  if (!raw || raw.length > 512) return d;
+  if (!raw.startsWith("/") || raw.startsWith("//")) return d;
+  if (/[\\\u0000-\u001f\u007f]/.test(raw)) return d;
+  try {
+    if (new URL(raw, "https://relay.invalid").origin !== "https://relay.invalid") return d;
+  } catch {
+    return d;
+  }
+  return raw;
+}
+
+/** True when the posted `state` matches this browser's relay state cookie. Reads a clone; the body stays intact. */
+async function isRelayReturn(request: Request): Promise<boolean> {
+  const cookie = cookieValue(request.headers.get("cookie"), STATE_COOKIE);
+  if (!cookie) return false;
+  const cState = parseState(cookie).state;
+  if (!cState) return false;
+  try {
+    const posted = (await request.clone().formData()).get("state");
+    return typeof posted === "string" && safeEqual(posted, cState);
+  } catch {
+    return false;
+  }
+}
+
+/** Cookie value is `<state>.<relay nonce>`, plus `~<base64url next>` when `next` isn't the default. */
+function parseState(cookie: string): { state: string; nonce: string; next: string } {
+  let rest = cookie;
+  let next = "/app";
+  const t = rest.lastIndexOf("~");
+  if (t >= 0) {
+    try {
+      next = safeNext(new TextDecoder().decode(b64urlDecode(rest.slice(t + 1))));
+    } catch {}
+    rest = rest.slice(0, t);
+  }
+  const dot = rest.indexOf(".");
+  return dot > 0 ? { state: rest.slice(0, dot), nonce: rest.slice(dot + 1), next } : { state: "", nonce: "", next };
+}
+
+/** Website: static assets, with the site's own 404 page. */
+async function website(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "HEAD") return relayError(405, "use GET", { allow: "GET, HEAD" });
+  const res = await env.ASSETS.fetch(request);
+  if (res.status !== 404) return res;
+  const nf = await env.ASSETS.fetch(new Request(new URL("/404", request.url), { headers: { accept: "text/html" } }));
+  return new Response(request.method === "HEAD" ? null : nf.body, {
+    status: 404,
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+  });
 }
 
 function need(method: string, want: string): Response | null {
@@ -136,7 +215,8 @@ function stripRelayCookie(header: string | null): string | null {
     .filter((s) => {
       if (!s) return false;
       const i = s.indexOf("=");
-      return (i < 0 ? s : s.slice(0, i)).trim() !== COOKIE;
+      const n = (i < 0 ? s : s.slice(0, i)).trim();
+      return n !== COOKIE && n !== STATE_COOKIE;
     });
   return kept.length ? kept.join("; ") : null;
 }
@@ -273,15 +353,16 @@ function webAudiences(env: Env): string[] | undefined {
 /** Cookie for the state binding. SameSite=None on HTTPS because Google's form_post is a cross-site POST. */
 function stateCookie(url: URL, value: string, maxAge: number): string {
   const https = url.protocol === "https:";
-  return `${STATE_COOKIE}=${value}; HttpOnly; SameSite=${https ? "None; Secure" : "Lax"}; Path=/relay/auth; Max-Age=${maxAge}`;
+  return `${STATE_COOKIE}=${value}; HttpOnly; SameSite=${https ? "None; Secure" : "Lax"}; Path=/; Max-Age=${maxAge}`;
 }
 
 async function authStart(url: URL, env: Env): Promise<Response> {
+  const next = safeNext(url.searchParams.get("next"));
   const { nonce } = await makeNonce(env.RELAY_SECRET);
   const state = randomB64url(18);
   const g = new URL(env.GOOGLE_AUTH_URL || DEFAULT_AUTH_URL);
   g.searchParams.set("client_id", env.RELAY_WEB_CLIENT_ID || env.GOOGLE_WEB_CLIENT_ID);
-  g.searchParams.set("redirect_uri", url.origin + "/relay/auth/return");
+  g.searchParams.set("redirect_uri", url.origin + "/oauth/google/return");
   g.searchParams.set("response_type", "id_token");
   g.searchParams.set("response_mode", "form_post");
   g.searchParams.set("scope", "openid email");
@@ -292,7 +373,7 @@ async function authStart(url: URL, env: Env): Promise<Response> {
     status: 302,
     headers: {
       location: g.toString(),
-      "set-cookie": stateCookie(url, `${state}.${nonce}`, STATE_TTL),
+      "set-cookie": stateCookie(url, `${state}.${nonce}${next === "/app" ? "" : "~" + b64urlEncode(utf8(next))}`, STATE_TTL),
       "cache-control": "no-store",
     },
   });
@@ -308,9 +389,7 @@ async function authReturn(request: Request, env: Env): Promise<Response> {
     return errorPage(400, "The sign-in response was malformed.");
   }
   const cookie = cookieValue(request.headers.get("cookie"), STATE_COOKIE) ?? "";
-  const dot = cookie.indexOf(".");
-  const cState = dot > 0 ? cookie.slice(0, dot) : "";
-  const cNonce = dot > 0 ? cookie.slice(dot + 1) : "";
+  const { state: cState, nonce: cNonce, next } = parseState(cookie);
   const posted = form.get("state");
   if (!cState || typeof posted !== "string" || !safeEqual(posted, cState)) {
     const r = errorPage(401, "This sign-in wasn't started in this browser. Try again.");
@@ -320,7 +399,7 @@ async function authReturn(request: Request, env: Env): Promise<Response> {
   try {
     const { g, acct, stub } = await verifySignIn(env, form.get("id_token"), cNonce, webAudiences(env));
     const { token } = await issueToken(env, acct, g.email, "web", stub);
-    const headers = new Headers({ location: "/", "cache-control": "no-store" });
+    const headers = new Headers({ location: next, "cache-control": "no-store" });
     headers.append("set-cookie", setCookie(url, token, WEB_TOKEN_TTL));
     headers.append("set-cookie", clear);
     return new Response(null, { status: 303, headers });
@@ -343,7 +422,12 @@ function wantsHtml(request: Request): boolean {
 async function forward(request: Request, env: Env, url: URL): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) {
-    return wantsHtml(request) ? signInPage() : relayError(401, "sign in to the Grouper relay first");
+    if (!wantsHtml(request)) return relayError(401, "sign in to the Grouper relay first");
+    const next = safeNext(url.pathname + url.search);
+    return new Response(null, {
+      status: 302,
+      headers: { location: "/relay/sign-in?next=" + encodeURIComponent(next), "cache-control": "no-store" },
+    });
   }
 
   const headers = new Headers();

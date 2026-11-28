@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy · Grouper</title>
+<meta name="description" content="What Grouper stores, what leaves your hub, and what the relay sees.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/site/style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><div class="wrap">
+  <a class="brand" href="/"><img src="/site/icon.svg" alt="" width="32" height="32">Grouper</a>
+  <nav class="main" aria-label="Main">
+    <a href="/download">Download</a>
+    <a href="/privacy" aria-current="page">Privacy</a>
+    <a href="https://github.com/BlacklionXYZ2/Grouper">GitHub</a>
+    <a class="btn small" href="/app">Open Grouper</a>
+  </nav>
+</div></header>
+<main id="main"><div class="wrap prose">
+  <h1>Grouper privacy policy</h1>
+  <p class="updated">Last updated 28 November 2026</p>
+
+  <p>Grouper is software you run yourself. Each person who uses it runs their own Grouper hub
+  on their own hardware (a computer, a virtual machine or a server they control) and connects
+  their own devices and apps to it. This page explains what a hub stores, what leaves it, and
+  what the Grouper project itself, including its relay, sees.</p>
+
+  <h2>What your hub stores</h2>
+  <ul>
+    <li>Your chats, the work threads they start, their results and files, and the settings you choose.</li>
+    <li>The devices you connect and their tokens (only a hash of each token's secret).</li>
+    <li>The API keys you add for AI providers, encrypted with a key kept outside the hub's database.</li>
+    <li>If you sign in with Google: your Google account's unique id, email address and name, so the hub recognises its owner.</li>
+    <li>If you turn on notifications: the address your browser gave for delivering them.</li>
+  </ul>
+  <p>All of this stays on the hub you run. The Grouper project has no copy of it.</p>
+
+  <h2>What leaves your hub</h2>
+  <ul>
+    <li><strong>AI providers you configure</strong> (for example OpenRouter, OpenAI or Anthropic) receive the messages and files your chats and threads send them, under your own account with them and their privacy terms.</li>
+    <li><strong>Google</strong>, when you choose &ldquo;Sign in with Google&rdquo;: you sign in on Google's own page, and Google tells Grouper who you are (id, email, name). Grouper asks only for these basic profile details, never for access to your Google data such as Gmail or Drive.</li>
+    <li><strong>Browser push services</strong> (run by your browser's maker), if you turn on notifications: they carry a short notice that a tool is waiting for your approval, with the tool, device, thread and chat names. Notifications never include the command, its contents or your messages.</li>
+  </ul>
+
+  <h2>What the relay sees</h2>
+  <p>To reach your hub from your phone or another network, your hub keeps an outbound connection
+  to the Grouper relay at <code>grouper.clockmillbarn.uk</code>, and your devices send their
+  requests to the relay, which passes them to your hub and passes the answers back.</p>
+  <ul>
+    <li><strong>What the relay keeps:</strong> your Google email address and an account id derived from your Google account, so it knows which hub is yours; a secret that lets your hub connect; and whether your hub is currently connected.</li>
+    <li><strong>What it handles in transit:</strong> your requests and your hub's responses pass through the relay while they are routed. The relay does not store message content, chats, files or provider keys.</li>
+    <li><strong>Request routing:</strong> the relay runs on Cloudflare, which processes ordinary connection details, such as IP addresses, to deliver requests, under Cloudflare's own terms.</li>
+  </ul>
+  <p>The relay has no analytics, advertising or tracking, and this website loads nothing from
+  other sites. You can unlink your hub at any time; the relay then forgets the hub's secret.</p>
+
+  <h2>Your control</h2>
+  <ul>
+    <li>Your hub's owner can delete chats, revoke devices and sessions, remove API keys and turn off notifications at any time.</li>
+    <li>You can unlink your hub from the relay or your Google account in the hub's Settings, or remove Grouper's access at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</li>
+    <li>Deleting the hub's data folder removes everything it stored.</li>
+  </ul>
+
+  <h2>Contact</h2>
+  <p>For a hub someone else runs, contact that person. For the Grouper apps, relay and sign-in, use the support email shown on Grouper's Google sign-in screen, or open an issue on <a href="https://github.com/BlacklionXYZ2/Grouper">GitHub</a>.</p>
+</div></main>
+<footer class="bottom"><div class="wrap">
+  <span>Grouper is open source. You run your own hub.</span>
+  <nav aria-label="Footer"><a href="/download">Download</a><a href="/privacy">Privacy</a><a href="https://github.com/BlacklionXYZ2/Grouper">GitHub</a></nav>
+</div></footer>
+</body>
+</html>

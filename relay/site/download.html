@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download Grouper</title>
+<meta name="description" content="Download Grouper for Windows and Mac, or build the iPhone app from Xcode.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/site/style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top"><div class="wrap">
+  <a class="brand" href="/"><img src="/site/icon.svg" alt="" width="32" height="32">Grouper</a>
+  <nav class="main" aria-label="Main">
+    <a href="/download" aria-current="page">Download</a>
+    <a href="/privacy">Privacy</a>
+    <a href="https://github.com/BlacklionXYZ2/Grouper">GitHub</a>
+    <a class="btn small" href="/app">Open Grouper</a>
+  </nav>
+</div></header>
+<main id="main"><div class="wrap prose wide">
+  <h1>Download Grouper</h1>
+  <p>Install the app on the computer that will be your hub, then add your other devices. Builds come from the <a href="https://github.com/BlacklionXYZ2/Grouper/releases">releases page</a>. The newest successful build is the pre-release called &ldquo;Latest build (harness)&rdquo;.</p>
+  <div class="dl-grid">
+    <section class="card">
+      <h2>Windows</h2>
+      <p>Installer for 64-bit Windows: <code>Grouper-windows-x64-setup.exe</code></p>
+      <div class="note"><p>The installer is unsigned, so SmartScreen shows a warning. Choose <strong>More info</strong>, then <strong>Run anyway</strong>.</p></div>
+      <a class="btn" href="https://github.com/BlacklionXYZ2/Grouper/releases/tag/harness-latest">Get the Windows installer</a>
+    </section>
+    <section class="card">
+      <h2>Mac</h2>
+      <p>Mac app for Apple Silicon: <code>Grouper-macOS-arm64.zip</code></p>
+      <div class="note">
+        <p>The app is ad-hoc signed, not notarized. Unzip it and move <code>Grouper.app</code> to Applications, then run:</p>
+        <p><code>xattr -dr com.apple.quarantine /Applications/Grouper.app</code></p>
+        <p>Or open System Settings, then Privacy &amp; Security, and choose <strong>Open Anyway</strong>.</p>
+      </div>
+      <a class="btn" href="https://github.com/BlacklionXYZ2/Grouper/releases/tag/harness-latest">Get the Mac app</a>
+    </section>
+    <section class="card">
+      <h2>iPhone</h2>
+      <p>The iPhone app isn't on the App Store or the releases page yet. iOS apps need Apple signing, so for now install it from Xcode, using the project on <a href="https://github.com/BlacklionXYZ2/Grouper">GitHub</a>.</p>
+    </section>
+    <section class="card">
+      <h2>In your browser</h2>
+      <p>Once your hub is linked, the web app works on any device with a browser, with nothing to install.</p>
+      <a class="btn quiet" href="/app">Open Grouper</a>
+    </section>
+  </div>
+</div></main>
+<footer class="bottom"><div class="wrap">
+  <span>Grouper is open source. You run your own hub.</span>
+  <nav aria-label="Footer"><a href="/download">Download</a><a href="/privacy">Privacy</a><a href="https://github.com/BlacklionXYZ2/Grouper">GitHub</a></nav>
+</div></footer>
+</body>
+</html>
