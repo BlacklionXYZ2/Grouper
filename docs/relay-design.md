@@ -264,10 +264,10 @@ Remote access. The hub's default relay URL is `https://grouper.clockmillbarn.uk`
   2. The CLI listens on `127.0.0.1:<port>` and opens
      `<hub>/relay/sign-in?next=/relay/v1/cli-token?port=<port>&state=<random>`. The browser signs in at
      the relay as for the web app.
-  3. **Needs a relay endpoint (not built yet):** `GET /relay/v1/cli-token?port&state`, requires the relay
+  3. **Relay endpoint (built):** `GET /relay/v1/cli-token?port&state`, requires the relay
      session cookie, accepts only a loopback `port` (1024–65535), mints a single-use code bound to the
      account and `state` (valid about 60 seconds), and redirects to `http://127.0.0.1:<port>/?code=<code>&state=<state>`.
-  4. **Needs a relay endpoint (not built yet):** `POST /relay/v1/cli-token/exchange` `{code, state}` →
+  4. **Relay endpoint (built):** `POST /relay/v1/cli-token/exchange` `{code, state}` →
      `{relay_token, expires}`; the code works once; the token is the same kind `sign-in` with
      `client: "app"` returns. The CLI checks `state` before it exchanges.
   5. The CLI runs the existing link flow with `Grouper-Relay: <relay_token>` on every call; the

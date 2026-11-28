@@ -59,6 +59,9 @@ export class Account extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS nonces (n TEXT PRIMARY KEY, exp INTEGER NOT NULL)");
+    ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS cli_codes (h TEXT PRIMARY KEY, state TEXT NOT NULL, email TEXT NOT NULL, exp INTEGER NOT NULL)",
+    );
     // Ids must stay unique per open socket across hibernation: restart from a reserved block.
     const reserved = (ctx.storage.kv.get("id_limit") as number | undefined) ?? 0;
     this.nextId = reserved + 1;
@@ -84,6 +87,25 @@ export class Account extends DurableObject<Env> {
     if (seen) return false;
     sql.exec("INSERT INTO nonces (n, exp) VALUES (?, ?)", nonce, exp);
     return true;
+  }
+
+  /** Stores a CLI sign-in code (by hash) for `ttl` seconds. */
+  putCliCode(hash: string, state: string, email: string, ttl: number): void {
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM cli_codes WHERE exp <= ?", nowSec());
+    sql.exec("INSERT INTO cli_codes (h, state, email, exp) VALUES (?, ?, ?, ?)", hash, state, email, nowSec() + ttl);
+  }
+
+  /** Consumes a CLI code: single use whatever the outcome. Returns the email if state matches and it hasn't expired. */
+  takeCliCode(hash: string, state: string): string | null {
+    const sql = this.ctx.storage.sql;
+    const row = sql.exec("SELECT state, email, exp FROM cli_codes WHERE h = ?", hash).toArray()[0] as
+      | { state: string; email: string; exp: number }
+      | undefined;
+    if (!row) return null;
+    sql.exec("DELETE FROM cli_codes WHERE h = ?", hash);
+    if (row.exp <= nowSec() || !safeEqual(row.state, state)) return null;
+    return row.email;
   }
 
   generation(): number {

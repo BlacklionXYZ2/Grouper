@@ -11,6 +11,8 @@ export interface Env {
   GOOGLE_JWKS_URL?: string;
   GOOGLE_AUTH_URL?: string;
   GOOGLE_ISSUERS?: string;
+  /** Test hook: lifetime in seconds of a CLI sign-in code (default 60). */
+  CLI_CODE_TTL?: string;
 }
 
 const enc = new TextEncoder();

@@ -83,6 +83,7 @@ function startRelay() {
     GOOGLE_WEB_CLIENT_ID: CLIENT_ID,
     GOOGLE_JWKS_URL: `${GOOGLE}/jwks`,
     GOOGLE_AUTH_URL: `${GOOGLE}/auth`,
+    CLI_CODE_TTL: "3",
   };
   const args = [
     "wrangler", "dev", "--local", "--ip", "127.0.0.1", "--port", String(PORT), "--local-upstream", `127.0.0.1:${PORT}`,
@@ -517,6 +518,93 @@ async function main() {
     const hubPage = await api("GET", "/app/threads?open=2", { headers: { cookie: sc.split(";")[0], accept: "text/html" } });
     check("the next path reaches the hub with the new cookie", hubPage.json?.hub === "A" && hubPage.json.path.startsWith("/app/threads"));
     check("hub paths with a session are forwarded (/sw.js, /v1, /healthz)", (await Promise.all(["/sw.js", "/v1/x", "/healthz", "/favicon.ico"].map((p) => api("GET", p, { headers: { "grouper-relay": tokA } })))).every((r) => r.json?.hub === "A"));
+  }
+
+  console.log("command-line sign-in");
+  {
+    const STATE = "abcdef0123456789abcdef0123456789";
+    const PORT_CLI = 41234;
+    const path = (port = PORT_CLI, state = STATE) => `/relay/v1/cli-token?port=${port}&state=${state}`;
+    const web = await api("POST", "/relay/v1/sign-in", { body: await signInBody({ ...A, nonce: await newNonce() }, "web") });
+    const ck = (web.headers.get("set-cookie") ?? "").split(";")[0];
+    const form = (fields, { cookie = ck, origin } = {}) =>
+      fetch(BASE + "/relay/v1/cli-token", { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", ...(cookie ? { cookie } : {}), ...(origin ? { origin } : {}) }, body: new URLSearchParams(fields) });
+    const confirm = async (port, state) => {
+      const r = await api("GET", path(port, state), { headers: { cookie: ck, accept: "text/html" } });
+      return { r, csrf: /name="csrf" value="([^"]+)"/.exec(r.text)?.[1] };
+    };
+    const exchange = (code, state, extra = {}) => api("POST", "/relay/v1/cli-token/exchange", { body: { code, state }, ...extra });
+    const codeFrom = (res) => new URL(res.headers.get("location")).searchParams.get("code");
+
+    const noSess = await api("GET", path(), { headers: { accept: "text/html" } });
+    check("no session: redirect to sign-in with next = this path and query", noSess.status === 302 && noSess.headers.get("location") === "/relay/sign-in?next=" + encodeURIComponent(path()), noSess.headers.get("location"));
+    check("no session, JSON client: 401", (await api("GET", path(), { headers: { accept: "application/json" } })).status === 401);
+    const signInNext = await api("GET", "/relay/sign-in?next=" + encodeURIComponent(path()), { headers: { accept: "text/html" } });
+    check("the sign-in page carries the cli-token next", signInNext.text.includes(encodeURIComponent(path())), signInNext.text.slice(-400));
+
+    const { r: page, csrf } = await confirm(PORT_CLI, STATE);
+    check("GET with a session shows the confirm page with the email and a POST form", page.status === 200 && page.text.includes("a@example.com") && page.text.includes('method="post"') && !!csrf && /frame-ancestors/.test(page.headers.get("content-security-policy") ?? ""), page.text.slice(-500));
+    check("GET never mints (no redirect to loopback, no code)", !page.headers.get("location") && !/code=/.test(page.text));
+    check("bad port refused (80)", (await api("GET", path(80), { headers: { cookie: ck } })).status === 400);
+    check("bad port refused (70000)", (await api("GET", path(70000), { headers: { cookie: ck } })).status === 400);
+    check("bad state refused (short)", (await api("GET", path(PORT_CLI, "abc"), { headers: { cookie: ck } })).status === 400);
+    check("bad state refused (chars)", (await api("GET", `/relay/v1/cli-token?port=${PORT_CLI}&state=${encodeURIComponent("a".repeat(15) + "<")}`, { headers: { cookie: ck } })).status === 400);
+
+    // POST refusals
+    check("POST without csrf refused", (await form({ port: PORT_CLI, state: STATE })).status === 403);
+    check("POST with a wrong csrf refused", (await form({ port: PORT_CLI, state: STATE, csrf: csrf.slice(0, -3) + "AAA" })).status === 403);
+    check("csrf is bound to the port", (await form({ port: PORT_CLI + 1, state: STATE, csrf })).status === 403);
+    check("csrf is bound to the state", (await form({ port: PORT_CLI, state: STATE.replace("a", "b"), csrf })).status === 403);
+    check("POST cross-origin refused", (await form({ port: PORT_CLI, state: STATE, csrf }, { origin: "https://evil.example" })).status === 403);
+    check("POST without a session refused", (await form({ port: PORT_CLI, state: STATE, csrf }, { cookie: "" })).status === 401);
+    const other = await appSignIn({ sub: "sub-other", email: "o@example.com" });
+    const otherCsrf = (await fetch(BASE + "/relay/v1/cli-token", { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", "grouper-relay": other }, body: new URLSearchParams({ port: PORT_CLI, state: STATE, csrf }) })).status;
+    check("another account's session can't use this csrf", otherCsrf === 403);
+    check("POST with JSON content type refused (415)", (await api("POST", "/relay/v1/cli-token", { body: { port: PORT_CLI }, headers: { cookie: ck } })).status === 415);
+    for (const bad of ["http://evil.example:41234", "localhost"]) {
+      const r = await form({ port: bad, state: STATE, csrf });
+      check(`non-numeric port ${bad} refused`, r.status === 400 && !r.headers.get("location"));
+    }
+
+    // Happy path
+    const ok = await form({ port: PORT_CLI, state: STATE, csrf });
+    const loc = ok.headers.get("location") ?? "";
+    const code = ok.status === 303 ? codeFrom(ok) : null;
+    check("POST mints a code and redirects to 127.0.0.1 loopback with code and state", ok.status === 303 && loc.startsWith(`http://127.0.0.1:${PORT_CLI}/?code=cc.`) && new URL(loc).searchParams.get("state") === STATE && new URL(loc).hostname === "127.0.0.1", loc);
+    const ex = await exchange(code, STATE);
+    const claims = ex.json?.relay_token ? JSON.parse(Buffer.from(ex.json.relay_token.split(".")[1], "base64url").toString()) : {};
+    check("exchange returns an app relay token (365 d)", ex.status === 200 && ex.json.relay_token?.startsWith("rt.") && claims.k === "app" && claims.e === "a@example.com" && Math.abs(ex.json.expires - (Math.floor(Date.now() / 1000) + 365 * 86400)) < 120, ex.text);
+    check("the token works at the relay", (await api("GET", "/relay/v1/me", { headers: { "grouper-relay": ex.json.relay_token } })).json?.signed_in === true);
+    check("code is single use", (await exchange(code, STATE)).status === 401);
+
+    // Wrong state burns the code
+    const c2 = codeFrom(await form({ port: PORT_CLI, state: STATE, csrf }));
+    check("wrong state refused", (await exchange(c2, "z".repeat(32))).status === 401);
+    check("…and the code is burned", (await exchange(c2, STATE)).status === 401);
+
+    // Expired
+    const c3 = codeFrom(await form({ port: PORT_CLI, state: STATE, csrf }));
+    await sleep(3500);
+    check("expired code refused", (await exchange(c3, STATE)).status === 401);
+
+    // Forged / malformed / request checks
+    check("forged code refused", (await exchange("cc." + claims.a + ".AAAA.BBBB", STATE)).status === 401);
+    check("garbage code refused", (await exchange("nope", STATE)).status === 401);
+    check("missing state refused", (await api("POST", "/relay/v1/cli-token/exchange", { body: { code } })).status === 400);
+    const raw = (headers, body) => fetch(`${BASE}/relay/v1/cli-token/exchange`, { method: "POST", headers, body });
+    check("exchange needs JSON content type (415)", (await raw({ "content-type": "text/plain" }, JSON.stringify({ code, state: STATE }))).status === 415);
+    check("exchange from another origin refused (403)", (await raw({ "content-type": "application/json", origin: "https://evil.example" }, JSON.stringify({ code, state: STATE }))).status === 403);
+    check("exchange with no Origin (the CLI) is accepted by the origin check", (await raw({ "content-type": "application/json" }, JSON.stringify({ code, state: STATE }))).status === 401);
+    check("exchange GET refused (405)", (await api("GET", "/relay/v1/cli-token/exchange")).status === 405);
+
+    // Sign-out everywhere invalidates the minted token (separate account so A keeps its tokens)
+    const web2 = await api("POST", "/relay/v1/sign-in", { body: await signInBody({ sub: "sub-cli2", email: "c2@example.com", nonce: await newNonce() }, "web") });
+    const ck2 = (web2.headers.get("set-cookie") ?? "").split(";")[0];
+    const csrf2 = /name="csrf" value="([^"]+)"/.exec((await api("GET", path(), { headers: { cookie: ck2, accept: "text/html" } })).text)?.[1];
+    const c4 = codeFrom(await form({ port: PORT_CLI, state: STATE, csrf: csrf2 }, { cookie: ck2 }));
+    const t4 = (await exchange(c4, STATE)).json.relay_token;
+    await api("POST", "/relay/v1/sign-out", { body: { everywhere: true }, headers: { "grouper-relay": t4 } });
+    check("a CLI token is revoked by sign-out everywhere", (await api("GET", "/relay/v1/me", { headers: { "grouper-relay": t4 } })).json?.signed_in === false);
   }
 
   console.log("client websocket");
