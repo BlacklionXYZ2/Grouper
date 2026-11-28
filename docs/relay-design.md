@@ -193,3 +193,51 @@ each answers. The relay closes a hub socket that sends nothing for 90 s; the hub
 Direct connections when on the same network (mDNS is planned separately), end-to-end encryption
 so the relay sees only ciphertext, APNs push from the relay, per-IP rate limits, a relay page in
 the hub's Settings UI (v1 links by API), more than one hub per account.
+
+## Deployment layout: one host, three parts (owner decision, 28 November 2026)
+
+Everything lives on `https://grouper.clockmillbarn.uk`, split by path, served by the one relay
+Worker (a zone route `grouper.clockmillbarn.uk/*`, so the existing proxied DNS record stays):
+
+| Path | Part | Served by |
+|---|---|---|
+| `/`, `/privacy`, `/download`, `/site/*` (and any other path the Worker doesn't claim below) | **Website** | The Worker's static assets (`relay/site/`), no sign-in |
+| `/relay/*` | **Relay** | The Worker (API, sign-in page `/relay/sign-in`) |
+| `/app`, `/app/*`, `/v1/*`, `/sw.js`, `/oauth/*`, `/favicon.ico`, `/healthz` | **Web app and hub API** | Forwarded to the signed-in account's hub |
+
+- Hub paths without a relay session: browser navigations (`Accept: text/html`) redirect to
+  `/relay/sign-in?next=<path>`; anything else gets the 401 JSON. After sign-in the relay
+  redirects to `next` (same-origin paths only; default `/app`).
+- **Google return page:** the relay's browser sign-in uses `redirect_uri =
+  <origin>/oauth/google/return`, the URI already registered on the web client, so no Google
+  console change is needed. A `POST /oauth/google/return` whose `state` matches the
+  `grouper_relay_state` cookie is the relay's own sign-in; any other request to that path is
+  forwarded to the hub as before (the hub's web sign-in uses the same return URI).
+- Web client: `GOOGLE_WEB_CLIENT_ID` = the hub's `DEFAULT_WEB_CLIENT_ID`. `GOOGLE_CLIENT_IDS` =
+  the hub's `DEFAULT_CLIENT_IDS` (iOS, Mac, web, Windows desktop).
+- The hub's service worker is registered with scope `/app/`, not `/`, so a hub never controls
+  the website or relay pages.
+
+## Clients (apps, CLI, Windows app)
+
+Default address stays `https://grouper.clockmillbarn.uk`. A client signs in twice, relay first:
+
+1. `POST /relay/v1/nonce` → `{nonce}`.
+2. Google sign-in with `nonce = b64url_nopad(SHA-256("grouper-relay-v1:" + nonce))`.
+3. `POST /relay/v1/sign-in` `{id_token, relay_nonce: nonce, client: "app"}` → `{relay_token,
+   expires}`; store it with the hub token (Keychain / DPAPI / credentials file).
+4. Every request to the hub address carries `Grouper-Relay: <relay_token>`, WebSocket
+   handshakes included. A `401` whose JSON has `"relay": true` (or a `503` with `"relay": true`:
+   hub offline) is about the relay, not the hub: on 401 redo steps 1–3, on 503 show "your hub
+   is offline".
+5. Then the hub's own sign-in as before (`/v1/auth/google/nonce`, `/v1/auth/google`). A hub nonce
+   is sent to Google verbatim **only if it matches `^[0-9a-f]{32}$`**; anything else is refused
+   (so a hub can never get a token usable at the relay).
+
+Addresses that aren't a relay (a LAN address, `localhost`, Tailscale) skip steps 1–4: a client
+treats an address as a relay when `GET /relay/v1/me` answers JSON with a `signed_in` field.
+
+**Linking a hub** (owner, once): `POST /v1/relay/nonce` on the hub → Google sign-in with the hashed
+nonce → `POST /v1/relay/link` `{id_token, relay_nonce}`. Offered in the Windows app's tray menu
+("Turn on phone and web access") using its desktop Google client, and in the web app's Settings →
+Remote access. The hub's default relay URL is `https://grouper.clockmillbarn.uk`.
