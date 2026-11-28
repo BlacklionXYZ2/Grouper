@@ -768,7 +768,7 @@ fn wanted(hub: &Hub) -> Wanted {
         Err(error) => return Wanted::Failed(format!("{error:#}")),
     };
     let Some(url) = hub.db.relay_url() else { return Wanted::Off };
-    Wanted::Run(Plan { url, secret, hub_id: hub.db.hub_device_id() })
+    Wanted::Run(Plan { url, secret, hub_id: hub.db.hub_id() })
 }
 
 enum Exit {
@@ -1152,7 +1152,7 @@ async fn post_link(State(hub): State<Arc<Hub>>, headers: HeaderMap, Json(body): 
     if let Err((status, message)) = crate::google_auth::verify_owner_token(&hub, &body.id_token).await {
         return err(status, message);
     }
-    let claim = json!({"hub_id": hub.db.hub_device_id(), "id_token": body.id_token});
+    let claim = json!({"hub_id": hub.db.hub_id(), "id_token": body.id_token});
     let resp = match relay_http().post(format!("{url}/relay/v1/hubs/claim")).json(&claim).send().await {
         Ok(r) => r,
         Err(e) => return relay_unavailable("link this hub", e),
@@ -1440,7 +1440,7 @@ mod tests {
                 tokio::time::timeout(WAIT, self.conns.recv()).await.expect("the hub to connect").expect("fake relay running");
             let hello = conn.recv().await;
             assert_eq!(hello["t"], "hello");
-            assert_eq!(hello["hub_id"], hub.db.hub_device_id());
+            assert_eq!(hello["hub_id"], hub.db.hub_id());
             assert_eq!(hello["version"], env!("CARGO_PKG_VERSION"));
             conn
         }
@@ -1692,7 +1692,7 @@ mod tests {
         {
             let attempts = f.relay.shared.attempts.lock().unwrap();
             assert_eq!(attempts[0].0, format!("Bearer {SECRET}"));
-            assert_eq!(attempts[0].1, f.hub.db.hub_device_id());
+            assert_eq!(attempts[0].1, f.hub.db.hub_id());
         }
         // The hub pings on its own, and answers the relay's pings.
         tokio::time::timeout(WAIT, async {
@@ -2259,7 +2259,7 @@ mod tests {
         {
             let claims = f.relay.shared.claims.lock().unwrap();
             let claim = claims.last().unwrap();
-            assert_eq!(claim["hub_id"], f.hub.db.hub_device_id());
+            assert_eq!(claim["hub_id"], f.hub.db.hub_id());
             assert_eq!(claim["id_token"], owner_token);
             assert_eq!(claim.as_object().unwrap().len(), 2);
         }
