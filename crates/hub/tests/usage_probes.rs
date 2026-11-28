@@ -90,6 +90,7 @@ async fn usage_probe_tool_is_unlisted_and_snapshots_persist_when_device_goes_off
         folders: vec![],
         usage_probes: false,
         usage_probe_providers: None,
+        relay_token: None,
     };
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let client = tokio::spawn(core_client::run(config, Arc::new(NoTools), Arc::new(Quiet), stopped));

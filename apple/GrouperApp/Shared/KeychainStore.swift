@@ -10,6 +10,8 @@ enum GrouperSecret: String, Sendable {
     /// This app install's random id (`InstallID`), not secret. Kept across sign-outs; only
     /// removing the app should lose it (and the Keychain may outlive even that).
     case installId = "grouper.install.id"
+    /// The relay sign-in token for the hub address in `AppModel.relayHubKey` (docs/relay-design.md).
+    case relay = "grouper.relay"
 }
 
 /// This app install's `install_id` (docs/accounts-design.md, "Contract"): made on first use,

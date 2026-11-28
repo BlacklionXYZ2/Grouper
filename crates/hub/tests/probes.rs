@@ -252,6 +252,7 @@ async fn probes_work_through_a_device_hosted_provider_and_report_offline() {
             folders: Vec::new(),
             usage_probes: false,
             usage_probe_providers: None,
+            relay_token: None,
         },
         Arc::new(NoTools),
         Arc::new(Quiet),

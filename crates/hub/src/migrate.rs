@@ -2174,6 +2174,7 @@ mod tests {
             folders: vec![],
             usage_probes: false,
             usage_probe_providers: None,
+            relay_token: None,
         };
         let target_host_info = NodeHostInfo {
             can_host: true,
@@ -2388,6 +2389,7 @@ mod tests {
                 folders: vec![],
                 usage_probes: false,
                 usage_probe_providers: None,
+                relay_token: None,
             };
             let host_info = NodeHostInfo {
                 can_host: true,
@@ -2542,6 +2544,7 @@ mod tests {
             folders: vec![],
             usage_probes: false,
             usage_probe_providers: None,
+            relay_token: None,
         };
         let host_info = NodeHostInfo {
             can_host: true,
@@ -2668,6 +2671,7 @@ mod tests {
             folders: vec![],
             usage_probes: false,
             usage_probe_providers: None,
+            relay_token: None,
         };
         let host_info = NodeHostInfo {
             can_host: true,
@@ -3039,6 +3043,7 @@ mod tests {
             folders: vec![],
             usage_probes: false,
             usage_probe_providers: None,
+            relay_token: None,
         };
         let host_info = NodeHostInfo {
             can_host: true,

@@ -11,6 +11,10 @@ public enum HubClientError: Error, Equatable, Sendable, LocalizedError {
     case conflict(String)
     case badRequest(String)
     case server(status: Int, message: String)
+    /// The relay (not the hub) refused: its sign-in is missing or expired. Sign in to the relay again.
+    case relayUnauthorized(String)
+    /// The relay is up but the hub behind it isn't connected ("Your hub is offline").
+    case hubOffline(String)
     case transport(String)
     case decoding(String)
 
@@ -18,6 +22,8 @@ public enum HubClientError: Error, Equatable, Sendable, LocalizedError {
         switch self {
         case .invalidBaseURL: return "The hub URL is invalid."
         case .unauthorized(let m), .forbidden(let m), .notFound(let m), .conflict(let m), .badRequest(let m): return m
+        case .relayUnauthorized: return "Your sign-in to the Grouper relay expired. Sign in again."
+        case .hubOffline: return "Your hub is offline. Check that Grouper is running on the computer that hosts it."
         case .server(let status, let message): return "Hub error \(status): \(message)"
         case .transport(let message): return message
         case .decoding(let message): return "The hub returned an unexpected response: \(message)"
@@ -47,32 +53,36 @@ public struct ModelImportRequest: Codable, Equatable, Sendable {
 public actor HubClient {
     public nonisolated let baseURL: URL
     private nonisolated let token: String
+    /// Sent as `Grouper-Relay` on every request (and the event stream's handshake) when the
+    /// hub address is a relay. Nil for a plain hub.
+    public nonisolated let relayToken: String?
     private let session: URLSession
     private let encoder = JSONEncoder.grouper
     private let decoder = JSONDecoder.grouper
 
-    public init(baseURL: URL, token: String, session: URLSession = .shared) throws {
+    public init(baseURL: URL, token: String, relayToken: String? = nil, session: URLSession = .shared) throws {
         guard let scheme = baseURL.scheme?.lowercased(), scheme == "http" || scheme == "https", baseURL.host != nil else {
             throw HubClientError.invalidBaseURL
         }
         self.baseURL = baseURL
         self.token = token
+        self.relayToken = relayToken.flatMap { $0.isEmpty ? nil : $0 }
         self.session = session
     }
 
-    public init(baseURL: String, token: String, session: URLSession = .shared) throws {
+    public init(baseURL: String, token: String, relayToken: String? = nil, session: URLSession = .shared) throws {
         guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else { throw HubClientError.invalidBaseURL }
-        try self.init(baseURL: url, token: token, session: session)
+        try self.init(baseURL: url, token: token, relayToken: relayToken, session: session)
     }
 
     /// A client with no token, for the calls a signed-out app makes (`authStatus`,
     /// `googleNonce`, `signInWithGoogle`). Authenticated calls on it get 401.
-    public init(baseURL: String, session: URLSession = .shared) throws {
-        try self.init(baseURL: baseURL, token: "", session: session)
+    public init(baseURL: String, relayToken: String? = nil, session: URLSession = .shared) throws {
+        try self.init(baseURL: baseURL, token: "", relayToken: relayToken, session: session)
     }
 
     public nonisolated func eventStream(conversationId: String? = nil) -> EventStream {
-        EventStream(baseURL: baseURL, token: token, conversationId: conversationId)
+        EventStream(baseURL: baseURL, token: token, conversationId: conversationId, relayToken: relayToken)
     }
 
     public func health() async throws {
@@ -239,8 +249,14 @@ public actor HubClient {
     public func authStatus() async throws -> AuthStatus { try await get(["v1", "auth", "status"], authenticated: false) }
 
     /// `POST /v1/auth/google/nonce` (no token): a one-time nonce to put in the Google request.
+    /// A nonce that isn't 32 lowercase hex characters is refused: the app never sends anything
+    /// else to Google as a hub nonce, so a hub can't pass off a relay nonce as its own.
     public func googleNonce() async throws -> GoogleNonce {
-        try await send(["v1", "auth", "google", "nonce"], method: "POST", body: EmptyRequest(), authenticated: false)
+        let nonce: GoogleNonce = try await send(["v1", "auth", "google", "nonce"], method: "POST", body: EmptyRequest(), authenticated: false)
+        guard RelayNonce.isHubNonce(nonce.nonce) else {
+            throw HubClientError.badRequest("The hub sent a sign-in nonce this app won't use.")
+        }
+        return nonce
     }
 
     /// `POST /v1/auth/google` (no token): trades a Google ID token (with this hub's nonce) for a
@@ -319,6 +335,8 @@ public actor HubClient {
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if authenticated, !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        // Every call to a relay address carries the relay token, signed-out calls included.
+        if let relayToken { request.setValue(relayToken, forHTTPHeaderField: RelayHeader.name) }
         if let body { request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         let data: Data
         let response: URLResponse
@@ -330,19 +348,10 @@ public actor HubClient {
     }
 
     private func error(status: Int, data: Data) -> HubClientError {
-        let message = (try? decoder.decode(ErrorEnvelope.self, from: data).error) ?? String(decoding: data, as: UTF8.self)
-        switch status {
-        case 400: return .badRequest(message)
-        case 401: return .unauthorized(message)
-        case 403: return .forbidden(message)
-        case 404: return .notFound(message)
-        case 409: return .conflict(message)
-        default: return .server(status: status, message: message)
-        }
+        HubClientError.map(status: status, data: data)
     }
 }
 
-private struct ErrorEnvelope: Codable { let error: String }
 private struct EmptyRequest: Codable {}
 private struct ChatRequest: Codable { let conversationId: String?; let mode: String?; let text: String; let model: String? }
 private struct ConversationModelRequest: Codable { let model: String? }

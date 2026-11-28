@@ -180,6 +180,9 @@ pub struct Config {
     /// Which providers to probe when `usage_probes` is on. `None`: every supported provider
     /// (Antigravity only if its CLI is installed here).
     pub usage_probe_providers: Option<Vec<String>>,
+    /// Relay token for a hub reached through the relay; sent as `Grouper-Relay` on the WebSocket
+    /// handshake. `None`: direct connection (LAN, localhost, Tailscale).
+    pub relay_token: Option<String>,
 }
 
 enum Outcome {
@@ -733,6 +736,30 @@ fn start_harness_turn(
     }
 }
 
+/// A relay's own refusal (`{"relay": true, ...}` with 401 or 503), in words. `None` for anything the
+/// hub itself said (a 401 from the hub means the device token is rejected).
+fn relay_refusal(status: u16, body: Option<&[u8]>) -> Option<String> {
+    if status != 401 && status != 503 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body?).ok()?;
+    if value.get("relay").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    Some(if status == 503 { "your hub is offline".to_string() } else { "relay sign-in needed".to_string() })
+}
+
+/// Headers every hub request carries: the device token, plus `Grouper-Relay` when the hub is
+/// reached through the relay. `Err` when a value can't be a header (the token is unusable).
+fn apply_auth_headers(headers: &mut tungstenite::http::HeaderMap, config: &Config) -> Result<(), ()> {
+    let bearer = format!("Bearer {}", config.token.trim()).parse().map_err(|_| ())?;
+    headers.insert("authorization", bearer);
+    if let Some(relay) = config.relay_token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        headers.insert("grouper-relay", relay.parse().map_err(|_| ())?);
+    }
+    Ok(())
+}
+
 async fn connect_once(
     url: &str,
     config: &Config,
@@ -746,14 +773,9 @@ async fn connect_once(
         Ok(r) => r,
         Err(e) => return Outcome::Retry(e.to_string()),
     };
-    match format!("Bearer {}", config.token.trim()).parse() {
-        Ok(v) => {
-            request.headers_mut().insert("authorization", v);
-        }
-        Err(_) => {
-            events.status(Status::Unauthorized);
-            return Outcome::Stop;
-        }
+    if apply_auth_headers(request.headers_mut(), config).is_err() {
+        events.status(Status::Unauthorized);
+        return Outcome::Stop;
     }
 
     let mut ws_config = tungstenite::protocol::WebSocketConfig::default();
@@ -761,9 +783,17 @@ async fn connect_once(
     ws_config.max_frame_size = Some(MAX_WS_MESSAGE_BYTES);
     let ws = match tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false).await {
         Ok((ws, _)) => ws,
-        Err(tungstenite::Error::Http(resp)) if resp.status() == 401 => {
-            events.status(Status::Unauthorized);
-            return Outcome::Stop;
+        Err(tungstenite::Error::Http(resp)) => {
+            if let Some(why) = relay_refusal(resp.status().as_u16(), resp.body().as_deref()) {
+                // The relay answered, not the hub: the device token isn't at fault. Keep retrying so
+                // the node comes back when the hub is back or the app hands it a new relay token.
+                return Outcome::Retry(why);
+            }
+            if resp.status() == 401 {
+                events.status(Status::Unauthorized);
+                return Outcome::Stop;
+            }
+            return Outcome::Retry(format!("HTTP {}", resp.status()));
         }
         Err(e) => return Outcome::Retry(e.to_string()),
     };
@@ -956,6 +986,53 @@ mod tests {
     use super::*;
     use core_protocol::Permission;
     use serde_json::json;
+
+    fn auth_config(relay_token: Option<&str>) -> Config {
+        Config {
+            hub_url: "https://hub.example.com".into(),
+            token: "dev.secret".into(),
+            capabilities: vec![],
+            workspace_root: None,
+            allow_shell: false,
+            mcp_config: None,
+            folders: vec![],
+            usage_probes: false,
+            usage_probe_providers: None,
+            relay_token: relay_token.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn relay_refusals_are_told_apart_from_the_hubs_own_401() {
+        let relay_401 = br#"{"error":"sign in","relay":true}"#;
+        let relay_503 = br#"{"error":"hub offline","relay":true}"#;
+        let hub_401 = br#"{"error":"bad token"}"#;
+        assert_eq!(relay_refusal(401, Some(relay_401)).as_deref(), Some("relay sign-in needed"));
+        assert_eq!(relay_refusal(503, Some(relay_503)).as_deref(), Some("your hub is offline"));
+        assert_eq!(relay_refusal(401, Some(hub_401)), None);
+        assert_eq!(relay_refusal(401, None), None);
+        assert_eq!(relay_refusal(500, Some(relay_503)), None);
+        assert_eq!(relay_refusal(503, Some(b"not json")), None);
+    }
+
+    #[test]
+    fn handshake_carries_relay_header_only_when_configured() {
+        let mut h = tungstenite::http::HeaderMap::new();
+        apply_auth_headers(&mut h, &auth_config(Some(" rt_abc "))).unwrap();
+        assert_eq!(h["authorization"], "Bearer dev.secret");
+        assert_eq!(h["grouper-relay"], "rt_abc");
+
+        let mut h = tungstenite::http::HeaderMap::new();
+        apply_auth_headers(&mut h, &auth_config(None)).unwrap();
+        assert!(h.get("grouper-relay").is_none());
+        let mut h = tungstenite::http::HeaderMap::new();
+        apply_auth_headers(&mut h, &auth_config(Some("  "))).unwrap();
+        assert!(h.get("grouper-relay").is_none());
+
+        let mut h = tungstenite::http::HeaderMap::new();
+        assert!(apply_auth_headers(&mut h, &auth_config(Some("bad
+value"))).is_err());
+    }
 
     #[test]
     fn detect_host_info_reports_desktop_capability_and_version() {

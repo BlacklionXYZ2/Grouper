@@ -154,6 +154,7 @@ async fn start_thread_without_a_device_picks_from_needs_and_past_results() {
                 folders,
                 usage_probes: false,
                 usage_probe_providers: None,
+                relay_token: None,
             };
             let (stop, stopped) = watch::channel(false);
             Client {
