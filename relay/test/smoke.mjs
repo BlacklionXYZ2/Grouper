@@ -85,7 +85,7 @@ function startRelay() {
     GOOGLE_AUTH_URL: `${GOOGLE}/auth`,
   };
   const args = [
-    "wrangler", "dev", "--local", "--ip", "127.0.0.1", "--port", String(PORT),
+    "wrangler", "dev", "--local", "--ip", "127.0.0.1", "--port", String(PORT), "--local-upstream", `127.0.0.1:${PORT}`,
     "--persist-to", `"${persist}"`, "--show-interactive-dev-session=false",
     ...Object.entries(vars).flatMap(([k, v]) => ["--var", `${k}:${v}`]),
   ];
@@ -184,17 +184,17 @@ class FakeHub {
     if (f.t === "ws_close") return void this.wsClosed.push(f);
     if (f.t !== "req") return;
     if (f.path.startsWith("/hang")) return;
-    if (f.path.startsWith("/evilcookie")) {
+    if (f.path.startsWith("/v1/evilcookie")) {
       this.send({ t: "res", id: f.id, status: 200, headers: [["set-cookie", "grouper_relay=evil; Path=/"], ["set-cookie", "grouper_relay_state=evil"], ["set-cookie", " Grouper_Relay=evil2"], ["set-cookie", "app=ok"]] });
       return this.send({ t: "end", id: f.id });
     }
-    if (f.path.startsWith("/slowstream")) {
+    if (f.path.startsWith("/v1/slowstream")) {
       this.send({ t: "res", id: f.id, status: 200, headers: [["content-type", "application/octet-stream"]] });
       this.send({ t: "data", id: f.id, b64: Buffer.from("first").toString("base64") });
       return; // never ends
     }
-    if (f.path.startsWith("/boom")) return this.send({ t: "err", id: f.id, message: "kaput" });
-    if (f.path.startsWith("/cut")) {
+    if (f.path.startsWith("/v1/boom")) return this.send({ t: "err", id: f.id, message: "kaput" });
+    if (f.path.startsWith("/v1/cut")) {
       this.send({ t: "res", id: f.id, status: 200, headers: [["content-type", "text/plain"]] });
       this.send({ t: "data", id: f.id, b64: Buffer.from("partial").toString("base64") });
       return this.send({ t: "err", id: f.id, message: "mid-stream" });
@@ -350,7 +350,7 @@ async function main() {
 
   const hdr = Object.fromEntries(ra.json.headers);
   check("x-forwarded-proto/for added", hdr["x-forwarded-proto"] === "http" && !!hdr["x-forwarded-for"]);
-  check("host is relay host", hdr.host === `127.0.0.1:${PORT}`);
+  check("host is relay host", hdr.host === `127.0.0.1:${PORT}`, hdr.host);
 
   const pr = await api("POST", "/v1/echo", {
     body: { hello: "world" },
@@ -370,15 +370,15 @@ async function main() {
   check("origin + authorization forwarded", ph.origin === "https://app.example" && ph.authorization === "Bearer app-token");
   check("no relay token in any forwarded value", !JSON.stringify(pr.json.headers).includes(tokA));
 
-  const cut = await fetch(`${BASE}/cut`, { headers: { "grouper-relay": tokA } });
+  const cut = await fetch(`${BASE}/v1/cut`, { headers: { "grouper-relay": tokA } });
   let cutErr = false;
   let cutText = "";
   try { cutText = await cut.text(); } catch (e) { cutErr = true; cutText = String(e); }
   check("err after res never ends as a clean 200 body", cutErr || cut.status !== 200, JSON.stringify(cutText));
-  const ec = await fetch(`${BASE}/evilcookie`, { headers: { "grouper-relay": tokA } });
+  const ec = await fetch(`${BASE}/v1/evilcookie`, { headers: { "grouper-relay": tokA } });
   const ecCookies = ec.headers.getSetCookie();
   check("hub Set-Cookie for relay cookies stripped, others kept", ecCookies.length === 1 && ecCookies[0] === "app=ok", JSON.stringify(ecCookies));
-  const boom = await api("GET", "/boom", { headers: { "grouper-relay": tokA } });
+  const boom = await api("GET", "/v1/boom", { headers: { "grouper-relay": tokA } });
   check("err before res is 502", boom.status === 502 && boom.json?.relay === true, boom.text);
 
   const ac = new AbortController();
@@ -393,8 +393,45 @@ async function main() {
   else console.log("  warn client abort not propagated by wrangler dev (cancel path unverified locally)");
 
   console.log("unauthenticated");
-  const html = await api("GET", "/", { headers: { accept: "text/html,application/xhtml+xml" } });
-  check("sign-in page for html GET", html.status === 200 && html.text.includes("Sign in with Google") && html.text.includes("/relay/auth/start"));
+  const HTML = { accept: "text/html,application/xhtml+xml" };
+  const html = await api("GET", "/relay/sign-in", { headers: HTML });
+  check("sign-in page", html.status === 200 && html.text.includes("Sign in with Google") && html.text.includes('href="/relay/auth/start"') && html.text.includes("/site/style.css"));
+  const htmlNext = await api("GET", "/relay/sign-in?next=%2Fapp%2Fchat%3Fx%3D1", { headers: HTML });
+  check("sign-in page carries a safe next", htmlNext.text.includes("/relay/auth/start?next=%2Fapp%2Fchat%3Fx%3D1"), htmlNext.text);
+  for (const evil of ["https://evil.example/", "//evil.example/x", "/\\evil.example", "javascript:alert(1)", "/app\r\nSet-Cookie: x=1"]) {
+    const r = await api("GET", "/relay/sign-in?next=" + encodeURIComponent(evil), { headers: HTML });
+    check(`sign-in page drops open-redirect next ${JSON.stringify(evil)}`, r.status === 200 && !r.text.includes("next=") && r.text.includes('href="/relay/auth/start"'), r.text);
+    const s = await api("GET", "/relay/auth/start?next=" + encodeURIComponent(evil));
+    const ck = s.headers.getSetCookie().find((c) => c.startsWith("grouper_relay_state=")) ?? "";
+    check(`auth/start drops open-redirect next ${JSON.stringify(evil)}`, s.status === 302 && !ck.includes("~"), ck);
+  }
+  check("hub path without session redirects html to sign-in", await (async () => {
+    const r = await api("GET", "/app", { headers: HTML });
+    return r.status === 302 && r.headers.get("location") === "/relay/sign-in?next=%2Fapp";
+  })());
+  check("deep hub path keeps its query in next", (await api("GET", "/app/x?y=1", { headers: HTML })).headers.get("location") === "/relay/sign-in?next=%2Fapp%2Fx%3Fy%3D1");
+  for (const p of ["/oauth/google/return", "/sw.js", "/favicon.ico", "/healthz"]) {
+    check(`${p} without session redirects html`, (await api("GET", p, { headers: HTML })).headers.get("location") === "/relay/sign-in?next=" + encodeURIComponent(p));
+  }
+  check("hub API without session is 401 JSON, not a redirect", (await api("GET", "/v1/hub", { headers: { accept: "application/json" } })).status === 401);
+  check("unknown /relay path is 404 JSON", (await api("GET", "/relay/nope")).status === 404);
+
+  console.log("website");
+  {
+    const home = await api("GET", "/", { headers: HTML });
+    check("/ is the website, no sign-in", home.status === 200 && home.text.includes("Open Grouper") && home.text.includes('href="/download"') && home.text.includes("github.com/BlacklionXYZ2/Grouper"), home.text.slice(0, 200));
+    const dl = await api("GET", "/download", { headers: HTML });
+    check("/download", dl.status === 200 && dl.text.includes("harness-latest"));
+    const pv = await api("GET", "/privacy", { headers: HTML });
+    check("/privacy", pv.status === 200 && pv.text.includes("What the relay sees"));
+    const css = await api("GET", "/site/style.css");
+    check("/site/style.css served as css", css.status === 200 && /text\/css/.test(css.headers.get("content-type") ?? ""));
+    check("/site/icon.svg", (await api("GET", "/site/icon.svg")).status === 200);
+    check("website works without Accept: text/html", (await api("GET", "/")).status === 200);
+    const nf = await api("GET", "/no-such-page", { headers: HTML });
+    check("unclaimed path is the site's 404 page", nf.status === 404 && nf.text.includes("Page not found"), `${nf.status} ${nf.text.slice(0, 100)}`);
+    check("website refuses POST", (await api("POST", "/privacy", { body: { a: 1 } })).status === 405);
+  }
   const noTok = await api("GET", "/v1/hub", { headers: { accept: "application/json" } });
   check("401 JSON without token", noTok.status === 401 && noTok.json?.relay === true && noTok.json.error === "sign in to the Grouper relay first");
   check("401 JSON for POST", (await api("POST", "/v1/x", { body: { a: 1 } })).status === 401);
@@ -405,7 +442,7 @@ async function main() {
   {
     const s = await api("GET", "/relay/auth/start");
     const loc = new URL(s.headers.get("location"));
-    check("auth/start redirects to Google", s.status === 302 && loc.origin === GOOGLE && loc.searchParams.get("response_type") === "id_token" && loc.searchParams.get("response_mode") === "form_post" && loc.searchParams.get("redirect_uri") === `${BASE}/relay/auth/return` && loc.searchParams.get("client_id") === CLIENT_ID);
+    check("auth/start redirects to Google", s.status === 302 && loc.origin === GOOGLE && loc.searchParams.get("response_type") === "id_token" && loc.searchParams.get("response_mode") === "form_post" && loc.searchParams.get("redirect_uri") === `${BASE}/oauth/google/return` && loc.searchParams.get("client_id") === CLIENT_ID, loc.toString());
     const claimNonce = loc.searchParams.get("nonce");
     const state = loc.searchParams.get("state");
     const stateSet = s.headers.getSetCookie().find((c) => c.startsWith("grouper_relay_state=")) ?? "";
@@ -431,12 +468,55 @@ async function main() {
     const sc = cks.find((c) => c.startsWith("grouper_relay=")) ?? "";
     check("auth/return clears the state cookie", cks.some((c) => c.startsWith("grouper_relay_state=;") && /Max-Age=0/.test(c)));
     check("state/nonce are single use", (await form(goodTok())).status === 401);
-    check("auth/return sets cookie and redirects to /", ok.status === 303 && ok.headers.get("location") === "/" && /grouper_relay=rt\./.test(sc) && /HttpOnly/i.test(sc) && /SameSite=Lax/i.test(sc) && /Path=\//.test(sc), sc);
+    check("auth/return sets cookie and redirects to /", ok.status === 303 && ok.headers.get("location") === "/app" && /grouper_relay=rt\./.test(sc) && /HttpOnly/i.test(sc) && /SameSite=Lax/i.test(sc) && /Path=\//.test(sc), sc);
     const cookie = sc.split(";")[0];
-    const viaCookie = await api("GET", "/", { headers: { cookie: `${cookie}; other=1`, accept: "text/html" } });
+    const viaCookie = await api("GET", "/app", { headers: { cookie: `${cookie}; other=1`, accept: "text/html" } });
     check("cookie reaches hub A, stripped", viaCookie.json?.hub === "A" && Object.fromEntries(viaCookie.json.headers).cookie === "other=1", viaCookie.text);
     const web = await api("POST", "/relay/v1/sign-in", { body: await signInBody({ ...A, nonce: await newNonce() }, "web") });
     check("web sign-in sets cookie, no token in body", web.status === 200 && !web.json.relay_token && /grouper_relay=/.test(web.headers.get("set-cookie") ?? ""));
+  }
+
+  console.log("browser flow: /oauth/google/return, next");
+  {
+    const start = async (next) => {
+      const s = await api("GET", "/relay/auth/start" + (next ? "?next=" + encodeURIComponent(next) : ""));
+      const loc = new URL(s.headers.get("location"));
+      const cookie = (s.headers.getSetCookie().find((c) => c.startsWith("grouper_relay_state=")) ?? "").split(";")[0];
+      const set = s.headers.getSetCookie().find((c) => c.startsWith("grouper_relay_state=")) ?? "";
+      const rn = cookie.slice(cookie.indexOf(".") + 1).split("~")[0];
+      return { state: loc.searchParams.get("state"), cookie, rn, set };
+    };
+    const post = (f, cookie, extra = {}) => fetch(`${BASE}/oauth/google/return`, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", ...(cookie ? { cookie } : {}) }, body: new URLSearchParams({ ...extra, ...f }) });
+    const a = await start("/app/threads?open=2");
+    check("state cookie has Path=/ so it reaches /oauth/google/return", /Path=\/;/.test(a.set), a.set);
+    const wrong = await post({ id_token: mint({ ...A, nonce: a.rn }), state: "nope" }, a.cookie);
+    check("return with a mismatched state isn't the relay's: forwarded, and with no session refused (401 JSON)", wrong.status === 401 && (await wrong.json()).relay === true);
+    const ok = await post({ id_token: mint({ ...A, nonce: a.rn }), state: a.state }, a.cookie);
+    const sc = ok.headers.getSetCookie().find((c) => c.startsWith("grouper_relay=")) ?? "";
+    check("POST /oauth/google/return with matching state signs in and redirects to next", ok.status === 303 && ok.headers.get("location") === "/app/threads?open=2" && /grouper_relay=rt\./.test(sc), `${ok.status} ${ok.headers.get("location")}`);
+    const replay = await post({ id_token: mint({ ...A, nonce: a.rn }), state: a.state }, a.cookie);
+    check("replaying it fails", replay.status !== 303);
+    const b = await start("/app");
+    const okB = await post({ id_token: mint({ ...A, nonce: b.rn }), state: b.state }, b.cookie);
+    check("default next is /app", okB.status === 303 && okB.headers.get("location") === "/app");
+    // Tampered next in the cookie is validated again.
+    const c = await start();
+    const evilCookie = c.cookie + "~" + Buffer.from("https://evil.example/").toString("base64url");
+    const okC = await post({ id_token: mint({ ...A, nonce: c.rn }), state: c.state }, evilCookie);
+    check("a tampered next in the cookie falls back to /app", okC.status === 303 && okC.headers.get("location") === "/app", okC.headers.get("location"));
+    // Without a relay state cookie the hub gets it, with the session.
+    const hubSide = await fetch(`${BASE}/oauth/google/return`, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", "grouper-relay": tokA }, body: new URLSearchParams({ id_token: "x", state: "hubstate" }) });
+    const hj = await hubSide.json().catch(() => null);
+    check("POST /oauth/google/return without relay state is forwarded to the hub", hj?.hub === "A" && hj.path === "/oauth/google/return", JSON.stringify(hj));
+    const hubSideAnon = await post({ id_token: "x", state: "hubstate" }, "");
+    check("…and with no session is refused (401)", hubSideAnon.status === 401);
+    // Forwarded hub requests never carry the relay state cookie.
+    const viaState = await api("GET", "/app", { headers: { "grouper-relay": tokA, cookie: "grouper_relay_state=abc.def; other=1", accept: "text/html" } });
+    check("relay state cookie is stripped before the hub", Object.fromEntries(viaState.json?.headers ?? []).cookie === "other=1", viaState.text);
+    // After sign-in the redirect target works with the cookie.
+    const hubPage = await api("GET", "/app/threads?open=2", { headers: { cookie: sc.split(";")[0], accept: "text/html" } });
+    check("the next path reaches the hub with the new cookie", hubPage.json?.hub === "A" && hubPage.json.path.startsWith("/app/threads"));
+    check("hub paths with a session are forwarded (/sw.js, /v1, /healthz)", (await Promise.all(["/sw.js", "/v1/x", "/healthz", "/favicon.ico"].map((p) => api("GET", p, { headers: { "grouper-relay": tokA } })))).every((r) => r.json?.hub === "A"));
   }
 
   console.log("client websocket");
@@ -466,7 +546,7 @@ async function main() {
   {
     const r = await api("GET", "/v1/x", { headers: { "grouper-relay": tokC, accept: "application/json" } });
     check("503 JSON for user with no hub", r.status === 503 && r.json?.relay === true && r.json.error === "your hub isn't connected to the relay", r.text);
-    const h = await api("GET", "/", { headers: { "grouper-relay": tokC, accept: "text/html" } });
+    const h = await api("GET", "/app", { headers: { "grouper-relay": tokC, accept: "text/html" } });
     check("503 page for html navigation", h.status === 503 && h.text.includes("<html"));
     let st = null;
     await clientWs("/v1/events", { "grouper-relay": tokC }).catch((e) => (st = e.status));
@@ -483,7 +563,7 @@ async function main() {
     check("sign-out needs a token", (await api("POST", "/relay/v1/sign-out", { body: {} })).status === 401);
     const wsLive = await clientWs("/v1/events", { "grouper-relay": t2 });
     const wsLiveClosed = closed(wsLive);
-    const streaming = await fetch(`${BASE}/slowstream`, { headers: { "grouper-relay": t2 } });
+    const streaming = await fetch(`${BASE}/v1/slowstream`, { headers: { "grouper-relay": t2 } });
     const reader = streaming.body.getReader();
     const firstChunk = await reader.read();
     check("streaming response started", !firstChunk.done);
