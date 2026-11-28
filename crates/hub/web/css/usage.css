@@ -1,0 +1,962 @@
+/* Usage page (usage-tab-spec 3-5, 8): two summary cards (API costs with a donut by key,
+   Subscriptions with a card per plan account), and the ten key colours.
+   Loaded after app.css. The older breakdown, limits and provider-report styles
+   (`.u-*`, `.limit-*`) stay in app.css; this file only holds what the summaries add.
+   Colours are tokens only: the ten key colours alias the family hues, so light, dark
+   and increased-contrast values come for free (usage-tab-spec 4.4). */
+
+/* ---- key colours: the solid step (3) of the hue ramp of the same name (app.css) */
+
+:root {
+  --key-teal: var(--hue-teal-solid);
+  --key-purple: var(--hue-purple-solid);
+  --key-orange: var(--hue-orange-solid);
+  --key-pink: var(--hue-pink-solid);
+  --key-blue: var(--hue-blue-solid);
+  --key-green: var(--hue-green-solid);
+  --key-amber: var(--hue-amber-solid);
+  --key-rose: var(--hue-rose-solid);
+  --key-indigo: var(--hue-indigo-solid);
+  --key-cyan: var(--hue-cyan-solid);
+}
+
+.key-c-teal { --key-c: var(--key-teal); }
+.key-c-purple { --key-c: var(--key-purple); }
+.key-c-orange { --key-c: var(--key-orange); }
+.key-c-pink { --key-c: var(--key-pink); }
+.key-c-blue { --key-c: var(--key-blue); }
+.key-c-green { --key-c: var(--key-green); }
+.key-c-amber { --key-c: var(--key-amber); }
+.key-c-rose { --key-c: var(--key-rose); }
+.key-c-indigo { --key-c: var(--key-indigo); }
+.key-c-cyan { --key-c: var(--key-cyan); }
+.key-c-unknown { --key-c: var(--fam-unknown); }
+
+/* A key's swatch: a 12px disc; an outline ring for a key with nothing in the donut. */
+.key-swatch {
+  display: inline-block;
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: var(--r-full);
+  background: var(--key-c, var(--fam-unknown));
+  border: 2px solid var(--key-c, var(--fam-unknown));
+  box-sizing: border-box;
+}
+
+.key-swatch.is-ring {
+  background: transparent;
+}
+
+/* The colour picker: ten swatches, each named in text. */
+.key-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+  gap: 6px;
+}
+
+.key-pick {
+  display: grid;
+  justify-items: center;
+  align-content: start;
+  gap: 4px;
+  min-height: 44px;
+  padding: 8px 6px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-control);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--type-caption-size);
+  cursor: pointer;
+}
+
+.key-pick:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.key-pick.is-selected {
+  border-color: var(--key-c);
+  box-shadow: inset 0 0 0 1px var(--key-c);
+}
+
+.key-pick:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.key-pick-disc {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-full);
+  background: var(--key-c);
+  color: var(--surface);
+}
+
+.key-pick-disc .icon {
+  width: 14px;
+  height: 14px;
+  stroke-width: 3;
+}
+
+.key-pick-name {
+  font-weight: 600;
+}
+
+.key-pick-used {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--type-micro-size);
+  color: var(--text-4);
+}
+
+/* Provider headers in Models and providers in Settings carry the swatch inline. */
+.provider-id .key-swatch,
+.row-title .key-swatch {
+  margin-right: 8px;
+  vertical-align: -1px;
+}
+
+/* ---- narrow phones: four tabs fit at 320px (each tile at least 72px) */
+
+@media (max-width: 360px) {
+  .tabbar {
+    left: 8px;
+    right: 8px;
+    gap: 2px;
+    padding: 4px;
+  }
+
+  .tab {
+    font-size: var(--type-micro-size);
+  }
+}
+
+/* ---- the page */
+
+.us-page {
+  container-type: inline-size;
+  container-name: usage;
+}
+
+.us-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+  margin: 0 0 20px;
+}
+
+/* Wide web and Mac: API costs left, Subscriptions right. Under 1100px they stack. */
+@container usage (min-width: 1100px) {
+  .us-cols:not(.us-cols-one) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px;
+  }
+}
+
+.us-cols-one {
+  max-width: 640px;
+}
+
+.us-card {
+  min-width: 0;
+  padding: 16px 18px 18px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
+  background: var(--surface);
+}
+
+.us-title {
+  /* Instrument-style eyebrow (design system 3.1): mono micro, uppercase. */
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--type-micro-size);
+  line-height: var(--type-micro-lh);
+  font-weight: 600;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.us-sub {
+  margin: 2px 0 14px;
+  font-size: var(--type-ui-size);
+  color: var(--text-3);
+}
+
+.us-body {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.us-body > * {
+  min-width: 0;
+}
+
+.us-body[aria-busy="true"] .us-donut,
+.us-body[aria-busy="true"] .us-plans {
+  opacity: 0.75;
+}
+
+.us-period-row {
+  display: flex;
+}
+
+.us-period {
+  flex: 1 1 auto;
+  max-width: 100%;
+}
+
+.us-period label {
+  flex: 1 1 0;
+  justify-content: center;
+  min-height: 36px;
+}
+
+/* ---- API costs: total and donut */
+
+.us-total {
+  display: grid;
+  gap: 2px;
+}
+
+.us-total-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+
+.us-total-v {
+  font-size: var(--type-display-size);
+  font-weight: 600;
+  letter-spacing: var(--type-display-track);
+  font-variant-numeric: tabular-nums;
+}
+
+.us-total-cap {
+  font-size: var(--type-ui-size);
+  color: var(--text-2);
+}
+
+.us-total-tok {
+  font-size: var(--type-ui-size);
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
+}
+
+.us-donut {
+  position: relative;
+  width: 180px;
+  height: 180px;
+  margin: 4px auto;
+}
+
+@container usage (min-width: 480px) {
+  .us-donut {
+    width: 200px;
+    height: 200px;
+  }
+}
+
+.us-ring {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.us-seg {
+  fill: var(--key-c, var(--fam-unknown));
+  stroke: var(--surface);
+  stroke-width: 2;
+  cursor: pointer;
+}
+
+/* A single paid key: a full ring with no gaps. */
+.us-seg-ring {
+  fill: none;
+  stroke: var(--key-c, var(--fam-unknown));
+}
+
+.us-ring-empty {
+  stroke: var(--line-2);
+}
+
+.us-ring.has-focus .us-seg:not(.is-focus) {
+  opacity: 0.35;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .us-seg {
+    transition: opacity var(--dur-fast) var(--ease-out);
+  }
+}
+
+.us-centre {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 0 38px;
+  text-align: center;
+  pointer-events: none;
+  min-width: 0;
+}
+
+.us-centre.is-focus {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.us-centre-top {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--type-caption-size);
+  color: var(--text-2);
+}
+
+.us-centre-v {
+  font-size: var(--type-title-size);
+  font-weight: 600;
+  letter-spacing: var(--type-title-track);
+  font-variant-numeric: tabular-nums;
+}
+
+.us-centre-low {
+  font-size: var(--type-ui-size);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.us-note {
+  margin: 0;
+  font-size: var(--type-ui-size);
+  color: var(--text-2);
+  text-align: center;
+}
+
+.us-warn {
+  margin: 0;
+  font-size: var(--type-ui-size);
+}
+
+.us-budget {
+  margin: 0;
+  padding: 8px 0 0;
+  border-top: 1px solid var(--line-1);
+  font-size: var(--type-ui-size);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- the key list (the legend) */
+
+.us-keys-h {
+  margin: 4px 0 4px;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.us-keylist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.us-key {
+  border-top: 1px solid var(--line-1);
+}
+
+.us-key:last-child {
+  border-bottom: 1px solid var(--line-1);
+}
+
+.us-key-btn {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto 16px;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 52px;
+  padding: 8px 4px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.us-key-btn:hover {
+  background: var(--surface-2);
+}
+
+.us-key-btn .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.us-key.is-open > .us-key-btn .icon {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .us-key-btn .icon {
+    transition: none;
+  }
+}
+
+.us-key-main {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.us-key-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  font-size: var(--type-body-size);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.us-badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.us-key-meta {
+  font-size: var(--type-caption-size);
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.us-key-fig {
+  display: grid;
+  justify-items: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.us-key-cost {
+  font-size: var(--type-body-size);
+  font-weight: 600;
+}
+
+.us-key-share {
+  font-size: var(--type-caption-size);
+  color: var(--text-3);
+}
+
+.us-key-panel {
+  display: grid;
+  gap: 12px;
+  padding: 4px 4px 16px 26px;
+}
+
+.us-key-panel[hidden] {
+  display: none;
+}
+
+.us-block h4 {
+  margin: 0 0 6px;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.us-block .hint {
+  margin: 0 0 8px;
+  font-size: var(--type-caption-size);
+  color: var(--text-3);
+}
+
+.us-empty-line,
+.us-totals {
+  margin: 0;
+  font-size: var(--type-ui-size);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.us-models {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.us-model-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  font-size: var(--type-ui-size);
+}
+
+.us-model-name {
+  flex: 1 1 8em;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 500;
+}
+
+.us-model-cost {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.us-model-tok {
+  margin: 1px 0 4px;
+  padding-left: 30px;
+  font-size: var(--type-caption-size);
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A model's share of its key's cost, in the key's colour (4px). */
+.us-bar {
+  height: 4px;
+  margin-left: 30px;
+  border-radius: 2px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.us-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--key-c, var(--fam-unknown));
+}
+
+.us-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.us-actions .btn {
+  min-height: 44px;
+}
+
+.us-actions .key-swatch {
+  margin-right: 2px;
+}
+
+.us-picker {
+  display: grid;
+  gap: 6px;
+}
+
+.us-picker .hint {
+  margin: 0;
+  font-size: var(--type-caption-size);
+  color: var(--text-3);
+}
+
+.us-free {
+  margin-top: 10px;
+}
+
+/* ---- subscriptions */
+
+.us-plans {
+  display: grid;
+  gap: 12px;
+}
+
+.us-plan {
+  container-type: inline-size;
+  padding: 14px 16px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
+  background: var(--surface-2);
+}
+
+.us-plan-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 4px 12px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+
+.us-plan-titles {
+  min-width: 0;
+}
+
+.us-plan h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: var(--type-body-size);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.us-plan-sub {
+  margin-top: 2px;
+  font-size: var(--type-caption-size);
+  color: var(--text-3);
+}
+
+.us-plan-age {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px 8px;
+  font-size: var(--type-caption-size);
+  color: var(--text-4);
+}
+
+.us-rows {
+  display: grid;
+  gap: 12px;
+}
+
+.us-group + .us-group,
+.us-rows + .us-group {
+  margin-top: 14px;
+}
+
+.us-group-h {
+  margin: 0 0 8px;
+  font-size: var(--type-caption-size);
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+/* One window: label, bar, value, reset time. Stacked in a narrow card, one line in a wide one. */
+.us-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "label val"
+    "bar bar"
+    "reset reset";
+  gap: 4px 12px;
+  align-items: baseline;
+  font-size: var(--type-ui-size);
+}
+
+.us-row-label {
+  grid-area: label;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.us-meter {
+  grid-area: bar;
+  align-self: center;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  overflow: hidden;
+}
+
+.us-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--fam, var(--accent));
+}
+
+.us-row.is-warn .us-meter-fill {
+  background: var(--warn);
+}
+
+.us-row.is-danger .us-meter-fill {
+  background: var(--danger);
+}
+
+/* The window reset since the reading: an empty, dashed bar. */
+.us-row.is-passed .us-meter {
+  background: transparent;
+  border: 1px dashed var(--text-3);
+}
+
+.us-row-val {
+  grid-area: val;
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 4px 8px;
+  text-align: right;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.us-state {
+  gap: 4px;
+}
+
+.us-row-reset {
+  grid-area: reset;
+  font-size: var(--type-caption-size);
+  color: var(--text-4);
+}
+
+.us-row-reset:empty {
+  display: none;
+}
+
+.us-row-amount {
+  grid-template-areas: "label val";
+}
+
+@container (min-width: 620px) {
+  .us-row {
+    grid-template-columns: 7.5em minmax(120px, 1fr) minmax(5.5em, auto) minmax(8em, auto);
+    grid-template-areas: "label bar val reset";
+    align-items: center;
+  }
+
+  .us-row-reset {
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  .us-row-amount {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "label val";
+  }
+}
+
+/* Stale: the last values are kept, bars at 60%. */
+.us-plan.is-stale .us-meter {
+  opacity: 0.6;
+}
+
+.us-notes {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.us-notes li {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: var(--type-caption-size);
+  color: var(--text-2);
+}
+
+.us-notes .icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  color: var(--warn);
+}
+
+.us-through {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-1);
+  font-size: var(--type-caption-size);
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.us-slims {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.us-slim {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-control);
+  background: var(--surface-2);
+  font-size: var(--type-ui-size);
+}
+
+.us-slim .icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--text-2);
+}
+
+.us-slim.warn .icon {
+  color: var(--warn);
+}
+
+.us-slim-how {
+  margin-top: 2px;
+  font-size: var(--type-caption-size);
+  color: var(--text-3);
+}
+
+/* ---- loading skeleton: a ring and three rows */
+
+.us-skel {
+  display: grid;
+  gap: 12px;
+  justify-items: center;
+}
+
+.us-skel > div:last-child {
+  width: 100%;
+}
+
+.us-skel-ring {
+  width: 180px;
+  height: 180px;
+  border-radius: var(--r-full);
+  border: 22px solid var(--surface-3);
+}
+
+/* ---- More list and the sources disclosure */
+
+.us-more-title {
+  margin: 0 0 8px;
+  font-size: var(--type-body-size);
+  font-weight: 600;
+}
+
+.us-about {
+  margin-top: 10px;
+  padding: 0;
+}
+
+.us-about summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 8px 16px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.us-about summary .icon {
+  width: 16px;
+  height: 16px;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.us-about[open] summary .icon {
+  transform: rotate(90deg);
+}
+
+.us-about dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 14px;
+  margin: 0;
+  padding: 4px 16px 16px;
+  font-size: var(--type-ui-size);
+  color: var(--text-2);
+}
+
+.us-about dd {
+  margin: 0;
+}
+
+@media (max-width: 760px) {
+  .us-about dl {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .us-about dd {
+    margin-bottom: 8px;
+  }
+
+  .us-card {
+    padding: 14px 14px 16px;
+  }
+}
+
+.us-chat-breakdown {
+  margin-top: 8px;
+}
+
+/* ---- increased contrast and forced colours */
+
+@media (prefers-contrast: more) {
+  .us-meter,
+  .us-bar {
+    outline: 1px solid var(--text-2);
+  }
+
+  .us-card,
+  .us-plan {
+    border-color: var(--border-strong);
+  }
+}
+
+@media (forced-colors: active) {
+  /* Segments are outlined in the system text colour; swatches keep a border. */
+  .us-seg {
+    stroke: CanvasText;
+    stroke-width: 1.5;
+    forced-color-adjust: none;
+  }
+
+  .us-seg-ring {
+    fill: none;
+  }
+
+  .us-ring-empty {
+    stroke: GrayText;
+  }
+
+  .us-meter,
+  .us-bar {
+    border: 1px solid CanvasText;
+    background: Canvas;
+  }
+
+  .us-meter-fill,
+  .us-bar-fill {
+    background: Highlight;
+    forced-color-adjust: none;
+  }
+
+  .key-swatch,
+  .key-pick-disc {
+    border: 2px solid CanvasText;
+    forced-color-adjust: none;
+  }
+
+  .us-card,
+  .us-plan,
+  .us-slim {
+    border-color: CanvasText;
+  }
+}

@@ -102,6 +102,7 @@ impl McpSession {
             let meta = peer.peer_info().and_then(|i| i.meta.as_ref().map(|m| m.0.clone()));
             let folders = reported_folders(meta.clone());
             let usage_probes = reported_usage_probes(meta.as_ref());
+            let usage_probe_providers = if usage_probes { reported_usage_probe_providers(meta.as_ref()) } else { Vec::new() };
             {
                 let Some(h) = hub.upgrade() else { return };
                 let mut live = h.live.lock().await;
@@ -110,6 +111,8 @@ impl McpSession {
                         l.mcp = Some(peer.clone());
                         l.usage_probes = usage_probes;
                         h.db.set_device_folders(&device_id, &folders);
+                        // Kept after the device disconnects, so an offline device still shows it.
+                        h.db.set_device_usage_probes(&device_id, usage_probes, &usage_probe_providers);
                     }
                     None => return,
                 }
@@ -149,6 +152,27 @@ pub(crate) fn reported_usage_probes(meta: Option<&serde_json::Map<String, Value>
         Some(Value::Bool(true)) => true,
         Some(Value::Array(items)) => !items.is_empty(),
         _ => false,
+    }
+}
+
+/// The probe providers a device advertised in `initialize` `_meta`: the names in its list (lower-cased,
+/// valid slugs only, no repeats, at most 16), or every provider this hub knows when it sent plain `true`.
+pub(crate) fn reported_usage_probe_providers(meta: Option<&serde_json::Map<String, Value>>) -> Vec<String> {
+    match meta.and_then(|m| m.get(USAGE_PROBES_META_KEY)) {
+        Some(Value::Bool(true)) => crate::usage::PROBE_PROVIDERS.iter().map(|p| p.to_string()).collect(),
+        Some(Value::Array(items)) => {
+            let mut out: Vec<String> = Vec::new();
+            for name in items.iter().filter_map(Value::as_str) {
+                let name = name.trim().to_ascii_lowercase();
+                let valid = (1..=32).contains(&name.len())
+                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+                if valid && !out.contains(&name) && out.len() < 16 {
+                    out.push(name);
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -249,6 +273,14 @@ mod tests {
         assert!(!reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: []})).as_ref()));
         assert!(reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: true})).as_ref()));
         assert!(reported_usage_probes(meta(json!({USAGE_PROBES_META_KEY: ["claude", "codex"]})).as_ref()));
+
+        // The advertised providers: sanitised, lower-cased, no repeats; `true` means every provider the hub knows.
+        let providers = |value: Value| reported_usage_probe_providers(meta(value).as_ref());
+        assert!(reported_usage_probe_providers(None).is_empty());
+        assert!(providers(json!({})).is_empty());
+        assert!(providers(json!({USAGE_PROBES_META_KEY: false})).is_empty());
+        assert_eq!(providers(json!({USAGE_PROBES_META_KEY: ["Claude", "grok", "claude", "bad name", "", 7, "antigravity"]})), ["claude", "grok", "antigravity"]);
+        assert_eq!(providers(json!({USAGE_PROBES_META_KEY: true})), ["claude", "codex", "grok", "antigravity"]);
     }
 
     #[test]

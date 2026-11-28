@@ -1,0 +1,97 @@
+/* Device sign-in (views/link.js, #/link) and the Devices owner line (views/devices.js).
+   Tokens and base classes (.card, .btn, .banner, .hint) live in app.css. */
+
+.link-card {
+  display: grid;
+  gap: 12px;
+}
+
+.link-card h2 {
+  margin: 0;
+  font-size: var(--type-heading-size);
+  line-height: var(--type-heading-lh);
+}
+
+.link-card p {
+  margin: 0;
+}
+
+.link-details {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-control);
+  overflow: hidden;
+}
+
+.link-row {
+  display: grid;
+  grid-template-columns: minmax(84px, 30%) 1fr;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.link-row + .link-row {
+  border-top: 1px solid var(--line-1);
+}
+
+.link-row dt {
+  color: var(--text-2);
+}
+
+.link-row dd {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* The code people compare with the device: large and spaced so it reads at a glance. */
+.link-code {
+  font-family: var(--mono);
+  font-size: var(--type-title-size);
+  font-weight: 600;
+  letter-spacing: 0.12em; /* code spacing, deliberate; not a type-step track */
+}
+
+.link-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.link-ok h2 {
+  color: var(--ok);
+}
+
+.link-denied h2,
+.link-error h2 {
+  color: var(--danger);
+}
+
+.devices-owner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.devices-owner strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.devices-owner > .icon {
+  flex: none;
+  color: var(--accent);
+}
+
+@media (max-width: 480px) {
+  .link-actions > .btn {
+    flex: 1 1 0;
+  }
+}

@@ -63,6 +63,7 @@ fn model() -> ModelEntry {
         roles: vec!["orchestrator".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     }
 }
 
@@ -152,6 +153,7 @@ async fn start_thread_without_a_device_picks_from_needs_and_past_results() {
                 mcp_config: Some(dir.join("mcp.json")),
                 folders,
                 usage_probes: false,
+                usage_probe_providers: None,
             };
             let (stop, stopped) = watch::channel(false);
             Client {

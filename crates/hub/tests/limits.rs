@@ -50,6 +50,7 @@ fn setup(tag: &str, script: Value, limits: Limits) -> (PathBuf, Arc<Hub>) {
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     })
     .unwrap();
     db.set_limits(&limits).unwrap();
@@ -257,10 +258,12 @@ async fn an_approval_timeout_denies_the_call_and_the_hub_thread_continues() {
 
     let events = hub.db.events(&conv, 0, None);
     let resolved = texts_of(&events, |b| match b {
-        EventBody::ApprovalResolved { approval_id, approved: false } => Some(approval_id.as_str()),
+        EventBody::ApprovalResolved { approval_id, approved: false, reason } if reason.as_deref() == Some("timeout") => {
+            Some(approval_id.as_str())
+        }
         _ => None,
     });
-    assert_eq!(resolved.len(), 1, "one denial, not a second resolution: {events:?}");
+    assert_eq!(resolved.len(), 1, "one timeout denial, not a second resolution: {events:?}");
     let notices = texts_of(&events, |b| match b {
         EventBody::ThreadActivity { event: AgentEvent::Notice { text } } => Some(text.as_str()),
         _ => None,
@@ -313,7 +316,13 @@ async fn an_approval_timeout_can_stop_the_thread() {
     });
     assert_eq!(notices, vec!["No answer within 1 second; stopping the thread."]);
     assert_eq!(
-        events.iter().filter(|e| matches!(e.body, EventBody::ApprovalResolved { approved: false, .. })).count(),
+        events
+            .iter()
+            .filter(|e| matches!(
+                &e.body,
+                EventBody::ApprovalResolved { approved: false, reason, .. } if reason.as_deref() == Some("timeout_stop")
+            ))
+            .count(),
         1
     );
     let outputs = texts_of(&events, |b| match b {

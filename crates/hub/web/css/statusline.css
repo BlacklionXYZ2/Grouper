@@ -1,0 +1,181 @@
+/* Desktop status line (design system 3.8). A 26px strip on --glass-solid along the
+   bottom of the main column: connection and devices on the left, up to four
+   subscription meters on the right. Shown only at 1100px and wider; views/statusline.js
+   hides it when the owner turned it off or no subscription is being read. */
+
+.statusline {
+  display: none;
+}
+
+@media (min-width: 1100px) {
+  /* The strip takes a second grid row under the main column only; the sidebar and the
+     inspector keep their full height. */
+  .shell.has-statusline {
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .shell.has-statusline > .sidebar,
+  .shell.has-statusline > .inspector {
+    grid-row: 1 / -1;
+  }
+
+  .shell.has-statusline > .main {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .statusline:not([hidden]) {
+    grid-column: 2;
+    grid-row: 2;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    height: 26px;
+    min-width: 0;
+    padding: 0 14px;
+    background: var(--glass-solid);
+    border-top: 1px solid var(--line-1);
+    font-family: var(--mono);
+    font-size: var(--type-micro-size);
+    line-height: var(--type-micro-lh);
+    color: var(--text-3);
+    overflow: hidden;
+  }
+}
+
+.sl-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.sl-conn::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: var(--r-full);
+  background: var(--warn);
+  vertical-align: 1px;
+}
+
+.sl-conn[data-online='true']::before {
+  background: var(--ok);
+}
+
+.sl-meters {
+  min-width: 0;
+}
+
+.sl-list {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sl-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  color: var(--text-3);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.sl-item:hover {
+  color: var(--text);
+}
+
+.sl-item:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+  border-radius: var(--r-chip);
+}
+
+.sl-item.is-stale {
+  opacity: 0.6;
+}
+
+/* 14px provider mark: the family's step-1 box, step-2 edge and a step-3 dot. */
+.sl-mark {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--fam-edge, var(--line-3));
+  border-radius: var(--r-chip);
+  background: var(--fam-bg, var(--surface-2));
+}
+
+.sl-mark::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--fam-solid, var(--text-3));
+}
+
+.sl-meter {
+  flex: none;
+  width: 32px;
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.sl-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-full);
+  background: var(--fam-solid, var(--text-3));
+}
+
+.sl-item.is-warn .sl-fill {
+  background: var(--warn);
+}
+
+.sl-item.is-danger .sl-fill {
+  background: var(--danger);
+}
+
+.sl-pct {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+.sl-item.is-warn .sl-pct {
+  color: var(--warn);
+}
+
+.sl-item.is-danger .sl-pct {
+  color: var(--danger);
+}
+
+.sl-reset {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-4);
+}
+
+@media (forced-colors: active) {
+  .statusline {
+    border-top: 1px solid CanvasText;
+  }
+
+  .sl-meter {
+    border: 1px solid CanvasText;
+  }
+
+  .sl-fill {
+    background: CanvasText;
+  }
+}

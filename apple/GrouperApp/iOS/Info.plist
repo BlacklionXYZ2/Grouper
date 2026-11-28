@@ -11,7 +11,16 @@
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>CFBundleURLTypes</key>
-    <array><dict><key>CFBundleURLName</key><string>uk.clockmillbarn.grouper</string><key>CFBundleURLSchemes</key><array><string>grouper</string></array></dict></array>
+    <array>
+        <dict><key>CFBundleURLName</key><string>uk.clockmillbarn.grouper</string><key>CFBundleURLSchemes</key><array><string>grouper</string></array></dict>
+        <!-- Google sign-in returns here: the reversed GrouperGoogleClientID, e.g.
+             com.googleusercontent.apps.1234-abcd for 1234-abcd.apps.googleusercontent.com. -->
+        <dict><key>CFBundleURLName</key><string>uk.clockmillbarn.grouper.google</string><key>CFBundleURLSchemes</key><array><string>com.googleusercontent.apps.998648431961-aeomun58v9i625ofsprfc5oroalv233t</string></array></dict>
+    </array>
+    <!-- Grouper's Google OAuth client ID for the iPhone app (an "iOS" client for bundle ID
+         uk.clockmillbarn.grouper.ios). A public identifier, not a secret. Empty hides
+         "Sign in with Google". -->
+    <key>GrouperGoogleClientID</key><string>998648431961-aeomun58v9i625ofsprfc5oroalv233t.apps.googleusercontent.com</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
     <key>NSSupportsLiveActivities</key><true/>
     <key>UILaunchScreen</key><dict/>

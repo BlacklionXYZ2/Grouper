@@ -18,7 +18,7 @@ use serde_json::Value;
 pub mod tunnel;
 
 /// Bumped on any breaking change to the frames below.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// WebSocket endpoint for devices, relative to the hub's base URL.
 pub const CONNECT_PATH: &str = "/v1/connect";
@@ -67,7 +67,9 @@ pub struct ToolSummary {
     pub description: String,
 }
 
-/// A registered device as the hub sees it.
+/// A device as the hub lists it: one machine, however many credentials (tokens) it holds.
+/// `id` is the credential threads run on (its node), and `aliases` are the machine's other
+/// credential ids, so any id the hub ever handed out still finds its machine.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DeviceInfo {
     pub id: String,
@@ -82,6 +84,25 @@ pub struct DeviceInfo {
     /// Scoped folders the device last reported (names and modes, never paths).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<FolderInfo>,
+    /// Whether the device's latest connection advertised opted-in subscription usage
+    /// probes. Kept after it disconnects, so an offline device still shows it.
+    #[serde(default)]
+    pub usage_probes: bool,
+    /// The probe providers (`claude`, `codex`, `grok`, `antigravity`) that connection
+    /// advertised. Empty when `usage_probes` is false.
+    #[serde(default)]
+    pub usage_probe_providers: Vec<String>,
+    /// Ids of the machine's other credentials (an app's sign-in next to its node). Left out when
+    /// the machine has just one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Whether any of the machine's credentials is an admin token.
+    #[serde(default)]
+    pub admin: bool,
+    /// Whether threads can run on the machine (it has a node credential). False for a phone
+    /// that only signs in. An older hub doesn't say, so this reads false there.
+    #[serde(default)]
+    pub runs_threads: bool,
 }
 
 /// What threads may do in a device's scoped folder.
@@ -158,13 +179,116 @@ pub struct WorkspaceListing {
     pub truncated: bool,
 }
 
+/// Host capability metadata reported by a node in [`NodeMessage::Hello`].
+/// Tells the hub whether this install can become the hub, its version, disk headroom,
+/// and whether `cloudflared` is installed.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct NodeHostInfo {
+    pub can_host: bool,
+    pub app_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    #[serde(default)]
+    pub cloudflared: bool,
+}
+
+/// Sign-in state of a CLI harness on a device, derived locally from credential file
+/// presence and expiry. Tokens and secret values never leave the device.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessSignIn {
+    SignedIn,
+    Expired,
+    NotSignedIn,
+}
+
+impl HarnessSignIn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SignedIn => "signed_in",
+            Self::Expired => "expired",
+            Self::NotSignedIn => "not_signed_in",
+        }
+    }
+
+    pub fn is_signed_in(self) -> bool {
+        matches!(self, Self::SignedIn)
+    }
+}
+
+/// Capabilities of an installed CLI harness on a device.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HarnessCapabilities {
+    /// Can act as a project-chat orchestrator via MCP (tool confinement + session resume).
+    #[serde(default)]
+    pub can_orchestrate: bool,
+    /// Supports resuming a continuous session across turns.
+    #[serde(default)]
+    pub supports_resume: bool,
+    /// Supports connecting to external MCP servers.
+    #[serde(default)]
+    pub supports_mcp: bool,
+}
+
+/// One model reported for an installed CLI harness.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HarnessModel {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Scan result for one CLI harness detected on a device.
+/// Contains CLI identifiers, sign-in state, capabilities and model IDs only — never tokens.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DetectedHarness {
+    /// Canonical harness slug (`claude-code`, `codex`, `antigravity`, `grok`, `hermes`, `pi`, `opencode`).
+    pub harness: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub sign_in: HarnessSignIn,
+    /// Command to run on the device to authenticate when `sign_in != SignedIn`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_command: Option<String>,
+    #[serde(default)]
+    pub capabilities: HarnessCapabilities,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<HarnessModel>,
+}
+
+/// Token counts reported by a CLI harness for one turn.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HarnessUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+}
+
+impl HarnessUsage {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
 /// Device → hub.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeMessage {
     /// Must be the first frame on a new connection. The device's tools are listed
     /// over MCP (`tools/list`) once the hub has welcomed it.
-    Hello { protocol_version: u32, client_version: String },
+    Hello {
+        protocol_version: u32,
+        client_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<NodeHostInfo>,
+    },
     /// One MCP JSON-RPC message from the device's MCP server to the hub's client.
     Mcp { message: Value },
     /// Ask the hub to relay a model call to the device named by the provider's
@@ -190,6 +314,9 @@ pub enum NodeMessage {
     ApprovalRequest { approval_id: String, thread_id: String, tool: String, input: Value, reason: String },
     /// A thread needs something from the orchestrator (often another device's data).
     AskOrchestrator { thread_id: String, question: String },
+    /// A harness thread's CLI session id, so a later message resumes the same session.
+    /// Older hubs ignore an unknown frame; the device also keeps the id until the thread ends.
+    ThreadHarnessSession { thread_id: String, session_id: String },
     /// Offline hand-over: acknowledgement for one [`HubMessage::WorkspaceFile`].
     WorkspaceFileResult {
         thread_id: String,
@@ -197,6 +324,37 @@ pub enum NodeMessage {
         ok: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    /// Hub move: progress or acknowledgement from the target node.
+    HubMoveStatus {
+        move_id: String,
+        /// `copying`, `ready`, `switched`, or `failed`.
+        stage: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress_pct: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// Optional direct URL where the new hub is reachable (for LAN/local confirmation).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_url: Option<String>,
+    },
+    /// CLI harnesses detected on this device, sent on connect and whenever the scan changes.
+    /// Carries CLI names, sign-in states, capabilities and model lists only; never tokens.
+    HarnessReport {
+        harnesses: Vec<DetectedHarness>,
+    },
+    /// A standard-chat harness turn completed on this device.
+    HarnessFinished {
+        conversation_id: String,
+        text: String,
+        session_id: String,
+        #[serde(default)]
+        usage: HarnessUsage,
+    },
+    /// A standard-chat harness turn failed on this device.
+    HarnessFailed {
+        conversation_id: String,
+        error: String,
     },
 }
 
@@ -252,6 +410,65 @@ pub enum HubMessage {
     /// away. Write it into that thread's workspace (`path` is workspace-relative, with
     /// `/`) before the thread's `StartThread`, which follows on the same connection.
     WorkspaceFile { thread_id: String, path: String, content_base64: String },
+    /// Hub move: offer a one-time ticket to the target node so it can download the
+    /// snapshot (`GET /v1/hub/move/{ticket}/snapshot`) and fetch encrypted secrets.
+    HubMoveOffer {
+        move_id: String,
+        ticket: String,
+        target_device_id: String,
+        current_epoch: u64,
+        snapshot_bytes: u64,
+        snapshot_sha256: String,
+    },
+    /// Hub move: tell the target node to commit the switch (`hub_device_id` -> target,
+    /// `epoch` -> `new_epoch`) while the old hub stops serving.
+    HubMoveCommit {
+        move_id: String,
+        ticket: String,
+        target_device_id: String,
+        new_epoch: u64,
+    },
+    /// Hub move: cancel an in-progress move so the target discards its staging folder.
+    HubMoveAbort {
+        move_id: String,
+        reason: String,
+    },
+    /// Run one turn of a CLI harness for a standard chat, or for a project chat whose
+    /// orchestrator is a confinable harness. `session_id` is `None` on the first harness
+    /// turn in a chat and `Some` on subsequent turns so the harness resumes its own
+    /// continuous session. `mcp`, `allowed_tools` and `system_prompt` are set only for
+    /// an orchestrator turn; older peers ignore them and frames without them still decode.
+    HarnessTurn {
+        conversation_id: String,
+        agent: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        message: String,
+        /// Loopback MCP endpoint the harness orchestrator must call. Absent for a standard chat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp: Option<HarnessMcp>,
+        /// Tool names the harness may use (`mcp__grouper__*`). Empty for a standard chat.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allowed_tools: Vec<String>,
+        /// Appended to the harness's own prompt for an orchestrator turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
+    },
+}
+
+/// Per-turn attachment that points a harness orchestrator at the hub's loopback MCP server.
+/// The bearer token is a secret: debug output redacts it, and callers must not log it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct HarnessMcp {
+    pub url: String,
+    pub bearer_token: String,
+}
+
+impl std::fmt::Debug for HarnessMcp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HarnessMcp").field("url", &self.url).field("bearer_token", &"[redacted]").finish()
+    }
 }
 
 /// A tool definition as models see it.
@@ -365,6 +582,21 @@ pub fn mcp_call_timeout(args: &Value) -> std::time::Duration {
     std::time::Duration::from_secs(secs + MCP_GRACE_SECS)
 }
 
+/// A thread that runs as a CLI harness session instead of the API agent loop.
+///
+/// Older hubs omit [`ThreadSpec::harness`]. Devices treat a missing field as an API thread.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HarnessThread {
+    /// Canonical harness slug (`claude-code`, `codex`, …).
+    pub agent: String,
+    /// The harness's own model name, not the registry id.
+    pub model: String,
+    /// CLI session to resume. Absent on the first start; set when the hub restarts
+    /// the thread from the session the device reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
 /// Everything a device needs to run a subagent thread.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ThreadSpec {
@@ -390,6 +622,10 @@ pub struct ThreadSpec {
     /// or unavailable. Empty for paid models. Older hubs don't send it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_models: Vec<String>,
+    /// When set, the device runs this CLI harness instead of the API agent loop.
+    /// Missing on a spec from an older hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessThread>,
 }
 
 /// How long `ask_orchestrator` waits when the account hasn't changed it.
@@ -460,7 +696,13 @@ pub enum EventBody {
     /// `skipped`, with reasons) and the thread continues there with `brief`.
     ThreadHandedOver { device_id: String, files: Vec<String>, skipped: Vec<String>, brief: String },
     ApprovalRequested { approval_id: String, device_id: String, tool: String, input: Value, reason: String },
-    ApprovalResolved { approval_id: String, approved: bool },
+    ApprovalResolved {
+        approval_id: String,
+        approved: bool,
+        /// Set when resolved without an owner click: `"timeout"`, `"timeout_stop"`, or `"dropped"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// The orchestrator finished a turn; it wakes again on the next message or thread result.
     TurnFinished { running_threads: u32 },
     Error { message: String },
@@ -473,6 +715,22 @@ pub enum EventBody {
         online: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device: Option<DeviceInfo>,
+    },
+    /// Hub move progress (live only, seq 0, never stored).
+    HubMoveProgress {
+        move_id: String,
+        /// `idle`, `preparing`, `copying`, `switching`, `done`, or `rolled_back`.
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_device_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress_pct: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 
@@ -585,6 +843,22 @@ pub struct ToolInfo {
     pub input_schema: Value,
 }
 
+fn default_model_kind() -> String {
+    "api".into()
+}
+
+fn default_model_source() -> String {
+    "manual".into()
+}
+
+fn default_price_source() -> String {
+    "manual".into()
+}
+
+fn default_model_tools() -> String {
+    "unknown".into()
+}
+
 /// A row of the model registry.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModelEntry {
@@ -622,6 +896,75 @@ pub struct ModelEntry {
     /// Empty until a catalog import sets them.
     #[serde(default)]
     pub modalities: Vec<String>,
+    /// Model kind: `"api"` (default) or `"harness"`.
+    #[serde(default = "default_model_kind")]
+    pub kind: String,
+    /// Hosting device id for harness models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// For harness models: whether the harness can orchestrate a project chat via MCP
+    /// (requires tool confinement and continuous session resume).
+    #[serde(default)]
+    pub can_orchestrate: bool,
+    /// How this row was registered: `"manual"` (default) or `"auto"`.
+    #[serde(default = "default_model_source")]
+    pub source: String,
+    /// Hidden models are skipped by role defaults, routing and pickers, while staying
+    /// in the table so past threads, usage and outcome stats still resolve them.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Why this row is hidden: `"gone"` (dropped from provider listings) or `"user"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_reason: Option<String>,
+    /// Unix seconds when a provider sync last saw this model, if ever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
+    /// Human-readable display name from the provider, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Where prices came from (`"manual"`, `"catalog"`, `"table"`, `"api"`, `"none"`, …).
+    #[serde(default = "default_price_source")]
+    pub price_source: String,
+    /// Tool-calling support: `"yes"`, `"no"`, or `"unknown"`.
+    #[serde(default = "default_model_tools")]
+    pub tools: String,
+}
+
+impl Default for ModelEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            provider_id: String::new(),
+            model: String::new(),
+            input_price: 0.0,
+            output_price: 0.0,
+            cache_read_price: None,
+            cache_write_price: None,
+            context_window: 0,
+            use_cases: String::new(),
+            free: false,
+            roles: Vec::new(),
+            local: false,
+            modalities: Vec::new(),
+            kind: default_model_kind(),
+            device_id: None,
+            can_orchestrate: false,
+            source: default_model_source(),
+            hidden: false,
+            hidden_reason: None,
+            last_seen: None,
+            display_name: None,
+            price_source: default_price_source(),
+            tools: default_model_tools(),
+        }
+    }
+}
+
+impl ModelEntry {
+    /// Whether this row represents a device-hosted CLI harness rather than an API model.
+    pub fn is_harness(&self) -> bool {
+        self.kind == "harness"
+    }
 }
 
 /// `POST /v1/models/import`. Pull one model from the provider's catalog.
@@ -721,6 +1064,13 @@ pub struct UsageSnapshot {
     pub provider: String,
     pub kind: String,
     pub window: String,
+    /// The provider's own name for a window's scope (Antigravity group, Grok product). Max 64 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Opaque fingerprint of the subscription account the reading came from (same account on two
+    /// devices -> same value). Hex of the first 16 bytes of SHA-256("grouper-sub-account:" + provider + ":" + stable account id). Never the raw id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_key: Option<String>,
     #[serde(default)]
     pub used_pct: Option<f64>,
     #[serde(default)]
@@ -873,12 +1223,24 @@ pub struct LimitsReport {
 }
 
 /// `GET /v1/hub`: who this hub is. Public; nothing private in it. `hub_id` is random,
-/// made once per hub database, so a client cache can tell two hubs apart.
+/// made once per hub database, so a client cache can tell two hubs apart. `account` is the
+/// Google owner's email (or `null` when unclaimed), `hub_device_id` names the device row
+/// currently acting as the hub, and `epoch` rises whenever `hub_device_id` changes.
+/// `key_sha256` carries the hex SHA-256 of the hub's identity key when one exists; no
+/// identity key exists yet (arrives with LAN TLS), so it is omitted.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct HubInfo {
     pub hub_id: String,
     pub hub_version: String,
     pub protocol_version: u32,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub hub_device_id: String,
+    #[serde(default)]
+    pub epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_sha256: Option<String>,
 }
 
 /// A provider as listed to clients (keys never leave the hub this way).
@@ -894,6 +1256,90 @@ pub struct ProviderInfo {
     /// Kind-specific non-secret options (API keys never leave the hub here).
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub options: Value,
+    /// Key colour, one of [`KEY_COLORS`]. Stored on the hub, never part of [`ProviderConfig`],
+    /// so a full provider `PUT` keeps it. Harness providers have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// The ten key colours, in the order auto-assignment takes them (`docs/usage-tab-spec.md` 4.4).
+pub const KEY_COLORS: [&str; 10] =
+    ["teal", "purple", "orange", "pink", "blue", "green", "amber", "rose", "indigo", "cyan"];
+
+/// The canonical (lower-case) key colour named by `name`, ignoring case and surrounding space.
+pub fn parse_key_color(name: &str) -> Option<&'static str> {
+    let name = name.trim();
+    KEY_COLORS.iter().copied().find(|color| color.eq_ignore_ascii_case(name))
+}
+
+/// Counts and cost for one slice of metered usage: [`UsageTotal`] without its key.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct UsageTotals {
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cost: f64,
+}
+
+/// One model used through a key in `GET /v1/usage/summary`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageSummaryModel {
+    /// The provider's model string as recorded with the call.
+    pub model: String,
+    /// Registry display name, else the model string.
+    pub name: String,
+    pub free: bool,
+    pub local: bool,
+    /// False when the registry entry has no price and is neither free nor local.
+    pub priced: bool,
+    pub totals: UsageTotals,
+}
+
+/// One API key (provider) in `GET /v1/usage/summary`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageSummaryKey {
+    pub provider: String,
+    /// Provider kind (`anthropic`, `openai`, …), or `unknown` for a removed provider.
+    pub kind: String,
+    /// Key colour name; `None` (JSON `null`) for a removed provider.
+    pub color: Option<String>,
+    pub local: bool,
+    pub removed: bool,
+    pub totals: UsageTotals,
+    pub models: Vec<UsageSummaryModel>,
+}
+
+/// Subscription-billed usage of one harness provider in `GET /v1/usage/summary`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageSummarySubscription {
+    /// Harness provider id, `<harness>@<device_id>`.
+    pub provider: String,
+    /// Probe provider name the readings use (`claude`, `codex`, `grok`, `antigravity`),
+    /// or the harness slug when it has no probe.
+    pub harness: String,
+    pub device_id: Option<String>,
+    pub totals: UsageTotals,
+}
+
+/// `GET /v1/usage/summary`: one call for the Usage tab's donut and key list.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UsageSummary {
+    pub since: u64,
+    pub until: u64,
+    /// Metered API usage only (`billing = 'api'`).
+    pub total: UsageTotals,
+    /// API calls in range whose model has no price set.
+    pub unpriced_calls: u64,
+    pub keys: Vec<UsageSummaryKey>,
+    pub subscriptions: Vec<UsageSummarySubscription>,
 }
 
 /// Body of `POST /v1/devices/{id}/call`.
@@ -1131,10 +1577,30 @@ mod tests {
 
     #[test]
     fn frames_round_trip() {
-        let m = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "0.1.0".into() };
+        let m = NodeMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "0.1.0".into(),
+            host: Some(NodeHostInfo {
+                can_host: true,
+                app_version: "0.1.0".into(),
+                free_bytes: Some(1_000_000),
+                cloudflared: true,
+            }),
+        };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""type":"hello""#));
+        assert!(s.contains(r#""can_host":true"#));
         assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), m);
+        // Legacy hello without host field still deserializes cleanly.
+        let legacy: NodeMessage = serde_json::from_str(
+            r#"{"type":"hello","protocol_version":7,"client_version":"0.1.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(
+            legacy,
+            NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "0.1.0".into(), host: None }
+        );
 
         let rpc = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let h = HubMessage::Mcp { message: rpc.clone() };
@@ -1153,6 +1619,91 @@ mod tests {
         let s = serde_json::to_string(&ack).unwrap();
         assert!(s.contains(r#""type":"workspace_file_result""#), "{s}");
         assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), ack);
+
+        let hr = NodeMessage::HarnessReport {
+            harnesses: vec![DetectedHarness {
+                harness: "claude-code".into(),
+                display_name: "Claude Code".into(),
+                version: Some("1.0.0".into()),
+                sign_in: HarnessSignIn::SignedIn,
+                login_command: None,
+                capabilities: HarnessCapabilities {
+                    can_orchestrate: true,
+                    supports_resume: true,
+                    supports_mcp: true,
+                },
+                models: vec![HarnessModel { id: "opus".into(), display_name: Some("Claude Opus".into()) }],
+            }],
+        };
+        let s = serde_json::to_string(&hr).unwrap();
+        assert!(s.contains(r#""type":"harness_report""#), "{s}");
+        assert!(s.contains(r#""sign_in":"signed_in""#), "{s}");
+        assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), hr);
+
+        let ht_first = HubMessage::HarnessTurn {
+            conversation_id: "c1".into(),
+            agent: "claude-code".into(),
+            model: "sonnet".into(),
+            session_id: None,
+            message: "hello".into(),
+            mcp: None,
+            allowed_tools: Vec::new(),
+            system_prompt: None,
+        };
+        let s = serde_json::to_string(&ht_first).unwrap();
+        assert!(s.contains(r#""type":"harness_turn""#), "{s}");
+        assert!(!s.contains("session_id"), "{s}");
+        assert!(!s.contains("mcp"), "{s}");
+        assert!(!s.contains("allowed_tools"), "{s}");
+        assert!(!s.contains("system_prompt"), "{s}");
+        assert_eq!(serde_json::from_str::<HubMessage>(&s).unwrap(), ht_first);
+
+        // Protocol v7 frames from before the orchestrator fields still decode.
+        let legacy = r#"{"type":"harness_turn","conversation_id":"c1","agent":"claude-code","model":"sonnet","message":"hello"}"#;
+        assert_eq!(serde_json::from_str::<HubMessage>(legacy).unwrap(), ht_first);
+
+        let ht_resume = HubMessage::HarnessTurn {
+            conversation_id: "c1".into(),
+            agent: "claude-code".into(),
+            model: "sonnet".into(),
+            session_id: Some("sess-42".into()),
+            message: "follow up".into(),
+            mcp: Some(HarnessMcp { url: "http://127.0.0.1:9/mcp/orchestrator".into(), bearer_token: "tok-test".into() }),
+            allowed_tools: vec!["mcp__grouper__*".into()],
+            system_prompt: Some("You are the orchestrator.".into()),
+        };
+        let s = serde_json::to_string(&ht_resume).unwrap();
+        assert!(s.contains(r#""session_id":"sess-42""#), "{s}");
+        assert!(s.contains(r#""url":"http://127.0.0.1:9/mcp/orchestrator""#), "{s}");
+        assert!(s.contains("mcp__grouper__*"), "{s}");
+        assert!(s.contains("You are the orchestrator."), "{s}");
+        assert_eq!(serde_json::from_str::<HubMessage>(&s).unwrap(), ht_resume);
+        let dbg = format!("{ht_resume:?}");
+        assert!(dbg.contains("[redacted]"), "{dbg}");
+        assert!(!dbg.contains("tok-test"), "{dbg}");
+
+        let hf = NodeMessage::HarnessFinished {
+            conversation_id: "c1".into(),
+            text: "hi there".into(),
+            session_id: "sess-42".into(),
+            usage: HarnessUsage {
+                input_tokens: 12,
+                output_tokens: 8,
+                cache_read_tokens: 4,
+                cache_write_tokens: 0,
+            },
+        };
+        let s = serde_json::to_string(&hf).unwrap();
+        assert!(s.contains(r#""type":"harness_finished""#), "{s}");
+        assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), hf);
+
+        let hfail = NodeMessage::HarnessFailed {
+            conversation_id: "c1".into(),
+            error: "cli exited 1".into(),
+        };
+        let s = serde_json::to_string(&hfail).unwrap();
+        assert!(s.contains(r#""type":"harness_failed""#), "{s}");
+        assert_eq!(serde_json::from_str::<NodeMessage>(&s).unwrap(), hfail);
     }
 
     #[test]
@@ -1206,6 +1757,8 @@ mod tests {
         .unwrap();
         assert!(d.folders.is_empty());
         assert!(!serde_json::to_string(&d).unwrap().contains("folders"));
+        assert!(d.aliases.is_empty() && !d.admin && !d.runs_threads);
+        assert!(!serde_json::to_string(&d).unwrap().contains("aliases"));
     }
 
     #[test]
@@ -1262,6 +1815,27 @@ mod tests {
             "system": "", "brief": "b", "permissions": {}, "max_turns": 4, "ask_timeout_secs": 12
         });
         assert_eq!(serde_json::from_value::<ThreadSpec>(custom).unwrap().ask_timeout_secs, Some(12));
+        assert!(spec.harness.is_none(), "an older spec without harness stays an API thread");
+        let with_harness = serde_json::json!({
+            "thread_id": "t", "conversation_id": "c", "title": "T", "provider_id": "p", "model": "m",
+            "system": "", "brief": "b", "permissions": {}, "max_turns": 4,
+            "harness": {"agent": "claude-code", "model": "sonnet"}
+        });
+        let parsed = serde_json::from_value::<ThreadSpec>(with_harness).unwrap();
+        assert_eq!(
+            parsed.harness,
+            Some(HarnessThread { agent: "claude-code".into(), model: "sonnet".into(), session: None })
+        );
+        let wire = serde_json::to_string(&parsed.harness).unwrap();
+        assert!(!wire.contains("session"), "{wire}");
+        let resumed = HarnessThread {
+            agent: "codex".into(),
+            model: "gpt-5.2".into(),
+            session: Some("thr_1".into()),
+        };
+        let resumed_wire = serde_json::to_string(&resumed).unwrap();
+        assert!(resumed_wire.contains(r#""session":"thr_1""#), "{resumed_wire}");
+        assert_eq!(serde_json::from_str::<HarnessThread>(&resumed_wire).unwrap(), resumed);
 
         let old = r#"{"type":"approval_result","approval_id":"a","approved":false}"#;
         assert_eq!(
@@ -1307,6 +1881,11 @@ mod tests {
                 }],
                 last_seen: Some(123),
                 folders: vec![],
+                usage_probes: false,
+                usage_probe_providers: vec![],
+                aliases: vec![],
+                admin: false,
+                runs_threads: true,
             }],
         };
         let value = serde_json::to_value(&msg).unwrap();
@@ -1322,5 +1901,32 @@ mod tests {
         .unwrap();
         assert!(info.available);
         assert_eq!(info.input_schema, default_input_schema());
+    }
+
+    #[test]
+    fn hub_info_serializes_account_and_omits_missing_key_sha256() {
+        let unclaimed = HubInfo {
+            hub_id: "h1".into(),
+            hub_version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            account: None,
+            hub_device_id: "d1".into(),
+            epoch: 1,
+            key_sha256: None,
+        };
+        let v = serde_json::to_value(&unclaimed).unwrap();
+        assert_eq!(v["account"], Value::Null);
+        assert_eq!(v["hub_device_id"], "d1");
+        assert_eq!(v["epoch"], 1);
+        assert!(v.get("key_sha256").is_none(), "missing identity key must be omitted: {v}");
+        assert_eq!(serde_json::from_value::<HubInfo>(v).unwrap(), unclaimed);
+
+        // Older hubs without the local-first fields still deserialize cleanly.
+        let legacy: HubInfo =
+            serde_json::from_str(r#"{"hub_id":"h0","hub_version":"0.1.0","protocol_version":6}"#).unwrap();
+        assert_eq!(legacy.account, None);
+        assert_eq!(legacy.hub_device_id, "");
+        assert_eq!(legacy.epoch, 0);
+        assert_eq!(legacy.key_sha256, None);
     }
 }

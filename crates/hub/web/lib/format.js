@@ -120,3 +120,17 @@ export function pretty(value) {
 export function plural(n, one, many = `${one}s`) {
   return `${n} ${n === 1 ? one : many}`;
 }
+
+/** 412K, 1.84M: three significant figures (the exact figure goes in a tooltip). */
+export function abbr(n) {
+  const v = Number(n) || 0;
+  const trim = (x) => String(Number(x.toPrecision(3)));
+  if (v >= 1e9) return `${trim(v / 1e9)}B`;
+  if (v >= 1e6) return `${trim(v / 1e6)}M`;
+  if (v >= 1e3) return `${trim(v / 1e3)}K`;
+  return String(Math.round(v));
+}
+
+/** Tokens in = input + cache read + cache write; tokens out = output (usage-tab-spec 4.3). */
+export const tokensIn = (r) => (r?.input_tokens || 0) + (r?.cache_read_tokens || 0) + (r?.cache_write_tokens || 0);
+export const tokensOut = (r) => r?.output_tokens || 0;

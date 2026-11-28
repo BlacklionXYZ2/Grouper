@@ -1,13 +1,307 @@
-//! Device selection hub glue: builds [`DeviceProfile`]s from live presence and the
-//! tool/folder registry, then delegates ranking and need matching to [`core_registry::devices`].
+//! Device selection hub glue and install-level hub-candidate listing:
+//! - Builds [`DeviceProfile`]s from live presence and the tool/folder registry, delegating
+//!   ranking and need matching to [`core_registry::devices`].
+//! - Groups active device rows by `install_id` and exposes `GET /v1/devices/installs` so
+//!   clients can show which installs are eligible to become the hub (section 4a of
+//!   `docs/local-first-design.md`).
 
-use core_protocol::{FILE_TOOLS, Permission};
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use core_protocol::{DeviceInfo, FILE_TOOLS, NodeHostInfo, Permission};
 pub use core_registry::devices::{DevicePick, DeviceSuggestion, RankedDevice};
 use core_registry::devices::{DeviceProfile, Need, lack_error, missing_needs, parse_needs, satisfied_tokens, suggest_from_conn};
+use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::registry::{By, stats_line};
-use crate::server::{HUB_DEVICE, Hub};
+use crate::server::{HUB_DEVICE, Hub, err};
+
+const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
+const HOST_META_PREFIX: &str = "device_host:";
+const HUB_SINCE_KEY: &str = "hub_since";
+
+/// One underlying device row inside an [`InstallDevice`] group.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InstallDeviceRow {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub admin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_kind: Option<String>,
+    pub online: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
+    pub is_hub: bool,
+}
+
+/// One install-level device entry returned by `GET /v1/devices/installs`.
+/// An app's admin client row and plain node row share an `install_id` and appear once.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InstallDevice {
+    /// Representative device id (the node row if present, else the hub row, else the first row).
+    pub device_id: String,
+    /// All non-revoked device row ids belonging to this install.
+    pub device_ids: Vec<String>,
+    /// All non-revoked device rows belonging to this install (admin UI row, node row, etc.).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<InstallDeviceRow>,
+    /// The node device id that accepts WebSocket connections and move tickets, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<String>,
+    pub name: String,
+    pub platform: String,
+    pub is_hub: bool,
+    pub online: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<NodeHostInfo>,
+    /// True when the platform can host (`macos`, `windows`, `linux`) and the node reported `can_host: true`
+    /// (or this install is the current hub).
+    pub eligible: bool,
+    /// True when this install can be picked as a hub-move target right now.
+    pub selectable: bool,
+    /// Machine-readable reason when `selectable` is `false`:
+    /// `current_hub`, `cannot_host`, `offline`, or `older_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Non-blocking advisories (e.g. missing `cloudflared` or low disk headroom).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Response payload for `GET /v1/devices/installs`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InstallDevicesResponse {
+    pub hub_device_id: String,
+    pub epoch: u64,
+    pub hub_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_since: Option<u64>,
+    pub estimated_snapshot_bytes: u64,
+    pub installs: Vec<InstallDevice>,
+}
+
+impl InstallDevicesResponse {
+    /// Installs eligible and ready to be offered as hub-move targets right now (never includes the hub's own install).
+    pub fn move_targets(&self) -> Vec<&InstallDevice> {
+        self.installs.iter().filter(|d| !d.is_hub && d.selectable).collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DeviceRow {
+    id: String,
+    name: String,
+    platform: String,
+    last_seen: Option<u64>,
+    admin: bool,
+    install_id: Option<String>,
+    install_kind: Option<String>,
+    /// Set by `grouper-hub device merge`: the device row this one is the same machine as.
+    merged_into: Option<String>,
+    created: u64,
+}
+
+/// Rows that are one machine, in the order each machine's first row was made: rows that share an
+/// `install_id` (an app's older `<id>-node` spelling counts as `<id>`) or that were joined by
+/// `grouper-hub device merge`. A merge pointing at a row that isn't in `rows` (revoked) joins nothing.
+fn group_machines(rows: Vec<DeviceRow>) -> Vec<Vec<DeviceRow>> {
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut parent: Vec<usize> = (0..rows.len()).collect();
+    let by_id: HashMap<&str, usize> = rows.iter().enumerate().map(|(i, r)| (r.id.as_str(), i)).collect();
+    let mut by_install: HashMap<&str, usize> = HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let mut join = |j: usize| {
+            let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+            if a != b {
+                parent[a.max(b)] = a.min(b);
+            }
+        };
+        if let Some(install) = row.install_id.as_deref() {
+            let canon = crate::db::canonical_install_id(install, row.install_kind.as_deref(), row.admin);
+            match by_install.get(canon) {
+                Some(&j) => join(j),
+                None => {
+                    by_install.insert(canon, i);
+                }
+            }
+        }
+        if let Some(&j) = row.merged_into.as_deref().and_then(|target| by_id.get(target)) {
+            join(j);
+        }
+    }
+    let mut groups: Vec<Vec<DeviceRow>> = Vec::new();
+    let mut slot: HashMap<usize, usize> = HashMap::new();
+    for (i, row) in rows.iter().cloned().enumerate() {
+        let r = root(&mut parent, i);
+        let at = *slot.entry(r).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[at].push(row);
+    }
+    groups
+}
+
+/// The live device rows that count as devices (a browser session's `web` row doesn't), oldest first.
+fn live_device_rows(db: &crate::db::Db) -> Vec<DeviceRow> {
+    let c = db.c();
+    let mut st = c
+        .prepare(
+            "SELECT id, name, platform, last_seen, admin, install_id, install_kind, merged_into, created
+             FROM devices WHERE revoked = 0 AND lower(platform) != 'web' ORDER BY created, rowid",
+        )
+        .unwrap();
+    st.query_map([], |r| {
+        Ok(DeviceRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            platform: r.get(2)?,
+            last_seen: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+            admin: r.get::<_, i64>(4)? != 0,
+            install_id: r.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
+            install_kind: r.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
+            merged_into: r.get::<_, Option<String>>(7)?.filter(|s| !s.is_empty()),
+            created: r.get::<_, i64>(8)? as u64,
+        })
+    })
+    .unwrap()
+    .filter_map(Result::ok)
+    .collect()
+}
+
+/// One machine as the Devices list shows it. The entry is the credential threads run on (a node
+/// before an app's admin sign-in, a connected one before an idle one) under the machine's own
+/// name, online when any credential is connected, with the other credentials' ids as `aliases`.
+fn machine_entry(mut members: Vec<(DeviceRow, DeviceInfo)>) -> DeviceInfo {
+    let rank = |m: &(DeviceRow, DeviceInfo)| {
+        (m.0.admin, !m.1.online, m.0.install_kind.as_deref() != Some(crate::db::NODE_INSTALL), std::cmp::Reverse(m.0.created))
+    };
+    let primary = (0..members.len()).min_by_key(|&i| rank(&members[i])).unwrap_or(0);
+    let admin = members.iter().any(|m| m.0.admin);
+    let runs_threads = members.iter().any(|m| !m.0.admin || !m.1.capabilities.is_empty());
+    let online = members.iter().any(|m| m.1.online);
+    let last_seen = members.iter().filter_map(|m| m.1.last_seen).max();
+    let platform = members.iter().map(|m| &m.1.platform).find(|p| is_host_platform(p)).cloned();
+    let (_, mut entry) = members.remove(primary);
+    let aliases = members.into_iter().map(|m| m.1.id).collect();
+    entry.name = crate::db::machine_name(&entry.name).to_string();
+    if let Some(platform) = platform {
+        entry.platform = platform;
+    }
+    entry.aliases = aliases;
+    entry.admin = admin;
+    entry.runs_threads = runs_threads;
+    entry.online = online;
+    entry.last_seen = last_seen;
+    entry
+}
+
+/// One machine in `grouper-hub device list`, with the credentials it holds.
+pub struct MachineSummary {
+    pub name: String,
+    pub platform: String,
+    pub credentials: Vec<CredentialSummary>,
+}
+
+/// One live device row (a token) of a [`MachineSummary`].
+pub struct CredentialSummary {
+    pub id: String,
+    pub name: String,
+    pub admin: bool,
+}
+
+/// The live devices grouped by machine, as the Devices list groups them (no browser sessions).
+pub fn list_machines(db: &crate::db::Db) -> Vec<MachineSummary> {
+    group_machines(live_device_rows(db))
+        .into_iter()
+        .map(|group| {
+            let lead = group.iter().find(|r| !r.admin).unwrap_or(&group[0]);
+            let platform = group.iter().map(|r| &r.platform).find(|p| is_host_platform(p)).unwrap_or(&lead.platform);
+            MachineSummary {
+                name: crate::db::machine_name(&lead.name).to_string(),
+                platform: platform.clone(),
+                credentials: group.iter().map(|r| CredentialSummary { id: r.id.clone(), name: r.name.clone(), admin: r.admin }).collect(),
+            }
+        })
+        .collect()
+}
+
+/// Platforms that can run the Grouper hub (`macos`, `windows`, `linux`).
+pub fn is_host_platform(platform: &str) -> bool {
+    matches!(platform.trim().to_ascii_lowercase().as_str(), "macos" | "windows" | "linux")
+}
+
+/// Compare two semver-like version strings (`major.minor.patch`, ignoring any `-pre`/`+build` suffix).
+pub(crate) fn compare_versions(left: &str, right: &str) -> Ordering {
+    fn parse(v: &str) -> (u64, u64, u64) {
+        let core = v.trim().trim_start_matches('v').split(['-', '+']).next().unwrap_or("");
+        let mut parts = core.split('.');
+        let major = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let minor = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let patch = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        (major, minor, patch)
+    }
+    parse(left).cmp(&parse(right))
+}
+
+/// Estimate the uncompressed size of `grouper.db` (plus WAL) and `workspaces/`.
+pub(crate) fn estimate_snapshot_bytes(data_dir: &std::path::Path) -> u64 {
+    fn dir_bytes(path: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_file() {
+                total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+            } else if ft.is_dir() {
+                total = total.saturating_add(dir_bytes(&entry.path()));
+            }
+        }
+        total
+    }
+    let mut bytes = 0u64;
+    for name in ["grouper.db", "grouper.db-wal"] {
+        if let Ok(meta) = std::fs::metadata(data_dir.join(name)) {
+            bytes = bytes.saturating_add(meta.len());
+        }
+    }
+    bytes.saturating_add(dir_bytes(&data_dir.join("workspaces")))
+}
+
+pub(crate) fn routes() -> Router<Arc<Hub>> {
+    Router::new().route("/v1/devices/installs", get(list_install_devices))
+}
+
+async fn list_install_devices(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+    if hub.auth(&headers).is_none() {
+        return err(StatusCode::UNAUTHORIZED, "invalid or missing device token");
+    }
+    Json(hub.install_devices().await).into_response()
+}
 
 impl Hub {
     pub(crate) async fn device_profiles(&self) -> Vec<DeviceProfile> {
@@ -130,6 +424,244 @@ impl Hub {
         }
         rows
     }
+
+    /// Record host capability metadata reported in a device's `NodeMessage::Hello` frame.
+    /// Cached in memory and persisted in `hub_meta` so offline installs remember whether they can host.
+    pub fn record_host_info(&self, device_id: &str, host: NodeHostInfo) {
+        if let Ok(json) = serde_json::to_string(&host) {
+            let key = format!("{HOST_META_PREFIX}{device_id}");
+            let _ = self.db.c().execute(
+                "INSERT OR REPLACE INTO hub_meta (key, value) VALUES (?1, ?2)",
+                params![key, json],
+            );
+        }
+        self.host_info.lock().unwrap_or_else(|e| e.into_inner()).insert(device_id.to_string(), host);
+    }
+
+    /// Last-known host metadata for `device_id` (memory cache first, then `hub_meta`).
+    pub fn host_info_for(&self, device_id: &str) -> Option<NodeHostInfo> {
+        if let Some(info) = self.host_info.lock().unwrap_or_else(|e| e.into_inner()).get(device_id).cloned() {
+            return Some(info);
+        }
+        let key = format!("{HOST_META_PREFIX}{device_id}");
+        let raw: Option<String> = self
+            .db
+            .c()
+            .query_row("SELECT value FROM hub_meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        let parsed: NodeHostInfo = serde_json::from_str(&raw?).ok()?;
+        self.host_info.lock().unwrap_or_else(|e| e.into_inner()).insert(device_id.to_string(), parsed.clone());
+        Some(parsed)
+    }
+
+    /// Record when the current device became the hub (`hub_since` in `hub_meta`).
+    pub(crate) fn record_hub_since(&self, ts: u64) {
+        let _ = self.db.c().execute(
+            "INSERT OR REPLACE INTO hub_meta (key, value) VALUES (?1, ?2)",
+            params![HUB_SINCE_KEY, ts.to_string()],
+        );
+    }
+
+    fn hub_since(&self, hub_device_created: Option<u64>) -> Option<u64> {
+        let stored: Option<u64> = self
+            .db
+            .c()
+            .query_row("SELECT value FROM hub_meta WHERE key = ?1", [HUB_SINCE_KEY], |r| r.get::<_, String>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok());
+        stored.or(hub_device_created)
+    }
+
+    /// The Devices list: the hub, then one entry per machine (see [`machine_entry`]). A person's
+    /// phone or Mac is one device however many credentials it holds; browser sessions aren't
+    /// devices. Routing, approvals and permissions still work per credential ([`Hub::devices`]).
+    pub async fn machines(&self) -> Vec<DeviceInfo> {
+        let mut infos: HashMap<String, DeviceInfo> = self.devices().await.into_iter().map(|d| (d.id.clone(), d)).collect();
+        let mut out: Vec<DeviceInfo> = infos.remove(HUB_DEVICE).into_iter().collect();
+        for group in group_machines(live_device_rows(&self.db)) {
+            let members: Vec<_> = group.into_iter().filter_map(|row| infos.remove(&row.id).map(|info| (row, info))).collect();
+            if !members.is_empty() {
+                out.push(machine_entry(members));
+            }
+        }
+        out
+    }
+
+    /// List devices grouped by install (`install_id`), reporting hub eligibility, online state,
+    /// version compatibility, and non-blocking advisories (`GET /v1/devices/installs`).
+    pub async fn install_devices(&self) -> InstallDevicesResponse {
+        let (hub_device_id, epoch) = self.db.ensure_hub_device().unwrap_or_else(|_| (String::new(), 1));
+        let estimated_snapshot_bytes = estimate_snapshot_bytes(&self.data_dir);
+        let rows = live_device_rows(&self.db);
+
+        let hub_device_created = rows.iter().find(|r| r.id == hub_device_id).map(|r| r.created);
+        let hub_since = self.hub_since(hub_device_created);
+
+        // One entry per machine: rows sharing a canonical install_id (an app's admin, node and hub
+        // rows, including the legacy `<install_id>-node` spelling) or joined by `device merge`.
+        let groups = group_machines(rows);
+
+        let live = self.live.lock().await;
+        let local_host = NodeHostInfo {
+            can_host: true,
+            app_version: HUB_VERSION.to_string(),
+            free_bytes: None,
+            cloudflared: crate::tunnel::find_cloudflared().is_some(),
+        };
+
+        let mut installs = Vec::with_capacity(groups.len());
+        for group in groups {
+            let is_hub = group.iter().any(|r| r.id == hub_device_id);
+            let install_id = group
+                .iter()
+                .find_map(|r| {
+                    let raw = r.install_id.as_deref()?;
+                    let canon = crate::db::canonical_install_id(raw, r.install_kind.as_deref(), r.admin);
+                    (raw == canon).then(|| raw.to_string())
+                })
+                .or_else(|| {
+                    group.iter().find_map(|r| {
+                        let raw = r.install_id.as_deref()?;
+                        Some(crate::db::canonical_install_id(raw, r.install_kind.as_deref(), r.admin).to_string())
+                    })
+                });
+            let device_ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
+            let install_rows: Vec<InstallDeviceRow> = group
+                .iter()
+                .map(|r| InstallDeviceRow {
+                    id: r.id.clone(),
+                    name: r.name.clone(),
+                    platform: r.platform.clone(),
+                    admin: r.admin,
+                    install_kind: r.install_kind.clone(),
+                    online: live.contains_key(&r.id),
+                    last_seen: r.last_seen,
+                    is_hub: r.id == hub_device_id,
+                })
+                .collect();
+
+            // Pick the node row (plain device or install_kind == "node") for WebSocket / move tickets.
+            let node_row = group
+                .iter()
+                .find(|r| !r.admin && live.contains_key(&r.id))
+                .or_else(|| group.iter().find(|r| r.install_kind.as_deref() == Some(crate::db::NODE_INSTALL)))
+                .or_else(|| group.iter().find(|r| !r.admin));
+            let node_device_id = node_row.map(|r| r.id.clone());
+
+            let rep = if is_hub {
+                group.iter().find(|r| r.id == hub_device_id).unwrap_or(&group[0])
+            } else {
+                node_row.unwrap_or(&group[0])
+            };
+
+            let online = is_hub || group.iter().any(|r| live.contains_key(&r.id));
+            let last_seen = if is_hub {
+                Some(crate::db::now())
+            } else {
+                group.iter().filter_map(|r| r.last_seen).max()
+            };
+
+            let host = if is_hub {
+                Some(local_host.clone())
+            } else {
+                group.iter().find_map(|r| self.host_info_for(&r.id))
+            };
+
+            // Pick a desktop platform if any row in the install has one (e.g. macos + node).
+            let platform = group
+                .iter()
+                .find(|r| is_host_platform(&r.platform))
+                .map(|r| r.platform.clone())
+                .unwrap_or_else(|| rep.platform.clone());
+
+            let eligible = is_hub
+                || (is_host_platform(&platform)
+                    && host.as_ref().is_some_and(|h| h.can_host)
+                    && node_device_id.is_some());
+            let version_older = !is_hub
+                && host
+                    .as_ref()
+                    .is_some_and(|h| compare_versions(&h.app_version, HUB_VERSION) == Ordering::Less);
+
+            let (selectable, reason) = if is_hub {
+                (false, Some("current_hub".to_string()))
+            } else if !eligible {
+                (false, Some("cannot_host".to_string()))
+            } else if !online {
+                (false, Some("offline".to_string()))
+            } else if version_older {
+                (false, Some("older_version".to_string()))
+            } else {
+                (true, None)
+            };
+
+            let mut warnings = Vec::new();
+            if eligible && !is_hub && let Some(h) = &host {
+                if !h.cloudflared {
+                    warnings.push(
+                        "Remote access will stop until cloudflared is installed there".to_string(),
+                    );
+                }
+                let needed = estimated_snapshot_bytes.saturating_mul(2);
+                if let Some(free) = h.free_bytes && free < needed {
+                    warnings.push(format!(
+                        "Low disk space: {} bytes free, need at least {} bytes for the move",
+                        free, needed
+                    ));
+                }
+            }
+
+            installs.push(InstallDevice {
+                device_id: rep.id.clone(),
+                device_ids,
+                rows: install_rows,
+                node_device_id,
+                install_id,
+                name: crate::db::machine_name(&rep.name).to_string(),
+                platform,
+                is_hub,
+                online,
+                last_seen,
+                host,
+                eligible,
+                selectable,
+                reason,
+                warnings,
+            });
+        }
+
+        // Order: current hub first, then selectable, then eligible (offline/older), then ineligible; tie-break by name.
+        installs.sort_by(|a, b| {
+            let rank = |d: &InstallDevice| -> u8 {
+                if d.is_hub {
+                    0
+                } else if d.selectable {
+                    1
+                } else if d.eligible {
+                    2
+                } else {
+                    3
+                }
+            };
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                .then_with(|| a.device_id.cmp(&b.device_id))
+        });
+
+        InstallDevicesResponse {
+            hub_device_id,
+            epoch,
+            hub_version: HUB_VERSION.to_string(),
+            hub_since,
+            estimated_snapshot_bytes,
+            installs,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +724,7 @@ mod tests {
             roles: vec!["thread".into()],
             local: false,
             modalities: vec![],
+            ..Default::default()
         }
     }
 
@@ -376,5 +909,517 @@ mod tests {
         .expect("the hub thread finishes");
         drop(hub);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn install_devices_groups_by_install_id_and_reports_eligibility_and_online_state() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let (hub_dev_id, epoch) = db.ensure_hub_device().unwrap();
+        assert_eq!(epoch, 1);
+
+        // One Mac install with two rows (admin client + plain node) sharing install_id.
+        let mac_install = "mac_install_12345678";
+        let mac_admin = db
+            .issue_device("Oscar's Mac", "macos", true, Some(crate::db::Install { id: mac_install, kind: "macos" }), None)
+            .unwrap();
+        let mac_node = db
+            .issue_device(
+                "Oscar's Mac",
+                "macos",
+                false,
+                Some(crate::db::Install { id: mac_install, kind: crate::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+
+        // An offline Linux host install that previously reported can_host = true.
+        let linux_node = db
+            .issue_device(
+                "Home Server",
+                "linux",
+                false,
+                Some(crate::db::Install { id: "linux_install_123456", kind: crate::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+
+        // An older-version Windows host install (connected).
+        let old_win = db
+            .issue_device(
+                "Old PC",
+                "windows",
+                false,
+                Some(crate::db::Install { id: "win_old_install_1234", kind: crate::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+
+        // An iPhone (cannot host).
+        let _iphone = db
+            .issue_device(
+                "Oscar's iPhone",
+                "ios",
+                true,
+                Some(crate::db::Install { id: "ios_install_12345678", kind: "ios" }),
+                None,
+            )
+            .unwrap();
+
+        let hub = Hub::new(db, dir.clone());
+        hub.record_host_info(
+            &linux_node.device.id,
+            NodeHostInfo { can_host: true, app_version: HUB_VERSION.into(), free_bytes: Some(500_000_000), cloudflared: true },
+        );
+
+        // Start a real listener so the Mac node and Old PC can connect with Hello { host }.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(hub.clone());
+        let srv = tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let connect_with_host = |token: String, host: NodeHostInfo| async move {
+            let mut req = format!("ws://{addr}{}", core_protocol::CONNECT_PATH).into_client_request().unwrap();
+            req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            let hello = core_protocol::NodeMessage::Hello {
+                protocol_version: core_protocol::PROTOCOL_VERSION,
+                client_version: host.app_version.clone(),
+                host: Some(host),
+            };
+            ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
+            while let Some(Ok(WsMsg::Text(text))) = ws.next().await {
+                if matches!(serde_json::from_str::<core_protocol::HubMessage>(&text), Ok(core_protocol::HubMessage::Welcome { .. })) {
+                    break;
+                }
+            }
+            ws
+        };
+
+        let _mac_ws = connect_with_host(
+            mac_node.token.clone(),
+            NodeHostInfo {
+                can_host: true,
+                app_version: HUB_VERSION.into(),
+                free_bytes: Some(1_000_000_000),
+                cloudflared: false,
+            },
+        )
+        .await;
+        let _old_win_ws = connect_with_host(
+            old_win.token.clone(),
+            NodeHostInfo {
+                can_host: true,
+                app_version: "0.0.1".into(),
+                free_bytes: Some(1_000_000_000),
+                cloudflared: true,
+            },
+        )
+        .await;
+
+        let http = reqwest::Client::new();
+        // Unauthenticated request is rejected.
+        let unauth = http.get(format!("http://{addr}/v1/devices/installs")).send().await.unwrap();
+        assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let resp: InstallDevicesResponse = http
+            .get(format!("http://{addr}/v1/devices/installs"))
+            .bearer_auth(&mac_admin.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp.hub_device_id, hub_dev_id);
+        assert_eq!(resp.epoch, 1);
+
+        // Current hub is first, ticked, not selectable.
+        assert!(resp.installs[0].is_hub);
+        assert!(!resp.installs[0].selectable);
+        assert_eq!(resp.installs[0].reason.as_deref(), Some("current_hub"));
+
+        // Mac install collapses admin + node rows into one entry, eligible + online + selectable, with cloudflared warning.
+        let mac = resp.installs.iter().find(|d| d.install_id.as_deref() == Some(mac_install)).unwrap();
+        assert_eq!(mac.device_ids.len(), 2);
+        assert_eq!(mac.node_device_id.as_deref(), Some(mac_node.device.id.as_str()));
+        assert!(mac.online);
+        assert!(mac.eligible);
+        assert!(mac.selectable);
+        assert_eq!(mac.reason, None);
+        assert!(mac.warnings.iter().any(|w| w.contains("cloudflared")), "{:?}", mac.warnings);
+
+        // Linux install is eligible but offline.
+        let linux = resp.installs.iter().find(|d| d.name == "Home Server").unwrap();
+        assert!(linux.eligible);
+        assert!(!linux.online);
+        assert!(!linux.selectable);
+        assert_eq!(linux.reason.as_deref(), Some("offline"));
+
+        // Older Windows install is online + eligible but blocked by older_version.
+        let old = resp.installs.iter().find(|d| d.name == "Old PC").unwrap();
+        assert!(old.eligible);
+        assert!(old.online);
+        assert!(!old.selectable);
+        assert_eq!(old.reason.as_deref(), Some("older_version"));
+
+        // iPhone is ineligible.
+        let phone = resp.installs.iter().find(|d| d.name == "Oscar's iPhone").unwrap();
+        assert!(!phone.eligible);
+        assert!(!phone.selectable);
+        assert_eq!(phone.reason.as_deref(), Some("cannot_host"));
+
+        srv.abort();
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn embedded_hub_and_node_share_one_install_and_hub_is_excluded_from_move_targets() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let pc_install = "pc_install_0123456789abcdef0123";
+        let (hub_dev_id, epoch) = db.ensure_hub_device_for_install(Some(pc_install)).unwrap();
+        assert_eq!(epoch, 1);
+
+        // Same PC registers its admin client row and its node row (reusing the hub row).
+        let pc_admin = db
+            .issue_device("Oscar's PC", "windows", true, Some(crate::db::Install { id: pc_install, kind: "windows" }), None)
+            .unwrap();
+        let pc_node = db
+            .issue_device(
+                "Oscar's PC",
+                "windows",
+                false,
+                Some(crate::db::Install { id: pc_install, kind: crate::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(pc_node.device.id, hub_dev_id, "node on same install reuses hub row");
+
+        // Second computer using legacy `<install_id>-node` for its node row still groups with its admin row.
+        let laptop_install = "laptop_install_0123456789abcdef";
+        let laptop_legacy_node = format!("{laptop_install}-node");
+        let laptop_admin = db
+            .issue_device("Laptop", "macos", true, Some(crate::db::Install { id: laptop_install, kind: "macos" }), None)
+            .unwrap();
+        let laptop_node = db
+            .issue_device(
+                "Laptop",
+                "macos",
+                false,
+                Some(crate::db::Install { id: &laptop_legacy_node, kind: crate::db::NODE_INSTALL }),
+                None,
+            )
+            .unwrap();
+
+        let hub = Hub::new(db, dir.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(hub.clone());
+        let srv = tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let connect_host = |token: String| async move {
+            let mut req = format!("ws://{addr}{}", core_protocol::CONNECT_PATH).into_client_request().unwrap();
+            req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            let hello = core_protocol::NodeMessage::Hello {
+                protocol_version: core_protocol::PROTOCOL_VERSION,
+                client_version: HUB_VERSION.into(),
+                host: Some(NodeHostInfo {
+                    can_host: true,
+                    app_version: HUB_VERSION.into(),
+                    free_bytes: Some(1_000_000_000),
+                    cloudflared: true,
+                }),
+            };
+            ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
+            while let Some(Ok(WsMsg::Text(text))) = ws.next().await {
+                if matches!(serde_json::from_str::<core_protocol::HubMessage>(&text), Ok(core_protocol::HubMessage::Welcome { .. })) {
+                    break;
+                }
+            }
+            ws
+        };
+
+        // Both the hub's own node and the second PC's node are connected and report can_host: true.
+        let _pc_ws = connect_host(pc_node.token.clone()).await;
+        let _laptop_ws = connect_host(laptop_node.token.clone()).await;
+
+        let http = reqwest::Client::new();
+        let resp: InstallDevicesResponse = http
+            .get(format!("http://{addr}/v1/devices/installs"))
+            .bearer_auth(&pc_admin.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        // Only 2 install entries total: the PC (hub + node + admin) and the Laptop (admin + legacy node).
+        assert_eq!(resp.installs.len(), 2, "{:?}", resp.installs);
+
+        let pc_entry = &resp.installs[0];
+        assert!(pc_entry.is_hub);
+        assert_eq!(pc_entry.install_id.as_deref(), Some(pc_install));
+        assert_eq!(pc_entry.device_id, hub_dev_id);
+        assert_eq!(pc_entry.node_device_id.as_deref(), Some(hub_dev_id.as_str()));
+        assert_eq!(pc_entry.device_ids.len(), 2);
+        assert_eq!(pc_entry.rows.len(), 2);
+        assert!(pc_entry.rows.iter().any(|r| r.id == hub_dev_id && !r.admin && r.is_hub && r.online));
+        assert!(pc_entry.rows.iter().any(|r| r.id == pc_admin.device.id && r.admin && !r.is_hub));
+        assert!(!pc_entry.selectable);
+        assert_eq!(pc_entry.reason.as_deref(), Some("current_hub"));
+
+        let laptop_entry = &resp.installs[1];
+        assert!(!laptop_entry.is_hub);
+        assert_eq!(laptop_entry.install_id.as_deref(), Some(laptop_install));
+        assert_eq!(laptop_entry.device_ids.len(), 2);
+        assert!(laptop_entry.device_ids.contains(&laptop_admin.device.id));
+        assert!(laptop_entry.device_ids.contains(&laptop_node.device.id));
+        assert_eq!(laptop_entry.rows.len(), 2);
+        assert!(laptop_entry.selectable);
+
+        // Move targets list excludes the hub's own install and offers only the other host install.
+        let targets = resp.move_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].install_id.as_deref(), Some(laptop_install));
+        assert!(targets.iter().all(|t| !t.is_hub && t.install_id.as_deref() != Some(pc_install)));
+
+        // /v1/devices lists machines: the hub, the PC (admin + node + hub rows) and the laptop (admin + node).
+        let machines: Value = http
+            .get(format!("http://{addr}/v1/devices"))
+            .bearer_auth(&pc_admin.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(machines.as_array().unwrap().len(), 3);
+
+        srv.abort();
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn install<'a>(id: &'a str, kind: &'a str) -> Option<crate::db::Install<'a>> {
+        Some(crate::db::Install { id, kind })
+    }
+
+    fn entry<'a>(list: &'a [DeviceInfo], name: &str) -> &'a DeviceInfo {
+        list.iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("no {name:?} in {:?}", list.iter().map(|d| &d.name).collect::<Vec<_>>()))
+    }
+
+    #[tokio::test]
+    async fn the_list_has_one_entry_per_machine_and_leaves_out_browser_sessions() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let mac_install = "mac_install_12345678";
+        let admin = db.issue_device("Grouper on Oscar's Macbook Air", "macos", true, install(mac_install, "macos"), None).unwrap();
+        let node = db.issue_device("Oscar's Macbook Air", "macos", false, install(mac_install, crate::db::NODE_INSTALL), None).unwrap();
+        let phone = db.issue_device("Grouper on iPhone", "ios", true, install("ios_install_12345678", "ios"), None).unwrap();
+        let server = db.issue_device("Home Server", "linux", false, install("linux_install_123456", crate::db::NODE_INSTALL), None).unwrap();
+        let (web, _) = db.add_device("Web (Google sign-in)", "web", true).unwrap();
+        let (browser, _) = db.add_device("Browser", "web", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+
+        let list = hub.machines().await;
+        let names: Vec<&str> = list.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Hub", "Oscar's Macbook Air", "iPhone", "Home Server"]);
+        assert!(list.iter().all(|d| d.platform != "web" && d.id != web.id && d.id != browser.id));
+        assert!(list.iter().all(|d| !d.aliases.contains(&web.id) && !d.aliases.contains(&browser.id)));
+
+        // The Mac: the node credential leads, the app's sign-in is an alias, admin if either is.
+        let mac = entry(&list, "Oscar's Macbook Air");
+        assert_eq!(mac.id, node.device.id);
+        assert_eq!(mac.aliases, vec![admin.device.id.clone()]);
+        assert!(mac.admin && mac.runs_threads);
+        // The phone only signs in: one entry, named for the phone, no threads.
+        let iphone = entry(&list, "iPhone");
+        assert_eq!((iphone.id.as_str(), iphone.platform.as_str()), (phone.device.id.as_str(), "ios"));
+        assert!(iphone.aliases.is_empty() && iphone.admin && !iphone.runs_threads);
+        let home = entry(&list, "Home Server");
+        assert_eq!(home.id, server.device.id);
+        assert!(!home.admin && home.runs_threads);
+
+        // Per credential, nothing changed: routing still sees every row.
+        let raw = hub.devices().await;
+        assert_eq!(raw.iter().filter(|d| d.id != HUB_DEVICE).count(), 6);
+
+        // And over HTTP, for a plain device token as well as an admin one.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = crate::server::router(hub.clone());
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await });
+        for token in [&admin.token, &node.token] {
+            let over_http: Vec<DeviceInfo> = reqwest::Client::new()
+                .get(format!("http://{addr}/v1/devices"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(over_http.len(), 4);
+            assert_eq!(entry(&over_http, "Oscar's Macbook Air").aliases, vec![admin.device.id.clone()]);
+        }
+        srv.abort();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn merging_joins_credentials_without_changing_rights_or_tokens() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        // Rows from before install ids: nothing ties the Mac's two credentials together.
+        let (admin, admin_token) = db.add_device("Grouper on Oscar's Macbook Air", "macos", true).unwrap();
+        let (node, node_token) = db.add_device("Oscar's Macbook Air", "macos", false).unwrap();
+        let (phone, _) = db.add_device("Grouper on iPhone", "ios", true).unwrap();
+        let (web, _) = db.add_device("Browser", "web", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        assert_eq!(hub.machines().await.len(), 4, "hub + three unrelated rows");
+
+        hub.db.merge_devices(&node.id, &admin.id).unwrap();
+        let list = hub.machines().await;
+        assert_eq!(list.len(), 3);
+        let mac = entry(&list, "Oscar's Macbook Air");
+        assert_eq!(mac.id, node.id);
+        assert_eq!(mac.aliases, vec![admin.id.clone()]);
+        assert!(mac.admin);
+
+        // The plain credential is still plain; the admin one is still admin; both tokens still work.
+        let plain = hub.db.authenticate(&node_token).expect("node token still valid");
+        assert!(!plain.admin, "merging must not give the plain device token admin rights");
+        assert_eq!(plain.device_id, node.id);
+        let strong = hub.db.authenticate(&admin_token).expect("admin token still valid");
+        assert!(strong.admin);
+        assert_eq!(strong.device_id, admin.id);
+        assert!(hub.db.devices().iter().filter(|d| d.id == node.id || d.id == admin.id).all(|d| !d.revoked));
+
+        // Merging is idempotent; either order is the same machine; a browser session is not a device.
+        hub.db.merge_devices(&admin.id, &node.id).unwrap();
+        assert_eq!(hub.machines().await.len(), 3);
+        assert!(hub.db.merge_devices(&node.id, &node.id).is_err());
+        assert!(hub.db.merge_devices(&node.id, "nope").is_err());
+        assert!(hub.db.merge_devices(&node.id, &web.id).is_err());
+        assert!(hub.db.merge_devices(&web.id, &node.id).is_err());
+
+        // Revoking one credential ends only that credential; the machine stays listed under the other.
+        hub.db.revoke_device(&node.id).unwrap();
+        assert!(hub.db.authenticate(&node_token).is_none());
+        assert!(hub.db.authenticate(&admin_token).is_some());
+        let list = hub.machines().await;
+        assert_eq!(list.len(), 3);
+        assert_eq!(entry(&list, "Oscar's Macbook Air").id, admin.id);
+        assert!(entry(&list, "Oscar's Macbook Air").aliases.is_empty());
+        assert!(list.iter().any(|d| d.id == phone.id));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unmerge_splits_a_merged_group_again() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let (a, _) = db.add_device("Mac app", "macos", true).unwrap();
+        let (b, _) = db.add_device("Mac node", "macos", false).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        hub.db.merge_devices(&b.id, &a.id).unwrap();
+        assert_eq!(hub.machines().await.len(), 2);
+        hub.db.unmerge_device(&a.id).unwrap();
+        assert_eq!(hub.machines().await.len(), 3);
+        assert!(hub.db.unmerge_device("nope").is_err());
+        // A chain (c into a, a into b) lists all three once.
+        let (c, _) = hub.db.add_device("Mac cli", "macos", true).unwrap();
+        hub.db.merge_devices(&b.id, &a.id).unwrap();
+        hub.db.merge_devices(&a.id, &c.id).unwrap();
+        let list = hub.machines().await;
+        assert_eq!(list.len(), 2);
+        assert_eq!(entry(&list, "Mac node").aliases.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn grouping_follows_install_ids_legacy_spellings_and_merges() {
+        let row = |id: &str, install: Option<&str>, kind: Option<&str>, admin: bool, merged: Option<&str>| DeviceRow {
+            id: id.into(),
+            name: id.into(),
+            platform: "macos".into(),
+            last_seen: None,
+            admin,
+            install_id: install.map(Into::into),
+            install_kind: kind.map(Into::into),
+            merged_into: merged.map(Into::into),
+            created: 1,
+        };
+        let base = "abcdefghijklmnop0123";
+        let legacy = format!("{base}-node");
+        let groups = group_machines(vec![
+            row("app", Some(base), Some("macos"), true, None),
+            row("node", Some(&legacy), Some("node"), false, None),
+            row("lone", None, None, false, None),
+            row("old-app", None, None, true, Some("lone")),
+            row("gone", None, None, true, Some("revoked-away")),
+        ]);
+        let ids: Vec<Vec<&str>> = groups.iter().map(|g| g.iter().map(|r| r.id.as_str()).collect()).collect();
+        assert_eq!(ids, [vec!["app", "node"], vec!["lone", "old-app"], vec!["gone"]]);
+    }
+
+    #[test]
+    fn a_machine_is_online_when_any_of_its_credentials_is() {
+        let row = |id: &str, admin: bool, created: u64| DeviceRow {
+            id: id.into(),
+            name: format!("Grouper on {id}"),
+            platform: "macos".into(),
+            last_seen: None,
+            admin,
+            install_id: None,
+            install_kind: None,
+            merged_into: None,
+            created,
+        };
+        let info = |id: &str, online: bool, last_seen: Option<u64>, tools: usize| DeviceInfo {
+            id: id.into(),
+            name: format!("Grouper on {id}"),
+            platform: "macos".into(),
+            online,
+            capabilities: (0..tools)
+                .map(|n| core_protocol::ToolSummary { name: format!("t{n}"), description: String::new() })
+                .collect(),
+            last_seen,
+            folders: vec![],
+            usage_probes: false,
+            usage_probe_providers: vec![],
+            aliases: vec![],
+            admin: false,
+            runs_threads: false,
+        };
+        // An idle plain row, a connected plain row and an admin row: the connected plain row leads.
+        let entry = machine_entry(vec![
+            (row("idle", false, 1), info("idle", false, Some(10), 0)),
+            (row("live", false, 2), info("live", true, Some(50), 3)),
+            (row("app", true, 3), info("app", false, Some(99), 0)),
+        ]);
+        assert_eq!(entry.id, "live");
+        assert_eq!(entry.name, "live", "the app prefix is dropped");
+        assert!(entry.online && entry.admin && entry.runs_threads);
+        assert_eq!(entry.last_seen, Some(99));
+        assert_eq!(entry.aliases, ["idle", "app"]);
+        assert_eq!(entry.capabilities.len(), 3);
+        // Nothing connected: offline.
+        let off = machine_entry(vec![(row("a", false, 1), info("a", false, None, 0)), (row("b", true, 2), info("b", false, None, 0))]);
+        assert!(!off.online && off.last_seen.is_none());
     }
 }

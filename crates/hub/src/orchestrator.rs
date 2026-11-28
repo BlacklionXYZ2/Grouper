@@ -167,11 +167,66 @@ async fn worker(hub: Weak<Hub>, conversation_id: String, mut rx: mpsc::Unbounded
     }
 }
 
+/// Resolve the model for a conversation turn.
+///
+/// In a project chat, any harness without `can_orchestrate` (for example a row that predates
+/// the rule) is refused with an error event and falls back to the orchestrator default.
+pub(crate) async fn resolve_turn_model(
+    hub: &Hub,
+    conversation_id: &str,
+    project: bool,
+) -> Option<core_protocol::ModelEntry> {
+    let role = if project { "orchestrator" } else { "standard" };
+    let chosen = match hub.db.conversation_model(conversation_id) {
+        Ok(Some(model)) if project && !crate::db::can_orchestrate_project(&model) => {
+            let reason = crate::db::HarnessCannotOrchestrate(model.id.clone());
+            hub.emit(
+                conversation_id,
+                None,
+                EventBody::Error { message: format!("{reason}; using the default model instead") },
+            );
+            None
+        }
+        Ok(model) => model,
+        // The conversation's chosen model was removed from the registry: say so and
+        // carry on with the role default rather than failing every turn.
+        Err(e) => {
+            hub.emit(
+                conversation_id,
+                None,
+                EventBody::Error { message: format!("{e:#}; using the default model instead") },
+            );
+            None
+        }
+    };
+    let model = match chosen {
+        Some(model) => Some(model),
+        None => hub.default_model(role).await,
+    };
+    match model {
+        Some(model) if project && !crate::db::can_orchestrate_project(&model) => {
+            let reason = crate::db::HarnessCannotOrchestrate(model.id.clone());
+            hub.emit(conversation_id, None, EventBody::Error { message: reason.to_string() });
+            None
+        }
+        other => other,
+    }
+}
+
 async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     let Some(conv) = hub.db.conversation(conversation_id) else { return };
     let project = conv.mode == "project";
-    // A spent daily or conversation budget (`limits.rs`): keep what arrived, say why, and stop here.
-    if crate::limits::refuse_turn(hub, conversation_id, &wakes) {
+    // Subscription-billed harnesses never spend API budgets. That includes a project chat
+    // whose orchestrator is a harness with `can_orchestrate`. API turns still check limits.
+    let role_for_default = if project { "orchestrator" } else { "standard" };
+    let subscription_harness = hub
+        .db
+        .conversation_model(conversation_id)
+        .ok()
+        .flatten()
+        .or_else(|| hub.db.default_model(role_for_default))
+        .is_some_and(|m| m.is_harness() && (!project || m.can_orchestrate));
+    if !subscription_harness && crate::limits::refuse_turn(hub, conversation_id, &wakes) {
         return;
     }
 
@@ -195,7 +250,7 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         text.push_str("\n\n");
         text.push_str(&block);
     }
-    push_user_text(&mut history, text);
+    push_user_text(&mut history, text.clone());
 
     let finish = |hub: &Arc<Hub>, history: &[providers::Message]| {
         if let Err(e) = hub.db.save_history(conversation_id, from, &history[from..]) {
@@ -204,40 +259,36 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
     };
 
     let role = if project { "orchestrator" } else { "standard" };
-    let chosen = match hub.db.conversation_model(conversation_id) {
-        Ok(model) => model,
-        // The conversation's chosen model was removed from the registry: say so and
-        // carry on with the role default rather than failing every turn.
-        Err(e) => {
-            hub.emit(
-                conversation_id,
-                None,
-                EventBody::Error { message: format!("{e:#}; using the default model instead") },
-            );
-            None
-        }
-    };
-    let model = match chosen {
-        Some(model) => Some(model),
-        None => hub.default_model(role).await,
-    };
-    let Some(model) = model else {
+    let Some(model) = resolve_turn_model(hub, conversation_id, project).await else {
         finish(hub, &history);
-        // Models may exist but all live on devices that are offline; say which.
+        // Models may exist but all live on devices that are offline, or only non-orchestrating harnesses exist.
         let message = match hub.db.default_model(role) {
             Some(m) => {
-                let host = hub
-                    .db
-                    .provider(&m.provider_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|p| p.via_device().map(String::from))
+                let raw_host = m
+                    .device_id
+                    .clone()
+                    .or_else(|| {
+                        hub.db
+                            .provider(&m.provider_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|p| p.via_device().map(String::from))
+                    })
                     .unwrap_or_else(|| "a device".into());
+                let host = hub
+                    .resolve_device(&raw_host)
+                    .map(|(_, name)| name)
+                    .unwrap_or(raw_host);
                 format!(
                     "Every model for this chat runs on a device that's offline ({} runs on {host}). Bring it back \
                      online, or add a model that doesn't depend on it (`grouper models add`).",
                     m.id
                 )
+            }
+            None if project && hub.db.visible_models().iter().any(|m| m.is_harness() && !m.can_orchestrate) => {
+                "No model can orchestrate a project chat (registered harnesses don't support project orchestration). \
+                 Add an API model or a harness with can_orchestrate, or start a standard chat."
+                    .into()
             }
             None => "No models registered. Add a provider key (`grouper keys set`) and a model (`grouper models add`)."
                 .into(),
@@ -246,6 +297,34 @@ async fn run_turn(hub: &Arc<Hub>, conversation_id: &str, wakes: Vec<Wake>) {
         hub.emit(conversation_id, None, EventBody::TurnFinished { running_threads: 0 });
         return;
     };
+
+    if model.is_harness() {
+        let orchestrator_prompt = project.then(|| ORCHESTRATOR_SYSTEM.to_string());
+        match hub
+            .run_standard_harness_turn(conversation_id, &model, &text, &wakes, orchestrator_prompt)
+            .await
+        {
+            Ok(reply) => {
+                let clean = without_imitated_notes(&reply.text);
+                if !clean.is_empty() {
+                    hub.emit(conversation_id, None, EventBody::AssistantMessage { text: clean });
+                }
+                history.push(providers::Message {
+                    role: providers::Role::Assistant,
+                    content: vec![providers::Block::Text { text: reply.text }],
+                    raw: None,
+                });
+                finish(hub, &history);
+            }
+            Err(message) => {
+                finish(hub, &history);
+                hub.emit(conversation_id, None, EventBody::Error { message });
+            }
+        }
+        hub.emit(conversation_id, None, EventBody::TurnFinished { running_threads: 0 });
+        return;
+    }
+
     let provider = match hub
         .db
         .provider(&model.provider_id)
@@ -344,6 +423,21 @@ fn orchestrator_tools(hub: &Arc<Hub>, conversation_id: &str) -> Vec<Arc<dyn Tool
     tools.extend(crate::memory::memory_tools(hub, conversation_id));
     tools.extend(crate::registry::registry_tools(hub, conversation_id));
     tools.extend(crate::skills::skill_tools(hub, conversation_id));
+    tools
+}
+
+/// The tools a harness may call at `/mcp/orchestrator`. Same implementations as the API
+/// orchestrator: start, message and stop a thread, list devices and threads, and memory.
+pub(crate) fn harness_orchestrator_tools(hub: &Arc<Hub>, conversation_id: &str) -> Vec<Arc<dyn Tool>> {
+    let ctx = || Ctx { hub: hub.clone(), conversation_id: conversation_id.to_string() };
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(StartThread(ctx())),
+        Arc::new(MessageThread(ctx())),
+        Arc::new(StopThread(ctx())),
+        Arc::new(ListThreads(ctx())),
+        Arc::new(ListDevices(ctx())),
+    ];
+    tools.extend(crate::memory::memory_tools(hub, conversation_id));
     tools
 }
 
@@ -657,5 +751,239 @@ mod imitated_notes_tests {
 - [x] done";
         assert_eq!(without_imitated_notes(normal), normal);
         assert_eq!(without_imitated_notes("[Status] Devices: none."), "");
+    }
+}
+
+#[cfg(test)]
+mod harness_rule_tests {
+    use super::{Wake, resolve_turn_model, run_turn};
+    use crate::db::Db;
+    use crate::server::Hub;
+    use core_protocol::{EventBody, ModelEntry, ProviderConfig};
+    use serde_json::json;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("grouper-orch-h2-{tag}-{}", crate::db::random_hex(4)))
+    }
+
+    #[tokio::test]
+    async fn project_turn_refuses_legacy_non_orchestrating_harness_and_falls_back_to_api_default() {
+        let dir = tmp("fallback");
+        let db = Db::open(&dir).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+
+        db.upsert_provider(&ProviderConfig {
+            id: "scripted".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({
+                "inline": {
+                    "rules": [
+                        {"last": "hello project", "reply": [{"type": "text", "text": "Handled by API fallback."}]}
+                    ]
+                }
+            }),
+        })
+        .unwrap();
+        let codex_pid = format!("codex@{}", pc.id);
+        db.upsert_provider(&ProviderConfig {
+            id: codex_pid.clone(),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"harness": "codex", "via_device": pc.id, "signed_in": true}),
+        })
+        .unwrap();
+        let claude_pid = format!("claude-code@{}", pc.id);
+        db.upsert_provider(&ProviderConfig {
+            id: claude_pid.clone(),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"harness": "claude-code", "via_device": pc.id, "signed_in": true}),
+        })
+        .unwrap();
+
+        db.upsert_model(&ModelEntry {
+            id: "api-orch".into(),
+            provider_id: "scripted".into(),
+            model: "scripted-api".into(),
+            roles: vec!["orchestrator".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "codex-o3".into(),
+            provider_id: codex_pid,
+            model: "o3".into(),
+            kind: "harness".into(),
+            device_id: Some(pc.id.clone()),
+            can_orchestrate: false,
+            roles: vec!["standard".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "cc-opus".into(),
+            provider_id: claude_pid,
+            model: "opus".into(),
+            kind: "harness".into(),
+            device_id: Some(pc.id.clone()),
+            can_orchestrate: true,
+            roles: vec![],
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Simulate a legacy project chat whose DB row points at a non-orchestrating harness.
+        let project_conv = db.create_conversation("project", "Legacy project").unwrap();
+        db.c()
+            .execute("UPDATE conversations SET model = 'codex-o3' WHERE id = ?1", [&project_conv])
+            .unwrap();
+
+        let hub = Hub::new(db, dir.clone());
+        run_turn(&hub, &project_conv, vec![Wake::User("hello project".into())]).await;
+
+        let events = hub.db.events(&project_conv, 0, None);
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.body,
+                EventBody::Error { message }
+                    if message.contains("codex-o3 is a harness and can't orchestrate a project chat")
+                    && message.contains("using the default model instead")
+            )),
+            "expected harness fallback error event, got: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.body,
+                EventBody::AssistantMessage { text } if text.contains("Handled by API fallback.")
+            )),
+            "expected turn to finish on API default, got: {events:?}"
+        );
+
+        // A project chat pinned to a harness WITH can_orchestrate = true is NOT rejected by resolve_turn_model.
+        let orch_harness_conv = hub.db.create_conversation("project", "Confinable harness project").unwrap();
+        hub.db.set_conversation_model(&orch_harness_conv, Some("cc-opus")).unwrap();
+        let resolved = resolve_turn_model(&hub, &orch_harness_conv, true).await;
+        assert_eq!(resolved.unwrap().id, "cc-opus");
+        assert!(hub.db.events(&orch_harness_conv, 0, None).is_empty());
+
+        // A standard chat pinned to a harness WITHOUT can_orchestrate IS allowed by resolve_turn_model.
+        let standard_conv = hub.db.create_conversation("standard", "Standard harness").unwrap();
+        hub.db.set_conversation_model(&standard_conv, Some("codex-o3")).unwrap();
+        let resolved_std = resolve_turn_model(&hub, &standard_conv, false).await;
+        assert_eq!(resolved_std.unwrap().id, "codex-o3");
+        assert!(hub.db.events(&standard_conv, 0, None).is_empty());
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn project_turn_stops_cleanly_when_only_non_orchestrating_harnesses_exist() {
+        let dir = tmp("only-harness");
+        let db = Db::open(&dir).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+        let codex_pid = format!("codex@{}", pc.id);
+        db.upsert_provider(&ProviderConfig {
+            id: codex_pid.clone(),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({"harness": "codex", "via_device": pc.id, "signed_in": true}),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "codex-o3".into(),
+            provider_id: codex_pid,
+            model: "o3".into(),
+            kind: "harness".into(),
+            device_id: Some(pc.id.clone()),
+            can_orchestrate: false,
+            roles: vec!["standard".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let project_conv = db.create_conversation("project", "No API model").unwrap();
+        let hub = Hub::new(db, dir.clone());
+        run_turn(&hub, &project_conv, vec![Wake::User("hello".into())]).await;
+
+        let events = hub.db.events(&project_conv, 0, None);
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.body,
+                EventBody::Error { message } if message.contains("orchestrate a project chat")
+            )),
+            "expected clear error event, got: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(&e.body, EventBody::TurnFinished { running_threads: 0 })));
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// An API orchestrator still runs the in-hub tool loop. It does not open a harness session
+    /// or mint an orchestrator MCP token.
+    #[tokio::test]
+    async fn project_api_orchestrator_is_unchanged() {
+        let dir = tmp("api-unchanged");
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "scripted".into(),
+            kind: "scripted".into(),
+            base_url: None,
+            api_key: None,
+            options: json!({
+                "inline": {
+                    "rules": [
+                        {"last": "hello api orchestrator", "reply": [{"type": "text", "text": "Handled by the API orchestrator."}]}
+                    ]
+                }
+            }),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "api-orch".into(),
+            provider_id: "scripted".into(),
+            model: "scripted-api".into(),
+            roles: vec!["orchestrator".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let project_conv = db.create_conversation("project", "API project").unwrap();
+        db.set_conversation_model(&project_conv, Some("api-orch")).unwrap();
+        let hub = Hub::new(db, dir.clone());
+        run_turn(&hub, &project_conv, vec![Wake::User("hello api orchestrator".into())]).await;
+
+        let events = hub.db.events(&project_conv, 0, None);
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.body,
+                EventBody::AssistantMessage { text } if text.contains("Handled by the API orchestrator.")
+            )),
+            "API orchestrator should still answer through the model loop, got: {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| !matches!(&e.body, EventBody::Error { .. })),
+            "API orchestrator turn raised an error: {events:?}"
+        );
+        assert_eq!(hub.db.conversation_harness_session(&project_conv), None);
+        let live_tokens: i64 = hub
+            .db
+            .c()
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_tokens WHERE conversation_id = ?1 AND revoked = 0",
+                [&project_conv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_tokens, 0);
+
+        drop(hub);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

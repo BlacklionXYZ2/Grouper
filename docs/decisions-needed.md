@@ -70,6 +70,56 @@ Hub threads get file tools only. A sandboxed shell means running each thread's c
 a throwaway container, which needs the hub container to control Docker (mounting the
 Docker socket, or a separate runner). Yes or no, and if yes, which approach.
 
+## Local-first: what only Oscar can do (27 November 2026)
+
+The hub can now run inside the Windows app on your PC (see `docs/local-first-design.md`,
+`docs/local-first-review-2026-11-27.md`, and the step-by-step `deploy/MOVE-TO-PC.md`). These steps
+need you:
+
+1. **Google Cloud (project `grouper-515912`):** create an OAuth client of type **Desktop app**. Send
+   the client ID (it is public); keep the client secret in a file, never in chat. An agent then puts
+   the ID in `DEFAULT_DESKTOP_CLIENT_ID` (`apps/desktop/src-tauri/src/oauth.rs`) and
+   `DEFAULT_CLIENT_IDS` (`crates/hub/src/google_auth.rs`).
+2. **Google Auth Platform → Branding:** point the privacy policy link at
+   `https://grouper.clockmillbarn.uk/privacy`.
+3. **Cloudflare → Caching → Configuration → Browser Cache TTL → "Respect Existing Headers"**, so a
+   deploy shows up without a hard refresh.
+4. **Move the hub to the PC:** follow `deploy/MOVE-TO-PC.md` (VM backup, copy `master.key`
+   separately, stop the VM hub and its `cloudflared`, restore on the PC, point the tunnel at
+   `http://127.0.0.1:47600`, sign in with Google in the Windows app, paste the tunnel token in
+   Settings → Remote access).
+5. **The PC's CLI sign-in was lost** (an agent's test overwrote `%APPDATA%\grouper\credentials.json`
+   on 26 Nov): run `grouper login` once.
+6. **Try on real devices:** the Windows installer (CI artifact `Grouper-windows-x64-setup`), the Mac
+   app (`Grouper-macOS-arm64`), and the iPhone app (keyboard dismissal, Google-only sign-in, plan
+   checklist in threads).
+
+Open design points (no action yet):
+
+- **A second desktop joining a PC hub through the tunnel:** the desktop app hands its window a
+  session by trading its admin token at `POST /v1/session`, but a hub in local mode accepts token
+  sign-in only from its own machine, so a second desktop in client mode must sign in with Google in
+  the window instead. Fine for now; revisit when a second computer joins.
+- **Default domain for other users:** apps default to `grouper.clockmillbarn.uk`; anyone else would
+  reach your hub and be refused. Choose per-user discovery (e.g. the Drive record) before anyone
+  else gets the app.
+- **Mac as hub** (design package 11) waits until a real PC → other-machine move has worked.
+
+## Models and harnesses (27 November 2026)
+
+Built as `docs/models-and-harnesses-design.md` describes. Open points, each with the recommendation the build follows:
+
+- **May the orchestrator give threads to a harness on its own?** Today it only does when asked by
+  name. Recommendation: keep it off by default; add a per-harness switch "use for threads
+  automatically", skipped when that subscription's plan window is above 90 %.
+- **Harness detection reads whether Claude/Codex credential files exist and are unexpired** on every
+  device, without the usage-probe opt-in (only "signed in / expired / not signed in" leaves the
+  device). Recommendation: keep.
+- **Try it on your PC:** with Claude Code signed in on the hub's computer, pick "Claude Code" as a
+  project chat's orchestrator. Check that it only uses Grouper's tools, that a second message
+  continues the same session, and that threads start. Many CLI flags are marked "VERIFY" in
+  `crates/core-client/src/harness.rs`.
+
 ## Housekeeping (no decision needed, just actions)
 
 - **Hub model:** the online hub now uses free OpenRouter models, swapping to another free
@@ -91,3 +141,17 @@ Docker socket, or a separate runner). Yes or no, and if yes, which approach.
   files. Adopt a formatter only on purpose, with a `rustfmt.toml`, in its own commit.
 - **Back up the master key** (`/secrets/master.key` in the `grouper-secrets` volume)
   somewhere safe; backups don't include it (`deploy/README.md` section 5).
+
+## Usage tab (27 November 2026)
+
+Built per `docs/usage-tab-spec.md` (Fable's spec with your decisions at the top). Waiting on you:
+
+- **Look at it:** sign in at `https://grouper.clockmillbarn.uk/#/usage` (or the new Usage tab on iPhone
+  once the Apple build is installed). Subscription meters appear only for devices running a Grouper node
+  with a harness signed in; this PC's node needs `grouper login` (or the Windows app) first.
+- **Grok meter and sign-in expiry:** Grok's stored token lasts about an hour and only the Grok CLI renews
+  it, so the card often says "sign-in expired". Options: leave it (it refreshes whenever you use Grok), or
+  let Grouper renew the token itself, which writes Grok's sign-in file and could collide with the CLI.
+  Recommendation: leave it.
+- **Grok's on-demand and prepaid amounts** are left out until their unit is known.
+

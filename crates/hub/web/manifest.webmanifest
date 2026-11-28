@@ -1,0 +1,11 @@
+{
+  "name": "Grouper",
+  "short_name": "Grouper",
+  "description": "Chat with your orchestrator and answer approvals from your devices.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#10141d",
+  "theme_color": "#141821",
+  "icons": [{ "src": "/app/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

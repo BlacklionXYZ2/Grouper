@@ -5,6 +5,11 @@
 //! miss those pages. The master key is never written into the snapshot: provider keys
 //! stay ciphertext, and restore checks that the key this process can see decrypts them
 //! before it replaces anything.
+//!
+//! Restoring onto another computer points `hub_device_id` at a new device for this
+//! machine and raises `epoch` by one, so step-down can tell the old hub from this one.
+//! Restoring onto the computer that already owns that hub device leaves it unchanged.
+//! Device rows and their tokens come across either way.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -23,7 +28,7 @@ use fs2::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-use hub::secrets::Secrets;
+use crate::secrets::{DPAPI_KEY_FILE, Secrets};
 
 const FORMAT_VERSION: u32 = 1;
 const MANIFEST_NAME: &str = "manifest.json";
@@ -96,7 +101,7 @@ struct OpenedBackup {
     cleanup: bool,
 }
 
-pub(crate) struct DataLock {
+pub struct DataLock {
     file: File,
     path: PathBuf,
     remove_on_drop: bool,
@@ -111,7 +116,7 @@ impl Drop for DataLock {
     }
 }
 
-pub(crate) fn lock_data_dir(data_dir: &Path) -> Result<DataLock> {
+pub fn lock_data_dir(data_dir: &Path) -> Result<DataLock> {
     create_private_dir_all(data_dir)?;
     let path = data_dir.join(LOCK_NAME);
     let remove_on_drop = !path.exists();
@@ -173,7 +178,7 @@ fn sibling_stage(target: &Path, label: &str) -> Result<PathBuf> {
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     create_private_dir_all(parent)?;
     let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("grouper");
-    let dir = parent.join(format!(".{name}.{label}-{}-{}", std::process::id(), hub::db::random_hex(4)));
+    let dir = parent.join(format!(".{name}.{label}-{}-{}", std::process::id(), crate::db::random_hex(4)));
     create_private_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
 }
@@ -187,7 +192,7 @@ impl Drop for OpenedBackup {
 }
 
 /// Write a snapshot of `data_dir` to `output` (a directory, or a `.tar.gz` / `.tgz` file).
-pub(crate) fn backup(data_dir: &Path, output: &Path, include_workspaces: bool) -> Result<()> {
+pub fn backup(data_dir: &Path, output: &Path, include_workspaces: bool) -> Result<()> {
     let db_path = data_dir.join(DB_NAME);
     if !db_path.is_file() {
         bail!(
@@ -219,7 +224,7 @@ pub(crate) fn backup(data_dir: &Path, output: &Path, include_workspaces: bool) -
 }
 
 /// Restore `backup` (a snapshot directory or `.tar.gz`) into `data_dir`.
-pub(crate) fn restore(data_dir: &Path, backup_path: &Path, force: bool) -> Result<()> {
+pub fn restore(data_dir: &Path, backup_path: &Path, force: bool) -> Result<()> {
     let _lock = lock_data_dir(data_dir).context("refusing restore while grouper-hub serve is using this data directory")?;
     if data_dir.exists() && !data_dir.is_dir() {
         bail!("{} is not a directory", data_dir.display());
@@ -241,8 +246,87 @@ pub(crate) fn restore(data_dir: &Path, backup_path: &Path, force: bool) -> Resul
     }
     let sealed = decrypt_provider_keys(&opened.root, data_dir)?;
     let aside = install_with_rollback(data_dir, &opened.root, force)?;
-    print_restore_done(data_dir, &manifest.hub_id, sealed, aside.as_deref());
+    let reassigned = match adopt_hub_device_for_this_machine(data_dir) {
+        Ok(value) => value,
+        Err(error) => {
+            let undo = undo_install(data_dir, aside.as_deref());
+            return Err(match undo {
+                Ok(()) => error.context(
+                    "restore failed while recording this computer as the hub; the previous data directory was put back",
+                ),
+                Err(undo_error) => error.context(format!(
+                    "restore failed while recording this computer as the hub, and putting the previous data back also failed ({undo_error}). \
+                     Previous files are in {}.",
+                    aside
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| data_dir.display().to_string())
+                )),
+            });
+        }
+    };
+    print_restore_done(
+        data_dir,
+        &manifest.hub_id,
+        sealed,
+        aside.as_deref(),
+        reassigned.as_ref(),
+    );
     Ok(())
+}
+
+/// The name `ensure_hub_device` stores for the computer it is running on.
+/// Same rules as `machine_device_name` in `db.rs` (that function is private).
+fn host_device_name() -> String {
+    let raw = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_default();
+    let cleaned: String = raw.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("hub") {
+        "Grouper host".into()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn host_device_matches_this_machine(name: &str, platform: &str, host_name: &str) -> bool {
+    platform.eq_ignore_ascii_case(std::env::consts::OS) && name == host_name
+}
+
+/// If the restored hub device is another computer, register this one and assign it
+/// at `epoch + 1`. The same computer is left as the snapshot recorded it.
+/// Returns the new id and epoch when the assignment changes.
+fn adopt_hub_device_for_this_machine(data_dir: &Path) -> Result<Option<(String, u64)>> {
+    let db = crate::secrets::without_migration(|| crate::db::Db::open(data_dir))
+        .context("opening the restored database to record which computer is the hub")?;
+    let (current_id, epoch) = db.ensure_hub_device()?;
+    let host_name = host_device_name();
+    let same_machine = db.devices().iter().any(|device| {
+        device.id == current_id
+            && !device.revoked
+            && host_device_matches_this_machine(&device.name, &device.platform, &host_name)
+    });
+    if same_machine {
+        return Ok(None);
+    }
+    // Equivalent to the row `ensure_hub_device` inserts on a fresh hub: this
+    // computer's hostname and OS, not an admin token. The secret is not kept.
+    let (device, _token) = db.add_device(&host_name, std::env::consts::OS, false)?;
+    let new_epoch = db.set_hub_device_id(&device.id)?;
+    if new_epoch != epoch + 1 {
+        bail!(
+            "restored hub epoch {epoch} did not advance by one when assigning this computer (hub device {})",
+            device.id
+        );
+    }
+    Ok(Some((device.id, new_epoch)))
 }
 
 fn fill_staging(staging: &Path, data_dir: &Path, include_workspaces: bool) -> Result<Filled> {
@@ -256,7 +340,7 @@ fn fill_staging(staging: &Path, data_dir: &Path, include_workspaces: bool) -> Re
             copy_dir(&workspaces, &staging.join(WORKSPACES))?;
         }
     }
-    if staging.join(MASTER_KEY_NAME).exists() {
+    if staging.join(MASTER_KEY_NAME).exists() || staging.join(DPAPI_KEY_FILE).exists() {
         bail!("internal error: backup staging contains {MASTER_KEY_NAME}");
     }
     let nodes = walk(staging)?;
@@ -501,7 +585,7 @@ fn verify_backup(root: &Path) -> Result<Manifest> {
     }
     let mut listed = BTreeSet::new();
     for entry in &manifest.files {
-        if entry.path == MASTER_KEY_NAME {
+        if entry.path == MASTER_KEY_NAME || entry.path == DPAPI_KEY_FILE {
             bail!(
                 "backup lists {MASTER_KEY_NAME}. Hub backups never include the master key; \
                  remove that file from the backup and keep the key separately. Nothing was restored."
@@ -613,21 +697,7 @@ fn clear_sidecars(db_path: &Path) {
 }
 
 fn load_existing_secrets(data_dir: &Path) -> Result<Secrets> {
-    if std::env::var_os("GROUPER_MASTER_KEY").is_some() {
-        return Secrets::load(data_dir).context("reading GROUPER_MASTER_KEY");
-    }
-    let path = std::env::var_os("GROUPER_MASTER_KEY_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir.join(MASTER_KEY_NAME));
-    if !path.is_file() {
-        bail!(
-            "master key missing ({}). This backup does not contain the master key. Restore the same \
-             key with GROUPER_MASTER_KEY or GROUPER_MASTER_KEY_FILE (Docker: /secrets/master.key) \
-             before restoring, or provider keys cannot be decrypted. Nothing was restored",
-            path.display()
-        );
-    }
-    Secrets::load(data_dir).with_context(|| format!("reading master key {}", path.display()))
+    Secrets::load_for_restore(data_dir)
 }
 
 fn install_with_rollback(data_dir: &Path, root: &Path, force: bool) -> Result<Option<PathBuf>> {
@@ -730,12 +800,17 @@ fn hub_entries(data_dir: &Path) -> Result<Vec<PathBuf>> {
     if !data_dir.is_dir() {
         bail!("{} is not a directory", data_dir.display());
     }
+    let has_plain_key = data_dir.join(MASTER_KEY_NAME).is_file();
     let mut paths = Vec::new();
     for entry in
         fs::read_dir(data_dir).with_context(|| format!("reading {}", data_dir.display()))?
     {
         let entry = entry?;
-        if entry.file_name() == MASTER_KEY_NAME || entry.file_name() == LOCK_NAME {
+        let name = entry.file_name();
+        if name == MASTER_KEY_NAME
+            || name == LOCK_NAME
+            || (name == DPAPI_KEY_FILE && !has_plain_key)
+        {
             continue;
         }
         paths.push(entry.path());
@@ -837,9 +912,15 @@ fn print_restore_done(
     hub_id: &Option<String>,
     sealed: usize,
     aside: Option<&Path>,
+    reassigned: Option<&(String, u64)>,
 ) {
     let hub = hub_id.as_deref().unwrap_or("(no hub_id)");
     println!("Restored hub {hub} into {}.", data_dir.display());
+    if let Some((id, epoch)) = reassigned {
+        println!(
+            "This computer is not the hub in the backup. Hub device is now {id} at epoch {epoch}, so a hub still running on the old computer can tell it was replaced."
+        );
+    }
     if let Some(path) = aside {
         println!(
             "Moved the previous contents of {} to {} (not deleted).",
@@ -1838,7 +1919,7 @@ mod tests {
             let path = std::env::temp_dir().join(format!(
                 "grouper-backup-{label}-{}-{}",
                 std::process::id(),
-                hub::db::random_hex(4)
+                crate::db::random_hex(4)
             ));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
@@ -1853,7 +1934,7 @@ mod tests {
     }
 
     fn setup_hub(dir: &Path) -> String {
-        let db = hub::db::Db::open(dir).unwrap();
+        let db = crate::db::Db::open(dir).unwrap();
         db.upsert_provider(&ProviderConfig {
             id: "openai".into(),
             kind: "openai".into(),
@@ -1873,7 +1954,8 @@ mod tests {
 
     fn copy_key(from: &Path, to: &Path) {
         fs::create_dir_all(to).unwrap();
-        fs::copy(from.join(MASTER_KEY_NAME), to.join(MASTER_KEY_NAME)).unwrap();
+        let key = crate::secrets::read_master_key_b64(from).unwrap();
+        fs::write(to.join(MASTER_KEY_NAME), format!("{key}\n")).unwrap();
     }
 
     fn manifest_of(dir: &Path) -> Value {
@@ -1946,7 +2028,7 @@ mod tests {
             }
         }
         // An open hub connection, as when `serve` is running, plus a writer committing rows.
-        let live = hub::db::Db::open(&data).unwrap();
+        let live = crate::db::Db::open(&data).unwrap();
         assert_eq!(live.hub_id(), hub_id);
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicI64::new(100));
@@ -2021,7 +2103,7 @@ mod tests {
         let restored = root.0.join("restored");
         copy_key(&data, &restored);
         restore(&restored, &snap, false).unwrap();
-        let db = hub::db::Db::open(&restored).unwrap();
+        let db = crate::db::Db::open(&restored).unwrap();
         assert_eq!(db.hub_id(), hub_id);
         assert_eq!(
             db.provider("openai").unwrap().unwrap().api_key.as_deref(),
@@ -2104,7 +2186,7 @@ mod tests {
         restore(&restored, &snap, false).unwrap();
         assert_eq!(fs::read(restored.join(MASTER_KEY_NAME)).unwrap(), key_bytes);
         assert!(!restored.join(MANIFEST_NAME).exists());
-        let db = hub::db::Db::open(&restored).unwrap();
+        let db = crate::db::Db::open(&restored).unwrap();
         assert_eq!(db.hub_id(), hub_id);
         assert_eq!(
             db.provider("openai").unwrap().unwrap().api_key.as_deref(),
@@ -2125,7 +2207,7 @@ mod tests {
         let from_archive = root.0.join("from-archive");
         copy_key(&data, &from_archive);
         restore(&from_archive, &archive, false).unwrap();
-        let db = hub::db::Db::open(&from_archive).unwrap();
+        let db = crate::db::Db::open(&from_archive).unwrap();
         assert_eq!(db.hub_id(), hub_id);
         assert_eq!(
             db.provider("openai").unwrap().unwrap().api_key.as_deref(),
@@ -2149,7 +2231,7 @@ mod tests {
 
         let dest = root.0.join("dest");
         let old_id = {
-            let db = hub::db::Db::open(&dest).unwrap();
+            let db = crate::db::Db::open(&dest).unwrap();
             db.hub_id()
         };
         assert_ne!(old_id, hub_id);
@@ -2157,7 +2239,7 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("not empty"), "{message}");
         assert!(message.contains("--force"), "{message}");
-        let db = hub::db::Db::open(&dest).unwrap();
+        let db = crate::db::Db::open(&dest).unwrap();
         assert_eq!(db.hub_id(), old_id);
         assert!(db.provider("openai").unwrap().is_none());
     }
@@ -2174,14 +2256,14 @@ mod tests {
 
         let dest = root.0.join("dest");
         let old_id = {
-            let db = hub::db::Db::open(&dest).unwrap();
+            let db = crate::db::Db::open(&dest).unwrap();
             db.hub_id()
         };
-        fs::copy(data.join(MASTER_KEY_NAME), dest.join(MASTER_KEY_NAME)).unwrap();
+        copy_key(&data, &dest);
         let key = fs::read(dest.join(MASTER_KEY_NAME)).unwrap();
         restore(&dest, &snap, true).unwrap();
         assert_eq!(fs::read(dest.join(MASTER_KEY_NAME)).unwrap(), key);
-        let db = hub::db::Db::open(&dest).unwrap();
+        let db = crate::db::Db::open(&dest).unwrap();
         assert_eq!(db.hub_id(), hub_id);
         drop(db);
 
@@ -2268,7 +2350,7 @@ mod tests {
         let again = root.0.join("again");
         copy_key(&data, &again);
         restore(&again, &snap, false).unwrap();
-        assert_eq!(hub::db::Db::open(&again).unwrap().hub_id(), hub_id);
+        assert_eq!(crate::db::Db::open(&again).unwrap().hub_id(), hub_id);
     }
 
     #[test]
@@ -2311,7 +2393,7 @@ mod tests {
         let old_marker = data.join("old-marker.txt");
         fs::write(&old_marker, b"previous").unwrap();
         restore(&data, &archive, true).unwrap();
-        assert_eq!(hub::db::Db::open(&data).unwrap().hub_id(), hub_id);
+        assert_eq!(crate::db::Db::open(&data).unwrap().hub_id(), hub_id);
         assert_eq!(
             fs::read(data.join("workspaces/thread1/nested/note.txt")).unwrap(),
             b"snapshot-me"
@@ -2402,5 +2484,81 @@ mod tests {
         assert_eq!(fs::metadata(restored.join(DB_NAME)).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::metadata(restored.join(WORKSPACES).join("t")).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(restored.join(WORKSPACES).join("t/file")).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn restore_on_the_same_machine_keeps_hub_device_and_token() {
+        let _env = isolate_master_key();
+        let root = TempDir::new("same-machine");
+        let data = root.0.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let hub_id = setup_hub(&data);
+        let (hub_device, epoch, token) = {
+            let db = crate::db::Db::open(&data).unwrap();
+            let (hub_device, epoch) = db.ensure_hub_device().unwrap();
+            let (_device, token) = db.add_device("Phone", "ios", false).unwrap();
+            (hub_device, epoch, token)
+        };
+
+        let snap = root.0.join("snap");
+        backup(&data, &snap, false).unwrap();
+        let restored = root.0.join("restored");
+        copy_key(&data, &restored);
+        restore(&restored, &snap, false).unwrap();
+
+        let db = crate::db::Db::open(&restored).unwrap();
+        assert_eq!(db.hub_id(), hub_id);
+        let (restored_device, restored_epoch) = db.ensure_hub_device().unwrap();
+        assert_eq!(restored_device, hub_device);
+        assert_eq!(restored_epoch, epoch);
+        assert!(db.authenticate(&token).is_some());
+    }
+
+    #[test]
+    fn restore_on_another_machine_assigns_this_hub_device_at_next_epoch() {
+        let _env = isolate_master_key();
+        let root = TempDir::new("other-machine");
+        let data = root.0.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let hub_id = setup_hub(&data);
+        let (old_hub_device, old_epoch, token) = {
+            let db = crate::db::Db::open(&data).unwrap();
+            let (hub_device, epoch) = db.ensure_hub_device().unwrap();
+            // The snapshot must look like another computer's hub device. `platform`
+            // is never this OS, so the check does not depend on the hostname.
+            db.c()
+                .execute(
+                    "UPDATE devices SET name = 'grouper-vm', platform = 'foreign' WHERE id = ?1",
+                    [&hub_device],
+                )
+                .unwrap();
+            db.c().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            let (_device, token) = db.add_device("Phone", "ios", false).unwrap();
+            let epoch_now = db.epoch();
+            assert_eq!(epoch_now, epoch);
+            (hub_device, epoch_now, token)
+        };
+
+        let snap = root.0.join("snap");
+        backup(&data, &snap, false).unwrap();
+        let restored = root.0.join("restored");
+        copy_key(&data, &restored);
+        restore(&restored, &snap, false).unwrap();
+
+        let db = crate::db::Db::open(&restored).unwrap();
+        assert_eq!(db.hub_id(), hub_id);
+        let (new_device, new_epoch) = db.ensure_hub_device().unwrap();
+        assert_ne!(new_device, old_hub_device);
+        assert_eq!(new_epoch, old_epoch + 1);
+        let host = db
+            .devices()
+            .into_iter()
+            .find(|device| device.id == new_device)
+            .expect("new hub device");
+        assert_eq!(host.name, host_device_name());
+        assert_eq!(host.platform, std::env::consts::OS);
+        assert!(!host.admin);
+        assert!(db.devices().iter().any(|device| device.id == old_hub_device && !device.revoked));
+        assert!(db.authenticate(&token).is_some());
     }
 }

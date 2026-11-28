@@ -6,8 +6,9 @@ use serde_json::Value;
 use crate::agents;
 use crate::tools::Workspace;
 
-/// Tools that are never gated (they only talk to Grouper itself).
-pub const UNGATED: &[&str] = &["ask_orchestrator"];
+/// Tools that are never gated (they only talk to Grouper itself): no permission level,
+/// risk rule or folder rule applies to them.
+pub const UNGATED: &[&str] = &["ask_orchestrator", crate::plan::UPDATE_PLAN];
 
 /// `Some(reason)` if this call needs the user's approval.
 pub fn needs_approval(level: Permission, tool: &str, input: &Value) -> Option<String> {
@@ -36,6 +37,9 @@ pub fn needs_approval(level: Permission, tool: &str, input: &Value) -> Option<St
 /// (see [`crate::agents`]), then decide. `Some(reason)` if the call needs the user's
 /// approval; the reason mentions what Grouper changed.
 pub fn check_call(level: Permission, tool: &str, input: &mut Value, workspace: &Workspace) -> Option<String> {
+    if UNGATED.contains(&tool) {
+        return None;
+    }
     // File and shell calls into the device's scoped folders are gated apart from the workspace.
     if let Some(decision) = crate::folders::gate(level, tool, input, workspace) {
         return decision;
@@ -263,6 +267,7 @@ mod tests {
         assert!(needs_approval(Permission::Auto, "write_file", &json!({})).is_none());
         assert!(needs_approval(Permission::Auto, "run_shell", &ls).is_none());
         assert!(needs_approval(Permission::Manual, "ask_orchestrator", &json!({})).is_none());
+        assert!(needs_approval(Permission::Manual, "update_plan", &json!({})).is_none());
     }
 
     #[test]

@@ -1,0 +1,15 @@
+{
+  "identifier": "default",
+  "description": "Default permissions for the local Grouper setup screen",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-setup",
+    "allow-choose",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
+    "notification:default"
+  ]
+}

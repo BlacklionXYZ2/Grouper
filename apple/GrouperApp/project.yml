@@ -15,7 +15,9 @@ settings:
 targets:
   # VERIFY ON MAC: Add entitlements once signed with a team:
   # - com.apple.developer.usernotifications.time-sensitive (for approval notifications during Focus)
-  # - App Group + Keychain access group once widgets/share/notification extensions share state or tokens.
+  # - Keychain access group, only if an extension ever needs a token. The usage widgets don't: they
+  #   read a snapshot the app writes into the App Group (group.uk.clockmillbarn.grouper, in
+  #   Entitlements/). Register that group on the Apple developer account before a signed build.
   # - NSAppTransportSecurity (NSAllowsLocalNetworking) if testing against non-HTTPS LAN hubs on iOS.
   Grouper-iOS:
     type: application
@@ -34,6 +36,10 @@ targets:
       base:
         INFOPLIST_FILE: iOS/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.ios
+        CODE_SIGN_ENTITLEMENTS: Entitlements/Grouper-iOS.entitlements
+        # Shared/Assets.xcassets (a resource via the Shared source folder). iOS uses the
+        # single 1024 opaque square; the system masks the corners.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SUPPORTS_MACCATALYST: NO
         TARGETED_DEVICE_FAMILY: "1"
   GrouperWidgets:
@@ -45,10 +51,21 @@ targets:
           - Info.plist
       - path: iOS/ThreadActivityAttributes.swift
       - path: iOS/StopThreadIntent.swift
+      # The palette only (SwiftUI and UIKit, no GrouperAPI), so the Live Activity
+      # uses the same colours as the app.
+      - path: Shared/Theme.swift
+      # The usage widgets: the app group file's reader (Foundation + WidgetKit) and the family
+      # colours that the subscription bars wear. Both need only GrouperAPI, SwiftUI and Theme.
+      - path: Shared/WidgetSnapshotStore.swift
+      - path: Shared/ModelFamilyStyle.swift
+    dependencies:
+      - package: GrouperKit
+        product: GrouperAPI
     settings:
       base:
         INFOPLIST_FILE: iOSWidgets/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.ios.widgets
+        CODE_SIGN_ENTITLEMENTS: Entitlements/GrouperWidgets.entitlements
         SKIP_INSTALL: YES
         TARGETED_DEVICE_FAMILY: "1"
   Grouper-macOS:
@@ -68,6 +85,9 @@ targets:
       base:
         INFOPLIST_FILE: macOS/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: uk.clockmillbarn.grouper.macos
+        # Shared/Assets.xcassets: docs/brand/app-icon-1024.png as is (rounded tile,
+        # transparent corners) at every mac size.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         MACOSX_DEPLOYMENT_TARGET: "26.0"
 
 # Shared schemes, so `xcodebuild -scheme ...` (and CI) can resolve the local Swift package.

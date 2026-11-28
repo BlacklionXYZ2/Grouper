@@ -202,7 +202,7 @@ private actor LiveCapture {
 
     func hasResolvedApproval(_ id: String) -> Bool {
         folder.storedEvents.contains { event in
-            guard case .approvalResolved(let approvalId, let approved) = event.body else { return false }
+            guard case .approvalResolved(let approvalId, let approved, _) = event.body else { return false }
             return approvalId == id && approved
         }
     }

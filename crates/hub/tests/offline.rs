@@ -75,6 +75,7 @@ async fn setup(tag: &str, script: Value) -> Setup {
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     })
     .unwrap();
     let (device, token) = db.add_device("Laptop", "windows", false).unwrap();
@@ -103,6 +104,7 @@ impl Setup {
             mcp_config: Some(self.dir.join("mcp.json")),
             folders: Vec::new(),
             usage_probes: false,
+            usage_probe_providers: None,
         };
         let (stop, stopped) = watch::channel(false);
         (stop, tokio::spawn(core_client::run(config, Arc::new(Tools), Arc::new(Quiet), stopped)))
@@ -458,7 +460,7 @@ async fn handover_marks_unacknowledged_files_unconfirmed_on_timeout() {
     let mut req = ws_url.into_client_request().unwrap();
     req.headers_mut().insert("authorization", format!("Bearer {}", s.token).parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-    let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "legacy-v4".into() };
+    let hello = NodeMessage::Hello { protocol_version: PROTOCOL_VERSION, client_version: "legacy-v4".into(), host: None };
     ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
 
     // Wait for Welcome, then trigger hand_over directly (no MCP server needed for this mock socket).

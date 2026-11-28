@@ -1,12 +1,10 @@
-mod backup;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use core_protocol::{ModelEntry, ProviderConfig};
-use hub::{db::Db, server};
+use hub::{backup, db::Db, host};
 
 /// Grouper hub: the always-on server every device connects to.
 #[derive(Parser)]
@@ -25,10 +23,21 @@ enum Cmd {
     Serve {
         #[arg(long, env = "GROUPER_BIND", default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
+        /// Run in local mode (HTTP setup-code claim off, token sign-in loopback-only).
+        #[arg(long)]
+        local: bool,
     },
     /// Manage registered devices.
     #[command(subcommand)]
     Device(DeviceCmd),
+    /// Print a fresh one-time code for claiming this hub with Google (valid 1 hour).
+    SetupCode,
+    /// The Google account that owns this hub.
+    #[command(subcommand)]
+    Owner(OwnerCmd),
+    /// The connection to the Grouper relay (reach this hub away from home without a tunnel).
+    #[command(subcommand)]
+    Relay(RelayCmd),
     /// Add or update a model provider (keys can also be set from any device: `grouper keys set`).
     Provider {
         id: String,
@@ -83,6 +92,19 @@ enum Cmd {
         #[arg(long)]
         local: bool,
     },
+    /// Set only the prices (USD per 1M tokens) of an existing model, then re-price its past
+    /// unpriced calls. Everything else on the model is kept.
+    ModelPrice {
+        id: String,
+        #[arg(long)]
+        input: f64,
+        #[arg(long)]
+        output: f64,
+        #[arg(long)]
+        cache_read: Option<f64>,
+        #[arg(long)]
+        cache_write: Option<f64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -98,8 +120,18 @@ enum DeviceCmd {
         #[arg(long)]
         admin: bool,
     },
-    /// List registered devices.
+    /// List devices, one entry per machine with the credentials (tokens) it holds.
     List,
+    /// Make a device a credential of the same machine as another, so Devices lists them once.
+    /// Nothing is revoked and no token changes; `other` keeps its own rights.
+    Merge {
+        /// A device id on the machine to keep (`device list` shows ids).
+        keep: String,
+        /// A device id to join to it.
+        other: String,
+    },
+    /// Undo a merge for a device (and any merged into it).
+    Unmerge { id: String },
     /// Grant admin rights to a device's existing token (or remove them with --off).
     Admin {
         id: String,
@@ -108,6 +140,24 @@ enum DeviceCmd {
     },
     /// Revoke a device's token.
     Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+enum OwnerCmd {
+    /// Show the linked Google account.
+    Show,
+    /// Unlink the owner (if the Google account is lost). Device tokens and sessions keep working.
+    Reset,
+}
+
+#[derive(Subcommand)]
+enum RelayCmd {
+    /// Show the relay address, whether relaying is on and which Google account the hub is linked to.
+    /// The secret is never printed.
+    Status,
+    /// Tell the relay to forget this hub, then delete the stored secret and turn relaying off.
+    /// A running hub notices within about 30 seconds.
+    Unlink,
 }
 
 #[tokio::main]
@@ -122,33 +172,19 @@ async fn main() -> Result<()> {
     match &cli.cmd {
         Cmd::Backup { output, include_workspaces } => return backup::backup(&cli.data, output, *include_workspaces),
         Cmd::Restore { backup, force } => return backup::restore(&cli.data, backup, *force),
+        Cmd::Serve { bind, local } => {
+            let handle = host::start_with_options(&cli.data, &[*bind], host::Options { local: *local }).await?;
+            let _ = tokio::signal::ctrl_c().await;
+            handle.stop().await;
+            return Ok(());
+        }
         _ => {}
     }
-    let _serve_lock = if matches!(&cli.cmd, Cmd::Serve { .. }) {
-        Some(backup::lock_data_dir(&cli.data)?)
-    } else {
-        None
-    };
     let db = Db::open(&cli.data)?;
 
     match cli.cmd {
-        Cmd::Backup { .. } | Cmd::Restore { .. } => unreachable!("handled before opening the database"),
-        Cmd::Serve { bind } => {
-            let hub = server::Hub::new(db, cli.data.clone());
-            // Threads waiting for a device keep waiting; a hub part that was running stops at once.
-            hub.recover_waiting_threads();
-            // Threads that were running when the hub stopped can't be resumed.
-            for t in hub.db.threads(None).into_iter().filter(|t| t.status == "running") {
-                hub.db.finish_thread(&t.id, "failed", "The hub restarted while this thread was running.");
-            }
-            tokio::spawn(hub::usage::collector_loop(hub.clone()));
-            let listener = tokio::net::TcpListener::bind(bind).await?;
-            tracing::info!("grouper-hub listening on {bind}, data in {}", cli.data.display());
-            axum::serve(listener, server::router(hub))
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
+        Cmd::Backup { .. } | Cmd::Restore { .. } | Cmd::Serve { .. } => {
+            unreachable!("handled before opening the database")
         }
         Cmd::Device(DeviceCmd::Add { name, platform, admin }) => {
             let (d, token) = db.add_device(&name, &platform, admin)?;
@@ -157,11 +193,28 @@ async fn main() -> Result<()> {
             println!("Token (shown once, keep it secret):\n{token}");
         }
         Cmd::Device(DeviceCmd::List) => {
-            for d in db.devices() {
-                let state = if d.revoked { "revoked" } else { "active" };
-                let kind = if d.admin { "admin" } else { "device" };
-                println!("{}  {:<20} {:<8} {:<7} {}", d.id, d.name, d.platform, state, kind);
+            for machine in hub::devices::list_machines(&db) {
+                println!("{}  {}", machine.name, machine.platform);
+                for c in machine.credentials {
+                    println!("    {}  {:<7} {}", c.id, if c.admin { "admin" } else { "device" }, c.name);
+                }
             }
+            let others: Vec<_> = db.devices().into_iter().filter(|d| d.revoked || d.platform.eq_ignore_ascii_case("web")).collect();
+            if !others.is_empty() {
+                println!("Not listed as devices (browser sign-ins, revoked tokens):");
+                for d in others {
+                    let state = if d.revoked { "revoked" } else { "active" };
+                    println!("    {}  {:<20} {:<8} {}", d.id, d.name, d.platform, state);
+                }
+            }
+        }
+        Cmd::Device(DeviceCmd::Merge { keep, other }) => {
+            db.merge_devices(&keep, &other)?;
+            println!("{other} is now listed with {keep} as one machine. No token changed and nothing was revoked.");
+        }
+        Cmd::Device(DeviceCmd::Unmerge { id }) => {
+            db.unmerge_device(&id)?;
+            println!("{id} is no longer merged with other devices.");
         }
         Cmd::Device(DeviceCmd::Admin { id, off }) => {
             db.set_admin(&id, !off)?;
@@ -174,6 +227,46 @@ async fn main() -> Result<()> {
         Cmd::Device(DeviceCmd::Revoke { id }) => {
             db.revoke_device(&id)?;
             println!("Revoked {id}. Restart the hub to drop any live connection, and rotate any API keys it held.");
+        }
+        Cmd::SetupCode => {
+            if let Some(o) = db.owner() {
+                anyhow::bail!("this hub is already claimed by {}; `grouper-hub owner reset` unlinks it first", o.email);
+            }
+            let (code, _) = db.new_setup_code()?;
+            println!("Setup code (valid 1 hour, once): {code}");
+            println!("Claim the hub: open <hub address>{}", hub::google_auth::claim_path(&code));
+        }
+        Cmd::Owner(OwnerCmd::Show) => match db.owner() {
+            Some(o) => println!("{} {} ({} account {}), since {}", o.email, o.name, o.provider, o.sub, o.claimed_at),
+            None => println!("No owner: this hub hasn't been claimed or linked."),
+        },
+        Cmd::Owner(OwnerCmd::Reset) => match db.reset_owner()? {
+            Some(o) => println!(
+                "Unlinked {}. Device tokens and sessions keep working; `grouper-hub setup-code` lets a Google account claim the hub again.",
+                o.email
+            ),
+            None => println!("No owner to unlink."),
+        },
+        Cmd::Relay(RelayCmd::Status) => {
+            println!("Relay address: {}", db.relay_url().as_deref().unwrap_or("not set"));
+            println!("Enabled: {}", if db.relay_enabled() { "yes" } else { "no" });
+            match (db.has_relay_secret(), db.relay_account_email()) {
+                (true, Some(email)) => println!("Linked: yes ({email})"),
+                (true, None) => println!("Linked: yes"),
+                (false, _) => println!("Linked: no (link the hub from Grouper, or POST /v1/relay/link)"),
+            }
+        }
+        Cmd::Relay(RelayCmd::Unlink) => {
+            if !db.has_relay_secret() {
+                println!("This hub isn't linked to a relay.");
+            } else if hub::relay::unlink(&db).await? {
+                println!("The relay forgot this hub. Relaying is off and the secret is deleted.");
+            } else {
+                println!(
+                    "Deleted the secret and turned relaying off, but the relay didn't confirm (it may be unreachable); \
+                     its record of this hub expires when another hub claims the account."
+                );
+            }
         }
         Cmd::Provider { id, kind, base_url, key, options } => {
             let options = match options {
@@ -209,8 +302,20 @@ async fn main() -> Result<()> {
                 roles: roles.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
                 local,
                 modalities: vec![],
+                ..Default::default()
             })?;
             println!("Saved model {id}.");
+        }
+        Cmd::ModelPrice { id, input, output, cache_read, cache_write } => {
+            let mut entry = db.find_model(&id).with_context(|| format!("no model {id}"))?;
+            entry.input_price = input;
+            entry.output_price = output;
+            entry.cache_read_price = cache_read;
+            entry.cache_write_price = cache_write;
+            entry.price_source = "manual".into();
+            db.upsert_model(&entry)?;
+            let n = db.reprice_unpriced_usage(&entry)?;
+            println!("Set prices for model {id}; re-priced {n} past call(s) that had no cost.");
         }
     }
     Ok(())

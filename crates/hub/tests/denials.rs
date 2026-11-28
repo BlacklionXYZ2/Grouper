@@ -44,6 +44,7 @@ fn setup(tag: &str, script: Value) -> (PathBuf, Arc<Hub>) {
         roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
         local: false,
         modalities: vec![],
+        ..Default::default()
     })
     .unwrap();
     // `list_files` is Auto unless the registry says otherwise.

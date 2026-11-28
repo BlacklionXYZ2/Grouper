@@ -53,7 +53,8 @@ struct ThreadsPanel: View {
             Button("Close", action: onClose).keyboardShortcut(.cancelAction)
         }
         .padding(.horizontal).padding(.vertical, 6)
-        .background(.bar)
+        .background(Theme.bgTint)
+        .overlay(alignment: .bottom) { Rectangle().fill(Theme.border).frame(height: 1) }
     }
     #endif
 
@@ -106,30 +107,47 @@ private struct ThreadsList: View {
         let groups = ThreadGroups(threads: model.threads(in: conversationId), approvals: model.approvals(in: conversationId))
         List {
             Section { header(groups) }
+                .listRowBackground(Theme.bgTint)
             if !groups.approvals.isEmpty || !groups.needsYou.isEmpty {
-                Section("Needs you") {
+                Section {
                     ForEach(groups.approvals) { approval in approvalRow(approval) }
                     ForEach(groups.needsYou) { thread in threadLink(thread, needsApproval: groups.withApproval.contains(thread.id)) }
+                } header: {
+                    sectionLabel("Needs you", tint: Theme.brand)
                 }
+                .listRowBackground(Theme.surface)
             }
             if !groups.running.isEmpty {
-                Section("Running") {
+                Section {
                     ForEach(groups.running) { thread in threadLink(thread, needsApproval: false) }
+                } header: {
+                    sectionLabel("Running", tint: Theme.text)
                 }
+                .listRowBackground(Theme.surface)
             }
             if !groups.finished.isEmpty {
-                Section("Finished") {
+                Section {
                     ForEach(visibleFinished(groups.finished)) { thread in threadLink(thread, needsApproval: false) }
                     if groups.finished.count > Self.finishedLimit {
                         Button(showAllFinished ? "Show recent only" : "Show all \(groups.finished.count)") { showAllFinished.toggle() }
+                            .foregroundStyle(Theme.accent)
                     }
+                } header: {
+                    sectionLabel("Finished", tint: Theme.text)
                 }
+                .listRowBackground(Theme.surface)
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(Theme.bgTint)
         .overlay {
             if groups.isEmpty { emptyState }
         }
         .refreshable { await model.refreshThreads(conversationId: conversationId) }
+    }
+
+    private func sectionLabel(_ title: String, tint: Color) -> some View {
+        Text(title).font(Theme.Typeface.sectionLabel).foregroundStyle(tint).textCase(nil)
     }
 
     private func visibleFinished(_ finished: [ThreadInfo]) -> [ThreadInfo] {
@@ -139,8 +157,8 @@ private struct ThreadsList: View {
     private func header(_ groups: ThreadGroups) -> some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("In \(chatTitle)").font(.subheadline.weight(.semibold)).lineLimit(2)
-                Text(caption(groups)).font(.caption).foregroundStyle(.secondary)
+                Text("In \(chatTitle)").font(Theme.Typeface.title).foregroundStyle(Theme.text).lineLimit(2)
+                Text(caption(groups)).font(Theme.Typeface.meta).foregroundStyle(Theme.text3)
             }
             #if os(macOS)
             Spacer()
@@ -185,21 +203,21 @@ private struct ThreadsList: View {
             #endif
         } label: {
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
+                Image(systemName: "exclamationmark.shield.fill").foregroundStyle(Theme.brand)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("\(approval.tool) on \(model.deviceDisplayName(approval.deviceId))").font(.headline).foregroundStyle(.primary)
+                    Text("\(approval.tool) on \(model.deviceDisplayName(approval.deviceId))").font(Theme.Typeface.row.weight(.semibold)).foregroundStyle(Theme.text)
                     if !approval.reason.isEmpty {
-                        Text(approval.reason).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        Text(approval.reason).font(.caption).foregroundStyle(Theme.text2).lineLimit(2)
                     }
                     HStack(spacing: 4) {
                         Text(threadTitle(approval.threadId))
                         Text("·")
                         RelativeAgeText(seconds: approval.ts)
                     }
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .font(Theme.Typeface.meta).foregroundStyle(Theme.text3).lineLimit(1)
                 }
                 Spacer(minLength: 8)
-                Text("Review").font(.callout.weight(.semibold)).foregroundStyle(.tint)
+                Text("Review").font(.callout.weight(.semibold)).foregroundStyle(Theme.accent)
             }
             .contentShape(Rectangle())
         }
@@ -215,44 +233,27 @@ private struct ThreadsList: View {
     }
 }
 
-/// One thread: title, model name with its family accent and glyph, device, elapsed
-/// time (live while running or waiting, total once finished) and status.
+/// One thread, like a row of the chat's threads card: family dot, title, model tag,
+/// status pill; underneath, the device and elapsed time (live while running or
+/// waiting, total once finished) and, once finished, the summary's first line.
 struct ThreadRow: View {
     @EnvironmentObject private var model: AppModel
     let thread: ThreadInfo
     let needsApproval: Bool
 
     var body: some View {
-        let family = model.family(ofModel: thread.model)
-        HStack(alignment: .top, spacing: 8) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(thread.title.isEmpty ? "Thread" : thread.title).font(.headline).lineLimit(2)
-                HStack(spacing: 6) {
-                    FamilyMark(family: family)
-                    Text(thread.model.isEmpty ? "model not recorded" : thread.model)
-                        .font(.caption.monospaced()).lineLimit(1)
-                }
-                HStack(spacing: 10) {
-                    Label(model.deviceDisplayName(thread.deviceId), systemImage: "desktopcomputer").lineLimit(1)
-                    ElapsedText(thread: thread)
-                }
-                .font(.caption).foregroundStyle(.secondary)
-                if !thread.isActive, let summary = thread.summary, !summary.isEmpty {
-                    Text(Self.clip(summary)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                }
+        ThreadLine(title: thread.title, modelId: thread.model, family: model.family(ofModel: thread.model),
+                   status: thread.status, needsApproval: needsApproval, showsChevron: false) {
+            HStack(spacing: 10) {
+                Label(model.deviceDisplayName(thread.deviceId), systemImage: "desktopcomputer").lineLimit(1)
+                ElapsedText(thread: thread)
             }
-            Spacer(minLength: 4)
-            if needsApproval {
-                Label("Needs approval", systemImage: "exclamationmark.shield.fill")
-                    .font(.caption.weight(.semibold)).foregroundStyle(.orange)
-            } else {
-                StatusLabel(status: thread.status)
+            .font(Theme.Typeface.meta).foregroundStyle(Theme.text3)
+            if !thread.isActive, let summary = thread.summary, !summary.isEmpty {
+                Text(Self.clip(summary)).font(Theme.Typeface.meta).foregroundStyle(Theme.text2).lineLimit(2)
             }
         }
-        .padding(.leading, 10)
-        .background(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 2).fill(family.color).frame(width: 4)
-        }
+        .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
     }
 

@@ -53,6 +53,171 @@ pub struct Device {
     /// permissions, answer approvals, manage providers and models, chat or steer
     /// threads. Plain device tokens can connect and read.
     pub admin: bool,
+    /// Google `sub` of the account this device belongs to, once the hub has an owner.
+    pub account_sub: Option<String>,
+}
+
+/// The app or CLI install a device belongs to: its random `install_id` and the kind of client
+/// that registered it (`ios`, `macos` or `cli` for Google sign-in; `node` for a plain device).
+#[derive(Clone, Copy, Debug)]
+pub struct Install<'a> {
+    pub id: &'a str,
+    pub kind: &'a str,
+}
+
+/// Kinds of [`Install`]: plain (non-admin) devices from `POST /v1/devices` and the device link flow.
+pub const NODE_INSTALL: &str = "node";
+
+/// An `install_id` as clients send it: 16 to 64 characters of `[A-Za-z0-9_-]`.
+pub fn valid_install_id(id: &str) -> bool {
+    (16..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Legacy desktop builds suffixed the node row's `install_id` with `"-node"`.
+pub(crate) fn legacy_node_install_id(install_id: &str) -> String {
+    let base: String = install_id.chars().take(48).collect();
+    format!("{base}-node")
+}
+
+/// Canonical `install_id` for grouping: strips the legacy `"-node"` suffix from non-admin node
+/// rows when the base itself is a valid `install_id`.
+pub(crate) fn canonical_install_id<'a>(install_id: &'a str, install_kind: Option<&str>, admin: bool) -> &'a str {
+    if !admin
+        && (install_kind == Some(NODE_INSTALL) || install_kind.is_none())
+        && let Some(base) = install_id.strip_suffix("-node")
+        && valid_install_id(base)
+    {
+        return base;
+    }
+    install_id
+}
+
+/// What older apps put in front of the name of their sign-in device ("Grouper on Oscar's Mac").
+const APP_NAME_PREFIX: &str = "Grouper on ";
+
+/// A device name as people see it: the machine's own name, without the "Grouper on " that an
+/// app's sign-in device used to carry (the same machine's node never had it).
+pub(crate) fn machine_name(name: &str) -> &str {
+    match name.strip_prefix(APP_NAME_PREFIX).map(str::trim) {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => name,
+    }
+}
+
+/// The live device row an install's registration or sign-in should take over, if any.
+/// First by `install_id` (the `<id>-node` spelling older Apple builds used counts for a node);
+/// failing that, the one live row of the same role (admin or not), platform and machine name
+/// that predates install ids, so a machine's existing rows are attached to it, not duplicated.
+/// Two or more such rows are ambiguous and match nothing: `grouper-hub device merge` settles them.
+fn find_reusable_device(
+    tx: &rusqlite::Transaction<'_>,
+    install: &Install<'_>,
+    admin: bool,
+    name: &str,
+    platform: &str,
+) -> Result<Option<String>> {
+    let canonical = canonical_install_id(install.id, Some(install.kind), admin);
+    let legacy = legacy_node_install_id(canonical);
+    let node = !admin && install.kind == NODE_INSTALL;
+    let found: Option<String> = tx
+        .query_row(
+            "SELECT id FROM devices
+             WHERE install_kind = ?1 AND admin = ?2 AND revoked = 0
+               AND (install_id = ?3 OR (?5 AND (install_id = ?4 OR install_id = ?6)))
+             ORDER BY created DESC LIMIT 1",
+            params![install.kind, admin, install.id, canonical, node, legacy],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if found.is_some() {
+        return Ok(found);
+    }
+    let mut st = tx.prepare(
+        "SELECT id, name FROM devices
+         WHERE admin = ?1 AND revoked = 0 AND (install_id IS NULL OR install_id = '') AND lower(platform) = ?2",
+    )?;
+    let wanted = machine_name(name).to_lowercase();
+    let candidates: Vec<String> = st
+        .query_map(params![admin, platform], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, existing)| machine_name(existing).to_lowercase() == wanted)
+        .map(|(id, _)| id)
+        .collect();
+    Ok(match candidates.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    })
+}
+
+/// A new device would pass the hub's device limit.
+#[derive(Debug)]
+pub struct DeviceCapReached(pub usize);
+
+impl std::fmt::Display for DeviceCapReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "this hub already has {} devices; revoke one first", self.0)
+    }
+}
+
+impl std::error::Error for DeviceCapReached {}
+
+/// Machine-readable error code returned when a harness without `can_orchestrate`
+/// is assigned to orchestrate a project chat or hold the `orchestrator` role.
+pub const HARNESS_CANNOT_ORCHESTRATE_CODE: &str = "harness_cannot_orchestrate";
+
+/// A harness without `can_orchestrate` was chosen as a project-chat orchestrator
+/// or given the `orchestrator` default role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessCannotOrchestrate(pub String);
+
+impl std::fmt::Display for HarnessCannotOrchestrate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for HarnessCannotOrchestrate {}
+
+/// Whether `model` may orchestrate a project chat or hold the `orchestrator` default role:
+/// any API model, or a harness with `can_orchestrate = true`.
+pub fn can_orchestrate_project(model: &ModelEntry) -> bool {
+    core_registry::registry::can_orchestrate_project(model)
+}
+
+/// Refuse a harness without `can_orchestrate` when orchestrating a project chat.
+pub fn check_orchestrator_eligible(model: &ModelEntry) -> Result<()> {
+    if can_orchestrate_project(model) {
+        Ok(())
+    } else {
+        Err(HarnessCannotOrchestrate(model.id.clone()).into())
+    }
+}
+
+/// Refuse assigning the `orchestrator` role to a harness without `can_orchestrate`.
+/// Harnesses without `can_orchestrate` may still hold `standard` and `thread`.
+pub fn check_model_roles(model_id: &str, kind: &str, can_orchestrate: bool, roles: &[String]) -> Result<()> {
+    let has_orchestrator = roles.iter().any(|r| r.trim().eq_ignore_ascii_case("orchestrator"));
+    if has_orchestrator && kind == "harness" && !can_orchestrate {
+        return Err(HarnessCannotOrchestrate(model_id.to_string()).into());
+    }
+    Ok(())
+}
+
+/// What [`Db::issue_device`] did.
+#[derive(Debug)]
+pub struct IssuedDevice {
+    pub device: Device,
+    /// Shown once; only its hash is kept.
+    pub token: String,
+    /// An existing device of the same install got this token (its old one is revoked).
+    pub reused: bool,
+    /// Hashes of the browser sessions that ended with the old token.
+    pub ended_sessions: Vec<String>,
 }
 
 /// Who a valid token belongs to.
@@ -77,22 +242,27 @@ CREATE TABLE IF NOT EXISTS tools (
   available INTEGER NOT NULL DEFAULT 1, input_schema TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (device_id, name));
 CREATE TABLE IF NOT EXISTS providers (
-  id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}');
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}', color TEXT);
 CREATE TABLE IF NOT EXISTS models (
   id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, input_price REAL NOT NULL DEFAULT 0,
   output_price REAL NOT NULL DEFAULT 0, cache_read_price REAL, cache_write_price REAL,
   context_window INTEGER NOT NULL DEFAULT 0,
   use_cases TEXT NOT NULL DEFAULT '', free INTEGER NOT NULL DEFAULT 0, roles TEXT NOT NULL DEFAULT '',
-  modalities TEXT NOT NULL DEFAULT '');
+  modalities TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'api', device_id TEXT, can_orchestrate INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'manual', hidden INTEGER NOT NULL DEFAULT 0, hidden_reason TEXT,
+  missed_syncs INTEGER NOT NULL DEFAULT 0, last_seen INTEGER, display_name TEXT,
+  price_source TEXT NOT NULL DEFAULT 'manual', tools TEXT NOT NULL DEFAULT 'unknown');
 CREATE TABLE IF NOT EXISTS conversations (
-  id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created INTEGER NOT NULL, model TEXT);
+  id TEXT PRIMARY KEY, mode TEXT NOT NULL, title TEXT NOT NULL, created INTEGER NOT NULL,
+  model TEXT, harness_session TEXT);
 CREATE TABLE IF NOT EXISTS history (
   conversation_id TEXT NOT NULL, idx INTEGER NOT NULL, message TEXT NOT NULL,
   PRIMARY KEY (conversation_id, idx));
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, title TEXT NOT NULL, device_id TEXT NOT NULL,
   model TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, brief TEXT NOT NULL, summary TEXT,
-  created INTEGER NOT NULL, finished INTEGER);
+  created INTEGER NOT NULL, finished INTEGER, harness_session TEXT);
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, thread_id TEXT,
   ts INTEGER NOT NULL, body TEXT NOT NULL);
@@ -100,11 +270,12 @@ CREATE INDEX IF NOT EXISTS events_conv ON events (conversation_id, seq);
 CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT, thread_id TEXT, provider_id TEXT NOT NULL,
   model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
-  cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL, cost REAL NOT NULL, ts INTEGER NOT NULL);
+  cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL, cost REAL NOT NULL, ts INTEGER NOT NULL,
+  billing TEXT NOT NULL DEFAULT 'api');
 CREATE TABLE IF NOT EXISTS usage_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, provider TEXT NOT NULL, kind TEXT NOT NULL,
   window TEXT NOT NULL, used_pct REAL, used_amount REAL, limit_amount REAL, currency TEXT, resets_at INTEGER,
-  source TEXT NOT NULL, device_id TEXT, fetched_at INTEGER NOT NULL);
+  source TEXT NOT NULL, device_id TEXT, fetched_at INTEGER NOT NULL, label TEXT, account_key TEXT);
 CREATE INDEX IF NOT EXISTS usage_snapshots_latest ON usage_snapshots
   (provider, account, kind, window, fetched_at DESC);
 ";
@@ -131,9 +302,65 @@ fn csv_list(value: String) -> Vec<String> {
     value.split(',').filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
-fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
+fn device_ref_map(conn: &Connection) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(mut st) = conn.prepare("SELECT id, name FROM devices WHERE revoked = 0") else {
+        return map;
+    };
+    let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) else {
+        return map;
+    };
+    for (id, name) in rows.filter_map(Result::ok) {
+        map.insert(id.clone(), id.clone());
+        map.entry(name.to_ascii_lowercase()).or_insert(id);
+    }
+    map
+}
+
+fn resolve_device_ref(device_map: &HashMap<String, String>, host: &str) -> String {
+    let host = host.trim();
+    device_map
+        .get(host)
+        .or_else(|| device_map.get(&host.to_ascii_lowercase()))
+        .cloned()
+        .unwrap_or_else(|| host.to_string())
+}
+
+fn model_row(r: &rusqlite::Row, device_map: &HashMap<String, String>) -> rusqlite::Result<ModelEntry> {
     let roles: String = r.get(10)?;
     let modalities: String = r.get(12)?;
+    let stored_kind: String = r.get(13)?;
+    let stored_device_id: Option<String> = r.get::<_, Option<String>>(14)?.filter(|s| !s.is_empty());
+    let source: String = r.get(15)?;
+    let hidden: bool = r.get::<_, i64>(16)? != 0;
+    let hidden_reason: Option<String> = if hidden {
+        r.get::<_, Option<String>>(17)?.filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let last_seen: Option<u64> = r.get::<_, Option<i64>>(18)?.map(|v| v as u64);
+    let display_name: Option<String> = r.get::<_, Option<String>>(19)?.filter(|s| !s.is_empty());
+    let price_source: String = r.get(20)?;
+    let tools: String = r.get(21)?;
+    let provider_kind: Option<String> = r.get(22)?;
+    let provider_options: Option<String> = r.get(23)?;
+    let can_orchestrate: bool = r.get::<_, i64>(24)? != 0;
+    let is_harness_provider = provider_kind.as_deref() == Some("harness");
+    let kind = if is_harness_provider {
+        "harness".to_string()
+    } else if stored_kind.is_empty() {
+        "api".to_string()
+    } else {
+        stored_kind
+    };
+    let device_id = stored_device_id.or_else(|| {
+        if !is_harness_provider {
+            return None;
+        }
+        let opts: Value = provider_options.as_deref().and_then(|s| serde_json::from_str(s).ok())?;
+        let via = opts.get("via_device").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
+        Some(resolve_device_ref(device_map, via))
+    });
     Ok(ModelEntry {
         id: r.get(0)?,
         provider_id: r.get(1)?,
@@ -148,10 +375,23 @@ fn model_row(r: &rusqlite::Row) -> rusqlite::Result<ModelEntry> {
         roles: csv_list(roles),
         local: r.get::<_, i64>(11)? != 0,
         modalities: csv_list(modalities),
+        kind,
+        device_id,
+        can_orchestrate,
+        source: if source.is_empty() { "manual".into() } else { source },
+        hidden,
+        hidden_reason,
+        last_seen,
+        display_name,
+        price_source: if price_source.is_empty() { "manual".into() } else { price_source },
+        tools: if tools.is_empty() { "unknown".into() } else { tools },
     })
 }
-const MODEL_COLS: &str = "id, provider_id, model, input_price, output_price, cache_read_price, cache_write_price, \
-                           context_window, use_cases, free, roles, local, modalities";
+const MODEL_SELECT: &str = "SELECT m.id, m.provider_id, m.model, m.input_price, m.output_price, m.cache_read_price, \
+                            m.cache_write_price, m.context_window, m.use_cases, m.free, m.roles, m.local, m.modalities, \
+                            m.kind, m.device_id, m.source, m.hidden, m.hidden_reason, m.last_seen, m.display_name, \
+                            m.price_source, m.tools, p.kind, p.options, m.can_orchestrate \
+                            FROM models m LEFT JOIN providers p ON p.id = m.provider_id";
 
 fn conversation_row(r: &rusqlite::Row) -> rusqlite::Result<ConversationInfo> {
     Ok(ConversationInfo {
@@ -205,7 +445,10 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
     conn.execute_batch(crate::offline::SCHEMA)?;
     conn.execute_batch(crate::limits::SCHEMA)?;
     conn.execute_batch(crate::session::SCHEMA)?;
+    // Sessions opened by POST /v1/auth/google/return record the Google `sub`. Older rows stay NULL.
+    ensure_column(&conn, "sessions", "google_sub", "ALTER TABLE sessions ADD COLUMN google_sub TEXT")?;
     conn.execute_batch(crate::push::SCHEMA)?;
+    conn.execute_batch(crate::google_auth::SCHEMA)?;
     // Databases made before admin tokens: every existing token becomes a plain
     // device token; grant admin with `grouper-hub device admin <id>`.
     let has_admin: bool = conn
@@ -223,11 +466,65 @@ fn open_connection(data_dir: &Path) -> Result<Connection> {
         }
     }
     ensure_column(&conn, "models", "modalities", "ALTER TABLE models ADD COLUMN modalities TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&conn, "models", "kind", "ALTER TABLE models ADD COLUMN kind TEXT NOT NULL DEFAULT 'api'")?;
+    ensure_column(&conn, "models", "device_id", "ALTER TABLE models ADD COLUMN device_id TEXT")?;
+    ensure_column(&conn, "models", "source", "ALTER TABLE models ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")?;
+    ensure_column(&conn, "models", "hidden", "ALTER TABLE models ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "models", "hidden_reason", "ALTER TABLE models ADD COLUMN hidden_reason TEXT")?;
+    ensure_column(&conn, "models", "missed_syncs", "ALTER TABLE models ADD COLUMN missed_syncs INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "models", "last_seen", "ALTER TABLE models ADD COLUMN last_seen INTEGER")?;
+    ensure_column(&conn, "models", "display_name", "ALTER TABLE models ADD COLUMN display_name TEXT")?;
+    ensure_column(&conn, "models", "price_source", "ALTER TABLE models ADD COLUMN price_source TEXT NOT NULL DEFAULT 'manual'")?;
+    ensure_column(&conn, "models", "tools", "ALTER TABLE models ADD COLUMN tools TEXT NOT NULL DEFAULT 'unknown'")?;
+    ensure_column(&conn, "models", "can_orchestrate", "ALTER TABLE models ADD COLUMN can_orchestrate INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "conversations", "model", "ALTER TABLE conversations ADD COLUMN model TEXT")?;
+    ensure_column(&conn, "conversations", "harness_session", "ALTER TABLE conversations ADD COLUMN harness_session TEXT")?;
+    ensure_column(&conn, "threads", "harness_session", "ALTER TABLE threads ADD COLUMN harness_session TEXT")?;
+    ensure_column(&conn, "usage", "billing", "ALTER TABLE usage ADD COLUMN billing TEXT NOT NULL DEFAULT 'api'")?;
+    // Key colour (a name from `core_protocol::KEY_COLORS`); existing providers get one in creation order.
+    ensure_column(&conn, "providers", "color", "ALTER TABLE providers ADD COLUMN color TEXT")?;
+    assign_missing_provider_colors(&conn)?;
+    // The provider's own name for a usage window's scope (Antigravity group, Grok product).
+    ensure_column(&conn, "usage_snapshots", "label", "ALTER TABLE usage_snapshots ADD COLUMN label TEXT")?;
+    // Opaque fingerprint of the subscription account a reading came from (merges cards across devices).
+    ensure_column(&conn, "usage_snapshots", "account_key", "ALTER TABLE usage_snapshots ADD COLUMN account_key TEXT")?;
+    // Subscription usage probes the device advertised on its last connection.
+    ensure_column(&conn, "devices", "usage_probes", "ALTER TABLE devices ADD COLUMN usage_probes INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "devices", "usage_probe_providers", "ALTER TABLE devices ADD COLUMN usage_probe_providers TEXT NOT NULL DEFAULT '[]'")?;
     ensure_column(&conn, "tools", "available", "ALTER TABLE tools ADD COLUMN available INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(&conn, "tools", "input_schema", "ALTER TABLE tools ADD COLUMN input_schema TEXT NOT NULL DEFAULT '{}'")?;
     ensure_column(&conn, "devices", "folders", "ALTER TABLE devices ADD COLUMN folders TEXT NOT NULL DEFAULT '[]'")?;
+    // Which app or CLI install a device belongs to, so signing in again from it reuses the device.
+    ensure_column(&conn, "devices", "install_id", "ALTER TABLE devices ADD COLUMN install_id TEXT")?;
+    ensure_column(&conn, "devices", "install_kind", "ALTER TABLE devices ADD COLUMN install_kind TEXT")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS devices_install ON devices (install_id);")?;
+    // `grouper-hub device merge`: this credential belongs to the same machine as that device row.
+    ensure_column(&conn, "devices", "merged_into", "ALTER TABLE devices ADD COLUMN merged_into TEXT")?;
+    // Link devices to the owning Google account (`hub_owner.sub`), and track which device is the hub.
+    ensure_column(&conn, "devices", "account_sub", "ALTER TABLE devices ADD COLUMN account_sub TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS devices_account ON devices (account_sub);
+         UPDATE devices SET account_sub = (SELECT sub FROM hub_owner WHERE id = 1)
+           WHERE account_sub IS NULL AND EXISTS (SELECT 1 FROM hub_owner WHERE id = 1);
+         CREATE TABLE IF NOT EXISTS hub_state (
+           id INTEGER PRIMARY KEY CHECK (id = 1),
+           hub_device_id TEXT NOT NULL REFERENCES devices(id),
+           epoch INTEGER NOT NULL CHECK (epoch >= 1)
+         );",
+    )?;
+    conn.execute_batch(crate::link::SCHEMA)?;
+    ensure_column(&conn, "push_subscriptions", "session_id", "ALTER TABLE push_subscriptions ADD COLUMN session_id TEXT")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS push_subscriptions_session ON push_subscriptions (session_id);")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS hub_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
+    // Per-chat bearer tokens for the harness orchestrator MCP endpoint. Hashes only.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS orchestrator_tokens (
+           token_hash TEXT PRIMARY KEY,
+           conversation_id TEXT NOT NULL,
+           created INTEGER NOT NULL,
+           revoked INTEGER NOT NULL DEFAULT 0);
+         CREATE INDEX IF NOT EXISTS orchestrator_tokens_conv ON orchestrator_tokens (conversation_id);",
+    )?;
     Ok(conn)
 }
 
@@ -242,6 +539,102 @@ fn migrate_dotted_tool_names(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The key colour a provider takes first because it clearly belongs to one maker: Anthropic pink,
+/// OpenAI blue, Google teal, DeepSeek cyan, Mistral rose (`docs/usage-tab-spec.md` 4.4).
+///
+/// An endpoint on a known maker host decides. With an endpoint on any other host (OpenRouter, a
+/// local server, a proxy) only an id that is exactly the maker's name counts. With no endpoint the
+/// provider kind decides (`anthropic` is Anthropic, `openai` is OpenAI's own endpoint), then the id.
+fn maker_color(id: &str, kind: &str, base_url: Option<&str>) -> Option<&'static str> {
+    const MAKERS: [(&str, &[&str], &[&str]); 5] = [
+        ("pink", &["anthropic.com"], &["anthropic", "claude"]),
+        ("blue", &["openai.com"], &["openai"]),
+        ("teal", &["googleapis.com", "google.com"], &["google", "gemini"]),
+        ("cyan", &["deepseek.com"], &["deepseek"]),
+        ("rose", &["mistral.ai"], &["mistral"]),
+    ];
+    let id = id.trim().to_ascii_lowercase();
+    let host = base_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .and_then(|url| url::Url::parse(url).ok())
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    for (color, hosts, words) in MAKERS {
+        let matched = match &host {
+            Some(host) => {
+                hosts.iter().any(|h| host == h || host.ends_with(&format!(".{h}"))) || words.contains(&id.as_str())
+            }
+            None => {
+                (kind == "anthropic" && color == "pink")
+                    || (kind == "openai" && color == "blue" && id != "scripted")
+                    || words.iter().any(|w| id.contains(w))
+            }
+        };
+        if matched {
+            return Some(color);
+        }
+    }
+    None
+}
+
+/// The colour for a provider, given how many other keys use each colour: the maker's colour if it is
+/// unused, else the first unused colour in the fixed order, else the colour the fewest keys use.
+fn pick_key_color(used: &HashMap<String, usize>, preferred: Option<&'static str>) -> &'static str {
+    let count = |color: &str| used.get(color).copied().unwrap_or(0);
+    if let Some(color) = preferred.filter(|color| count(color) == 0) {
+        return color;
+    }
+    if let Some(color) = core_protocol::KEY_COLORS.iter().copied().find(|color| count(color) == 0) {
+        return color;
+    }
+    // `min_by_key` keeps the first of equals, so ties go to the earlier colour in the fixed order.
+    core_protocol::KEY_COLORS.iter().copied().min_by_key(|color| count(color)).unwrap_or("teal")
+}
+
+/// Give provider `id` a colour if it is a non-harness provider without a valid one. Returns its colour.
+/// Harness providers (subscription entries) get none. Runs inside whatever transaction `conn` is in.
+fn assign_provider_color(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let row: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row("SELECT kind, base_url, color FROM providers WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?;
+    let Some((kind, base_url, color)) = row else { return Ok(None) };
+    if kind == "harness" {
+        return Ok(None);
+    }
+    if let Some(color) = color.as_deref().and_then(core_protocol::parse_key_color) {
+        return Ok(Some(color.to_string()));
+    }
+    let mut used: HashMap<String, usize> = HashMap::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT color, COUNT(*) FROM providers WHERE id != ?1 AND kind != 'harness' AND color IS NOT NULL GROUP BY color",
+        )?;
+        let rows = statement.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)))?;
+        for row in rows {
+            let (color, count) = row?;
+            used.insert(color, count);
+        }
+    }
+    let color = pick_key_color(&used, maker_color(id, &kind, base_url.as_deref()));
+    conn.execute("UPDATE providers SET color = ?1 WHERE id = ?2", params![color, id])?;
+    Ok(Some(color.to_string()))
+}
+
+/// Colour every non-harness provider that has none, oldest first, so a hub that predates key
+/// colours ends up with distinct colours that stay put. Safe to repeat.
+fn assign_missing_provider_colors(conn: &Connection) -> Result<()> {
+    let ids: Vec<String> = {
+        let mut statement = conn.prepare("SELECT id FROM providers WHERE kind != 'harness' ORDER BY rowid")?;
+        statement.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in ids {
+        assign_provider_color(conn, &id)?;
+    }
+    Ok(())
+}
+
 /// `ALTER TABLE` only when the column is missing, so opening an existing database is safe to repeat.
 fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) -> Result<()> {
     let exists = conn
@@ -251,6 +644,52 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) 
         conn.execute(alter_sql, [])?;
     }
     Ok(())
+}
+
+/// Default device name for the machine hosting a fresh hub: its hostname, sanitized, with a safe fallback.
+fn machine_device_name() -> String {
+    let raw = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_default();
+    let cleaned: String = raw.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("hub") {
+        "Grouper host".into()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// Pick the best live device row to act as the hub for `install_id` (or its legacy `<base>-node`
+/// companion id), preferring an exact-match non-admin node row, then any non-admin row, then an admin row.
+fn find_install_hub_candidate(
+    tx: &rusqlite::Transaction<'_>,
+    install_id: &str,
+    legacy_node: &str,
+) -> Result<Option<(String, i64)>> {
+    Ok(tx
+        .query_row(
+            "SELECT id, admin FROM devices
+             WHERE (install_id = ?1 OR (install_id = ?2 AND admin = 0)) AND revoked = 0
+             ORDER BY
+               CASE
+                 WHEN install_id = ?1 AND admin = 0 AND install_kind = ?3 THEN 0
+                 WHEN install_id = ?2 AND admin = 0 AND install_kind = ?3 THEN 1
+                 WHEN admin = 0 THEN 2
+                 ELSE 3
+               END,
+               created DESC
+             LIMIT 1",
+            params![install_id, legacy_node, NODE_INSTALL],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
 }
 
 impl Db {
@@ -293,6 +732,229 @@ impl Db {
         let id = random_hex(16);
         let _ = c.execute("INSERT OR IGNORE INTO hub_meta (key, value) VALUES ('hub_id', ?1)", [&id]);
         c.query_row("SELECT value FROM hub_meta WHERE key = 'hub_id'", [], |r| r.get(0)).unwrap_or(id)
+    }
+
+    /// Ensure this hub has a device row for the host machine and a `(hub_device_id, epoch)` assignment.
+    /// On a fresh hub, registers a non-admin device with the OS platform and machine hostname and sets
+    /// `hub_device_id` to it at `epoch = 1`.
+    pub fn ensure_hub_device(&self) -> Result<(String, u64)> {
+        self.ensure_hub_device_for_install(None)
+    }
+
+    /// Ensure this hub has a `(hub_device_id, epoch)` assignment, optionally bound to an embedding
+    /// app's `install_id`.
+    ///
+    /// When `install_id` is `Some`:
+    /// - If `hub_state` is absent, adopts an existing live device row for `install_id` (preferring a
+    ///   non-admin node row, including legacy `<install_id>-node` rows) or inserts one tagged with
+    ///   `(install_id, NODE_INSTALL)` so the hub and its local node share one row.
+    /// - If `hub_state` already points to an unattached synthetic hub row (`install_id IS NULL`),
+    ///   adopts the install's existing node row (retiring the unused synthetic row) or attaches
+    ///   `install_id` to the current hub row without bumping `epoch`.
+    /// - If `hub_state` already points to a row of the same install (or a different explicit install),
+    ///   reuses it without creating a duplicate row or bumping `epoch`.
+    pub fn ensure_hub_device_for_install(&self, install_id: Option<&str>) -> Result<(String, u64)> {
+        let install_id = match install_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => {
+                if !valid_install_id(id) {
+                    bail!("install_id must be 16 to 64 characters of letters, digits, - and _");
+                }
+                Some(id)
+            }
+            None => None,
+        };
+
+        let mut c = self.c();
+        if install_id.is_none()
+            && let Some((id, epoch)) = c
+                .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })
+                .optional()?
+        {
+            return Ok((id, epoch));
+        }
+
+        let tx = c.transaction()?;
+        let owner_sub: Option<String> = tx
+            .query_row("SELECT sub FROM hub_owner WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
+        let existing_state: Option<(String, u64)> = tx
+            .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .optional()?;
+
+        if let Some((cur_id, cur_epoch)) = existing_state {
+            let Some(inst) = install_id else {
+                return Ok((cur_id, cur_epoch));
+            };
+            let legacy_node = legacy_node_install_id(inst);
+            type HubDeviceRow = (Option<String>, Option<String>, i64, Option<i64>, i64);
+            let cur_row: Option<HubDeviceRow> = tx
+                .query_row(
+                    "SELECT install_id, install_kind, admin, last_seen, revoked FROM devices WHERE id = ?1",
+                    [&cur_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?;
+
+            if let Some((cur_inst, cur_kind, cur_admin, cur_last_seen, cur_revoked)) = cur_row
+                && cur_revoked == 0
+            {
+                match cur_inst.as_deref().filter(|s| !s.is_empty()) {
+                    Some(id) if id == inst => {
+                        return Ok((cur_id, cur_epoch));
+                    }
+                    Some(id) if id == legacy_node => {
+                        tx.execute(
+                            "UPDATE devices SET install_id = ?1, account_sub = COALESCE(account_sub, ?2) WHERE id = ?3",
+                            params![inst, owner_sub, cur_id],
+                        )?;
+                        tx.commit()?;
+                        return Ok((cur_id, cur_epoch));
+                    }
+                    Some(_) => {
+                        return Ok((cur_id, cur_epoch));
+                    }
+                    None => {
+                        if let Some((cand_id, cand_admin)) = find_install_hub_candidate(&tx, inst, &legacy_node)?
+                            && cur_admin == 0
+                            && cur_kind.is_none()
+                            && cur_last_seen.is_none()
+                            && cand_admin == 0
+                        {
+                            tx.execute(
+                                "UPDATE devices SET install_id = ?1, account_sub = COALESCE(account_sub, ?2) WHERE id = ?3",
+                                params![inst, owner_sub, cand_id],
+                            )?;
+                            tx.execute("UPDATE hub_state SET hub_device_id = ?1 WHERE id = 1", params![cand_id])?;
+                            tx.execute("UPDATE devices SET revoked = 1 WHERE id = ?1", [&cur_id])?;
+                            tx.commit()?;
+                            return Ok((cand_id, cur_epoch));
+                        }
+                        if cur_admin == 0 && cur_kind.is_none() {
+                            tx.execute(
+                                "UPDATE devices SET install_id = ?1, install_kind = ?2, account_sub = COALESCE(account_sub, ?3) WHERE id = ?4",
+                                params![inst, NODE_INSTALL, owner_sub, cur_id],
+                            )?;
+                        } else {
+                            tx.execute(
+                                "UPDATE devices SET install_id = ?1, account_sub = COALESCE(account_sub, ?2) WHERE id = ?3",
+                                params![inst, owner_sub, cur_id],
+                            )?;
+                        }
+                        tx.commit()?;
+                        return Ok((cur_id, cur_epoch));
+                    }
+                }
+            }
+            return Ok((cur_id, cur_epoch));
+        }
+
+        if let Some(inst) = install_id {
+            let legacy_node = legacy_node_install_id(inst);
+            if let Some((existing_id, _)) = find_install_hub_candidate(&tx, inst, &legacy_node)? {
+                tx.execute(
+                    "UPDATE devices SET install_id = ?1, account_sub = COALESCE(account_sub, ?2) WHERE id = ?3",
+                    params![inst, owner_sub, existing_id],
+                )?;
+                tx.execute("INSERT INTO hub_state (id, hub_device_id, epoch) VALUES (1, ?1, 1)", params![existing_id])?;
+                tx.commit()?;
+                return Ok((existing_id, 1));
+            }
+        }
+
+        let id = random_hex(6);
+        let secret = random_hex(32);
+        let name = machine_device_name();
+        let platform = std::env::consts::OS;
+        let install_kind = install_id.map(|_| NODE_INSTALL);
+        tx.execute(
+            "INSERT INTO devices (id, name, platform, secret_hash, created, admin, install_id, install_kind, account_sub)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
+            params![id, name, platform, hash(&secret), ts(), install_id, install_kind, owner_sub],
+        )?;
+        tx.execute("INSERT INTO hub_state (id, hub_device_id, epoch) VALUES (1, ?1, 1)", params![id])?;
+        tx.commit()?;
+        Ok((id, 1))
+    }
+
+    /// The `install_id` recorded on a device row, if any.
+    pub fn device_install_id(&self, id: &str) -> Option<String> {
+        self.c()
+            .query_row("SELECT install_id FROM devices WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The device id currently acting as the hub (registering this machine on first use).
+    pub fn hub_device_id(&self) -> String {
+        self.ensure_hub_device().expect("hub device registration").0
+    }
+
+    /// Hub assignment counter: starts at 1 and rises by 1 whenever `hub_device_id` changes.
+    pub fn epoch(&self) -> u64 {
+        self.ensure_hub_device().expect("hub device registration").1
+    }
+
+    /// Reassign `hub_device_id` to an active device of the account. Increments `epoch` when
+    /// `hub_device_id` changes; assigning the current device is a no-op and returns the current `epoch`.
+    pub fn set_hub_device_id(&self, device_id: &str) -> Result<u64> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let Some((revoked, dev_account)): Option<(i64, Option<String>)> = tx
+            .query_row("SELECT revoked, account_sub FROM devices WHERE id = ?1", [device_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?
+        else {
+            bail!("no such device");
+        };
+        if revoked != 0 {
+            bail!("cannot assign a revoked device as the hub");
+        }
+        let owner_sub: Option<String> = tx
+            .query_row("SELECT sub FROM hub_owner WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
+        if let Some(sub) = &owner_sub {
+            match &dev_account {
+                Some(existing) if existing != sub => bail!("device belongs to a different account"),
+                None => {
+                    tx.execute("UPDATE devices SET account_sub = ?1 WHERE id = ?2", params![sub, device_id])?;
+                }
+                _ => {}
+            }
+        }
+        let current: Option<(String, i64)> = tx
+            .query_row("SELECT hub_device_id, epoch FROM hub_state WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let epoch = match current {
+            Some((cur_id, cur_epoch)) if cur_id == device_id => cur_epoch as u64,
+            Some((_, cur_epoch)) => {
+                let next = (cur_epoch as u64) + 1;
+                tx.execute(
+                    "UPDATE hub_state SET hub_device_id = ?1, epoch = ?2 WHERE id = 1",
+                    params![device_id, next as i64],
+                )?;
+                next
+            }
+            None => {
+                tx.execute("INSERT INTO hub_state (id, hub_device_id, epoch) VALUES (1, ?1, 1)", params![device_id])?;
+                1
+            }
+        };
+        tx.commit()?;
+        Ok(epoch)
+    }
+
+    /// Hex SHA-256 of the hub's identity key, if one exists. No hub identity key exists yet
+    /// (arrives with LAN TLS in package 13), so this returns `None` and `/v1/hub` omits `key_sha256`.
+    pub fn identity_key_sha256(&self) -> Option<String> {
+        None
     }
 
     /// The Web Push (VAPID) private key: a P-256 scalar, made on first use and kept in
@@ -351,6 +1013,23 @@ impl Db {
     // ---- devices
 
     pub fn add_device(&self, name: &str, platform: &str, admin: bool) -> Result<(Device, String)> {
+        let issued = self.issue_device(name, platform, admin, None, None)?;
+        Ok((issued.device, issued.token))
+    }
+
+    /// A token for a new device, or, when `install` names a live device of the same install and
+    /// kind (and admin flag), a fresh token for that device: its old token stops working and its
+    /// browser sessions and push subscriptions go, as when it is revoked. `max_live` caps how many
+    /// live devices a new one may join (a reused device doesn't count). The caller closes the old
+    /// connection and tells live sockets ([`crate::server::Hub::issue_device`]).
+    pub fn issue_device(
+        &self,
+        name: &str,
+        platform: &str,
+        admin: bool,
+        install: Option<Install<'_>>,
+        max_live: Option<usize>,
+    ) -> Result<IssuedDevice> {
         let name = name.trim();
         if name.is_empty() {
             bail!("device name is empty");
@@ -358,37 +1037,182 @@ impl Db {
         if name.eq_ignore_ascii_case("hub") {
             bail!("\"hub\" is reserved for the hub itself");
         }
-        let id = random_hex(6);
+        if let Some(i) = &install
+            && !valid_install_id(i.id)
+        {
+            bail!("install_id must be 16 to 64 characters of letters, digits, - and _");
+        }
         let secret = random_hex(32);
         let platform = platform.trim().to_lowercase();
-        self.c().execute(
-            "INSERT INTO devices (id, name, platform, secret_hash, created, admin) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, name, platform, hash(&secret), ts(), admin],
-        )?;
-        Ok((
-            Device { id: id.clone(), name: name.into(), platform, revoked: false, last_seen: None, admin },
-            format!("{id}.{secret}"),
-        ))
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let owner_sub: Option<String> = tx
+            .query_row("SELECT sub FROM hub_owner WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
+        let existing: Option<String> = match &install {
+            Some(i) => find_reusable_device(&tx, i, admin, name, &platform)?,
+            None => None,
+        };
+        // Stored so every credential of one machine carries the machine's one install id.
+        let stored_install = install.map(|i| (canonical_install_id(i.id, Some(i.kind), admin), i.kind));
+        let (id, account_sub, ended_sessions) = match existing {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE devices SET secret_hash = ?1, name = ?2, platform = ?3,
+                       account_sub = COALESCE(?4, account_sub),
+                       install_id = COALESCE(?6, install_id), install_kind = COALESCE(?7, install_kind)
+                     WHERE id = ?5",
+                    params![
+                        hash(&secret),
+                        name,
+                        platform,
+                        owner_sub,
+                        id,
+                        stored_install.map(|(i, _)| i),
+                        stored_install.map(|(_, k)| k)
+                    ],
+                )?;
+                let account_sub: Option<String> =
+                    tx.query_row("SELECT account_sub FROM devices WHERE id = ?1", [&id], |r| r.get(0))?;
+                let sessions = {
+                    let mut st = tx.prepare("SELECT id_hash FROM sessions WHERE device_id = ?1")?;
+                    st.query_map([&id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                tx.execute("DELETE FROM sessions WHERE device_id = ?1", [&id])?;
+                tx.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [&id])?;
+                (id, account_sub, Some(sessions))
+            }
+            None => {
+                if let Some(max) = max_live {
+                    let live: i64 = tx.query_row("SELECT COUNT(*) FROM devices WHERE revoked = 0", [], |r| r.get(0))?;
+                    if live as usize >= max {
+                        return Err(DeviceCapReached(max).into());
+                    }
+                }
+                let id = random_hex(6);
+                tx.execute(
+                    "INSERT INTO devices (id, name, platform, secret_hash, created, admin, install_id, install_kind, account_sub)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        id,
+                        name,
+                        platform,
+                        hash(&secret),
+                        ts(),
+                        admin,
+                        stored_install.map(|(i, _)| i),
+                        stored_install.map(|(_, k)| k),
+                        owner_sub,
+                    ],
+                )?;
+                (id, owner_sub, None)
+            }
+        };
+        tx.commit()?;
+        Ok(IssuedDevice {
+            token: format!("{id}.{secret}"),
+            device: Device {
+                id,
+                name: name.into(),
+                platform,
+                revoked: false,
+                last_seen: None,
+                admin,
+                account_sub,
+            },
+            reused: ended_sessions.is_some(),
+            ended_sessions: ended_sessions.unwrap_or_default(),
+        })
+    }
+
+    /// The name of the live device an install would reuse, if any (see [`Db::issue_device`]).
+    pub fn install_device_name(&self, install: Install<'_>, admin: bool) -> Option<String> {
+        self.c()
+            .query_row(
+                "SELECT name FROM devices WHERE install_id = ?1 AND install_kind = ?2 AND admin = ?3 AND revoked = 0
+                 ORDER BY created DESC LIMIT 1",
+                params![install.id, install.kind, admin],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Encrypt a short secret with the master key (as provider keys are).
+    pub(crate) fn seal(&self, plaintext: &str) -> Result<String> {
+        self.secrets.seal(plaintext)
+    }
+
+    /// Decrypt what [`Db::seal`] made.
+    pub(crate) fn unseal(&self, sealed: &str) -> Result<String> {
+        self.secrets.open(sealed)
     }
 
     /// Grant or remove admin rights for a device's token.
     pub fn set_admin(&self, id: &str, admin: bool) -> Result<()> {
-        if self.c().execute("UPDATE devices SET admin = ?1 WHERE id = ?2", params![admin, id])? == 0 {
+        let c = self.c();
+        if c.execute("UPDATE devices SET admin = ?1 WHERE id = ?2", params![admin, id])? == 0 {
             bail!("no such device");
+        }
+        if !admin {
+            let _ = c.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [id]);
         }
         Ok(())
     }
 
     pub fn revoke_device(&self, id: &str) -> Result<()> {
-        if self.c().execute("UPDATE devices SET revoked = 1 WHERE id = ?1", [id])? == 0 {
+        let c = self.c();
+        if c.execute("UPDATE devices SET revoked = 1 WHERE id = ?1", [id])? == 0 {
             bail!("no such device");
         }
+        let _ = c.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [id]);
+        Ok(())
+    }
+
+    /// Make `other` another credential of the machine `keep` is on, so the Devices list shows
+    /// them once. Only the listing changes: neither token, permission, tool or thread placement
+    /// is touched, nothing is revoked and `other` keeps whatever rights it had (it does not gain
+    /// `keep`'s). Both must be live; a browser session's row is not a device and can't be merged.
+    pub fn merge_devices(&self, keep: &str, other: &str) -> Result<()> {
+        if keep == other {
+            bail!("pick two different devices");
+        }
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let platform_of = |id: &str| -> Result<String> {
+            tx.query_row("SELECT platform FROM devices WHERE id = ?1 AND revoked = 0", [id], |r| r.get::<_, String>(0))
+                .optional()?
+                .with_context(|| format!("no live device {id}"))
+        };
+        for id in [keep, other] {
+            if platform_of(id)? == "web" {
+                bail!("{id} is a browser session's credential, not a device; browser sessions are listed in Settings");
+            }
+        }
+        // Don't leave `keep` pointing back at `other`.
+        tx.execute("UPDATE devices SET merged_into = NULL WHERE id = ?1 AND merged_into = ?2", params![keep, other])?;
+        tx.execute("UPDATE devices SET merged_into = ?1 WHERE id = ?2", params![keep, other])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Undo [`Db::merge_devices`] for `id`: it and every device merged into it are no longer
+    /// joined by a merge (devices that share an `install_id` still list together).
+    pub fn unmerge_device(&self, id: &str) -> Result<()> {
+        let c = self.c();
+        if c.query_row("SELECT 1 FROM devices WHERE id = ?1", [id], |_| Ok(())).optional()?.is_none() {
+            bail!("no such device");
+        }
+        c.execute("UPDATE devices SET merged_into = NULL WHERE id = ?1 OR merged_into = ?1", [id])?;
         Ok(())
     }
 
     pub fn devices(&self) -> Vec<Device> {
         let c = self.c();
-        let mut st = c.prepare("SELECT id, name, platform, revoked, last_seen, admin FROM devices ORDER BY created").unwrap();
+        let mut st = c
+            .prepare("SELECT id, name, platform, revoked, last_seen, admin, account_sub FROM devices ORDER BY created")
+            .unwrap();
         st.query_map([], |r| {
             Ok(Device {
                 id: r.get(0)?,
@@ -397,6 +1221,7 @@ impl Db {
                 revoked: r.get::<_, i64>(3)? != 0,
                 last_seen: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                 admin: r.get::<_, i64>(5)? != 0,
+                account_sub: r.get(6)?,
             })
         })
         .unwrap()
@@ -414,6 +1239,81 @@ impl Db {
             })
             .ok()?;
         ct_eq(&stored, &hash(secret)).then(|| Auth { device_id: id.to_string(), admin: admin != 0 })
+    }
+
+    /// Mint a bearer token for the harness orchestrating `conversation_id`.
+    /// Only the SHA-256 is stored. The raw token is returned once.
+    pub fn mint_orchestrator_token(&self, conversation_id: &str) -> Result<String> {
+        if self.conversation(conversation_id).is_none() {
+            bail!("no such conversation");
+        }
+        let token = random_hex(32);
+        self.c().execute(
+            "INSERT INTO orchestrator_tokens (token_hash, conversation_id, created, revoked) VALUES (?1, ?2, ?3, 0)",
+            params![hash(&token), conversation_id, ts()],
+        )?;
+        Ok(token)
+    }
+
+    /// The conversation a live orchestrator token may act on.
+    pub fn orchestrator_conversation(&self, token: &str) -> Option<String> {
+        let hashed = hash(token);
+        let (stored, conversation_id): (String, String) = self
+            .c()
+            .query_row(
+                "SELECT token_hash, conversation_id FROM orchestrator_tokens WHERE token_hash = ?1 AND revoked = 0",
+                [&hashed],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()?;
+        ct_eq(&stored, &hashed).then_some(conversation_id)
+    }
+
+    /// Revoke one orchestrator token. False when it was already revoked or unknown.
+    pub fn revoke_orchestrator_token(&self, token: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE orchestrator_tokens SET revoked = 1 WHERE token_hash = ?1 AND revoked = 0",
+                params![hash(token)],
+            )
+            .is_ok_and(|n| n > 0)
+    }
+
+    /// Revoke every live orchestrator token for a chat. Returns how many changed.
+    pub fn revoke_conversation_orchestrator_tokens(&self, conversation_id: &str) -> usize {
+        self.c()
+            .execute(
+                "UPDATE orchestrator_tokens SET revoked = 1 WHERE conversation_id = ?1 AND revoked = 0",
+                [conversation_id],
+            )
+            .unwrap_or(0)
+    }
+
+    /// Revoke the chat's current orchestrator tokens and mint a replacement.
+    /// The raw token is returned once; only its hash is stored.
+    pub fn replace_orchestrator_token(&self, conversation_id: &str) -> Result<String> {
+        self.revoke_conversation_orchestrator_tokens(conversation_id);
+        self.mint_orchestrator_token(conversation_id)
+    }
+
+    /// Delete a chat and revoke its orchestrator tokens.
+    pub fn delete_conversation(&self, id: &str) -> Result<bool> {
+        if self.conversation(id).is_none() {
+            return Ok(false);
+        }
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute(
+            "UPDATE orchestrator_tokens SET revoked = 1 WHERE conversation_id = ?1 AND revoked = 0",
+            [id],
+        )?;
+        tx.execute("DELETE FROM history WHERE conversation_id = ?1", [id])?;
+        tx.execute("DELETE FROM events WHERE conversation_id = ?1", [id])?;
+        tx.execute("DELETE FROM threads WHERE conversation_id = ?1", [id])?;
+        tx.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM hub_meta WHERE key = ?1", [format!("conv_harness_provider:{id}")])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn touch(&self, id: &str) {
@@ -523,8 +1423,8 @@ impl Db {
     // ---- providers and models
 
     pub fn upsert_provider(&self, p: &ProviderConfig) -> Result<()> {
-        if !["anthropic", "openai", "scripted"].contains(&p.kind.as_str()) {
-            bail!("kind must be anthropic, openai or scripted");
+        if !["anthropic", "openai", "scripted", "harness"].contains(&p.kind.as_str()) {
+            bail!("kind must be anthropic, openai, scripted or harness");
         }
         if let Some(value) = p.options.get("via_device") {
             let Some(host) = value.as_str().map(str::trim).filter(|host| !host.is_empty()) else {
@@ -549,13 +1449,74 @@ impl Db {
             .filter(|key| !key.is_empty())
             .map(|key| self.secrets.seal(key))
             .transpose()?;
-        self.c().execute(
+        // The colour column is left out of the conflict update, so a full provider PUT keeps it; a new
+        // provider gets one in the same transaction.
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        tx.execute(
             "INSERT INTO providers (id, kind, base_url, api_key, options) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, base_url = excluded.base_url,
                api_key = COALESCE(excluded.api_key, providers.api_key), options = excluded.options",
             params![p.id, p.kind, p.base_url, api_key, options],
         )?;
+        assign_provider_color(&tx, &p.id)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Key colours by provider id (providers without one, such as harnesses, are absent).
+    pub fn provider_colors(&self) -> HashMap<String, String> {
+        let c = self.c();
+        let Ok(mut statement) = c.prepare("SELECT id, color FROM providers WHERE color IS NOT NULL") else {
+            return HashMap::new();
+        };
+        statement
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    /// Set provider `id`'s key colour to a palette name, or with `None` clear it and pick one
+    /// automatically. `Ok(false)` means no such provider; a name outside the palette is an error.
+    pub fn set_provider_color(&self, id: &str, color: Option<&str>) -> Result<bool> {
+        let canonical = match color {
+            Some(name) => Some(
+                core_protocol::parse_key_color(name)
+                    .with_context(|| format!("color must be one of {}", core_protocol::KEY_COLORS.join(", ")))?,
+            ),
+            None => None,
+        };
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let changed = tx.execute("UPDATE providers SET color = ?1 WHERE id = ?2", params![canonical, id])?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        if canonical.is_none() {
+            assign_provider_color(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Remember the subscription usage probes a device advertised on its latest connection.
+    pub fn set_device_usage_probes(&self, id: &str, enabled: bool, providers: &[String]) {
+        let json = serde_json::to_string(providers).unwrap_or_else(|_| "[]".into());
+        let _ = self.c().execute(
+            "UPDATE devices SET usage_probes = ?1, usage_probe_providers = ?2 WHERE id = ?3",
+            params![enabled, json, id],
+        );
+    }
+
+    /// The probes a device advertised on its last connection (kept while it is offline).
+    pub fn device_usage_probes(&self, id: &str) -> (bool, Vec<String>) {
+        self.c()
+            .query_row("SELECT usage_probes, usage_probe_providers FROM devices WHERE id = ?1", [id], |r| {
+                Ok((r.get::<_, bool>(0)?, r.get::<_, String>(1)?))
+            })
+            .ok()
+            .map(|(enabled, json)| (enabled, serde_json::from_str(&json).unwrap_or_default()))
+            .unwrap_or_default()
     }
 
     pub fn providers(&self) -> Result<Vec<ProviderConfig>> {
@@ -590,9 +1551,9 @@ impl Db {
     }
 
     pub fn upsert_model(&self, m: &ModelEntry) -> Result<()> {
-        if self.provider(&m.provider_id)?.is_none() {
+        let Some(provider) = self.provider(&m.provider_id)? else {
             bail!("no provider {}; add it first", m.provider_id);
-        }
+        };
         core_registry::cost::check_price("input_price", m.input_price)?;
         core_registry::cost::check_price("output_price", m.output_price)?;
         if let Some(p) = m.cache_read_price {
@@ -601,10 +1562,81 @@ impl Db {
         if let Some(p) = m.cache_write_price {
             core_registry::cost::check_price("cache_write_price", p)?;
         }
-        self.c().execute(
-            "INSERT OR REPLACE INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
-               cache_write_price, context_window, use_cases, free, roles, local, modalities)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        let kind = if provider.kind == "harness" {
+            "harness"
+        } else {
+            match m.kind.trim() {
+                "" | "api" => "api",
+                "harness" => "harness",
+                other => bail!("kind must be api or harness; got {other:?}"),
+            }
+        };
+        check_model_roles(&m.id, kind, m.can_orchestrate, &m.roles)?;
+        let source = match m.source.trim() {
+            "" | "manual" => "manual",
+            "auto" => "auto",
+            other => bail!("source must be manual or auto; got {other:?}"),
+        };
+        let hidden_reason = if !m.hidden {
+            None
+        } else {
+            match m.hidden_reason.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some("gone") => Some("gone"),
+                Some("user") => Some("user"),
+                Some(other) => bail!("hidden_reason must be gone or user; got {other:?}"),
+            }
+        };
+        let tools = match m.tools.trim() {
+            "" | "unknown" => "unknown",
+            "yes" => "yes",
+            "no" => "no",
+            other => bail!("tools must be yes, no or unknown; got {other:?}"),
+        };
+        let price_source = match m.price_source.trim() {
+            "" => "manual".to_string(),
+            other => other.to_ascii_lowercase(),
+        };
+        let display_name = m.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let c = self.c();
+        let explicit_device_id = m.device_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let device_id = explicit_device_id.or_else(|| {
+            if provider.kind != "harness" {
+                return None;
+            }
+            let via = provider.via_device()?;
+            let map = device_ref_map(&c);
+            Some(resolve_device_ref(&map, via))
+        });
+        c.execute(
+            "INSERT INTO models (id, provider_id, model, input_price, output_price, cache_read_price,
+               cache_write_price, context_window, use_cases, free, roles, local, modalities,
+               kind, device_id, source, hidden, hidden_reason, last_seen, display_name, price_source, tools, can_orchestrate)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+             ON CONFLICT (id) DO UPDATE SET
+               provider_id = excluded.provider_id,
+               model = excluded.model,
+               input_price = excluded.input_price,
+               output_price = excluded.output_price,
+               cache_read_price = excluded.cache_read_price,
+               cache_write_price = excluded.cache_write_price,
+               context_window = excluded.context_window,
+               use_cases = excluded.use_cases,
+               free = excluded.free,
+               roles = excluded.roles,
+               local = excluded.local,
+               modalities = excluded.modalities,
+               kind = excluded.kind,
+               device_id = excluded.device_id,
+               source = excluded.source,
+               hidden = excluded.hidden,
+               hidden_reason = excluded.hidden_reason,
+               missed_syncs = CASE WHEN excluded.hidden = 0 THEN 0 ELSE models.missed_syncs END,
+               last_seen = excluded.last_seen,
+               display_name = excluded.display_name,
+               price_source = excluded.price_source,
+               tools = excluded.tools,
+               can_orchestrate = excluded.can_orchestrate",
             params![
                 m.id,
                 m.provider_id,
@@ -618,9 +1650,42 @@ impl Db {
                 m.free,
                 m.roles.join(","),
                 m.local,
-                m.modalities.join(",")
+                m.modalities.join(","),
+                kind,
+                device_id,
+                source,
+                m.hidden,
+                hidden_reason,
+                m.last_seen.map(|v| v as i64),
+                display_name,
+                price_source,
+                tools,
+                m.can_orchestrate,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn set_model_hidden(&self, id: &str, hidden: bool, reason: Option<&str>) -> Result<()> {
+        let reason = if !hidden {
+            None
+        } else {
+            match reason.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some("gone") => Some("gone"),
+                Some("user") => Some("user"),
+                Some(other) => bail!("hidden_reason must be gone or user; got {other:?}"),
+            }
+        };
+        let n = self.c().execute(
+            "UPDATE models SET hidden = ?1, hidden_reason = ?2,
+               missed_syncs = CASE WHEN ?1 = 0 THEN 0 ELSE missed_syncs END
+             WHERE id = ?3",
+            params![hidden, reason, id],
+        )?;
+        if n == 0 {
+            bail!("no such model");
+        }
         Ok(())
     }
 
@@ -631,10 +1696,17 @@ impl Db {
         Ok(())
     }
 
+    /// Every model row, including hidden rows (so history, usage and outcome stats still resolve them).
     pub fn models(&self) -> Vec<ModelEntry> {
         let c = self.c();
-        let mut st = c.prepare(&format!("SELECT {MODEL_COLS} FROM models ORDER BY id")).unwrap();
-        st.query_map([], model_row).unwrap().filter_map(Result::ok).collect()
+        let device_map = device_ref_map(&c);
+        let mut st = c.prepare(&format!("{MODEL_SELECT} ORDER BY m.id")).unwrap();
+        st.query_map([], |r| model_row(r, &device_map)).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Visible models only (excluding hidden rows).
+    pub fn visible_models(&self) -> Vec<ModelEntry> {
+        self.models().into_iter().filter(|m| !m.hidden).collect()
     }
 
     /// The model to use for a role. Standard chat prefers a free model.
@@ -655,6 +1727,32 @@ impl Db {
     /// A model by registry id, or by the provider's model name.
     pub fn find_model(&self, key: &str) -> Option<ModelEntry> {
         core_registry::find_model_in(&self.models(), key)
+    }
+
+    /// When `model` is a free API model, the other visible free API models on the same
+    /// provider (same key), to swap in when it is rate limited. Never returns a harness row
+    /// as a fallback for an API model, and never treats a harness as a free API model.
+    pub fn free_alternates(&self, provider_id: &str, model: &str) -> Vec<String> {
+        let models = self.models();
+        if !models
+            .iter()
+            .any(|m| m.provider_id == provider_id && m.model == model && m.free && !m.is_harness())
+        {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for m in models {
+            if m.provider_id == provider_id
+                && m.free
+                && !m.is_harness()
+                && !m.hidden
+                && m.model != model
+                && !out.contains(&m.model)
+            {
+                out.push(m.model);
+            }
+        }
+        out
     }
 
     // ---- conversations and history
@@ -683,30 +1781,132 @@ impl Db {
     }
 
     /// Registry id this conversation uses instead of the role default, resolved to a model.
-    /// `Ok(None)` means it uses the role default. An error means the stored id is no longer registered.
+    /// `Ok(None)` means it uses the role default. An error means the stored id is no longer
+    /// registered or is hidden.
     pub fn conversation_model(&self, conversation_id: &str) -> Result<Option<ModelEntry>> {
         let Some(info) = self.conversation(conversation_id) else { bail!("no such conversation") };
         let Some(key) = info.model else { return Ok(None) };
-        self.find_model(&key).map(Some).with_context(|| {
-            format!("conversation {conversation_id} is set to model {key}, which is not in the registry")
-        })
+        let Some(model) = self.find_model(&key) else {
+            bail!("conversation {conversation_id} is set to model {key}, which is not in the registry");
+        };
+        if model.hidden {
+            if model.hidden_reason.as_deref() == Some("gone") {
+                bail!("conversation {conversation_id} is set to model {key}, which the provider no longer lists");
+            }
+            bail!("conversation {conversation_id} is set to model {key}, which is hidden");
+        }
+        Ok(Some(model))
     }
 
     /// Set or clear the conversation's model. `model` is a registry id (or the provider's model
     /// name); null uses the role default again. The stored value is the registry id.
+    /// Project conversations only accept API models or harnesses with `can_orchestrate = true`.
     pub fn set_conversation_model(&self, id: &str, model: Option<&str>) -> Result<ConversationInfo> {
-        if self.conversation(id).is_none() {
+        let Some(conv) = self.conversation(id) else {
             bail!("no such conversation");
-        }
+        };
         let stored = match model.map(str::trim).filter(|s| !s.is_empty()) {
             None => None,
             Some(key) => {
                 let Some(found) = self.find_model(key) else { bail!("no model {key:?} in the registry") };
+                if found.hidden {
+                    bail!("model {} is hidden and cannot be selected", found.id);
+                }
+                if conv.mode == "project" {
+                    check_orchestrator_eligible(&found)?;
+                }
                 Some(found.id)
             }
         };
-        self.c().execute("UPDATE conversations SET model = ?1 WHERE id = ?2", params![stored, id])?;
+        let new_harness_provider = stored
+            .as_deref()
+            .and_then(|id| self.find_model(id))
+            .filter(|m| m.is_harness())
+            .map(|m| m.provider_id);
+        let prev_harness_provider = self.conversation_harness_provider(id);
+        let clear_session = match (&prev_harness_provider, &new_harness_provider) {
+            (Some(prev), Some(next)) => prev != next,
+            (Some(_), None) => true,
+            (None, None) => true,
+            (None, Some(_)) => false,
+        };
+        {
+            let c = self.c();
+            c.execute("UPDATE conversations SET model = ?1 WHERE id = ?2", params![stored, id])?;
+            if clear_session {
+                let _ = c.execute("UPDATE conversations SET harness_session = NULL WHERE id = ?1", [id]);
+                let _ = c.execute(
+                    "DELETE FROM hub_meta WHERE key = ?1",
+                    [format!("conv_harness_provider:{id}")],
+                );
+            }
+        }
         Ok(self.conversation(id).expect("conversation exists"))
+    }
+
+    /// Stored CLI harness session id on `conversations.harness_session`, if any.
+    pub fn conversation_harness_session(&self, conversation_id: &str) -> Option<String> {
+        self.c()
+            .query_row(
+                "SELECT harness_session FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn conversation_harness_provider(&self, conversation_id: &str) -> Option<String> {
+        self.c()
+            .query_row(
+                "SELECT value FROM hub_meta WHERE key = ?1",
+                [format!("conv_harness_provider:{conversation_id}")],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Stored CLI harness session id for `conversation_id` when continuing on `provider_id`.
+    /// Returns `None` if the stored session belonged to a different harness provider.
+    pub fn conversation_harness_session_for(&self, conversation_id: &str, provider_id: &str) -> Option<String> {
+        let session = self.conversation_harness_session(conversation_id)?;
+        if let Some(prev_provider) = self.conversation_harness_provider(conversation_id)
+            && prev_provider != provider_id
+        {
+            return None;
+        }
+        Some(session)
+    }
+
+    /// Persist or clear `conversations.harness_session` (and record which harness provider owns it).
+    pub fn set_conversation_harness_session(
+        &self,
+        conversation_id: &str,
+        provider_id: &str,
+        session_id: Option<&str>,
+    ) {
+        let clean = session_id.map(str::trim).filter(|s| !s.is_empty());
+        let c = self.c();
+        let _ = c.execute(
+            "UPDATE conversations SET harness_session = ?1 WHERE id = ?2",
+            params![clean, conversation_id],
+        );
+        let meta_key = format!("conv_harness_provider:{conversation_id}");
+        if clean.is_some() {
+            let _ = c.execute(
+                "INSERT OR REPLACE INTO hub_meta (key, value) VALUES (?1, ?2)",
+                params![meta_key, provider_id],
+            );
+        } else {
+            let _ = c.execute("DELETE FROM hub_meta WHERE key = ?1", [meta_key]);
+        }
     }
 
     pub fn history(&self, conversation_id: &str) -> Vec<Message> {
@@ -805,6 +2005,22 @@ impl Db {
         done
     }
 
+    /// CLI session id for a harness thread, reported by the device that runs it.
+    pub fn thread_harness_session(&self, id: &str) -> Option<String> {
+        self.c()
+            .query_row("SELECT harness_session FROM threads WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    pub fn set_thread_harness_session(&self, id: &str, session: &str) {
+        let _ = self.c().execute(
+            "UPDATE threads SET harness_session = ?1 WHERE id = ?2",
+            params![session, id],
+        );
+    }
+
     // ---- events and usage
 
     pub fn add_event(&self, conversation_id: &str, thread_id: Option<&str>, body: EventBody) -> Event {
@@ -889,10 +2105,40 @@ impl Db {
             .unwrap_or(0.0);
         let _ = self.c().execute(
             "INSERT INTO usage (conversation_id, thread_id, provider_id, model, input_tokens, output_tokens,
-               cache_read_tokens, cache_write_tokens, cost, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+               cache_read_tokens, cache_write_tokens, cost, ts, billing) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'api')",
             params![conversation_id, thread_id, provider_id, model, input as i64, output as i64, cache_read as i64, cache_write as i64, cost, ts()],
         );
         cost
+    }
+
+    /// Record subscription-billed harness token usage at API cost `0.0` (`billing = "subscription"`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_subscription_usage(
+        &self,
+        conversation_id: Option<&str>,
+        thread_id: Option<&str>,
+        provider_id: &str,
+        model: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) {
+        let _ = self.c().execute(
+            "INSERT INTO usage (conversation_id, thread_id, provider_id, model, input_tokens, output_tokens,
+               cache_read_tokens, cache_write_tokens, cost, ts, billing) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0.0, ?9, 'subscription')",
+            params![
+                conversation_id,
+                thread_id,
+                provider_id,
+                model,
+                input as i64,
+                output as i64,
+                cache_read as i64,
+                cache_write as i64,
+                ts(),
+            ],
+        );
     }
 
     /// (input tokens, output tokens, cost) for a conversation.
@@ -1148,6 +2394,7 @@ mod tests {
             roles: roles.iter().map(|s| s.to_string()).collect(),
             local: false,
             modalities: vec![],
+            ..Default::default()
         };
         db.upsert_model(&m("big", false, &["orchestrator"])).unwrap();
         db.upsert_model(&m("free", true, &[])).unwrap();
@@ -1203,6 +2450,7 @@ mod tests {
                 roles: vec![],
                 local: false,
                 modalities: vec![],
+                ..Default::default()
             })
             .unwrap();
         }
@@ -1274,7 +2522,8 @@ mod tests {
         drop(db);
 
         let key_path = dir.join("master.key");
-        std::fs::remove_file(&key_path).unwrap();
+        // The key may live DPAPI-protected (Windows) or in the Keychain (macOS), not as a file.
+        crate::secrets::remove_master_key(&dir).unwrap();
 
         let error = Db::open(&dir).err().unwrap();
         let message = format!("{error:#}");
@@ -1299,7 +2548,8 @@ mod tests {
 
         // A sealed VAPID key alone is enough to refuse making a fresh master key.
         let key_path = dir.join("master.key");
-        std::fs::remove_file(&key_path).unwrap();
+        // The key may live DPAPI-protected (Windows) or in the Keychain (macOS), not as a file.
+        crate::secrets::remove_master_key(&dir).unwrap();
         let message = format!("{:#}", Db::open(&dir).err().unwrap());
         assert!(message.contains("master key missing"), "{message}");
         assert!(!key_path.exists());
@@ -1357,6 +2607,7 @@ mod tests {
             roles: vec![],
             local: false,
             modalities: vec!["text".into()],
+            ..Default::default()
         })
         .unwrap();
         let id = db.create_conversation("project", "notes").unwrap();
@@ -1422,6 +2673,7 @@ mod tests {
             roles: vec![],
             local: false,
             modalities: vec![],
+            ..Default::default()
         };
         db.upsert_model(&base).unwrap();
         for bad in [-0.01, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -1440,6 +2692,616 @@ mod tests {
         })
         .unwrap();
         drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fresh_hub_registers_host_device_and_epoch_rises_on_reassignment() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let hub_dev_id = db.hub_device_id();
+        assert!(!hub_dev_id.is_empty());
+        assert_eq!(db.epoch(), 1);
+        assert_eq!(db.identity_key_sha256(), None);
+
+        let devices = db.devices();
+        assert_eq!(devices.len(), 1);
+        let host = &devices[0];
+        assert_eq!(host.id, hub_dev_id);
+        assert_eq!(host.platform, std::env::consts::OS);
+        assert_eq!(host.name, machine_device_name());
+        assert!(!host.admin);
+        assert_eq!(host.account_sub, None);
+
+        // Reopening preserves the same hub_device_id and epoch without duplicating the host device.
+        drop(db);
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(db.hub_device_id(), hub_dev_id);
+        assert_eq!(db.epoch(), 1);
+        assert_eq!(db.devices().len(), 1);
+
+        // Assigning the same device is a no-op; assigning another rises epoch by 1 each time.
+        assert_eq!(db.set_hub_device_id(&hub_dev_id).unwrap(), 1);
+        let (mac, _) = db.add_device("MacBook", "macos", false).unwrap();
+        assert_eq!(db.set_hub_device_id(&mac.id).unwrap(), 2);
+        assert_eq!(db.hub_device_id(), mac.id);
+        assert_eq!(db.epoch(), 2);
+        assert_eq!(db.set_hub_device_id(&hub_dev_id).unwrap(), 3);
+        assert_eq!(db.hub_device_id(), hub_dev_id);
+        assert_eq!(db.epoch(), 3);
+
+        // Non-existent and revoked devices cannot become the hub.
+        assert!(db.set_hub_device_id("missing").is_err());
+        db.revoke_device(&mac.id).unwrap();
+        assert!(db.set_hub_device_id(&mac.id).is_err());
+        assert_eq!(db.epoch(), 3);
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn migration_links_existing_devices_to_owner_and_tracks_new_devices() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("grouper.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE devices (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL, platform TEXT NOT NULL,
+               secret_hash TEXT NOT NULL, created INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0,
+               last_seen INTEGER, admin INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE hub_owner (
+               id INTEGER PRIMARY KEY CHECK (id = 1), provider TEXT NOT NULL, sub TEXT NOT NULL,
+               email TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', claimed_at INTEGER NOT NULL);
+             INSERT INTO devices (id, name, platform, secret_hash, created, admin)
+               VALUES ('d1', 'Old PC', 'windows', 'h', 1, 0);
+             INSERT INTO hub_owner (id, provider, sub, email, name, claimed_at)
+               VALUES (1, 'google', 'sub-123', 'owner@example.com', 'Owner', 2);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Db::open(&dir).unwrap();
+        let devs = db.devices();
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].account_sub.as_deref(), Some("sub-123"));
+
+        // Registering the hub device and adding another device both link to the owner's sub.
+        let hub_dev_id = db.hub_device_id();
+        let (phone, _) = db.add_device("Phone", "ios", true).unwrap();
+        assert_eq!(phone.account_sub.as_deref(), Some("sub-123"));
+        for d in db.devices() {
+            assert_eq!(d.account_sub.as_deref(), Some("sub-123"), "device {}", d.id);
+        }
+        assert!(db.devices().iter().any(|d| d.id == hub_dev_id));
+
+        // Resetting the owner unlinks devices cleanly; claiming again re-links them.
+        db.reset_owner().unwrap();
+        assert!(db.devices().iter().all(|d| d.account_sub.is_none()));
+        db.set_owner_if_none(&crate::google_auth::Owner {
+            provider: "google".into(),
+            sub: "sub-456".into(),
+            email: "new@example.com".into(),
+            name: "New".into(),
+            claimed_at: 3,
+        })
+        .unwrap();
+        assert!(db.devices().iter().all(|d| d.account_sub.as_deref() == Some("sub-456")));
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn ensure_hub_device_for_install_adopts_existing_and_reuses_on_restart() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let install_id = "pc_install_1234567890abcdef";
+
+        // Invalid install_id is rejected.
+        assert!(db.ensure_hub_device_for_install(Some("short")).is_err());
+
+        // Fresh hub creates a single non-admin node row tagged with install_id.
+        let (hub_dev_id, epoch) = db.ensure_hub_device_for_install(Some(install_id)).unwrap();
+        assert_eq!(epoch, 1);
+        assert_eq!(db.device_install_id(&hub_dev_id).as_deref(), Some(install_id));
+        assert_eq!(db.devices().len(), 1);
+
+        // Issuing the local node for the same install reuses the hub row instead of creating a second row.
+        let node = db
+            .issue_device("Oscar-PC", "windows", false, Some(Install { id: install_id, kind: NODE_INSTALL }), None)
+            .unwrap();
+        assert!(node.reused);
+        assert_eq!(node.device.id, hub_dev_id);
+        assert_eq!(db.devices().len(), 1);
+
+        // Issuing the admin UI row for the same install keeps two rows total (node/hub + admin).
+        let admin = db
+            .issue_device("Oscar-PC", "windows", true, Some(Install { id: install_id, kind: "windows" }), None)
+            .unwrap();
+        assert_ne!(admin.device.id, hub_dev_id);
+        assert_eq!(db.devices().len(), 2);
+
+        // Reopening and ensuring with the same install_id reuses the row and keeps epoch = 1.
+        drop(db);
+        let db = Db::open(&dir).unwrap();
+        let (restarted_id, restarted_epoch) = db.ensure_hub_device_for_install(Some(install_id)).unwrap();
+        assert_eq!(restarted_id, hub_dev_id);
+        assert_eq!(restarted_epoch, 1);
+        assert_eq!(db.devices().len(), 2);
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+
+        // Pre-existing node row before hub_state exists is adopted rather than creating a separate hub row.
+        let dir2 = tmp();
+        let db2 = Db::open(&dir2).unwrap();
+        let existing_node = db2
+            .issue_device("Existing PC", "windows", false, Some(Install { id: install_id, kind: NODE_INSTALL }), None)
+            .unwrap();
+        let (adopted_id, adopted_epoch) = db2.ensure_hub_device_for_install(Some(install_id)).unwrap();
+        assert_eq!(adopted_id, existing_node.device.id);
+        assert_eq!(adopted_epoch, 1);
+        assert_eq!(db2.devices().len(), 1);
+        drop(db2);
+        std::fs::remove_dir_all(dir2).ok();
+
+        // Upgrading a legacy DB with an unattached hub row + `<install_id>-node` row adopts the node row
+        // and retires the unused synthetic hub row without bumping epoch.
+        let dir3 = tmp();
+        let db3 = Db::open(&dir3).unwrap();
+        let (orphan_id, _) = db3.ensure_hub_device().unwrap();
+        let legacy_id = legacy_node_install_id(install_id);
+        let legacy_node = db3
+            .issue_device("Legacy PC", "windows", false, Some(Install { id: &legacy_id, kind: NODE_INSTALL }), None)
+            .unwrap();
+        let (upgraded_id, upgraded_epoch) = db3.ensure_hub_device_for_install(Some(install_id)).unwrap();
+        assert_eq!(upgraded_id, legacy_node.device.id);
+        assert_eq!(upgraded_epoch, 1);
+        assert_eq!(db3.device_install_id(&upgraded_id).as_deref(), Some(install_id));
+        let orphan = db3.devices().into_iter().find(|d| d.id == orphan_id).unwrap();
+        assert!(orphan.revoked, "unused synthetic hub row should be revoked on adoption");
+        drop(db3);
+        std::fs::remove_dir_all(dir3).ok();
+    }
+
+    #[test]
+    fn old_models_table_migrates_with_m1_columns_and_defaults() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("grouper.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE providers (
+               id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT, api_key TEXT, options TEXT NOT NULL DEFAULT '{}', color TEXT);
+             CREATE TABLE models (
+               id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL,
+               input_price REAL NOT NULL DEFAULT 0, output_price REAL NOT NULL DEFAULT 0,
+               context_window INTEGER NOT NULL DEFAULT 0, use_cases TEXT NOT NULL DEFAULT '',
+               free INTEGER NOT NULL DEFAULT 0, roles TEXT NOT NULL DEFAULT '');
+             INSERT INTO providers (id, kind) VALUES ('p1', 'openai');
+             INSERT INTO models (id, provider_id, model, input_price, output_price, roles)
+               VALUES ('legacy-gpt', 'p1', 'gpt-4o', 2.5, 10.0, 'orchestrator');",
+        )
+        .unwrap();
+        drop(conn);
+
+        // First open migrates; second open is idempotent.
+        drop(Db::open(&dir).unwrap());
+        let db = Db::open(&dir).unwrap();
+        for column in [
+            "cache_read_price",
+            "cache_write_price",
+            "modalities",
+            "local",
+            "kind",
+            "device_id",
+            "source",
+            "hidden",
+            "hidden_reason",
+            "missed_syncs",
+            "last_seen",
+            "display_name",
+            "price_source",
+            "tools",
+            "can_orchestrate",
+        ] {
+            assert!(
+                db.c()
+                    .prepare("SELECT 1 FROM pragma_table_info('models') WHERE name = ?1")
+                    .unwrap()
+                    .exists([column])
+                    .unwrap(),
+                "missing column {column}"
+            );
+        }
+
+        let models = db.models();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.id, "legacy-gpt");
+        assert_eq!(m.kind, "api");
+        assert_eq!(m.device_id, None);
+        assert_eq!(m.source, "manual");
+        assert!(!m.hidden);
+        assert_eq!(m.hidden_reason, None);
+        assert_eq!(m.last_seen, None);
+        assert_eq!(m.display_name, None);
+        assert_eq!(m.price_source, "manual");
+        assert_eq!(m.tools, "unknown");
+        assert_eq!(db.default_model("orchestrator").unwrap().id, "legacy-gpt");
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hidden_models_are_skipped_by_defaults_and_routing_but_resolve_for_history_and_usage() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "p".into(),
+            kind: "openai".into(),
+            base_url: None,
+            api_key: Some("k".into()),
+            options: Value::Null,
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "old-default".into(),
+            provider_id: "p".into(),
+            model: "old-default-model".into(),
+            input_price: 10.0,
+            output_price: 20.0,
+            free: false,
+            roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
+            source: "auto".into(),
+            last_seen: Some(1000),
+            display_name: Some("Old Default".into()),
+            price_source: "table".into(),
+            tools: "yes".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "live-backup".into(),
+            provider_id: "p".into(),
+            model: "live-backup-model".into(),
+            input_price: 1.0,
+            output_price: 2.0,
+            roles: vec![],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let conv = db.create_conversation("standard", "pinned chat").unwrap();
+        db.set_conversation_model(&conv, Some("old-default")).unwrap();
+        let thread = db.create_thread(&conv, "Past work", "hub", "old-default", None, "brief").unwrap();
+
+        // Hide the old default because the provider dropped it.
+        db.set_model_hidden("old-default", true, Some("gone")).unwrap();
+
+        // Defaults, visible listing, and routing skip the hidden row.
+        assert_eq!(db.default_model("orchestrator").unwrap().id, "live-backup");
+        assert_eq!(db.default_model("standard").unwrap().id, "live-backup");
+        assert_eq!(db.default_model("thread").unwrap().id, "live-backup");
+        assert_eq!(db.route_model(None, Some("code"), &[]).unwrap().model.id, "live-backup");
+        assert!(db.route_model(Some("old-default"), None, &[]).is_err());
+        assert_eq!(db.visible_models().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["live-backup"]);
+
+        // History, usage, and outcome resolution still find the hidden row.
+        let resolved = db.find_model("old-default").unwrap();
+        assert!(resolved.hidden);
+        assert_eq!(resolved.hidden_reason.as_deref(), Some("gone"));
+        assert_eq!(db.models().len(), 2);
+        let cost = db.record_usage(Some(&conv), Some(&thread.id), "p", "old-default-model", 100_000, 50_000, 0, 0);
+        assert!((cost - 2.0).abs() < 1e-9, "usage still prices hidden row: {cost}");
+        assert!(db.finish_thread(&thread.id, "done", "finished"));
+        assert!(db.record_outcome(&thread.id));
+        assert_eq!(db.conversation(&conv).unwrap().model.as_deref(), Some("old-default"));
+        let conv_err = db.conversation_model(&conv).unwrap_err().to_string();
+        assert!(conv_err.contains("no longer lists"), "{conv_err}");
+        assert!(db.set_conversation_model(&conv, Some("old-default")).is_err());
+
+        // Unhiding restores it.
+        db.set_model_hidden("old-default", false, None).unwrap();
+        assert_eq!(db.default_model("orchestrator").unwrap().id, "old-default");
+        assert_eq!(db.conversation_model(&conv).unwrap().unwrap().id, "old-default");
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn harness_models_compute_kind_and_device_id_from_provider() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: format!("claude-code@{}", pc.id),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: serde_json::json!({"harness": "claude-code", "via_device": "Gaming PC", "signed_in": true}),
+        })
+        .unwrap();
+        db.upsert_model(&ModelEntry {
+            id: "cc-opus".into(),
+            provider_id: format!("claude-code@{}", pc.id),
+            model: "opus".into(),
+            source: "auto".into(),
+            price_source: "none".into(),
+            display_name: Some("Claude Code Opus".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let saved = db.find_model("cc-opus").unwrap();
+        assert_eq!(saved.kind, "harness");
+        assert_eq!(saved.device_id.as_deref(), Some(pc.id.as_str()));
+        assert_eq!(saved.source, "auto");
+        assert_eq!(saved.price_source, "none");
+        assert_eq!(saved.display_name.as_deref(), Some("Claude Code Opus"));
+        assert!(!db.model_is_local(&saved));
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn harness_role_and_conversation_rules() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let (pc, _) = db.add_device("Gaming PC", "windows", false).unwrap();
+
+        db.upsert_provider(&ProviderConfig {
+            id: "openai".into(),
+            kind: "openai".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            api_key: None,
+            options: serde_json::Value::Null,
+        })
+        .unwrap();
+        let codex_pid = format!("codex@{}", pc.id);
+        db.upsert_provider(&ProviderConfig {
+            id: codex_pid.clone(),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: serde_json::json!({"harness": "codex", "via_device": pc.id, "signed_in": true}),
+        })
+        .unwrap();
+        let claude_pid = format!("claude-code@{}", pc.id);
+        db.upsert_provider(&ProviderConfig {
+            id: claude_pid.clone(),
+            kind: "harness".into(),
+            base_url: None,
+            api_key: None,
+            options: serde_json::json!({"harness": "claude-code", "via_device": pc.id, "signed_in": true}),
+        })
+        .unwrap();
+
+        // API model can hold orchestrator.
+        db.upsert_model(&ModelEntry {
+            id: "z-gpt-4o".into(),
+            provider_id: "openai".into(),
+            model: "gpt-4o".into(),
+            roles: vec!["orchestrator".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Harness WITHOUT can_orchestrate: refused for orchestrator role with exact message.
+        let err = db
+            .upsert_model(&ModelEntry {
+                id: "a-codex-o3".into(),
+                provider_id: codex_pid.clone(),
+                model: "o3".into(),
+                kind: "harness".into(),
+                device_id: Some(pc.id.clone()),
+                can_orchestrate: false,
+                roles: vec!["orchestrator".into()],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.downcast_ref::<HarnessCannotOrchestrate>().is_some());
+        assert_eq!(
+            err.to_string(),
+            "a-codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+
+        // Same harness MAY hold standard and thread roles.
+        db.upsert_model(&ModelEntry {
+            id: "a-codex-o3".into(),
+            provider_id: codex_pid.clone(),
+            model: "o3".into(),
+            kind: "harness".into(),
+            device_id: Some(pc.id.clone()),
+            can_orchestrate: false,
+            roles: vec!["standard".into(), "thread".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Harness WITH can_orchestrate = true MAY hold orchestrator, standard, thread.
+        db.upsert_model(&ModelEntry {
+            id: "b-cc-opus".into(),
+            provider_id: claude_pid,
+            model: "opus".into(),
+            kind: "harness".into(),
+            device_id: Some(pc.id.clone()),
+            can_orchestrate: true,
+            roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Conversation model override rules.
+        let project_id = db.create_conversation("project", "Project chat").unwrap();
+        let standard_id = db.create_conversation("standard", "Standard chat").unwrap();
+
+        // Project chat refuses non-orchestrating harness.
+        let err = db.set_conversation_model(&project_id, Some("a-codex-o3")).unwrap_err();
+        assert!(err.downcast_ref::<HarnessCannotOrchestrate>().is_some());
+        assert_eq!(
+            err.to_string(),
+            "a-codex-o3 is a harness and can't orchestrate a project chat; pick it in a standard chat or for threads"
+        );
+        assert!(db.conversation(&project_id).unwrap().model.is_none());
+
+        // Project chat accepts can_orchestrate = true harness and API model.
+        assert_eq!(
+            db.set_conversation_model(&project_id, Some("b-cc-opus")).unwrap().model.as_deref(),
+            Some("b-cc-opus")
+        );
+        assert_eq!(
+            db.set_conversation_model(&project_id, Some("z-gpt-4o")).unwrap().model.as_deref(),
+            Some("z-gpt-4o")
+        );
+
+        // Standard chat accepts ANY harness (both without and with can_orchestrate).
+        assert_eq!(
+            db.set_conversation_model(&standard_id, Some("a-codex-o3")).unwrap().model.as_deref(),
+            Some("a-codex-o3")
+        );
+        assert_eq!(
+            db.set_conversation_model(&standard_id, Some("b-cc-opus")).unwrap().model.as_deref(),
+            Some("b-cc-opus")
+        );
+
+        // Even if a legacy row in SQLite has roles='orchestrator' on a non-orchestrating harness,
+        // default_model("orchestrator") still skips it.
+        db.c()
+            .execute("UPDATE models SET roles = 'orchestrator,standard,thread' WHERE id = 'a-codex-o3'", [])
+            .unwrap();
+        assert_eq!(db.default_model("orchestrator").unwrap().id, "b-cc-opus");
+        assert_eq!(db.default_model("standard").unwrap().id, "a-codex-o3");
+        assert_eq!(db.default_model("thread").unwrap().id, "a-codex-o3");
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn free_alternates_never_offers_harnesses_or_hidden_models() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        db.upsert_provider(&ProviderConfig {
+            id: "openrouter".into(),
+            kind: "openai".into(),
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            api_key: None,
+            options: serde_json::Value::Null,
+        })
+        .unwrap();
+
+        let make = |id: &str, model: &str, kind: &str, can_orch: bool, free: bool, hidden: bool| ModelEntry {
+            id: id.into(),
+            provider_id: "openrouter".into(),
+            model: model.into(),
+            kind: kind.into(),
+            can_orchestrate: can_orch,
+            free,
+            hidden,
+            hidden_reason: hidden.then(|| "gone".into()),
+            ..Default::default()
+        };
+        db.upsert_model(&make("api-free-1", "m/free-1:free", "api", false, true, false)).unwrap();
+        db.upsert_model(&make("api-free-2", "m/free-2:free", "api", false, true, false)).unwrap();
+        db.upsert_model(&make("api-hidden", "m/hidden:free", "api", false, true, true)).unwrap();
+        db.upsert_model(&make("harness-no-orch", "codex-free", "harness", false, true, false)).unwrap();
+        db.upsert_model(&make("harness-orch", "claude-free", "harness", true, true, false)).unwrap();
+
+        // API free model gets only visible API free alternates, never harnesses (with or without can_orchestrate).
+        assert_eq!(db.free_alternates("openrouter", "m/free-1:free"), vec!["m/free-2:free".to_string()]);
+        // A harness row never gets free API alternates either.
+        assert!(db.free_alternates("openrouter", "codex-free").is_empty());
+        assert!(db.free_alternates("openrouter", "claude-free").is_empty());
+
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_first_install_id_attaches_to_the_one_matching_old_row() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        // Rows made before install ids existed, as on the live hub.
+        let (old_app, old_app_token) = db.add_device("Grouper on Oscar's Macbook Air", "macos", true).unwrap();
+        let (old_node, old_node_token) = db.add_device("Oscar's Macbook Air", "macos", false).unwrap();
+        let (old_phone, _) = db.add_device("Grouper on iPhone", "ios", true).unwrap();
+        let id = "mac_install_12345678";
+
+        // The app signs in under the machine's own name: it takes over its old admin row (new token).
+        let app = db.issue_device("Oscar's Macbook Air", "macos", true, Some(Install { id, kind: "macos" }), None).unwrap();
+        assert!(app.reused);
+        assert_eq!(app.device.id, old_app.id);
+        assert_eq!(app.device.name, "Oscar's Macbook Air");
+        assert!(db.authenticate(&old_app_token).is_none(), "the old token was replaced");
+        assert!(db.authenticate(&app.token).unwrap().admin);
+
+        // The node registers: it takes its old plain row, not the admin one, and stays plain.
+        let node = db.issue_device("Oscar's Macbook Air", "macos", false, Some(Install { id, kind: NODE_INSTALL }), None).unwrap();
+        assert!(node.reused);
+        assert_eq!(node.device.id, old_node.id);
+        assert!(db.authenticate(&old_node_token).is_none());
+        assert!(!db.authenticate(&node.token).unwrap().admin);
+        assert_eq!(db.device_install_id(&old_app.id).as_deref(), Some(id));
+        assert_eq!(db.device_install_id(&old_node.id).as_deref(), Some(id));
+
+        // Signing in again finds the row by its install id now, and the phone's new name still matches its old row.
+        let again = db.issue_device("Oscar's Macbook Air", "macos", true, Some(Install { id, kind: "macos" }), None).unwrap();
+        assert_eq!(again.device.id, old_app.id);
+        let phone = db.issue_device("iPhone", "ios", true, Some(Install { id: "ios_install_12345678", kind: "ios" }), None).unwrap();
+        assert_eq!(phone.device.id, old_phone.id);
+        assert_eq!(phone.device.name, "iPhone");
+        assert_eq!(db.devices().len(), 3, "no row was added");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_old_row_is_not_taken_when_it_is_ambiguous_or_has_other_rights() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let (admin_row, _) = db.add_device("Studio", "macos", true).unwrap();
+        // A plain registration never takes an admin row, even under the same name.
+        let plain = db
+            .issue_device("Studio", "macos", false, Some(Install { id: "studio_install_123456", kind: NODE_INSTALL }), None)
+            .unwrap();
+        assert!(!plain.reused);
+        assert_ne!(plain.device.id, admin_row.id);
+        assert!(!plain.device.admin);
+        assert!(db.authenticate(&plain.token).is_some_and(|a| !a.admin));
+
+        // Two old rows that both fit: nothing is guessed, a new row is made.
+        db.add_device("Grouper on Twin", "linux", false).unwrap();
+        db.add_device("Twin", "linux", false).unwrap();
+        let twin = db
+            .issue_device("Twin", "linux", false, Some(Install { id: "twin_install_1234567", kind: NODE_INSTALL }), None)
+            .unwrap();
+        assert!(!twin.reused);
+        // A different platform or name doesn't match either.
+        db.add_device("Laptop", "windows", false).unwrap();
+        let other = db
+            .issue_device("Laptop", "linux", false, Some(Install { id: "laptop_install_12345", kind: NODE_INSTALL }), None)
+            .unwrap();
+        assert!(!other.reused);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_node_registering_under_the_plain_install_id_takes_its_legacy_node_row() {
+        let dir = tmp();
+        let db = Db::open(&dir).unwrap();
+        let id = "mac_install_12345678";
+        // Older Apple builds registered the node as `<id>-node`.
+        let legacy_id = legacy_node_install_id(id);
+        let old = db.issue_device("Mac", "macos", false, Some(Install { id: &legacy_id, kind: NODE_INSTALL }), None).unwrap();
+        let now = db.issue_device("Mac", "macos", false, Some(Install { id, kind: NODE_INSTALL }), None).unwrap();
+        assert!(now.reused);
+        assert_eq!(now.device.id, old.device.id);
+        assert_eq!(db.device_install_id(&old.device.id).as_deref(), Some(id), "the row now carries the plain id");
+        // The old spelling still finds the same row (an older build that hasn't updated).
+        let again = db.issue_device("Mac", "macos", false, Some(Install { id: &legacy_id, kind: NODE_INSTALL }), None).unwrap();
+        assert_eq!(again.device.id, old.device.id);
+        assert_eq!(db.devices().len(), 1);
         std::fs::remove_dir_all(dir).ok();
     }
 }

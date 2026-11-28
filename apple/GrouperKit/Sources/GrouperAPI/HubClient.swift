@@ -65,6 +65,12 @@ public actor HubClient {
         try self.init(baseURL: url, token: token, session: session)
     }
 
+    /// A client with no token, for the calls a signed-out app makes (`authStatus`,
+    /// `googleNonce`, `signInWithGoogle`). Authenticated calls on it get 401.
+    public init(baseURL: String, session: URLSession = .shared) throws {
+        try self.init(baseURL: baseURL, token: "", session: session)
+    }
+
     public nonisolated func eventStream(conversationId: String? = nil) -> EventStream {
         EventStream(baseURL: baseURL, token: token, conversationId: conversationId)
     }
@@ -84,6 +90,20 @@ public actor HubClient {
     public func registryStats() async throws -> RegistryStats { try await get(["v1", "registry", "stats"]) }
     public func limits() async throws -> LimitsReport { try await get(["v1", "limits"]) }
     public func usageSnapshots() async throws -> [UsageSnapshot] { try await get(["v1", "usage", "snapshots"]) }
+
+    /// `GET /v1/usage/summary` (docs/usage-tab-spec.md 7.2): the donut and key list for `[since, until)`,
+    /// as Unix seconds (the client works out local midnights, see `UsagePeriod.range`).
+    public func usageSummary(since: Int64, until: Int64, conversationId: String? = nil) async throws -> UsageSummary {
+        var query = [URLQueryItem(name: "since", value: String(since)), URLQueryItem(name: "until", value: String(until))]
+        if let conversationId { query.append(URLQueryItem(name: "conversation", value: conversationId)) }
+        return try await get(["v1", "usage", "summary"], query: query)
+    }
+
+    /// `PUT /v1/providers/{id}/color`: gives a key one of the ten colour names (`KeyColorName`), or
+    /// nil to let the hub pick one again. 400 for a name outside the palette, 404 for an unknown key.
+    public func setProviderColor(id: String, color: String?) async throws -> ProviderInfo {
+        try await send(["v1", "providers", id, "color"], method: "PUT", body: ProviderColorRequest(color: color))
+    }
 
     public func events(conversationId: String, after: Int64 = 0, threadId: String? = nil) async throws -> [Event] {
         var query = [URLQueryItem(name: "after", value: String(after))]
@@ -160,6 +180,20 @@ public actor HubClient {
     @discardableResult public func setPermission(_ permission: Permission, deviceId: String, tool: String) async throws -> JSONValue {
         try await send(["v1", "devices", deviceId, "tools", tool], method: "PUT", body: PermissionRequest(permission: permission))
     }
+    /// Registers a plain (non-admin) device; needs an admin token. The returned token is
+    /// shown only once. A hub without the route answers 404 or 405
+    /// (`DeviceRegistration.hubLacksRegistration`). With `installId`, a hub that already has a
+    /// live device for it issues that device a fresh token (revoking the old one) instead of
+    /// adding a device; older hubs ignore it. An id the hub wouldn't accept is left out.
+    public func registerDevice(name: String, platform: String, installId: String? = nil) async throws -> RegisteredDevice {
+        try await send(["v1", "devices"], method: "POST",
+                       body: DeviceRegistrationRequest(name: name, platform: platform, installId: InstallID.sendable(installId)))
+    }
+    /// Revokes a device's token on the hub (admin). 404 when the hub doesn't know it, or it
+    /// was already revoked; 409 for the token making the request.
+    @discardableResult public func revokeDevice(id: String) async throws -> DeviceRevocation {
+        try await delete(["v1", "devices", id])
+    }
     public func callDevice(id: String, tool: String, args: JSONValue = .object([:])) async throws -> ToolCallResponse {
         try await send(["v1", "devices", id, "call"], method: "POST", body: ToolCallRequest(tool: tool, args: args))
     }
@@ -199,6 +233,52 @@ public actor HubClient {
         return try await perform(path: ["v1", "threads", threadId, "files"] + pieces).0
     }
 
+    // MARK: Sign in with Google (docs/accounts-design.md)
+
+    /// `GET /v1/auth/status` (no token): whether the hub is claimed and allows Google sign-in.
+    public func authStatus() async throws -> AuthStatus { try await get(["v1", "auth", "status"], authenticated: false) }
+
+    /// `POST /v1/auth/google/nonce` (no token): a one-time nonce to put in the Google request.
+    public func googleNonce() async throws -> GoogleNonce {
+        try await send(["v1", "auth", "google", "nonce"], method: "POST", body: EmptyRequest(), authenticated: false)
+    }
+
+    /// `POST /v1/auth/google` (no token): trades a Google ID token (with this hub's nonce) for a
+    /// new admin token for this app install. An unclaimed hub needs `setupCode`. 401: bad token
+    /// or nonce; 403: setup code missing or wrong, or another Google account; 409: just claimed.
+    /// With `installId` (`InstallID`), signing in again from the same install reuses its device
+    /// (same id, fresh token, old token revoked); older hubs ignore it. An id the hub wouldn't
+    /// accept is left out.
+    public func signInWithGoogle(idToken: String, setupCode: String? = nil, client: GoogleSignInClient,
+                                 deviceName: String? = nil, installId: String? = nil) async throws -> GoogleSignInResult {
+        let code = setupCode?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = GoogleSignInRequest(idToken: idToken, setupCode: code?.isEmpty == false ? code : nil,
+                                       client: client, deviceName: deviceName, installId: InstallID.sendable(installId))
+        return try await send(["v1", "auth", "google"], method: "POST", body: body, authenticated: false)
+    }
+
+    /// `GET /v1/auth/google/link` (admin): the Google account that owns the hub, if any.
+    public func linkedGoogleAccount() async throws -> LinkedGoogleAccount? {
+        let response: GoogleLinkResponse = try await get(["v1", "auth", "google", "link"])
+        return response.owner
+    }
+
+    /// `POST /v1/auth/google/link` (admin): makes the ID token's Google account the hub's owner.
+    /// 409 when another account is linked.
+    @discardableResult
+    public func linkGoogle(idToken: String) async throws -> LinkedGoogleAccount? {
+        let response: GoogleLinkResponse = try await send(["v1", "auth", "google", "link"], method: "POST",
+                                                          body: GoogleLinkRequest(idToken: idToken))
+        return response.owner
+    }
+
+    /// `DELETE /v1/auth/google/link` (admin): unlinks the owner; tokens keep working. False when none was linked.
+    @discardableResult
+    public func unlinkGoogle() async throws -> Bool {
+        let response: GoogleUnlinkResponse = try await delete(["v1", "auth", "google", "link"])
+        return response.unlinked
+    }
+
     @discardableResult public func deleteModel(id: String) async throws -> JSONValue { try await delete(["v1", "models", id]) }
     @discardableResult public func deleteMemory(id: Int64) async throws -> JSONValue { try await delete(["v1", "memories", String(id)]) }
     @discardableResult public func deleteSkill(id: Int64) async throws -> JSONValue { try await delete(["v1", "skills", String(id)]) }
@@ -210,11 +290,11 @@ public actor HubClient {
         catch { throw HubClientError.decoding(String(describing: error)) }
     }
 
-    private func send<T: Decodable, Body: Encodable>(_ path: [String], method: String, body: Body) async throws -> T {
+    private func send<T: Decodable, Body: Encodable>(_ path: [String], method: String, body: Body, authenticated: Bool = true) async throws -> T {
         let encoded: Data
         do { encoded = try encoder.encode(body) }
         catch { throw HubClientError.decoding(String(describing: error)) }
-        let (data, _) = try await perform(path: path, method: method, body: encoded)
+        let (data, _) = try await perform(path: path, method: method, body: encoded, authenticated: authenticated)
         do { return try decoder.decode(T.self, from: data) }
         catch { throw HubClientError.decoding(String(describing: error)) }
     }
@@ -238,7 +318,7 @@ public actor HubClient {
         request.httpMethod = method
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if authenticated { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        if authenticated, !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let body { request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         let data: Data
         let response: URLResponse
@@ -271,5 +351,15 @@ private struct RatingRequest: Codable { let rating: String }
 private struct ApprovalDecision: Codable { let approve: Bool }
 private struct PermissionRequest: Codable { let permission: Permission }
 private struct ToolCallRequest: Codable { let tool: String; let args: JSONValue }
+private struct DeviceRegistrationRequest: Codable { let name: String; let platform: String; let installId: String? }
+/// `{"color": "purple"}`, or `{"color": null}` to re-run the hub's automatic choice (nil must be sent, not left out).
+private struct ProviderColorRequest: Encodable {
+    let color: String?
+    enum CodingKeys: String, CodingKey { case color }
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let color { try container.encode(color, forKey: .color) } else { try container.encodeNil(forKey: .color) }
+    }
+}
 private struct ProposalDecision: Codable { let accept: Bool }
 private struct RuleEnabled: Codable { let enabled: Bool }

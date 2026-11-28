@@ -3,7 +3,82 @@
 The iPhone and Mac apps share the Foundation-only `GrouperAPI` package and the
 SwiftUI sources in `Shared/`. The Mac target also links `GrouperKit` for its local
 device node. Tokens are stored in the Keychain as `grouper.admin` and
-`grouper.device`; they are never written to defaults or logs.
+`grouper.device` (with the device's id in `grouper.device.id`); they are never written
+to defaults or logs.
+
+## Sign in with Google
+
+`docs/accounts-design.md` has the design. The sign-in screen asks for the hub address
+(on later visits it's pre-filled and collapsed under **Hub**, since hub discovery will
+replace it), then checks `GET /v1/auth/status`. When the hub has Google sign-in on and the
+app has a client ID, **Sign in with Google** is the only way in on screen. Token sign-in is
+a recovery route: the toolbar's ⋯ menu > **Sign in with a recovery token**. A hub without
+Google sign-in (or an app without a client ID) shows the admin-token field as before; an
+unreachable address says so and offers **Try again**. An unclaimed hub first asks for its
+setup code (`XXXX-XXXX-XXXX`, from the hub's log or `grouper-hub setup-code`).
+
+Each install keeps a random 32-character `install_id` in the Keychain
+(`grouper.install.id`), made on first use and kept across sign-outs. It goes with
+`POST /v1/auth/google`, so signing in again from the same install reuses its device on the
+hub. The Mac's node registration (`POST /v1/devices`) sends `<install_id>-node`, so the
+node and the app's own admin device are never confused. Older hubs ignore the field.
+Settings > Account shows the Google account you're signed in as, with this install's
+device name and platform under it; device ids and tokens aren't shown.
+
+The app gets a nonce from the hub
+(`POST /v1/auth/google/nonce`) and opens Google in `ASWebAuthenticationSession`, using an
+authorization code with PKCE (S256) and no client secret. It exchanges the code at Google's
+token endpoint for an ID token, then sends that to `POST /v1/auth/google` with `client`
+`ios` or `macos` and the device name "Grouper on <device name>". The hub answers with an
+admin token for this install. The app keeps it in the Keychain as `grouper.admin`, the
+same as a pasted token, and connects the same way. On the Mac, connecting also registers
+the Mac's node device. Settings > Account shows the linked Google account with **Unlink**,
+or offers **Link your Google account** on a hub that has a token owner but no Google account.
+
+The URL building, PKCE, callback checks, token exchange and hub calls live in
+`GrouperAPI` (`GoogleOAuth`, `HubClient.signInWithGoogle` and related calls) and have unit
+tests. The browser step is `Shared/GoogleWebSignIn.swift`.
+
+### Client IDs and URL schemes
+
+Each app has its own Google OAuth client ID. Both are Google's **iOS** client type: one for
+bundle ID `uk.clockmillbarn.grouper.ios` and one for `uk.clockmillbarn.grouper.macos`. Client
+IDs are public identifiers, not secrets. Grouper's own clients (Google Cloud project
+`grouper-515912`) are set in each app's Info.plist (`iOS/Info.plist`, `macOS/Info.plist`); a
+fork changes them there:
+
+1. `GrouperGoogleClientID`: the full client ID, e.g.
+   `1234-abcd.apps.googleusercontent.com`. If it's empty or isn't a Google client ID, the
+   app hides Google sign-in.
+2. Under `CFBundleURLTypes`, the entry named `uk.clockmillbarn.grouper.google`: replace the
+   placeholder scheme `com.googleusercontent.apps.REPLACE-WITH-…` with the reversed client
+   ID, e.g. `com.googleusercontent.apps.1234-abcd`. Google sends the sign-in back to
+   `<that scheme>:/oauth2redirect`, and the app derives the same scheme from the client ID.
+
+The hub must also trust both client IDs: they are its defaults once they're filled in
+`crates/hub/src/google_auth.rs`, or set them with `GROUPER_GOOGLE_CLIENT_IDS`.
+
+The "G" on the button is drawn in SwiftUI (`GoogleGMark`). Swap it for Google's official
+asset from their branding guidelines once the app has an asset catalogue.
+
+## This Mac as a device
+
+Sign-in gets an admin token, either pasted or from Google sign-in. The admin token powers the
+window; the local node never gets it. On Connect, and at launch with saved
+credentials, the Mac checks its saved device token. With none (or one the hub rejects
+with 401) it registers itself through `POST /v1/devices` under the Mac's computer
+name with platform `macos`, keeps the new token in the Keychain and starts the node. A
+rejected token's old device is revoked, best effort. The node also reports a 401 while
+running; the app confirms it with the hub and registers again.
+
+Settings > This Mac shows the name it is registered as and **Register again** (on a hub
+with install ids, the same device with a fresh token; on an older hub, a new device, then
+the old one revoked). When registration fails, **Use an existing device token** appears for
+a plain token made with `grouper-hub device add`. A hub too old for
+`POST /v1/devices` (404 or 405) gets a plain message and the manual field opens.
+**Sign out on this device** keeps the device token, so the node keeps serving;
+**Sign out and remove this Mac** revokes it on the hub first. The iPhone app runs no
+node and has no device token.
 
 ## Status: GUI decisions of 25 November (unbuilt)
 
@@ -14,9 +89,8 @@ Only the `GrouperAPI` parts (model family rules, the thread-as-chat fold, elapse
 time, `ProviderInfo.viaDevice`) are built and tested, on the Windows toolchain.
 
 - **No Threads tab or Threads destination.** Threads belong to their chat. The
-  phone keeps Chat, Devices and More (the tab set is still an owner decision; see
-  the `TODO(owner decision: phone tabs)` in `iOS/GrouperIOSApp.swift`). The Chat
-  tab carries the needs-you badge.
+  phone has Chat, Usage, Devices and More (owner decision, 27 November 2026; see
+  `docs/usage-tab-spec.md`). The Chat tab carries the needs-you badge.
 - **Threads button in the chat toolbar** (count, orange dot when something needs
   you) opens the chat's threads: a sheet on iPhone, an inspector on Mac
   (`Shared/ThreadsPanel.swift`). Rows show the title, live elapsed time, the model
@@ -43,6 +117,38 @@ time, `ProviderInfo.viaDevice`) are built and tested, on the Windows toolchain.
 - **Mac command palette** (`macOS/CommandPaletteView.swift`, spec 5.15): Edit >
   Search… (⌘K) or the sidebar's search button. It has local results only.
   Matching and ranking live in `GrouperAPI.CommandPalette`, which has unit tests.
+
+## Usage widgets (iPhone)
+
+The `GrouperWidgets` extension has two Home Screen widgets and two Lock Screen ones, all opening the
+Usage tab (`grouper://usage`):
+
+- **API costs** (`iOSWidgets/CostsWidgetView.swift`): small is the period's total and a donut by key;
+  medium the donut and the top keys; large the donut and up to eight keys with tokens in and out.
+  Configurable period, Day / Week / Month (rolling, local time, default Day). Lock Screen
+  rectangle: the period's cost.
+- **Subscription usage** (`iOSWidgets/SubscriptionsWidgetView.swift`): small is one account's windows as
+  bars, medium two accounts (or one account's windows once you pick it), large every account as a
+  compact card with Antigravity's group headings. The account is configurable; left empty it is the one
+  closest to a limit. From 80% a bar turns amber with a "Nearly used" word and icon, at 100% red
+  with "Used up". Lock Screen circle: a gauge of the most used window.
+
+**Data.** The widgets have no sign-in and no token, and make no network call. The app writes a compact
+JSON snapshot (`GrouperAPI.WidgetSnapshot`: Day, Week and Month costs without the per-model rows, and
+the subscription cards) to the App Group container whenever the Usage page loads or refreshes
+(`UsageStore.publishToWidgets`, file `usage-widgets.json`), then asks WidgetKit to reload. The widgets
+read that file, redraw every 10 minutes so "resets in" keeps counting down, and look at the file again
+every 30. So they are as fresh as the last time the Usage tab loaded: each says "Updated 12 min ago",
+and from an hour on (or when the figure is from an earlier day, or a device's sign-in has expired)
+reads "Stale" with an icon. With nothing written yet they say "Open Grouper to load usage". Signing out
+deletes the file. Letting the widget fetch for itself would mean putting the admin token in a shared
+Keychain access group; that was left out on purpose.
+
+**App Group.** `group.uk.clockmillbarn.grouper` is in `Entitlements/Grouper-iOS.entitlements` and
+`Entitlements/GrouperWidgets.entitlements` and in `Shared/WidgetSnapshotStore.swift`. Register that
+group under Identifiers > App Groups on the Apple developer account and tick it for both app IDs
+(`uk.clockmillbarn.grouper.ios` and `uk.clockmillbarn.grouper.ios.widgets`) before a signed build. A
+build without the group still runs: nothing is shared, and the widgets show the empty state.
 
 ## Build on a Mac
 
@@ -90,6 +196,9 @@ go on a phone. From the Mac, with Xcode and a free Apple Account:
 2. Xcode > Settings > Accounts: add your Apple Account (a Personal Team appears).
 3. For the `Grouper-iOS` and `GrouperWidgets` targets, Signing & Capabilities: tick
    "Automatically manage signing" and pick the Personal Team.
+   Both carry the App Group `group.uk.clockmillbarn.grouper` (the usage widgets read their data
+   through it); if Xcode can't provision it for a Personal Team, the app still runs but the widgets
+   stay empty.
 4. Plug in the iPhone, turn on Settings > Privacy & Security > Developer Mode (it
    restarts), select the phone as the run destination and press Run.
 5. On the phone, trust the developer in Settings > General > VPN & Device Management.

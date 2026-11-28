@@ -78,6 +78,8 @@ do {
         ],
         workspaceRoot: workspace,
         allowShell: true,
+        usageProbes: env["GROUPER_USAGE_PROBES"].map { !["0", "false", "no", "off"].contains($0.lowercased()) } ?? true,
+        usageProbeProviders: nil,
         handler: MacTools(),
         listener: Printer()
     )

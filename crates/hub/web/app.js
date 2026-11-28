@@ -6,24 +6,36 @@
 //   #/chat/<id>            a conversation
 //   #/chat/<id>/thread/<t> a conversation with a thread open in the inspector
 //   #/chat/<id>/threads    this conversation with the threads panel open
+//   #/chat/<id>?approval=<a>           the conversation with its approval dock on request <a>
+//   #/chat/<id>/thread/<t>?approval=<a> the same, with thread <t> open and its dock on <a>
+//                          (notifications and inbox Review use the first; the dock checks
+//                          <a> against the hub's pending list and says when it's gone)
 //   #/threads              current or last conversation with the panel open, or #/chat
 //   #/threads/<t>          resolves the thread's conversation and opens the inspector
+//                          (keeps `?approval=<a>`)
 //   #/inbox                Needs you: approvals and waiting threads across all chats
 //   #/models               the registry
 //   #/models/<id>          the registry with that model's provider group open, its row shown and focused
-//   #/usage                usage and limits; `?provider=<id>` filters the breakdown
-//   #/usage?conversation=<id>  one chat's usage (also takes `&provider=<id>`)
+//   #/usage                the two summaries (API costs, Subscriptions); `?provider=<id>` opens
+//                          with that key focused
+//   #/usage?conversation=<id>  one chat's usage (API costs scoped to it, then its threads)
+//   #/usage/breakdown      the breakdown table (`?provider=<id>` filters it)
+//   #/usage/limits         limits and budgets
 //   #/devices #/devices/<id> #/memory #/skills #/settings #/more
+//   #/link?code=<c>        approve or deny a device's sign-in (`grouper login`); signed out,
+//                          it goes through sign-in and comes back here
+//   #/token-signin         recovery sign-in with a hub token (linked from nowhere; README)
+//   #/claim?code=<c>       claim an unclaimed hub (signed out)
 //
 // The shell (sidebar, tab bar) is built once per sign-in and updated in place, so
 // focus and scroll survive the live updates. Everything it subscribes to is torn
 // down on sign-out.
 
-import { h, icon, setChildren, syncList, setText, setAttr } from './lib/dom.js';
+import { h, icon, setChildren, syncList, setText, setAttr, srOnly } from './lib/dom.js';
 import { get, enc, isAbort, onApiError } from './lib/api.js';
 import { store, on, emit, threadsIn, approvalsIn, needsYouCount, waitingThreads, resetStore } from './lib/store.js';
 import { startLive, stopLive, loadConversations, loadThreads, loadDevices, loadModels, loadApprovals } from './lib/live.js';
-import { closeDrawer, navigate, syncInert, bar, skeletonBlocks, errorBanner } from './lib/ui.js';
+import { closeDrawer, navigate, syncInert, bar, skeletonBlocks, errorBanner, toast, isNarrow } from './lib/ui.js';
 import { ago } from './lib/format.js';
 import { renderLogin } from './views/login.js';
 import { renderChat } from './views/chat.js';
@@ -36,6 +48,10 @@ import { renderSkills } from './views/skills.js';
 import { renderSettings } from './views/settings.js';
 import { renderMore } from './views/more.js';
 import { renderInbox } from './views/inbox.js';
+import { renderLink, rememberPendingLink, takePendingLink } from './views/link.js';
+import { startNotifications, stopNotifications, forgetNotifications } from './lib/push.js';
+import { mountPalette, openPalette } from './views/palette.js';
+import { mountStatusline } from './views/statusline.js';
 
 const root = document.getElementById('app');
 const LAST_CONV = 'grouper.lastConversation';
@@ -60,8 +76,14 @@ export function applyTheme() {
   else document.documentElement.dataset.theme = theme;
 }
 
+function onHashChange() {
+  if (store.me && els) route();
+  else if (!store.me && !els) showLogin();
+}
+
 async function boot() {
   applyTheme();
+  window.addEventListener('hashchange', onHashChange);
   try {
     const me = await get('/v1/session');
     if (!me?.signed_in) {
@@ -87,20 +109,37 @@ async function boot() {
 function showLogin() {
   root.className = '';
   root.removeAttribute('aria-busy');
-  setChildren(root, renderLogin((me) => {
-    store.me = me;
-    startApp();
-  }));
+  const r = parseRoute();
+  // A device's sign-in request opened while signed out: come back to it after signing in
+  // (Google sign-in returns to #/, so the page remembers it for this tab).
+  if (r.view === 'link') rememberPendingLink(r.code);
+  const opts =
+    r.view === 'claim'
+      ? { claim: true, code: r.code, error: r.error }
+      : r.view === 'token-signin'
+        ? { tokenOnly: true }
+        : r.view === 'link'
+          ? { link: true }
+          : undefined;
+  setChildren(
+    root,
+    renderLogin((me) => {
+      store.me = me;
+      startApp();
+    }, opts),
+  );
 }
 
 function startApp() {
   root.className = '';
   root.removeAttribute('aria-busy');
+  const pending = takePendingLink();
+  if (pending && location.hash !== pending) history.replaceState(null, '', pending);
+  else if (parseRoute().view === 'token-signin') history.replaceState(null, '', '#/');
   buildShell();
   if (!started) {
     // Once per page: these outlive sign-outs and check `store.me` themselves.
     started = true;
-    window.addEventListener('hashchange', route);
     onApiError((e) => {
       if (e.status === 401 && store.me) signedOut();
     });
@@ -109,6 +148,7 @@ function startApp() {
     });
   }
   startLive();
+  startNotifications();
   Promise.allSettled([
     loadConversations(),
     loadDevices(),
@@ -131,6 +171,9 @@ function startApp() {
 /** The session ended on the hub (expired, logged out elsewhere, token revoked). */
 export function signedOut() {
   stopLive();
+  // The session is already gone on the hub: unsubscribe here (the hub drops its row).
+  stopNotifications();
+  forgetNotifications({ server: false });
   resetStore();
   mainCleanup?.();
   inspectorCleanup?.();
@@ -179,14 +222,19 @@ function buildShell() {
   els = { shell, sidebar, main, inspector, inspectorScrim, tabbar, offline };
   buildNav();
 
-  const subs = ['conversations', 'threads', 'approvals', 'online'].map((topic) => on(topic, scheduleNav));
+  const subs = ['conversations', 'threads', 'approvals', 'online', 'devices'].map((topic) => on(topic, scheduleNav));
   subs.push(
     on('online', (online) => {
       if (els) els.offline.hidden = online || !store.everOnline;
     }),
   );
+  // Keep the Needs you age ("3m ago") current while something waits.
+  const ageTimer = setInterval(() => {
+    if (needsYouCount()) scheduleNav();
+  }, 30000);
   signal.addEventListener('abort', () => {
     subs.forEach((off) => off());
+    clearInterval(ageTimer);
     cancelAnimationFrame(navFrame);
     navFrame = 0;
   });
@@ -201,6 +249,12 @@ function buildShell() {
     },
     { signal },
   );
+  // Remount #/chat/new so the composer reads a mode the palette just stored.
+  window.addEventListener('grouper-palette-remount-chat', () => {
+    mainKey = '';
+  }, { signal });
+  mountPalette(signal);
+  mountStatusline(shell, signal);
 }
 
 function focusMain() {
@@ -239,121 +293,199 @@ function setBadge(badge, n) {
   setAttr(badge, 'aria-label', n ? `${n} ${badge.dataset.label}` : null);
 }
 
+// Chats shown in the sidebar before "More chats…" (V4: one-line rows, about eight).
+const SIDE_CHATS = 8;
+// On phones the palette isn't offered, so "More chats…" lists the rest in the drawer.
+let showAllChats = false;
+
+function moreChats() {
+  if (isNarrow()) {
+    showAllChats = true;
+    renderNav();
+    nav?.chatList.querySelector(`li:nth-child(${SIDE_CHATS + 1}) a`)?.focus();
+  } else {
+    // The palette has no "chats only" entry point yet; it opens on everything,
+    // with recent chats first.
+    openPalette();
+  }
+}
+
 function buildNav() {
-  const footLink = (href, label, iconName, view, badgeLabel) => {
+  showAllChats = false;
+  const navLink =(href, label, iconName, view, badgeLabel) => {
     const badge = badgeLabel ? countBadge(badgeLabel) : null;
     const a = h('a', { class: 'side-item', href }, icon(iconName), h('span', { class: 'label' }, label), badge);
     return { a, view, badge };
   };
-  // Needs you: everything waiting on the owner across all chats (#/inbox).
-  const needsBadge = countBadge('need you');
-  const needsItem = h(
-    'a',
-    { class: 'side-item side-needs', href: '#/inbox' },
-    icon('inbox'),
-    h('span', { class: 'label' }, h('span', { class: 'title' }, 'Needs you'), h('span', { class: 'sub' })),
-    needsBadge,
-  );
+  const newChat = h('a', { class: 'side-new', href: '#/chat/new' }, icon('new-chat'), h('span', null, 'New chat'));
   const chatList = h('ul', { class: 'side-list' });
   const chatEmpty = h('p', { class: 'side-empty' }, 'No conversations yet.');
-  const foot = [
-    footLink('#/devices', 'Devices', 'devices', ['devices']),
-    footLink('#/models', 'Models', 'models', ['models'], 'waiting'),
-    footLink('#/usage', 'Usage & limits', 'usage', ['usage']),
-    footLink('#/memory', 'Memory', 'memory', ['memory']),
-    footLink('#/skills', 'Skills', 'skills', ['skills']),
-    footLink('#/settings', 'Settings', 'settings', ['settings']),
+  const more = h(
+    'button',
+    { type: 'button', class: 'side-item side-more', hidden: true, onclick: moreChats },
+    icon('more'),
+    h('span', { class: 'label' }, 'More chats…'),
+  );
+  // Needs you: everything waiting on the owner across all chats (#/inbox). A section
+  // header with the newest item's age and the count; its name says it in words.
+  const needsBadge = countBadge('need you');
+  needsBadge.setAttribute('aria-hidden', 'true');
+  const needsAge = h('span', { class: 'side-needs-age', 'aria-hidden': 'true' });
+  // Words for screen readers follow the visible label, so the name starts with what's shown.
+  const needsWords = h('span', { class: 'visually-hidden' });
+  const needsItem = h('a', { class: 'side-item', href: '#/inbox' }, h('span', { class: 'label' }, 'Needs you', needsWords), needsAge, needsBadge);
+  const sections = [
+    navLink('#/devices', 'Devices', 'devices-fill', ['devices']),
+    navLink('#/models', 'Models', 'models-fill', ['models'], 'waiting'),
+    navLink('#/usage', 'Usage', 'usage-fill', ['usage']),
+    navLink('#/memory', 'Memory', 'memory-fill', ['memory']),
+    navLink('#/skills', 'Skills', 'skills-fill', ['skills']),
+    navLink('#/settings', 'Settings', 'settings-fill', ['settings']),
   ];
-  const conn = h('div', { class: 'conn', role: 'status' }, h('span', { class: 'conn-dot', 'aria-hidden': 'true' }), h('span', { class: 'conn-text' }));
+  // Real state, not a slogan (Q8): opens Devices.
+  const status = h(
+    'a',
+    { class: 'side-item side-status', href: '#/devices' },
+    h('span', { class: 'conn-dot', 'aria-hidden': 'true' }),
+    h('span', { class: 'label' }),
+    icon('chevron'),
+  );
   setChildren(
     els.sidebar,
-    h(
-      'div',
-      { class: 'sidebar-head' },
-      h('a', { class: 'brand', href: '#/chat' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), 'Grouper'),
-      h('a', { class: 'icon-btn', href: '#/chat/new', 'aria-label': 'New chat', title: 'New chat' }, icon('plus')),
-    ),
+    h('div', { class: 'sidebar-head' }, h('a', { class: 'brand', href: '#/chat' }, h('span', { class: 'brand-mark', 'aria-hidden': 'true' }), 'Grouper')),
+    newChat,
     h(
       'div',
       { class: 'sidebar-scroll' },
-      needsItem,
-      h('section', { class: 'side-section', 'aria-labelledby': 'side-chats' }, h('h2', { class: 'side-title', id: 'side-chats' }, 'Chats'), chatList, chatEmpty),
+      h('section', { class: 'side-section', 'aria-labelledby': 'side-chats' }, h('h2', { class: 'side-title', id: 'side-chats' }, 'Chats'), chatList, more, chatEmpty),
+      h('div', { class: 'side-needs' }, needsItem),
+      h('nav', { class: 'side-nav', 'aria-label': 'Sections' }, sections.map((f) => f.a)),
     ),
-    h('nav', { class: 'side-foot', 'aria-label': 'Sections' }, foot.map((f) => f.a), conn),
+    h('div', { class: 'side-foot' }, status),
   );
 
+  // Phone tabs: outline icons, filled when selected (CSS shows one of the two).
   const tab = (href, label, iconName, views, badgeLabel) => {
     const badge = badgeLabel ? countBadge(badgeLabel) : null;
-    const a = h('a', { class: 'tab', href }, icon(iconName), h('span', null, label), badge);
+    const a = h('a', { class: 'tab', href }, icon(iconName), icon(`${iconName}-fill`), h('span', null, label), badge);
     return { a, view: views, badge };
   };
   const tabs = [
     tab('#/chat', 'Chat', 'chat', ['chat'], 'need you'),
+    // Usage is a tab of its own (usage-tab-spec 2); it has no badge in this round.
+    tab('#/usage', 'Usage', 'usage', ['usage']),
     tab('#/devices', 'Devices', 'devices', ['devices']),
     // The inbox is reached from More on phones for now, so More stays lit there.
-    tab('#/more', 'More', 'more', ['more', 'models', 'usage', 'memory', 'skills', 'settings', 'inbox'], 'pending'),
+    tab('#/more', 'More', 'more', ['more', 'models', 'memory', 'skills', 'settings', 'inbox'], 'pending'),
   ];
   setChildren(els.tabbar, tabs.map((t) => t.a));
-  nav = { needsItem, needsBadge, chatList, chatEmpty, foot, conn, tabs };
-}
-
-function sideItem() {
-  const title = h('span', { class: 'title' });
-  const sub = h('span', { class: 'sub' });
-  const a = h('a', { class: 'side-item' }, h('span', { class: 'label' }, title, sub));
-  return h('li', null, a);
+  nav = { newChat, needsItem, needsWords, needsBadge, needsAge, chatList, chatEmpty, more, sections, status, tabs };
 }
 
 function chatSideItem() {
-  const li = sideItem();
-  li.firstChild.append(countBadge('approvals waiting'));
-  return li;
+  const a = h(
+    'a',
+    { class: 'side-item' },
+    icon('chat'),
+    h('span', { class: 'label' }),
+    srOnly(''),
+    h('span', { class: 'side-state', hidden: true, 'aria-hidden': 'true' }),
+    countBadge('approvals waiting'),
+  );
+  a.querySelector('.count').setAttribute('aria-hidden', 'true');
+  return h('li', null, a);
+}
+
+/** The sidebar's chats: the newest few, plus the open one if it's older. */
+function sidebarChats(r) {
+  const limit = showAllChats ? 50 : SIDE_CHATS;
+  const list = store.conversations.slice(0, limit);
+  const open = r.view === 'chat' && r.conversation;
+  if (open && !list.some((c) => c.id === open)) {
+    const c = store.conversations.find((x) => x.id === open);
+    if (c) list.splice(limit - 1, 1, c);
+  }
+  return list;
+}
+
+/** Newest thing in Needs you (an approval request or a thread that began waiting). */
+function newestNeed() {
+  let newest = 0;
+  for (const a of store.approvals.values()) newest = Math.max(newest, a.ts || 0);
+  for (const t of waitingThreads()) newest = Math.max(newest, t.created || 0);
+  return newest;
+}
+
+/** The footer's words: "All systems online" only when it's true (Q8). */
+function systemStatus() {
+  if (!store.online) return { text: store.everOnline ? 'Offline · reconnecting' : 'Connecting…', state: 'offline' };
+  // Only devices that run threads count; browsers and phones never connect as nodes.
+  const devices = (store.devices || []).filter((d) => d.platform !== 'web' && d.platform !== 'ios');
+  const up = devices.filter((d) => d.online).length;
+  if (!devices.length) return { text: 'Hub online', state: 'online' };
+  if (up === devices.length) return { text: 'All systems online', state: 'online' };
+  return { text: `${up} of ${devices.length} devices online`, state: 'partial' };
 }
 
 function renderNav() {
   if (!els || !nav) return;
   const r = parseRoute();
 
-  // Chats, newest first, with per-chat running/waiting lines and approval badges.
+  // Chats, newest first: one line each, the live state as a dot or count at the end
+  // and in words for screen readers (status is never colour alone).
+  const chats = sidebarChats(r);
   syncList(
     nav.chatList,
-    store.conversations.slice(0, 50),
+    chats,
     (c) => c.id,
     chatSideItem,
     (li, c) => {
       const a = li.firstChild;
       setAttr(a, 'href', `#/chat/${enc(c.id)}`);
       setAttr(a, 'aria-current', r.view === 'chat' && r.conversation === c.id ? 'page' : null);
-      setText(a.querySelector('.title'), c.title || 'Untitled');
+      setText(a.querySelector('.label'), c.title || 'Untitled');
       const chatThreads = threadsIn(c.id);
       const running = chatThreads.filter((t) => t.status === 'running').length;
       const waiting = chatThreads.filter((t) => t.status === 'waiting_device').length;
-      const subParts = [c.mode === 'standard' ? 'Standard' : 'Project'];
-      if (running) subParts.push(`${running} running`);
-      if (waiting) subParts.push(`${waiting} waiting`);
-      if (!running && !waiting) subParts.push(ago(c.created));
-      setText(a.querySelector('.sub'), subParts.join(' · '));
-      setBadge(a.querySelector('.count'), approvalsIn(c.id).length);
+      const approvals = approvalsIn(c.id).length;
+      const parts = [];
+      if (approvals) parts.push(approvals === 1 ? '1 approval waiting' : `${approvals} approvals waiting`);
+      if (waiting) parts.push(`${waiting} waiting for a device`);
+      if (running) parts.push(`${running} running`);
+      setText(a.querySelector('.visually-hidden'), parts.length ? `, ${parts.join(', ')}` : '');
+      setAttr(a, 'title', [c.mode === 'standard' ? 'Standard' : 'Project', ...(parts.length ? parts : [ago(c.created)])].join(' · '));
+      setBadge(a.querySelector('.count'), approvals);
+      const dot = a.querySelector('.side-state');
+      const state = approvals ? null : waiting ? 'waiting' : running ? 'running' : null;
+      dot.hidden = !state;
+      dot.classList.toggle('waiting', state === 'waiting');
+      dot.classList.toggle('running', state === 'running');
     },
   );
   nav.chatEmpty.hidden = store.conversations.length > 0;
+  nav.more.hidden = store.conversations.length <= chats.length;
 
-  // Needs you: the count badge, and the same in words (status is never colour alone).
+  // Needs you: the count and the newest item's age, and the same in words.
   const approvalCount = store.approvals.size;
   const waitingCount = waitingThreads().length;
+  const newest = approvalCount + waitingCount ? newestNeed() : 0;
   setAttr(nav.needsItem, 'aria-current', r.view === 'inbox' ? 'page' : null);
   setBadge(nav.needsBadge, approvalCount + waitingCount);
+  setText(nav.needsAge, newest ? ago(newest) : '');
   const needsParts = [];
   if (approvalCount) needsParts.push(approvalCount === 1 ? '1 approval' : `${approvalCount} approvals`);
-  if (waitingCount) needsParts.push(`${waitingCount} waiting`);
-  setText(nav.needsItem.querySelector('.sub'), needsParts.length ? needsParts.join(' · ') : 'Nothing right now');
+  if (waitingCount) needsParts.push(`${waitingCount} waiting for a device`);
+  setText(nav.needsWords, `: ${needsParts.length ? `${needsParts.join(', ')}, newest ${ago(newest)}` : 'nothing right now'}`);
 
-  for (const f of nav.foot) {
+  setAttr(nav.newChat, 'aria-current', r.view === 'chat' && r.conversation === null ? 'page' : null);
+  for (const f of nav.sections) {
     setAttr(f.a, 'aria-current', f.view.includes(r.view) ? 'page' : null);
     if (f.badge) setBadge(f.badge, store.pendingProposals);
   }
-  nav.conn.classList.toggle('online', store.online);
-  setText(nav.conn.querySelector('.conn-text'), store.online ? `Connected · ${store.me?.name || 'signed in'}` : 'Offline · reconnecting');
+  const sys = systemStatus();
+  nav.status.classList.toggle('online', sys.state === 'online');
+  nav.status.classList.toggle('partial', sys.state === 'partial');
+  setText(nav.status.querySelector('.label'), sys.text);
 
   const needs = needsYouCount();
   for (const t of nav.tabs) {
@@ -386,23 +518,44 @@ export function parseRoute() {
       return { view: 'chat', conversation: a, threadsPanel: true };
     }
     if (a === 'new' && b === 'thread' && c) {
-      return { view: 'thread-redirect', thread: c };
+      return { view: 'thread-redirect', thread: c, approval: query.get('approval') || undefined };
     }
-    return { view, conversation: a && a !== 'new' ? a : a === 'new' ? null : undefined, thread: b === 'thread' ? c : undefined };
+    return {
+      view,
+      conversation: a && a !== 'new' ? a : a === 'new' ? null : undefined,
+      thread: b === 'thread' ? c : undefined,
+      // The approval dock's selection; not part of the view's key (it changes in place).
+      approval: query.get('approval') || undefined,
+    };
   }
   if (view === 'threads' && !a) return { view: 'threads-redirect' };
   if ((view === 'threads' || view === 'thread') && a) {
-    return { view: 'thread-redirect', thread: a };
+    return { view: 'thread-redirect', thread: a, approval: query.get('approval') || undefined };
   }
   if (view === 'usage') {
+    // #/usage/breakdown and #/usage/limits are their own pages (the old table and editor).
+    if (a === 'breakdown' || a === 'limits') {
+      return { view: 'usage', sub: a, conversation: null, provider: query.get('provider') || null };
+    }
     const conversation = query.get('conversation') || (a === 'conversation' ? b : a) || null;
-    // The provider filter changes in place: it's not part of the route key below.
-    return { view: 'usage', conversation, provider: query.get('provider') || null };
+    // The focused key (summary) or provider filter (breakdown) changes in place: it's
+    // not part of the route key below.
+    return { view: 'usage', sub: 'summary', conversation, provider: query.get('provider') || null };
   }
+  if (view === 'claim') {
+    return { view: 'claim', code: query.get('code') || '', error: query.get('error') || '' };
+  }
+  if (view === 'link') return { view: 'link', id: query.get('code') || '', code: query.get('code') || '' };
+  if (view === 'token-signin') return { view: 'token-signin' };
   return { view, id: a };
 }
 
-function renderThreadRedirect(container, { thread: threadId }) {
+/** `?approval=<id>` for a route that carries one (redirects keep it). */
+function approvalQuery(r) {
+  return r.approval ? `?approval=${enc(r.approval)}` : '';
+}
+
+function renderThreadRedirect(container, { thread: threadId, approval }) {
   const body = h('div', { class: 'view-body narrow' }, skeletonBlocks(2));
   container.append(h('section', { class: 'view' }, bar({ title: 'Opening thread…' }), body));
   const aborter = new AbortController();
@@ -416,7 +569,7 @@ function renderThreadRedirect(container, { thread: threadId }) {
         const known = store.threads.get(threadId);
         store.threads.set(threadId, { ...known, ...thread, checkpoint: known?.checkpoint });
         emit('threads');
-        location.replace(`#/chat/${enc(thread.conversation_id)}/thread/${enc(threadId)}`);
+        location.replace(`#/chat/${enc(thread.conversation_id)}/thread/${enc(threadId)}${approvalQuery({ approval })}`);
         return;
       }
       showMissing();
@@ -458,6 +611,16 @@ function route() {
   closeDrawer();
   const r = parseRoute();
 
+  if (r.view === 'claim') {
+    if (r.error) toast(r.error, 'error');
+    location.replace('#/');
+    return;
+  }
+  if (r.view === 'token-signin') {
+    location.replace('#/');
+    return;
+  }
+
   // #/threads opens the panel on the chat you were in (or the last one).
   if (r.view === 'threads-redirect') {
     const id = lastConversationId();
@@ -469,7 +632,7 @@ function route() {
   if (r.view === 'thread-redirect' && r.thread) {
     const known = store.threads.get(r.thread);
     if (known?.conversation_id) {
-      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}`);
+      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}${approvalQuery(r)}`);
       return;
     }
   }
@@ -492,7 +655,7 @@ function route() {
   if (r.view === 'chat' && r.conversation && r.thread) {
     const known = store.threads.get(r.thread);
     if (known?.conversation_id && known.conversation_id !== r.conversation) {
-      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}`);
+      location.replace(`#/chat/${enc(known.conversation_id)}/thread/${enc(r.thread)}${approvalQuery(r)}`);
       return;
     }
   }
@@ -521,7 +684,7 @@ function route() {
       : r.view === 'thread-redirect'
         ? `thread-redirect:${r.thread || ''}`
         : r.view === 'usage'
-          ? `usage:${r.conversation || ''}`
+          ? `usage:${r.sub}:${r.conversation || ''}`
           : `${r.view}:${r.id || ''}`;
   if (key !== mainKey) {
     mainChanged = true;
@@ -544,6 +707,7 @@ function route() {
       settings: renderSettings,
       more: renderMore,
       inbox: renderInbox,
+      link: renderLink,
     };
     const render = renderers[r.view] || renderChat;
     document.title = 'Grouper';

@@ -84,7 +84,7 @@ pub const PROPOSAL_LOW: f64 = 0.3;
 pub const MAX_USE_CASES_CHARS: usize = 500;
 
 /// Rule values for `require` / `forbid`, and for `prefer`.
-const PROPERTIES: &[&str] = &["local", "remote", "free", "paid"];
+const PROPERTIES: &[&str] = &["local", "remote", "free", "paid", "harness", "api"];
 const PREFERENCES: &[&str] = &["cheapest", "local", "free"];
 
 pub fn norm(s: &str) -> String {
@@ -122,7 +122,11 @@ pub fn is_local_url(url: &str) -> bool {
 }
 
 /// Whether a model counts as local: flagged, hosted on a device, or its provider's URL is local.
+/// Harness models run a CLI on a device but talk to cloud models, so they never count as local.
 pub fn model_is_local(model: &ModelEntry, provider_url: Option<&str>, via_device: bool) -> bool {
+    if model.is_harness() {
+        return false;
+    }
     model.local || via_device || provider_url.is_some_and(is_local_url)
 }
 
@@ -141,15 +145,28 @@ pub fn local_map(
         .collect()
 }
 
-/// The role default excluding providers that cannot currently serve an automatically
-/// selected model (for example, an offline device host). Standard chat prefers a free model.
+/// Whether a model may orchestrate a project chat (or hold the `orchestrator` role default):
+/// any API model, or a harness that explicitly supports MCP orchestration (`can_orchestrate`).
+pub fn can_orchestrate_project(model: &ModelEntry) -> bool {
+    !model.is_harness() || model.can_orchestrate
+}
+
+/// The role default excluding hidden models and providers that cannot currently serve an
+/// automatically selected model (for example, an offline device host). Standard chat prefers a free model.
+/// For the `orchestrator` role, harnesses without `can_orchestrate` are dropped before every fallback step.
 pub fn default_model_from(
     models: &[ModelEntry],
     role: &str,
     unavailable_providers: &HashSet<String>,
 ) -> Option<ModelEntry> {
-    let available: Vec<&ModelEntry> =
-        models.iter().filter(|model| !unavailable_providers.contains(&model.provider_id)).collect();
+    let available: Vec<&ModelEntry> = models
+        .iter()
+        .filter(|model| {
+            !model.hidden
+                && !unavailable_providers.contains(&model.provider_id)
+                && (role != "orchestrator" || can_orchestrate_project(model))
+        })
+        .collect();
     let by_role = |r: &str| available.iter().find(|m| m.roles.iter().any(|x| x == r)).copied().cloned();
     match role {
         "standard" => by_role("standard").or_else(|| available.iter().find(|m| m.free).copied().cloned()),
@@ -157,13 +174,25 @@ pub fn default_model_from(
         _ => None,
     }
     .or_else(|| by_role(role))
-    .or_else(|| by_role("orchestrator"))
+    .or_else(|| {
+        available
+            .iter()
+            .find(|m| can_orchestrate_project(m) && m.roles.iter().any(|x| x == "orchestrator"))
+            .copied()
+            .cloned()
+    })
     .or_else(|| available.first().copied().cloned())
 }
 
-/// Find a model by registry id, or by the provider's model name.
+/// Find a model by registry id, or by the provider's model name (preferring visible rows
+/// when matching by provider model name; still resolves hidden rows for history and usage).
 pub fn find_model_in(models: &[ModelEntry], key: &str) -> Option<ModelEntry> {
-    models.iter().find(|m| m.id == key).or_else(|| models.iter().find(|m| m.model == key)).cloned()
+    models
+        .iter()
+        .find(|m| m.id == key)
+        .or_else(|| models.iter().find(|m| !m.hidden && m.model == key))
+        .or_else(|| models.iter().find(|m| m.model == key))
+        .cloned()
 }
 
 /// Rough price for comparing models: USD per million input plus output tokens.
@@ -177,6 +206,8 @@ fn has_property(m: &ModelEntry, local: bool, property: &str) -> bool {
         "remote" => !local,
         "free" => m.free,
         "paid" => !m.free,
+        "harness" => m.is_harness(),
+        "api" => !m.is_harness(),
         _ => false,
     }
 }
@@ -837,6 +868,17 @@ pub fn route_model_from(
 
     if let Some(key) = requested {
         let m = find_model_in(models, key).ok_or_else(|| format!("no model {key:?} in the registry"))?;
+        if m.hidden {
+            let why = match m.hidden_reason.as_deref() {
+                Some("gone") => "the provider no longer lists it",
+                Some("user") => "it is hidden by the user",
+                _ => "it is hidden",
+            };
+            return Err(format!(
+                "model {} is hidden ({why}). Leave model out to let the registry choose, or pick one from list_models.",
+                m.id
+            ));
+        }
         if let Some(r) = blocked_by(&m) {
             return Err(format!(
                 "model {} is ruled out for this task by priority rule {}. Leave model out to let the registry \
@@ -847,13 +889,17 @@ pub fn route_model_from(
         return Ok(Route { model: m, reason: None });
     }
 
+    if !models.iter().any(|m| !m.hidden) {
+        return Err("no visible models registered".into());
+    }
+
     let mut allowed: Vec<ModelEntry> = models
         .iter()
-        .filter(|m| blocked_by(m).is_none() && !unavailable_providers.contains(&m.provider_id))
+        .filter(|m| !m.hidden && blocked_by(m).is_none() && !unavailable_providers.contains(&m.provider_id))
         .cloned()
         .collect();
     if allowed.is_empty() {
-        if models.iter().any(|m| blocked_by(m).is_none() && unavailable_providers.contains(&m.provider_id)) {
+        if models.iter().any(|m| !m.hidden && blocked_by(m).is_none() && unavailable_providers.contains(&m.provider_id)) {
             return Err("No automatically selectable model is currently available; the matching device-hosted model is offline. Connect its hosting device or choose another model.".into());
         }
         let why: Vec<String> = filters.iter().map(|r| describe_rule(r)).collect();
@@ -1045,6 +1091,7 @@ pub fn models_overview(
     let pending = proposals(conn, Some("pending"));
     let model_rows: Vec<Value> = models
         .iter()
+        .filter(|m| !m.hidden)
         .map(|m| {
             let is_local = local.get(&m.id).copied().unwrap_or(m.local);
             let mut v = serde_json::to_value(m).unwrap_or_default();
@@ -1140,6 +1187,211 @@ mod tests {
         assert!(
             serde_json::from_str::<RuleSpec>(r#"{"when_tags": "x", "require": "local"}"#).is_err(),
             "typos are refused"
+        );
+    }
+
+    #[test]
+    fn hidden_models_are_skipped_by_defaults_routing_and_overview() {
+        let mut hidden_orch = ModelEntry {
+            id: "old-orch".into(),
+            provider_id: "p".into(),
+            model: "shared-model".into(),
+            input_price: 0.1,
+            output_price: 0.1,
+            free: true,
+            roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
+            local: true,
+            hidden: true,
+            hidden_reason: Some("gone".into()),
+            ..Default::default()
+        };
+        let visible_api = ModelEntry {
+            id: "live-api".into(),
+            provider_id: "p".into(),
+            model: "shared-model".into(),
+            input_price: 5.0,
+            output_price: 10.0,
+            roles: vec![],
+            ..Default::default()
+        };
+        let models = vec![hidden_orch.clone(), visible_api.clone()];
+        let none_unavail = HashSet::new();
+
+        // Defaults skip hidden rows for every role (even when the hidden row holds the role and is free).
+        assert_eq!(default_model_from(&models, "orchestrator", &none_unavail).unwrap().id, "live-api");
+        assert_eq!(default_model_from(&models, "standard", &none_unavail).unwrap().id, "live-api");
+        assert_eq!(default_model_from(&models, "thread", &none_unavail).unwrap().id, "live-api");
+        assert!(default_model_from(std::slice::from_ref(&hidden_orch), "orchestrator", &none_unavail).is_none());
+
+        // find_model_in resolves hidden rows by exact id, and prefers visible rows when matching by provider model name.
+        assert_eq!(find_model_in(&models, "old-orch").unwrap().id, "old-orch");
+        assert_eq!(find_model_in(&models, "shared-model").unwrap().id, "live-api");
+        assert_eq!(find_model_in(std::slice::from_ref(&hidden_orch), "shared-model").unwrap().id, "old-orch");
+
+        // Automatic routing skips hidden rows even when they have better stats, lower price, or match a rule.
+        let local = HashMap::from([("old-orch".into(), true), ("live-api".into(), false)]);
+        let stats = HashMap::from([(
+            "old-orch".into(),
+            OutcomeStats {
+                subject: "old-orch".into(),
+                task_type: "code".into(),
+                done: 10,
+                successes: 10,
+                success_rate: Some(1.0),
+                mean_grade: Some(5.0),
+                ..Default::default()
+            },
+        )]);
+        let routed = route_model_from(&models, &local, &[], &stats, None, Some("code"), &[], true, &none_unavail)
+            .unwrap();
+        assert_eq!(routed.model.id, "live-api");
+
+        // A require:local rule does not pick a hidden local model.
+        let local_rule = vec![PriorityRule {
+            id: 1,
+            text: "Sensitive: local only".into(),
+            rule: RuleSpec { when_tag: Some("sensitive".into()), require: Some("local".into()), ..Default::default() },
+            enabled: true,
+            created: 1,
+        }];
+        let err = route_model_from(
+            &models,
+            &local,
+            &local_rule,
+            &stats,
+            None,
+            None,
+            &["sensitive".into()],
+            false,
+            &none_unavail,
+        )
+        .unwrap_err();
+        assert!(err.contains("No registered model satisfies"), "{err}");
+
+        // Explicit request for a hidden model is refused with the reason.
+        let err = route_model_from(&models, &local, &[], &stats, Some("old-orch"), None, &[], false, &none_unavail)
+            .unwrap_err();
+        assert!(err.contains("hidden") && err.contains("no longer lists"), "{err}");
+
+        // Only hidden models -> clear error, not an empty rules error.
+        hidden_orch.hidden_reason = Some("user".into());
+        let err = route_model_from(
+            std::slice::from_ref(&hidden_orch),
+            &local,
+            &[],
+            &stats,
+            None,
+            None,
+            &[],
+            false,
+            &none_unavail,
+        )
+        .unwrap_err();
+        assert!(err.contains("no visible models"), "{err}");
+
+        // models_overview omits hidden rows.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let overview = models_overview(&conn, &models, &local);
+        let listed = overview["models"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], "live-api");
+    }
+
+    #[test]
+    fn harness_models_never_count_as_local() {
+        let harness = ModelEntry {
+            id: "cc-opus".into(),
+            provider_id: "claude-code@pc".into(),
+            model: "opus".into(),
+            kind: "harness".into(),
+            device_id: Some("pc".into()),
+            local: true,
+            ..Default::default()
+        };
+        assert!(!model_is_local(&harness, Some("http://localhost:1234"), true));
+    }
+
+    #[test]
+    fn default_model_and_routing_enforce_harness_orchestration_rules() {
+        let non_orch_harness = ModelEntry {
+            id: "a-codex-o3".into(),
+            provider_id: "codex@pc".into(),
+            model: "o3".into(),
+            kind: "harness".into(),
+            device_id: Some("pc".into()),
+            can_orchestrate: false,
+            roles: vec!["orchestrator".into(), "standard".into(), "thread".into()],
+            ..Default::default()
+        };
+        let orch_harness = ModelEntry {
+            id: "b-cc-opus".into(),
+            provider_id: "claude-code@pc".into(),
+            model: "opus".into(),
+            kind: "harness".into(),
+            device_id: Some("pc".into()),
+            can_orchestrate: true,
+            roles: vec!["orchestrator".into()],
+            ..Default::default()
+        };
+        let api_model = ModelEntry {
+            id: "z-gpt-4o".into(),
+            provider_id: "openai".into(),
+            model: "gpt-4o".into(),
+            kind: "api".into(),
+            roles: vec![],
+            ..Default::default()
+        };
+        let none_unavail = HashSet::new();
+
+        // Only a non-orchestrating harness: never auto-picked for orchestrator (even if it carries the role
+        // or would be the final "first available" fallback), but allowed for standard and thread.
+        let only_non_orch = vec![non_orch_harness.clone()];
+        assert!(default_model_from(&only_non_orch, "orchestrator", &none_unavail).is_none());
+        assert_eq!(default_model_from(&only_non_orch, "standard", &none_unavail).unwrap().id, "a-codex-o3");
+        assert_eq!(default_model_from(&only_non_orch, "thread", &none_unavail).unwrap().id, "a-codex-o3");
+
+        // Even with no roles at all, only a non-orchestrating harness is never auto-picked for orchestrator.
+        let unroled_non_orch = vec![ModelEntry { roles: vec![], ..non_orch_harness.clone() }];
+        assert!(default_model_from(&unroled_non_orch, "orchestrator", &none_unavail).is_none());
+        assert_eq!(default_model_from(&unroled_non_orch, "standard", &none_unavail).unwrap().id, "a-codex-o3");
+        assert_eq!(default_model_from(&unroled_non_orch, "thread", &none_unavail).unwrap().id, "a-codex-o3");
+
+        // Non-orchestrating harness listed before an API model: orchestrator skips it and picks the API model.
+        let non_orch_and_api = vec![non_orch_harness.clone(), api_model.clone()];
+        assert_eq!(default_model_from(&non_orch_and_api, "orchestrator", &none_unavail).unwrap().id, "z-gpt-4o");
+        assert_eq!(default_model_from(&non_orch_and_api, "standard", &none_unavail).unwrap().id, "a-codex-o3");
+        assert_eq!(default_model_from(&non_orch_and_api, "thread", &none_unavail).unwrap().id, "a-codex-o3");
+
+        // A harness with can_orchestrate = true IS allowed as the orchestrator default.
+        let all = vec![non_orch_harness.clone(), orch_harness.clone(), api_model.clone()];
+        assert_eq!(default_model_from(&all, "orchestrator", &none_unavail).unwrap().id, "b-cc-opus");
+
+        // Any harness (with or without can_orchestrate) may be picked for threads in route_model_from.
+        let local = HashMap::new();
+        let stats = HashMap::new();
+        let routed_non_orch =
+            route_model_from(&all, &local, &[], &stats, Some("a-codex-o3"), Some("code"), &[], false, &none_unavail)
+                .unwrap();
+        assert_eq!(routed_non_orch.model.id, "a-codex-o3");
+        let routed_orch =
+            route_model_from(&all, &local, &[], &stats, Some("b-cc-opus"), Some("code"), &[], false, &none_unavail)
+                .unwrap();
+        assert_eq!(routed_orch.model.id, "b-cc-opus");
+
+        // Priority rules understand `api` and `harness` properties.
+        let api_only = validate_rule(&RuleSpec { require: Some("api".into()), ..Default::default() }).unwrap();
+        let forbid_harness = validate_rule(&RuleSpec { forbid: Some("harness".into()), ..Default::default() }).unwrap();
+        let rules = vec![
+            PriorityRule { id: 1, text: "API only".into(), rule: api_only, enabled: true, created: 1 },
+            PriorityRule { id: 2, text: "No harnesses".into(), rule: forbid_harness, enabled: true, created: 2 },
+        ];
+        let routed_api =
+            route_model_from(&all, &local, &rules, &stats, None, Some("code"), &[], false, &none_unavail).unwrap();
+        assert_eq!(routed_api.model.id, "z-gpt-4o");
+        assert!(
+            route_model_from(&all, &local, &rules, &stats, Some("a-codex-o3"), None, &[], false, &none_unavail)
+                .is_err()
         );
     }
 }

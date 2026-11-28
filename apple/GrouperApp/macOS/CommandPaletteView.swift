@@ -76,7 +76,7 @@ struct CommandPaletteView: View {
 
     private func searchField(rows: [PaletteItem], selected: String?) -> some View {
         HStack(spacing: 10) {
-            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            Image(systemName: "magnifyingglass").foregroundStyle(Theme.text2)
             TextField("Search chats, threads, models, devices, pages, actions", text: $query)
                 .textFieldStyle(.plain)
                 .font(.title3)
@@ -92,7 +92,7 @@ struct CommandPaletteView: View {
                 }
                 .accessibilityLabel("Search chats, threads, models, devices, pages and actions")
                 .accessibilityValue(rows.isEmpty ? "No matches" : "\(rows.count) results")
-            Text("⌘K").font(.caption.monospaced()).foregroundStyle(.secondary)
+            Text("⌘K").font(.caption.monospaced()).foregroundStyle(Theme.text2)
         }
         .padding(14)
     }
@@ -103,18 +103,18 @@ struct CommandPaletteView: View {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     if unavailable {
                         Label("That item is no longer available.", systemImage: "exclamationmark.triangle")
-                            .font(.callout).foregroundStyle(.orange).padding(.horizontal, 8).padding(.vertical, 6)
+                            .font(.callout).foregroundStyle(Theme.warn).padding(.horizontal, 8).padding(.vertical, 6)
                     }
                     if sections.isEmpty {
                         HStack {
-                            Text("No matches").foregroundStyle(.secondary)
+                            Text("No matches").foregroundStyle(Theme.text2)
                             Button("Clear search") { query = "" }.buttonStyle(.borderless)
                         }
                         .padding(12)
                     }
                     ForEach(sections) { section in
                         Text(section.title)
-                            .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            .font(.caption.weight(.semibold)).foregroundStyle(Theme.text2)
                             .padding(.horizontal, 8).padding(.top, 10).padding(.bottom, 2)
                             .accessibilityAddTraits(.isHeader)
                         ForEach(section.items) { item in
@@ -122,7 +122,7 @@ struct CommandPaletteView: View {
                         }
                         if section.total > section.items.count {
                             Text("\(section.total - section.items.count) more. Keep typing to narrow the list.")
-                                .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 8)
+                                .font(.caption).foregroundStyle(Theme.text2).padding(.horizontal, 8)
                         }
                     }
                 }
@@ -132,25 +132,25 @@ struct CommandPaletteView: View {
                 if let id { proxy.scrollTo(id) }
             }
         }
-        .background(.background)
+        .background(Theme.surface)
     }
 
     private func row(_ item: PaletteItem, isSelected: Bool) -> some View {
         Button { activate(item) } label: {
             HStack(spacing: 10) {
-                Image(systemName: icon(item)).frame(width: 20).foregroundStyle(.secondary)
+                Image(systemName: icon(item)).frame(width: 20).foregroundStyle(Theme.text2)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.title).lineLimit(1)
                     if !item.subtitle.isEmpty {
-                        Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(item.subtitle).font(.caption).foregroundStyle(Theme.text2).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 8)
-                Text(kindLabel(item)).font(.caption).foregroundStyle(.secondary)
+                Text(kindLabel(item)).font(.caption).foregroundStyle(Theme.text2)
             }
             .padding(.horizontal, 8).padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear, in: .rect(cornerRadius: 8))
+            .background(isSelected ? Theme.surfaceSelect : Color.clear, in: .rect(cornerRadius: Theme.Radius.sm))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -160,7 +160,7 @@ struct CommandPaletteView: View {
 
     private func footer(count: Int) -> some View {
         HStack {
-            Text("↑↓ to move · Return to open · Esc to close").font(.caption).foregroundStyle(.secondary)
+            Text("↑↓ to move · Return to open · Esc to close").font(.caption).foregroundStyle(Theme.text2)
             Spacer()
             Button("Close") { dismiss() }.keyboardShortcut(.cancelAction)
         }
@@ -196,7 +196,7 @@ struct CommandPaletteView: View {
             case .needsYou: return "exclamationmark.circle"
             case .devices: return "desktopcomputer"
             case .models: return "cpu"
-            case .usage: return "chart.bar"
+            case .usage: return "chart.pie"
             case .memory: return "brain"
             case .skills: return "sparkles"
             case .settings: return "gear"
@@ -269,11 +269,11 @@ struct ModelsListView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(entry.id).font(.body.monospaced())
                 Text(entry.roles.isEmpty ? entry.model : "\(entry.model) · \(entry.roles.joined(separator: ", "))")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(Theme.text2)
             }
             Spacer()
         }
         .padding(.vertical, 2)
-        .listRowBackground(entry.id == highlighted ? Color.accentColor.opacity(0.15) : nil)
+        .listRowBackground(entry.id == highlighted ? Theme.surfaceSelect : nil)
     }
 }

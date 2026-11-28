@@ -90,6 +90,7 @@ async fn http_probe_endpoint_auth_stats_proposals_and_budget() {
         roles: vec!["thread".into()],
         local: false,
         modalities: vec!["text".into()],
+        ..Default::default()
     })
     .unwrap();
 
@@ -214,6 +215,7 @@ async fn probes_work_through_a_device_hosted_provider_and_report_offline() {
         roles: vec!["thread".into()],
         local: true,
         modalities: vec!["text".into()],
+        ..Default::default()
     })
     .unwrap();
 
@@ -249,6 +251,7 @@ async fn probes_work_through_a_device_hosted_provider_and_report_offline() {
             mcp_config: Some(mcp_config),
             folders: Vec::new(),
             usage_probes: false,
+            usage_probe_providers: None,
         },
         Arc::new(NoTools),
         Arc::new(Quiet),

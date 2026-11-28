@@ -1,9 +1,13 @@
-# Running the hub
+# Server mode (parked)
 
-The hub runs in a Debian VM on the Windows PC (Hyper-V) and is reached at
-`https://grouper.clockmillbarn.uk` through a Cloudflare Tunnel. The tunnel connects
-out from the VM, so no router ports are opened and the VM's changing NAT address
-doesn't matter. Later the same compose file runs on a VPS.
+This folder is **server mode**: the hub in Docker, on the Debian VM or later a VPS.
+It stays as documentation. The hub to run is the Windows app on the PC. Moving this
+VM's data there is [MOVE-TO-PC.md](MOVE-TO-PC.md).
+
+What follows is how server mode runs: a Debian VM on the Windows PC (Hyper-V),
+reached at `https://grouper.clockmillbarn.uk` through a Cloudflare Tunnel. The tunnel
+connects out from the VM, so no router ports are opened and the VM's changing NAT
+address doesn't matter. Later the same compose file runs on a VPS.
 
 ## 1. The VM
 
@@ -103,6 +107,9 @@ grouper models add gemma-local --provider lmstudio --model grouper-gemma --free 
 
 ## 5. Backups and moving to a VPS
 
+Moving this hub onto the Windows PC is [MOVE-TO-PC.md](MOVE-TO-PC.md). The rest
+of this section stays in server mode: a backup, or a restore onto a VPS.
+
 The hub can keep running while you take a backup. `grouper-hub backup` uses SQLite's
 online backup API, so `grouper.db` is a consistent snapshot, and copies `<data>/workspaces`.
 The archive or directory also gets a `manifest.json` (hub id, versions, schema, file sizes
@@ -180,6 +187,10 @@ Restore checks every SHA-256 and checks that the master key this process can see
 provider keys. If either check fails, the data volume is left as it was.
 
 The restored database keeps its `hub_id`, so device caches still recognise the hub.
+If this machine is not the one named as the hub device in the backup (device name
+and OS), restore registers this computer and sets `hub_device_id` to it at
+`epoch + 1`. Device tokens in the backup still work. Restoring on that same
+machine leaves `hub_device_id` and `epoch` unchanged.
 Point the Cloudflare Tunnel at the new host: install `cloudflared` on the VPS and run a
 connector for the same `grouper-hub` tunnel (see [cloudflare-tunnel.md](cloudflare-tunnel.md)).
 The public hostname stays `grouper` / `clockmillbarn.uk`, service HTTP `localhost:8080`.

@@ -1,5 +1,5 @@
-// "More" on narrow screens: the sections that don't fit the tab bar. Needs you
-// comes first, with a live count, until the phone tabs are decided.
+// "More" on narrow screens: the sections that don't fit the tab bar (Chat / Usage /
+// Devices / More). Needs you comes first, with a live count. Rows use the filled nav icons.
 
 import { h, icon, setText, setAttr } from '../lib/dom.js';
 import { store, on, needsYouCount } from '../lib/store.js';
@@ -28,7 +28,7 @@ export function renderMore(container) {
     h(
       'a',
       { class: 'list-row', href: '#/inbox' },
-      icon('inbox'),
+      icon('inbox-fill'),
       h('div', { class: 'grow' }, h('div', { class: 'row-title' }, 'Needs you'), h('div', { class: 'row-sub' }, 'Approvals and threads waiting for a device')),
       needsBadge,
       icon('chevron'),
@@ -54,11 +54,10 @@ export function renderMore(container) {
           'ul',
           { class: 'list card' },
           needsRow,
-          item('#/models', 'Models', 'models', 'Registry, stats, proposals, rules', store.pendingProposals),
-          item('#/usage', 'Usage & limits', 'usage', 'Spend, balances, budgets'),
-          item('#/memory', 'Memory', 'memory', 'What Grouper remembers'),
-          item('#/skills', 'Skills', 'skills', 'Saved procedures'),
-          item('#/settings', 'Settings', 'settings', 'This browser, the hub, appearance'),
+          item('#/models', 'Models', 'models-fill', 'Registry, stats, proposals, rules', store.pendingProposals),
+          item('#/memory', 'Memory', 'memory-fill', 'What Grouper remembers'),
+          item('#/skills', 'Skills', 'skills-fill', 'Saved procedures'),
+          item('#/settings', 'Settings', 'settings-fill', 'This browser, the hub, appearance'),
         ),
       ),
     ),
