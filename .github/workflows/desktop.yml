@@ -23,6 +23,7 @@ on:
       - "Cargo.toml"
       - ".github/workflows/desktop.yml"
       - "scripts/publish-release.sh"
+      - ".gitattributes"
   pull_request:
     paths:
       - "apps/desktop/**"
@@ -36,6 +37,7 @@ on:
       - "Cargo.toml"
       - ".github/workflows/desktop.yml"
       - "scripts/publish-release.sh"
+      - ".gitattributes"
 
 permissions:
   contents: read
