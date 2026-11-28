@@ -42,6 +42,22 @@ A personal, multi-provider, multi-device AI orchestrator. Design:
 - **Swift ⇄ Rust**: the Mac demo app runs threads inside the Rust core and offers a
   Swift-implemented tool to them.
 
+## Download the apps
+
+Get them from the repository's [Releases page](https://github.com/BlacklionXYZ2/Grouper/releases):
+
+- **Latest build (harness)** is a pre-release that always holds the newest successful
+  build of the `harness` branch. Each file's label names the commit it came from.
+- **Grouper v1.2.3** releases are made by pushing a `v*` tag: `git tag v0.1.0 && git push origin v0.1.0`.
+
+| File | What it is |
+|---|---|
+| `Grouper-windows-x64-setup.exe` | Windows installer. Unsigned, so SmartScreen warns: More info > Run anyway. |
+| `Grouper-macOS-arm64.zip` | Mac app for Apple Silicon. Ad-hoc signed, not notarized: unzip, move `Grouper.app` to Applications, then run `xattr -dr com.apple.quarantine /Applications/Grouper.app` (or System Settings > Privacy & Security > Open Anyway). |
+
+The iPhone app isn't on Releases: iOS apps need Apple signing, so install it from Xcode.
+The Desktop and Apple workflows also keep each build as an Actions artifact for 14 days.
+
 ## Layout
 
 | Path | What |
