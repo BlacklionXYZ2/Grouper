@@ -107,6 +107,10 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (isHubPath(p)) {
     // The relay's own browser sign-in returns to the path Google has registered for the hub.
     if (p === "/oauth/google/return" && m === "POST" && (await isRelayReturn(request))) return authReturn(request, env);
+    // Every hub's browser Google sign-in comes back through this registered URI. The page needs no
+    // hub and no relay session: it reads the starting hub's origin from `state` and posts Google's
+    // answer on to that hub, exactly as the hub's own copy of the page does.
+    if (p === "/oauth/google/return" && (m === "POST" || m === "GET")) return hubReturnPage(request, url);
     return forward(request, env, url);
   }
   return website(request, env);
@@ -534,4 +538,84 @@ async function forward(request: Request, env: Env, url: URL): Promise<Response> 
     signal: request.signal,
   });
   return auth.stub.fetch(inner);
+}
+
+// ---- shared Google return page ----------------------------------------------------------------
+
+const RETURN_SUBMIT = "document.forms[0].submit()";
+
+/** `scheme://host[:port]` a browser sign-in may return to: HTTPS, or plain HTTP on a loopback host. */
+function returnOrigin(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (u.username || u.password || u.origin !== raw) return null;
+  if (u.protocol === "https:") return u.origin;
+  if (u.protocol === "http:") {
+    const h = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return u.origin;
+  }
+  return null;
+}
+
+/** The hub origin named in a hub's sign-in `state` (base64url JSON `{o, id}`). */
+function stateOrigin(state: string | null): string | null {
+  if (!state || state.length > 2048) return null;
+  try {
+    const v = JSON.parse(new TextDecoder().decode(b64urlDecode(state.trim())));
+    if (!v || typeof v.id !== "string" || !v.id) return null;
+    return returnOrigin(v.o);
+  } catch {
+    return null;
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+}
+
+async function hubReturnPage(request: Request, url: URL): Promise<Response> {
+  const params = new Map<string, string>();
+  url.searchParams.forEach((v, k) => params.set(k, v));
+  if (request.method === "POST") {
+    const text = await request.text();
+    if (text.length <= 64 * 1024) new URLSearchParams(text).forEach((v, k) => params.set(k, v));
+  }
+  const origin = stateOrigin(params.get("state") ?? null);
+  const base = {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+  };
+  const page = (body: string) =>
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">` +
+    `<meta name="viewport" content="width=device-width"><title>Grouper sign-in</title></head><body>${body}</body></html>`;
+  if (!origin) {
+    return new Response(
+      page("<p>This sign-in can't continue: it doesn't say which hub to return to. Go back to your hub and start again.</p>"),
+      {
+        status: 400,
+        headers: { ...base, "content-security-policy": "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" },
+      },
+    );
+  }
+  const fields = ["id_token", "state", "error"]
+    .filter((k) => params.has(k))
+    .map((k) => `<input type="hidden" name="${k}" value="${escapeHtml(params.get(k)!)}">`)
+    .join("");
+  const hash = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(RETURN_SUBMIT)))));
+  const csp = `default-src 'none'; script-src 'sha256-${hash}'; form-action ${origin}; base-uri 'none'; frame-ancestors 'none'`;
+  const action = escapeHtml(`${origin}/v1/auth/google/return`);
+  return new Response(
+    page(
+      `<form method="post" action="${action}">${fields}<p>Returning to your hub…</p>` +
+        `<noscript><button type="submit">Continue</button></noscript></form><script>${RETURN_SUBMIT}</script>`,
+    ),
+    { status: 200, headers: { ...base, "content-security-policy": csp } },
+  );
 }

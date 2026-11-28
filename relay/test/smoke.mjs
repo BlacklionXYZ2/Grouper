@@ -411,7 +411,7 @@ async function main() {
     return r.status === 302 && r.headers.get("location") === "/relay/sign-in?next=%2Fapp";
   })());
   check("deep hub path keeps its query in next", (await api("GET", "/app/x?y=1", { headers: HTML })).headers.get("location") === "/relay/sign-in?next=%2Fapp%2Fx%3Fy%3D1");
-  for (const p of ["/oauth/google/return", "/sw.js", "/favicon.ico", "/healthz"]) {
+  for (const p of ["/sw.js", "/favicon.ico", "/healthz"]) {
     check(`${p} without session redirects html`, (await api("GET", p, { headers: HTML })).headers.get("location") === "/relay/sign-in?next=" + encodeURIComponent(p));
   }
   check("hub API without session is 401 JSON, not a redirect", (await api("GET", "/v1/hub", { headers: { accept: "application/json" } })).status === 401);
@@ -491,7 +491,7 @@ async function main() {
     const a = await start("/app/threads?open=2");
     check("state cookie has Path=/ so it reaches /oauth/google/return", /Path=\/;/.test(a.set), a.set);
     const wrong = await post({ id_token: mint({ ...A, nonce: a.rn }), state: "nope" }, a.cookie);
-    check("return with a mismatched state isn't the relay's: forwarded, and with no session refused (401 JSON)", wrong.status === 401 && (await wrong.json()).relay === true);
+    check("return with a mismatched state isn't the relay's: no sign-in, no relay cookie (the hub return page refuses the unknown state)", wrong.status === 400 && !(wrong.headers.get("set-cookie") || "").includes("grouper_relay="));
     const ok = await post({ id_token: mint({ ...A, nonce: a.rn }), state: a.state }, a.cookie);
     const sc = ok.headers.getSetCookie().find((c) => c.startsWith("grouper_relay=")) ?? "";
     check("POST /oauth/google/return with matching state signs in and redirects to next", ok.status === 303 && ok.headers.get("location") === "/app/threads?open=2" && /grouper_relay=rt\./.test(sc), `${ok.status} ${ok.headers.get("location")}`);
@@ -505,12 +505,22 @@ async function main() {
     const evilCookie = c.cookie + "~" + Buffer.from("https://evil.example/").toString("base64url");
     const okC = await post({ id_token: mint({ ...A, nonce: c.rn }), state: c.state }, evilCookie);
     check("a tampered next in the cookie falls back to /app", okC.status === 303 && okC.headers.get("location") === "/app", okC.headers.get("location"));
-    // Without a relay state cookie the hub gets it, with the session.
-    const hubSide = await fetch(`${BASE}/oauth/google/return`, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", "grouper-relay": tokA }, body: new URLSearchParams({ id_token: "x", state: "hubstate" }) });
-    const hj = await hubSide.json().catch(() => null);
-    check("POST /oauth/google/return without relay state is forwarded to the hub", hj?.hub === "A" && hj.path === "/oauth/google/return", JSON.stringify(hj));
-    const hubSideAnon = await post({ id_token: "x", state: "hubstate" }, "");
-    check("…and with no session is refused (401)", hubSideAnon.status === 401);
+    // Without a relay state cookie it's a hub's own sign-in: the relay serves the shared return
+    // page (no hub, no session needed), which posts on to the hub named in the state.
+    const hubState = (o) => Buffer.from(JSON.stringify({ o, id: "abc123" })).toString("base64url");
+    const local = await post({ id_token: "tok.en", state: hubState("http://127.0.0.1:47600") }, "");
+    const lt = await local.text();
+    check("a hub's return (no relay session) gets the return page", local.status === 200 && lt.includes('action="http://127.0.0.1:47600/v1/auth/google/return"') && lt.includes('name="id_token" value="tok.en"'), `${local.status}`);
+    check("…with a CSP that only lets the form post to that hub", (local.headers.get("content-security-policy") || "").includes("form-action http://127.0.0.1:47600"));
+    check("…and it sets no relay cookie", !(local.headers.get("set-cookie") || "").includes("grouper_relay"));
+    const viaRelay = await post({ id_token: "x", state: hubState(BASE) }, "");
+    check("a hub reached through the relay is returned to the relay's origin", viaRelay.status === 200 && (await viaRelay.text()).includes(`action="${BASE}/v1/auth/google/return"`));
+    for (const [label, st] of [["plain http to a remote host", hubState("http://evil.example")], ["a path, not an origin", hubState("https://hub.example/x")], ["garbage", "not-a-state"]]) {
+      const r = await post({ id_token: "x", state: st }, "");
+      check(`return page refuses ${label}`, r.status === 400);
+    }
+    const getErr = await fetch(`${BASE}/oauth/google/return?error=access_denied&state=${hubState("https://hub.example")}`, { redirect: "manual" });
+    check("a GET with Google's error is passed on too", getErr.status === 200 && (await getErr.text()).includes('name="error" value="access_denied"'));
     // Forwarded hub requests never carry the relay state cookie.
     const viaState = await api("GET", "/app", { headers: { "grouper-relay": tokA, cookie: "grouper_relay_state=abc.def; other=1", accept: "text/html" } });
     check("relay state cookie is stripped before the hub", Object.fromEntries(viaState.json?.headers ?? []).cookie === "other=1", viaState.text);

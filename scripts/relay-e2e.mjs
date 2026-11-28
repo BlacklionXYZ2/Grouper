@@ -244,8 +244,20 @@ async function main() {
     const st = /name="state" value="([^"]+)"/.exec(gForm)?.[1];
     const back = await http(RELAY, "/oauth/google/return", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", cookie: stCookie }, raw: new URLSearchParams({ id_token: tok, state: st }).toString() });
     check("the relay completes it and sends the browser to next", back.status === 303 && back.headers.get("location") === "/app/settings" && (back.headers.get("set-cookie") || "").includes("grouper_relay="), `${back.status} ${back.headers.get("location")}`);
-    const hubReturn = await http(RELAY, "/oauth/google/return", { method: "POST", headers: { ...asA, "content-type": "application/x-www-form-urlencoded" }, raw: "id_token=x&state=hub-own-state" });
-    check("a return page post with no relay state goes to the hub", hubReturn.status !== 303 && !(hubReturn.headers.get("set-cookie") || "").includes("grouper_relay="), `${hubReturn.status}`);
+    // A hub's own browser sign-in (here: hub A started directly on its loopback address, as the
+    // Windows app does) comes back through the relay's shared return page with no relay session.
+    const hubStart = await http(A.base, "/v1/auth/google/start", { method: "POST", headers: { "content-type": "application/json", origin: A.base }, body: {} });
+    const hubAuth = hubStart.json?.auth_url ? new URL(hubStart.json.auth_url) : null;
+    check("hub A's own sign-in returns to the relay's return page", hubAuth?.searchParams.get("redirect_uri") === `${RELAY}/oauth/google/return`, hubStart.text.slice(0, 200));
+    if (hubAuth) {
+      const hubTok = mint("alice", { aud: WEB, nonce: hubAuth.searchParams.get("nonce") });
+      const page = await http(RELAY, "/oauth/google/return", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, raw: new URLSearchParams({ id_token: hubTok, state: hubAuth.searchParams.get("state") }).toString() });
+      const action = /action="([^"]+)"/.exec(page.text)?.[1]?.replace(/&#38;/g, "&");
+      check("the return page (no relay session) sends the browser back to hub A", page.status === 200 && action === `${A.base}/v1/auth/google/return`, `${page.status} ${action}`);
+      const fields = Object.fromEntries([...page.text.matchAll(/name="([^"]+)" value="([^"]*)"/g)].map((m) => [m[1], m[2]]));
+      const done = await http(A.base, "/v1/auth/google/return", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, raw: new URLSearchParams(fields).toString() });
+      check("…and hub A signs alice in", done.status === 303 && (done.headers.get("set-cookie") || "").includes("grouper_session"), `${done.status} ${done.headers.get("location")}`);
+    }
   }
 
   console.log("WebSockets through the relay");
