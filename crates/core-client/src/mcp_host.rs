@@ -854,6 +854,8 @@ async fn launch(
 ) -> Result<RunningService<RoleClient, HostClient>, String> {
     let mut cmd = tokio::process::Command::new(&spec.command);
     cmd.args(&spec.args);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console window pops up from the GUI app
     for key in core_agent::tools::secret_env_keys() {
         cmd.env_remove(key);
     }

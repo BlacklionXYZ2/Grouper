@@ -711,6 +711,11 @@ fn sanitized_command(program: &Path, args: &[&str]) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console window from the GUI app
+    }
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().to_ascii_uppercase().starts_with("GROUPER_") {
             cmd.env_remove(k);
@@ -1321,6 +1326,8 @@ async fn run_turn_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console window from the GUI app
 
     for (k, _) in std::env::vars_os() {
         let name = k.to_string_lossy();

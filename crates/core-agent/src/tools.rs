@@ -302,6 +302,7 @@ fn shell_program(cmd: &str) -> tokio::process::Command {
         );
         let mut c = tokio::process::Command::new(windows_powershell());
         c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &wrapped]);
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console window from the GUI app
         c
     };
     #[cfg(not(windows))]

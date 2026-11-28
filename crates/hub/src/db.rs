@@ -648,7 +648,13 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) 
 
 /// Default device name for the machine hosting a fresh hub: its hostname, sanitized, with a safe fallback.
 fn machine_device_name() -> String {
-    let raw = std::process::Command::new("hostname")
+    let mut hostname = std::process::Command::new("hostname");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        hostname.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console window from the GUI app
+    }
+    let raw = hostname
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())

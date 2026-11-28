@@ -278,7 +278,13 @@ pub fn restore(data_dir: &Path, backup_path: &Path, force: bool) -> Result<()> {
 /// The name `ensure_hub_device` stores for the computer it is running on.
 /// Same rules as `machine_device_name` in `db.rs` (that function is private).
 fn host_device_name() -> String {
-    let raw = std::process::Command::new("hostname")
+    let mut hostname = std::process::Command::new("hostname");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        hostname.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console window from the GUI app
+    }
+    let raw = hostname
         .output()
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
