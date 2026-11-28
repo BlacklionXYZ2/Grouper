@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(r.status(), reqwest::StatusCode::OK);
         assert_eq!(r.headers()["content-type"], "application/manifest+json");
         let manifest: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
-        assert_eq!(manifest["scope"], "/");
+        assert_eq!(manifest["scope"], "/app/"); // the website owns / behind the relay
         assert_eq!(manifest["display"], "standalone");
     }
 

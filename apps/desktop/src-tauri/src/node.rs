@@ -159,6 +159,8 @@ impl NodeHandle {
             folders,
             usage_probes: usage.enabled,
             usage_probe_providers: usage.providers,
+            // The desktop node talks to the hub on this computer, never through the relay.
+            relay_token: None,
         };
         let recipe = NodeRecipe {
             hub_url: hub_url.to_string(),
