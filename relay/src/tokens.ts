@@ -94,3 +94,43 @@ export async function verifyHubSecret(secret: string, hubSecret: string): Promis
   if (p.length !== 4 || p[0] !== "hs" || !ACCT_RE.test(p[1]!) || !p[2] || !p[3]) return null;
   return safeEqual(await hubTag(secret, p[1]!, p[2]), p[3]) ? p[1]! : null;
 }
+
+export const CLI_CODE_TTL = 60;
+export const FORM_TOKEN_TTL = 600;
+
+/** `cc.<acct>.<rand>.<tag>`: a CLI sign-in code. The account key routes to the right object; the tag rejects forgeries early. */
+export async function makeCliCode(secret: string, acct: string): Promise<string> {
+  const rand = randomB64url(32);
+  return `cc.${acct}.${rand}.${await cliTag(secret, acct, rand)}`;
+}
+
+async function cliTag(secret: string, acct: string, rand: string): Promise<string> {
+  return b64urlEncode((await hmac(secret, `cc:${acct}.${rand}`)).slice(0, 16));
+}
+
+/** The account key in a CLI code whose tag verifies; null if malformed or forged. */
+export async function verifyCliCode(secret: string, code: unknown): Promise<string | null> {
+  if (typeof code !== "string" || code.length > 256) return null;
+  const p = code.split(".");
+  if (p.length !== 4 || p[0] !== "cc" || !ACCT_RE.test(p[1]!) || !p[2] || !p[3]) return null;
+  return safeEqual(await cliTag(secret, p[1]!, p[2]), p[3]) ? p[1]! : null;
+}
+
+async function formTag(secret: string, claims: RelayClaims, port: string, state: string, exp: number): Promise<string> {
+  return b64urlEncode(await hmac(secret, `cli-form:${claims.a}:${claims.g}:${port}:${state}:${exp}`));
+}
+
+/** Form token bound to the session's account and generation and to this port and state. */
+export async function makeFormToken(secret: string, claims: RelayClaims, port: string, state: string): Promise<string> {
+  const exp = nowSec() + FORM_TOKEN_TTL;
+  return `${exp}.${await formTag(secret, claims, port, state, exp)}`;
+}
+
+export async function checkFormToken(secret: string, claims: RelayClaims, port: string, state: string, token: unknown): Promise<boolean> {
+  if (typeof token !== "string") return false;
+  const i = token.indexOf(".");
+  if (i <= 0 || !/^\d{1,12}$/.test(token.slice(0, i))) return false;
+  const exp = Number(token.slice(0, i));
+  if (exp <= nowSec()) return false;
+  return safeEqual(await formTag(secret, claims, port, state, exp), token.slice(i + 1));
+}

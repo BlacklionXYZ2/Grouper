@@ -35,6 +35,18 @@ export function signInPage(next = "/app"): Response {
   );
 }
 
+/** Confirmation for the command-line sign-in. The button POSTs; a GET never mints anything. */
+export function cliConfirmPage(email: string, port: string, state: string, csrf: string): Response {
+  const form = `<form method="post" action="/relay/v1/cli-token">
+<input type="hidden" name="port" value="${esc(port)}"><input type="hidden" name="state" value="${esc(state)}"><input type="hidden" name="csrf" value="${esc(csrf)}">
+<button class="btn" type="submit">Sign in the command line</button></form>
+<p style="margin:20px 0 0;font-size:14px">Only continue if you just ran <code>grouper login</code>. If not, close this tab.</p>`;
+  const r = html(200, page("Command line sign-in · Grouper", "Sign in the command line?", `Sign the Grouper command line on this computer in as ${email}?`, undefined, form));
+  r.headers.set("content-security-policy", "frame-ancestors 'none'");
+  r.headers.set("x-frame-options", "DENY");
+  return r;
+}
+
 export function hubOfflinePage(): Response {
   return html(
     503,

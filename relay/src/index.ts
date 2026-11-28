@@ -3,9 +3,14 @@
 export { Account } from "./account";
 
 import { AuthError, DEFAULT_AUTH_URL, verifyIdToken, type GoogleClaims } from "./google";
-import { errorPage, signInPage } from "./pages";
+import { cliConfirmPage, errorPage, signInPage } from "./pages";
 import {
   APP_TOKEN_TTL,
+  CLI_CODE_TTL,
+  checkFormToken,
+  makeCliCode,
+  makeFormToken,
+  verifyCliCode,
   WEB_TOKEN_TTL,
   acctKey,
   checkNonce,
@@ -81,6 +86,11 @@ async function route(request: Request, env: Env): Promise<Response> {
         return need(m, "DELETE") ?? deleteHub(request, env);
       case "/relay/v1/hub/connect":
         return need(m, "GET") ?? hubConnect(request, env);
+      case "/relay/v1/cli-token":
+        if (m === "GET") return cliConfirm(request, env, url);
+        return need(m, "POST") ?? cliMint(request, env);
+      case "/relay/v1/cli-token/exchange":
+        return need(m, "POST") ?? cliExchange(request, env);
       case "/relay/auth/start":
         return need(m, "GET") ?? authStart(url, env);
       case "/relay/auth/return":
@@ -344,6 +354,83 @@ async function hubConnect(request: Request, env: Env): Promise<Response> {
   return stubFor(env, acct).fetch(new Request("https://account.internal/hub-connect", { method: "GET", headers }));
 }
 
+// ---- command-line sign-in (loopback code exchange) --------------------------------------------
+
+const CLI_STATE_RE = /^[A-Za-z0-9_-]{16,128}$/;
+
+function signInRedirect(url: URL): Response {
+  const next = safeNext(url.pathname + url.search);
+  return new Response(null, {
+    status: 302,
+    headers: { location: "/relay/sign-in?next=" + encodeURIComponent(next), "cache-control": "no-store" },
+  });
+}
+
+/** Valid loopback port (1024-65535) and state, or null. */
+function cliParams(port: unknown, state: unknown): { port: string; state: string } | null {
+  if (typeof port !== "string" || !/^\d{4,5}$/.test(port)) return null;
+  const n = Number(port);
+  if (n < 1024 || n > 65535 || String(n) !== port) return null;
+  if (typeof state !== "string" || !CLI_STATE_RE.test(state)) return null;
+  return { port, state };
+}
+
+/** GET: needs a session, then only shows a confirmation page. It never mints anything. */
+async function cliConfirm(request: Request, env: Env, url: URL): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth) return wantsHtml(request) ? signInRedirect(url) : relayError(401, "sign in to the Grouper relay first");
+  const p = cliParams(url.searchParams.get("port"), url.searchParams.get("state"));
+  if (!p) return relayError(400, "port must be 1024-65535 and state 16-128 URL-safe characters");
+  const csrf = await makeFormToken(env.RELAY_SECRET, auth.claims, p.port, p.state);
+  return cliConfirmPage(auth.claims.e, p.port, p.state, csrf);
+}
+
+/** POST from the confirmation page: same origin, form token bound to the session; mints a 60 s single-use code. */
+async function cliMint(request: Request, env: Env): Promise<Response> {
+  const origin = request.headers.get("origin");
+  if (origin !== null && origin !== new URL(request.url).origin) return relayError(403, "cross-origin request refused");
+  const auth = await authenticate(request, env);
+  if (!auth) return relayError(401, "sign in to the Grouper relay first");
+  if (!(request.headers.get("content-type") ?? "").toLowerCase().startsWith("application/x-www-form-urlencoded")) {
+    return relayError(415, "content-type must be application/x-www-form-urlencoded");
+  }
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch {
+    return relayError(400, "malformed form");
+  }
+  const p = cliParams(form.get("port"), form.get("state"));
+  if (!p) return relayError(400, "port must be 1024-65535 and state 16-128 URL-safe characters");
+  if (!(await checkFormToken(env.RELAY_SECRET, auth.claims, p.port, p.state, form.get("csrf")))) {
+    return relayError(403, "this confirmation expired or wasn't issued to you; start again");
+  }
+  const code = await makeCliCode(env.RELAY_SECRET, auth.claims.a);
+  await auth.stub.putCliCode(await sha256Hex(code), p.state, auth.claims.e, Number(env.CLI_CODE_TTL) || CLI_CODE_TTL);
+  // Only the loopback address, never another host.
+  return new Response(null, {
+    status: 303,
+    headers: {
+      location: `http://127.0.0.1:${p.port}/?code=${encodeURIComponent(code)}&state=${encodeURIComponent(p.state)}`,
+      "cache-control": "no-store",
+      "referrer-policy": "no-referrer",
+    },
+  });
+}
+
+async function cliExchange(request: Request, env: Env): Promise<Response> {
+  const body = await readJson(request);
+  const state = body.state;
+  if (typeof state !== "string" || !CLI_STATE_RE.test(state)) throw new HttpError(400, "state is required");
+  const acct = await verifyCliCode(env.RELAY_SECRET, body.code);
+  if (!acct || typeof body.code !== "string") throw new HttpError(401, "invalid or expired code");
+  const stub = stubFor(env, acct);
+  const email = await stub.takeCliCode(await sha256Hex(body.code), state);
+  if (email === null) throw new HttpError(401, "invalid or expired code");
+  const { token, expires } = await issueToken(env, acct, email, "app", stub);
+  return json(200, { relay_token: token, expires });
+}
+
 // ---- browser sign-in ------------------------------------------------------------------------
 
 function webAudiences(env: Env): string[] | undefined {
@@ -422,12 +509,7 @@ function wantsHtml(request: Request): boolean {
 async function forward(request: Request, env: Env, url: URL): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth) {
-    if (!wantsHtml(request)) return relayError(401, "sign in to the Grouper relay first");
-    const next = safeNext(url.pathname + url.search);
-    return new Response(null, {
-      status: 302,
-      headers: { location: "/relay/sign-in?next=" + encodeURIComponent(next), "cache-control": "no-store" },
-    });
+    return wantsHtml(request) ? signInRedirect(url) : relayError(401, "sign in to the Grouper relay first");
   }
 
   const headers = new Headers();

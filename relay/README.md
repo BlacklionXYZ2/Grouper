@@ -13,7 +13,7 @@ Source layout (`src/`):
 | `account.ts` | `Account` Durable Object: nonces, generation, hub secret hash, the hub tunnel (Hibernation API) |
 | `google.ts` | Google ID token verification (WebCrypto RS256, JWKS cache) |
 | `tokens.ts` | Stateless HMAC account keys, relay nonces, relay tokens, hub secrets |
-| `pages.ts` | Sign-in and "hub offline" HTML pages |
+| `pages.ts` | Sign-in, CLI confirm, "hub offline" HTML pages |
 
 ## Develop
 
@@ -21,7 +21,7 @@ Source layout (`src/`):
 cd relay
 npm install
 cp .dev.vars.example .dev.vars     # local RELAY_SECRET; .dev.vars is git-ignored
-npx wrangler dev                   # http://localhost:8787 (add --local to stay fully offline)
+npm run preview                    # website + relay on http://127.0.0.1:8799, fully local, no .dev.vars needed
 npx tsc --noEmit                   # typecheck
 npm test                           # end-to-end smoke test, see below
 ```
@@ -32,6 +32,16 @@ minted ID tokens), starts `wrangler dev --local` on port 8799 against it (config
 between accounts, nonce/aud/exp/signature checks, credential stripping, streaming, WebSockets,
 sign-out everywhere, re-claim (close code 4001) and the no-hub 503. Set `RELAY_TEST_PORT` to
 change the port and `RELAY_TEST_VERBOSE=1` to print the wrangler log.
+
+`npm run preview` serves `/`, `/download`, `/privacy` (from `site/`), `/relay/sign-in` and the relay
+routes on `127.0.0.1:8799` with a throwaway `RELAY_SECRET`. Hub paths redirect to the sign-in page
+(there is no Google or hub behind it). Don't add `--local-upstream` to a preview: it exists only for
+the test runners, which need the Worker to see `127.0.0.1:<port>` as its host (the production route
+otherwise makes it see `grouper.clockmillbarn.uk`). The preview without it was checked to serve every page.
+
+The command-line sign-in endpoints (`GET/POST /relay/v1/cli-token`, `POST /relay/v1/cli-token/exchange`)
+are described in `../docs/relay-design.md` (Clients). The test hook `CLI_CODE_TTL` (seconds, default 60)
+shortens the code lifetime for the smoke test.
 
 ## Configuration
 

@@ -6,6 +6,7 @@
   "description": "Grouper relay: Cloudflare Worker + Durable Objects tunnel between signed-in clients and each user's hub",
   "scripts": {
     "dev": "wrangler dev",
+    "preview": "wrangler dev --local --ip 127.0.0.1 --port 8799 --var RELAY_SECRET:local-preview-only-secret --show-interactive-dev-session=false",
     "typecheck": "tsc --noEmit",
     "test": "node test/smoke.mjs",
     "deploy": "wrangler deploy"
